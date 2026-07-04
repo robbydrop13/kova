@@ -1,0 +1,7 @@
+# Rust build output (Cargo target is global at ~/.cargo/target, but a local
+# ./target may appear — never commit it)
+/target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
