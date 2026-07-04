@@ -20,6 +20,20 @@ Terminal Mac ultra-rapide en Rust + Metal.
 
 Voir `roadmap.md` pour le détail des versions et l'avancement.
 
+## Upstream / Sync avec le projet de Micka
+
+Ce repo (`claap-app/kova`) part de la base du projet de Micka, qui **continue de développer activement** sa version. Son repo est configuré comme remote `micktaiwan` (`git@github.com:micktaiwan/kova.git`).
+
+On voudra **récupérer et synchroniser régulièrement ses avancées** dans le futur :
+
+```bash
+git fetch micktaiwan
+git log --oneline main..micktaiwan/main   # voir ce qui est nouveau chez lui
+git merge micktaiwan/main                  # ou rebase, en gardant nos ajouts par-dessus
+```
+
+Nos ajouts propres à garder par-dessus sa base : file drag-and-drop, `cmd+1..9` compatible AZERTY, copie clipboard via `writeObjects`. Ne pas réintroduire ce qui n'est **pas** dans sa base courante (ex. entitlements caméra / screen-capture) : on s'aligne sur son projet.
+
 ## Build
 
 - Le target directory Cargo est **global** : `~/.cargo/target` (pas `./target`)
