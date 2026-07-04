@@ -496,6 +496,30 @@ define_class!(
             false
         }
 
+        // --- File drag & drop (NSDraggingDestination) ---
+        // Dragging a file from Finder onto a pane inserts its (shell-quoted) path,
+        // like iTerm. NSDragOperationCopy = 1.
+
+        #[unsafe(method(draggingEntered:))]
+        unsafe fn dragging_entered(&self, _sender: &objc2::runtime::AnyObject) -> usize {
+            1 // NSDragOperationCopy
+        }
+
+        #[unsafe(method(draggingUpdated:))]
+        unsafe fn dragging_updated(&self, _sender: &objc2::runtime::AnyObject) -> usize {
+            1 // NSDragOperationCopy
+        }
+
+        #[unsafe(method(prepareForDragOperation:))]
+        unsafe fn prepare_for_drag_operation(&self, _sender: &objc2::runtime::AnyObject) -> bool {
+            true
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        unsafe fn perform_drag_operation(&self, sender: &objc2::runtime::AnyObject) -> bool {
+            self.handle_file_drop(sender)
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             // Send-to-window overlay handles its own keys
@@ -1288,14 +1312,35 @@ unsafe fn nsstring_from_input(obj: &objc2::runtime::AnyObject) -> String {
     }
 }
 
+/// Shell-quote a filesystem path for insertion on the command line.
+/// Leaves paths made of safe characters untouched; otherwise wraps them in
+/// single quotes (escaping embedded single quotes).
+fn shell_quote(path: &str) -> String {
+    let safe = !path.is_empty()
+        && path.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+' | '=' | ':' | ',')
+        });
+    if safe {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
 /// Copy text to the system pasteboard.
 fn copy_to_pasteboard(text: &str) {
+    use objc2::runtime::ProtocolObject;
     let pasteboard = NSPasteboard::generalPasteboard();
     pasteboard.clearContents();
     let ns_str = NSString::from_str(text);
-    unsafe {
-        pasteboard.setString_forType(&ns_str, objc2_app_kit::NSPasteboardTypeString);
-    }
+    // Write the NSString as an object (not raw bytes under a fixed type) so the
+    // pasteboard can hand any requested text encoding to the receiving app.
+    // setString:forType: only registers literal UTF-8 bytes, which some legacy
+    // apps mis-decode as Mac Roman (turning "é" into "√©").
+    let writing: &ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting> =
+        ProtocolObject::from_ref(&*ns_str);
+    let objects = NSArray::from_slice(&[writing]);
+    pasteboard.writeObjects(&objects);
 }
 
 impl KovaView {
@@ -1346,7 +1391,65 @@ impl KovaView {
             recent_resizes: RefCell::new(std::collections::HashMap::new()),
             tab_backup: RefCell::new(std::collections::HashMap::new()),
         });
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        // Accept file drags from Finder (legacy filenames type; AppKit bridges
+        // modern file-URL drags into it automatically).
+        let types = NSArray::from_retained_slice(&[NSString::from_str("NSFilenamesPboardType")]);
+        let _: () = unsafe { msg_send![&*view, registerForDraggedTypes: &*types] };
+        view
+    }
+
+    /// Handle a Finder file drop: insert the shell-quoted path(s) of the dropped
+    /// files into the pane under the cursor (or the focused pane), like iTerm.
+    fn handle_file_drop(&self, sender: &objc2::runtime::AnyObject) -> bool {
+        let pasteboard: Retained<NSPasteboard> = unsafe { msg_send![sender, draggingPasteboard] };
+        let filenames_type = NSString::from_str("NSFilenamesPboardType");
+        let Some(plist) = (unsafe { pasteboard.propertyListForType(&filenames_type) }) else {
+            return false;
+        };
+
+        // plist is an NSArray<NSString> of filesystem paths.
+        let count: usize = unsafe { msg_send![&*plist, count] };
+        if count == 0 {
+            return false;
+        }
+        let mut quoted = Vec::with_capacity(count);
+        for i in 0..count {
+            let path: Retained<NSString> = unsafe { msg_send![&*plist, objectAtIndex: i] };
+            quoted.push(shell_quote(&path.to_string()));
+        }
+        // Trailing space so a subsequent path/arg is separated.
+        let text = format!("{} ", quoted.join(" "));
+
+        // Drop onto the pane under the cursor if any, else the focused pane.
+        let location: CGPoint = unsafe { msg_send![sender, draggingLocation] };
+        let pane = self
+            .pane_at_window_point(location)
+            .map(|(pane, _vp)| pane)
+            .or_else(|| self.focused_pane());
+        if let Some(pane) = pane {
+            pane.terminal.write().reset_scroll();
+            pane.pty.write(text.as_bytes());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Hit-test a pane from a window-coordinate point (active tab).
+    fn pane_at_window_point(&self, location: CGPoint) -> Option<(&Pane, PaneViewport)> {
+        let tabs = self.ivars().tabs.borrow();
+        let idx = self.ivars().active_tab.get();
+        let tab = tabs.get(idx)?;
+        let local: CGPoint = unsafe {
+            msg_send![self, convertPoint: location, fromView: std::ptr::null::<objc2::runtime::AnyObject>()]
+        };
+        let frame = self.frame();
+        let scale = self.backing_scale();
+        let px = local.x as f32 * scale;
+        let py = (frame.size.height as f32 - local.y as f32) * scale;
+        let (pane, vp) = tab.hit_test(px, py, self.panes_viewport_for_tab(tab))?;
+        Some((unsafe { &*(pane as *const Pane) }, vp))
     }
 
     /// Build memory report, store in renderer for overlay, and log to file.

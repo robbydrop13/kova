@@ -92,11 +92,15 @@ impl KeyCombo {
         let option = modifiers.contains(NSEventModifierFlags::Option);
         let shift = modifiers.contains(NSEventModifierFlags::Shift);
 
-        // Use keycodes only for special keys (arrows, enter, backspace) where
-        // charactersIgnoringModifiers returns private-use Unicode characters.
+        // Use keycodes for special keys (arrows, enter, backspace) where
+        // charactersIgnoringModifiers returns private-use Unicode characters,
+        // and for the number row so cmd+1..9 works on layouts where the digits
+        // require Shift (AZERTY: the "1" key types "&", "2" types "é", etc.).
         // For all other keys, use charactersIgnoringModifiers which respects the
         // active keyboard layout (AZERTY, QWERTZ, etc.).
-        let key = keycode_to_special(event.keyCode())
+        let code = event.keyCode();
+        let key = keycode_to_special(code)
+            .or_else(|| keycode_to_digit(code).map(Key::Char))
             .unwrap_or_else(|| {
                 let chars = event.charactersIgnoringModifiers();
                 let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
@@ -119,6 +123,25 @@ fn keycode_to_special(code: u16) -> Option<Key> {
         0x7D => Some(Key::Down),
         0x7B => Some(Key::Left),
         0x7C => Some(Key::Right),
+        _ => None,
+    }
+}
+
+/// Map number-row physical keycodes to their digit characters, so bindings like
+/// `cmd+1` match by physical key position regardless of keyboard layout. On
+/// AZERTY the top-row keys type symbols (`&`, `é`, `"`, …) without Shift, so
+/// resolving via characters would never match the digit bindings.
+fn keycode_to_digit(code: u16) -> Option<char> {
+    match code {
+        0x12 => Some('1'),
+        0x13 => Some('2'),
+        0x14 => Some('3'),
+        0x15 => Some('4'),
+        0x17 => Some('5'),
+        0x16 => Some('6'),
+        0x1A => Some('7'),
+        0x1C => Some('8'),
+        0x19 => Some('9'),
         _ => None,
     }
 }
