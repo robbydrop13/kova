@@ -31,6 +31,7 @@ echo "{\"cmd\":\"list-panes\"}" | nc -U "$KOVA_SOCKET"
 - One response per request: a single JSON object on its own line.
 - Multiple requests can be pipelined on the same connection.
 - Each line is capped at **64 KB** on the request side. Responses have **no cap** — `get-pane-content` can return arbitrary size.
+- One command escapes that shape: [`subscribe`](#subscribe--stream-state-changes-as-they-happen) turns the connection into a one-way event stream. After its response, Kova pushes one line per state change and never reads that connection again.
 
 ### Response envelope
 
@@ -125,12 +126,68 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "cwd": "/path", "title": "...",
   "focused": true,
   "pid": 12345,
-  "child_processes": [ { "pid": 67890, "name": "node" } ],
-  "is_idle": false
+  "child_processes": [ { "pid": 67890, "name": "node", "version": null } ],
+  "is_idle": false,
+  "working": true,
+  "awaiting": false,
+  "awaiting_since": null,
+  "awaiting_seen": false,
+  "minimized": false,
+  "agent": "claude",
+  "agent_session_id": "0b6f…",
+  "agent_session_name": "subscribe côté Kova",
+  "claude_session_id": "0b6f…",
+  "claude_session_name": "subscribe côté Kova"
 }
 ```
 
 `is_idle` means the shell has no child process — useful to check whether a pane is "free to receive a new command".
+
+`child_processes[].name` is the program's name as it was invoked (argv[0], what `ps` shows), not the kernel's `p_comm`. The difference matters for anything installed under a versioned filename: Claude Code's binary is `~/.local/share/claude/versions/2.1.226`, so `p_comm` there is `2.1.226` and the name would say nothing about which program is running. `version` carries that number when the executable's own filename is one, and is `null` otherwise — so a Claude Code pane reads `{"name": "claude", "version": "2.1.226"}`.
+
+`claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab, and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
+
+`agent` is `"claude"`, `"codex"`, or `null`. `agent_session_id` and `agent_session_name` expose the detected conversation's id and name for either agent; the name is `null` when absent. The `claude_*` fields remain `null` for Codex, including named Codex sessions. Codex resumes with `codex resume <id>`.
+
+Codex names come from `~/.codex/session_index.jsonl`, joined by session id to the live process detection. The last valid entry for an id wins; a blank name clears it. Reads share the detection's one-second cache, and missing or malformed entries leave the normal title fallback available. Unlike Claude's session files, this index does not distinguish automatic names from explicit `/rename` names: Kova displays the latest persisted name in both cases.
+
+The pane switcher, open-pane search results, IPC `title`, and automatic tab titles use the conversation name before the pane's custom title, OSC title, foreground process, and directory. An explicitly named tab keeps its own title. The per-pane status bar has its own existing rule (hovered URL, custom pane title, OSC title), and does not read the conversation name directly.
+
+`minimized` is `true` for a pane collapsed with `minimize-pane` (`Cmd+M` by default). Such a pane still runs and is still listed here; it simply takes no layout space and is not drawn. Kova marks it with a `⊟` glyph in the pane switcher and counts it in the status bar. A remote client should keep showing it and mark it the same way rather than filter it out.
+
+`working` is `true` when the app in the pane is actively generating or running a tool, detected from its OSC 0/2 title: Claude Code prepends an **animated Braille spinner glyph** (U+2800–U+28FF, e.g. `⠂`/`⠐`) followed by a space *only while it works*. At the prompt it instead shows an asterisk-like idle marker (`✳ Claude Code`) or a plain title, so the asterisk is explicitly NOT treated as busy. Counting panes with `working: true` therefore gives the number of Claude Code sessions actually busy — as opposed to those merely open and waiting for input (which stay `is_idle: false` too, since the `claude` process is always a child). It reads the live OSC 0/2 title even when a sticky custom title (OSC 1 / manual rename) shadows the display. Kova also shows this count in the global status bar as `✳N` (hidden when zero).
+
+`awaiting` is `true` when the app in the pane has declared, over `set-pane-status`, that it is waiting for the user — and nothing Kova observed since contradicts it. `awaiting_since` is the epoch second at which the wait started (`null` when not waiting), so a client can show how long a session has been unanswered. Unlike `working`, this is *pushed*, not guessed: `working` is inferred from the terminal title, while `awaiting` is a claim the running app makes about itself. See `set-pane-status` for how it is set and, more importantly, for the ways Kova retracts it on its own.
+
+`awaiting_seen` is `true` when a waiting pane has been looked at on this Mac since it started waiting: Kova stamps it on the focused pane of the key window, on every frame. It is the difference between the two things `awaiting` alone cannot tell apart, and the reason `Cmd+J` does not hand you the same pane twice. The marker stays up either way, because reading a question is not answering it; only the jump set shrinks. A remote client that walks waiting panes should obey the same halt, otherwise it offers panes already read here. It is `false` on a pane that is not waiting, where the bit means nothing.
+
+---
+
+### `set-pane-status` — declare that a pane is waiting for the user
+
+```json
+{ "cmd": "set-pane-status", "pane_id": 42, "status": "waiting" | "none" }
+```
+
+Marks the pane as waiting for an answer, or clears the mark. `status` accepts exactly those two strings; anything else is an error rather than a silent no-op, so a mistyped hook fails loudly instead of quietly clearing the flag.
+
+Meant to be driven by the app running inside the pane. For Claude Code that means its hooks: `Stop` and the `permission_prompt` notification set `waiting`; `UserPromptSubmit` and `SessionEnd` set `none`. A pane knows its own id and socket from `$KOVA_PANE_ID` / `$KOVA_SOCKET`, which hook processes inherit.
+
+Setting `waiting` twice does not restart the clock: `awaiting_since` keeps the timestamp of the first mark, so a second `Stop` on the same unanswered turn does not make an old wait look fresh.
+
+Response: `{ "ok": true }`.
+
+**The flag is a claim, not a fact.** A session killed with `-9` never gets to retract it, so Kova never reports the flag without re-checking it. It is dropped when:
+
+- the pane's foreground process is gone (its Claude Code died, or the pane fell back to a bare shell prompt) — checked on the same throttled probe that maintains the tab "running" indicator;
+- the pane's shell exited;
+- Claude Code went back to work (the Braille spinner reappears in the OSC title) — reported instantly, without waiting for the throttled probe;
+- the user typed into the pane, or `send-keys` wrote to it: someone answered;
+- the pane was closed, or Kova restarted. The state is deliberately not persisted across restarts; a resumed session re-declares itself on its next turn.
+
+There is intentionally **no time-based expiry**. A question left unanswered for three hours is exactly what this flag is for.
+
+**Nothing in the UI draws this flag.** It used to show as a `?` on the switcher row and a `?N` status-bar counter; both were dropped, because `Stop` fires at the end of every turn — so the marker said "waiting" on sessions that asked for nothing, and it stayed up until the next prompt was submitted even after the pane had been read. What the UI shows instead is unread output (bell / finished command), which is what `Cmd+P`'s `Tab`, the `●N` counter and `Cmd+J`'s first tier all walk. The flag lives on for IPC clients only — `list-panes` and the `pane-status` event, which `/pane-sweep` consumes.
 
 ---
 
@@ -140,7 +197,38 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 { "cmd": "focus-pane", "pane_id": 42 }
 ```
 
-Switches tab and window if needed. Response: `{ "ok": true }`.
+Switches tab and window if needed. A minimized pane is given its space back on
+the way — this is the only path that restores one by ID, and the reason the
+keyboard jumps (Cmd+J, back/forward) leave minimized panes alone while this
+command does not. Response: `{ "ok": true }`.
+
+---
+
+### `notify` — post a desktop notification that focuses a pane when clicked
+
+```json
+{ "cmd": "notify", "pane_id": 42, "title": "Claude Code", "message": "done", "sound": false }
+```
+
+Only `message` is required. `title` defaults to `"Kova"`, `sound` to `false`, and
+`pane_id` may be omitted for a notification that carries no destination — clicking
+it then only brings Kova to the front.
+
+Kova posts the notification itself instead of leaving it to a helper because it
+is the only process that can act on the click: the click focuses `pane_id` exactly
+as `focus-pane` would, restoring it if it was minimized. `terminal-notifier
+--execute` cannot do this on macOS 26 — it still speaks the removed
+`NSUserNotification` API, so its notification is delivered but its command never
+runs.
+
+`pane_id` is not checked when the notification is posted: the pane may
+legitimately be gone by the time the user clicks, and Kova logs the miss then
+rather than refusing the notification now. Response: `{ "ok": true }`, or an error
+when Kova runs outside its app bundle (notifications need a bundle identifier).
+
+The first notification of a fresh install triggers the system permission prompt;
+if the user declines, `notify` still answers `{ "ok": true }` and macOS silently
+drops the banner.
 
 ---
 
@@ -234,6 +322,8 @@ Response: `{ "ok": true }`.
 
 Sets the pane's custom title — the same field that `Cmd+Option+R` and `OSC 1` write to. Sticky: survives OSC 0/2 (window title) sequences emitted by programs running in the pane. Pass `"title": null` to clear (pane falls back to its OSC 0/2 / auto-derived title).
 
+One thing outranks it in the pane's display title: the current Claude or Codex conversation name (`agent_session_name` in `list-panes`). A sticky title outlives whatever the pane is used for next, so a pane running a named session shows that name, and the custom title reappears once the session ends or its name is cleared. The per-pane status bar uses the separate rule described under `list-panes`.
+
 Response: `{ "ok": true }`.
 
 ---
@@ -265,14 +355,17 @@ reparent-up|down|left|right        (move a pane across the tree)
 resize-left|right|up|down          (ratio resize, ±5%)
 edge-grow-left|right               (grow the focused pane's edge)
 minimize-pane  restore-minimized
+next-attention                     (focus the next unread pane, else an idle Claude session; skips minimized panes)
+history-back|history-forward       (walk the panes you visited, back then forward; skips minimized panes)
 detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
 open-recent-project  open-search  open-pane-switcher   (open an overlay)
-copy  copy-raw  paste  toggle-filter  clear-scrollback
+open-unread-switcher               (the pane switcher, listing only panes with a bell, an unread completion or a question)
+copy  copy-raw  paste  toggle-filter
 toggle-help  mem-report
 ```
 
-Note: a few actions open an **interactive overlay** that then expects keyboard input — `merge-tab`, `merge-window`, `detach-tab` (when several windows exist), `rename-tab`, `rename-pane`, `open-recent-project`, `open-search`, `open-pane-switcher`. For headless automation, prefer the deterministic typed commands where one exists (e.g. `merge-window` with explicit indices, `rename-pane` with a title).
+Note: a few actions open an **interactive overlay** that then expects keyboard input — `merge-tab`, `merge-window`, `detach-tab` (when several windows exist), `rename-tab`, `rename-pane`, `open-recent-project`, `open-search`, `open-pane-switcher`, `open-unread-switcher`. For headless automation, prefer the deterministic typed commands where one exists (e.g. `merge-window` with explicit indices, `rename-pane` with a title).
 
 ---
 
@@ -295,6 +388,21 @@ Response: `{ "ok": true }`.
 ```
 
 Pass `"title": null` to clear the override (tab falls back to the auto title, e.g. shell CWD).
+
+Response: `{ "ok": true }`.
+
+---
+
+### `set-tab-color` — color the tab holding a pane
+
+```json
+{ "cmd": "set-tab-color", "pane_id": 42, "color": 4 }
+```
+
+`color` is an index into the same six-color palette the tab bar's right-click menu offers:
+`0` red, `1` orange, `2` yellow, `3` green, `4` blue, `5` violet. Pass `"color": null` to
+clear it (tab falls back to the default background). Anything outside `0..5` is refused
+rather than wrapped.
 
 Response: `{ "ok": true }`.
 
@@ -377,8 +485,83 @@ Response:
 
 - If the wait arrives **after** the command already finished, it returns `completed: true` immediately.
 - Calling `wait-for-completion` twice in a row without sending a new command in between returns `completed: true` both times. The flag isn't consumed by observation. The intended pattern is `send-keys` → `wait-for-completion`, never two waits without a send in between.
+- Focusing the pane doesn't consume it either. The completion *dot* is acknowledged when you look at the pane, but that ack is a separate flag — a user switching panes can't make a pending `wait-for-completion` miss its event.
 
 **Long timeouts.** The connection-thread timeout is automatically extended to `timeout_ms + 2s`, so you can ask for a long wait without the connection dying first.
+
+---
+
+### `subscribe` — stream state changes as they happen
+
+```json
+{ "cmd": "subscribe", "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close"] }
+```
+
+Turns this connection into an event stream. `events` is optional — omit it to get
+every topic. An unknown name is an error, not a silently ignored entry: a typo
+would otherwise leave the client waiting forever for events that never come.
+
+The **response is a snapshot** of the current state, so a subscriber never needs a
+separate `list-panes` to bootstrap, and has no gap between "what is true now" and
+"what changed since":
+
+```json
+{ "ok": true, "data": {
+  "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close"],
+  "app_active": true,
+  "focus": { ...pane object, or null... },
+  "panes": [ ...same objects as `list-panes`... ]
+} }
+```
+
+Every line after that is one event, told apart from a response by its `event` key:
+
+| `event` | Payload | Fires when |
+|---|---|---|
+| `focus` | `app_active`, `reason`, `pane` (a pane object, or `null`) | the pane holding the user's attention changed |
+| `pane-status` | `pane_id`, `awaiting`, `awaiting_since` | a pane raised or retracted its `awaiting` flag |
+| `pane-working` | `pane_id`, `working` | a pane started or stopped working |
+| `pane-open` | `pane` | a pane appeared |
+| `pane-close` | `pane_id`, `window`, `tab` | a pane went away |
+| `ping` | — | 30 s of silence (see below) |
+
+**`focus` folds "is Kova even frontmost" into the same stream.** Leaving Kova for
+another app emits `focus` with `pane: null` and `reason: "app-inactive"`; coming
+back emits the pane with `reason: "app-active"`. A client tracking where the
+user's attention goes therefore doesn't have to join this stream with the system's
+active-app notifications — "which pane is focused" and "you are actually looking
+at it" are one fact here. `reason` is one of `pane`, `tab`, `window`, `session`,
+`app-active`, `app-inactive`, `no-key-window`, and always names the *coarsest*
+true hop: a pane change that is also a tab change reads `tab`.
+
+`session` is the one that does not involve moving: the focused pane is the same,
+but the Claude or Codex conversation in it changed — you launched an agent, it ended,
+or its name changed through `/rename`, right where you already were. The conversation is deliberately part of the focused
+pane's identity rather than just its payload, because a client keyed on
+conversations would otherwise hear about a session started in place only when the
+user next happened to leave the pane and come back.
+
+Notes that matter when writing a client:
+
+- **Redundant edges, never gaps.** The subscription is registered before the
+  snapshot is built, so an event firing in between is delivered right after the
+  snapshot instead of being lost. Every event carries absolute state, so applying
+  one you already knew about changes nothing.
+- **A `ping` every 30 s of silence.** It is how Kova notices a client that died
+  without closing, and how a client notices Kova is gone — treat a long silence
+  (say 90 s) as a dead link, reconnect, and re-subscribe.
+- **Falling behind gets you disconnected.** Each subscriber has a bounded queue
+  (256 events). A client that stops reading is dropped rather than served a hole:
+  it has to reconnect, and the fresh snapshot resyncs it. This is what keeps a
+  slow client from ever stalling Kova's render loop — the main thread only pushes
+  to those queues, and the connection's own thread does the socket write.
+- **The connection is one-way once subscribed.** Kova stops reading it. Open a
+  second connection for commands.
+- **`focus` is compared every frame; the pane sweep runs at ~4 Hz.** So
+  `pane-status` / `pane-working` / `pane-open` / `pane-close` can lag a change by
+  up to ~250 ms, while `focus` is reported on the next frame.
+- **The socket name carries Kova's pid**, so a Kova restart moves it. A long-lived
+  subscriber needs to re-glob `/tmp/kova-*.sock` and re-subscribe.
 
 ## Common patterns
 
@@ -397,6 +580,14 @@ printf '%s' "{\"cmd\":\"wait-for-completion\",\"pane_id\":$PID,\"timeout_ms\":30
 # 3. Fetch what was printed
 printf '%s' "{\"cmd\":\"get-pane-content\",\"panes\":[$PID],\"mode\":\"all\"}" | nc -U $SOCK \
   | jq -r '.data.panes[0].text'
+```
+
+### Follow the user's attention
+
+```bash
+# One line per change; the first line is the snapshot.
+printf '%s' '{"cmd":"subscribe","events":["focus"]}' | nc -U $KOVA_SOCKET \
+  | jq -r 'if .ok then "snapshot: \(.data.focus.cwd // "-")" else "\(.reason): \(.pane.cwd // "-")" end'
 ```
 
 ### Spawn an agent in a new tab
@@ -423,4 +614,5 @@ fi
 
 - All operations run on Kova's main thread (AppKit requirement). The IPC listener thread forwards parsed commands via an mpsc channel; the main thread processes them on its render tick (~60 Hz). End-to-end latency for a request is typically a single-digit number of milliseconds.
 - `wait-for-completion` is the only command that can defer its response across multiple ticks — it doesn't block the main thread or freeze the UI.
+- `subscribe` is the only command that keeps writing after its response. Events are produced on the main thread by diffing the previous state on the render tick — there is no single mutation site to hook, since focus moves from a dozen places and `working` / `awaiting` are derived rather than set. They are then handed to per-subscriber bounded queues; the socket write happens on the subscriber's own connection thread, so no client can slow the terminal down. When nobody is subscribed, the whole path costs one atomic load per tick.
 - The socket file is removed both on graceful shutdown and on panic (via a guard); a stale socket from a previous crash is cleaned up at startup.

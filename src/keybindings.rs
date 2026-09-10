@@ -40,7 +40,6 @@ pub enum Action {
     CopyRaw,
     Paste,
     ToggleFilter,
-    ClearScrollback,
     PrevTab,
     NextTab,
     RenameTab,
@@ -64,8 +63,16 @@ pub enum Action {
     OpenRecentProject,
     OpenSearchPalette,
     OpenPaneSwitcher,
+    /// The same switcher, opened with only the panes asking for something.
+    OpenUnreadSwitcher,
+    /// Save the focused pane's conversation to the bookmark list, or drop it if
+    /// it is already there.
+    ToggleBookmark,
     Equalize,
     RepaintPane,
+    NextAttention,
+    HistoryBack,
+    HistoryForward,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -234,7 +241,6 @@ impl Keybindings {
         bind(&keys.copy_raw, Action::CopyRaw);
         bind(&keys.paste, Action::Paste);
         bind(&keys.toggle_filter, Action::ToggleFilter);
-        bind(&keys.clear_scrollback, Action::ClearScrollback);
         bind(&keys.prev_tab, Action::PrevTab);
         bind(&keys.next_tab, Action::NextTab);
         bind(&keys.rename_tab, Action::RenameTab);
@@ -281,8 +287,13 @@ impl Keybindings {
         bind(&keys.open_recent_project, Action::OpenRecentProject);
         bind(&keys.open_search, Action::OpenSearchPalette);
         bind(&keys.open_pane_switcher, Action::OpenPaneSwitcher);
+        bind(&keys.open_unread_switcher, Action::OpenUnreadSwitcher);
+        bind(&keys.toggle_bookmark, Action::ToggleBookmark);
         bind(&keys.equalize, Action::Equalize);
         bind(&keys.repaint_pane, Action::RepaintPane);
+        bind(&keys.next_attention, Action::NextAttention);
+        bind(&keys.history_back, Action::HistoryBack);
+        bind(&keys.history_forward, Action::HistoryForward);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);
@@ -327,7 +338,6 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "copy-raw" => Action::CopyRaw,
         "paste" => Action::Paste,
         "toggle-filter" => Action::ToggleFilter,
-        "clear-scrollback" => Action::ClearScrollback,
         "prev-tab" => Action::PrevTab,
         "next-tab" => Action::NextTab,
         "rename-tab" => Action::RenameTab,
@@ -377,8 +387,13 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "open-recent-project" => Action::OpenRecentProject,
         "open-search" => Action::OpenSearchPalette,
         "open-pane-switcher" => Action::OpenPaneSwitcher,
+        "open-unread-switcher" => Action::OpenUnreadSwitcher,
+        "toggle-bookmark" => Action::ToggleBookmark,
         "equalize" => Action::Equalize,
         "repaint-pane" => Action::RepaintPane,
+        "next-attention" => Action::NextAttention,
+        "history-back" => Action::HistoryBack,
+        "history-forward" => Action::HistoryForward,
 
         _ => return None,
     };

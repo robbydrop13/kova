@@ -2,8 +2,19 @@ pub mod glyph_atlas;
 pub mod pipeline;
 pub mod vertex;
 
+/// Horizontal padding inside a pane, in LOGICAL points. Always go through
+/// `Renderer::h_padding()` (or `KovaView::h_padding()`), which scales it to
+/// pixels — using the constant raw makes the pane's apparent padding, and
+/// therefore its column count, depend on the display's scale factor.
 pub const PANE_H_PADDING: f32 = 10.0;
 const TOOLTIP_ANIM_FRAMES: u8 = 10; // ~166ms at 60fps
+
+/// Synthetic italic slant: tan(~12°). The glyph quad's top edge is shifted this
+/// fraction of the baseline height to the right, the descender edge to the left.
+/// Fallback only — used when the font has no real italic face, or for a char
+/// (box-drawing, etc.) with no italic form. Real italic glyphs are rasterized
+/// from the font's italic face; see `GlyphAtlas::rasterize_italic_char`.
+const ITALIC_SHEAR: f32 = 0.213;
 
 /// A hoverable zone in a status bar, with associated tooltip text.
 struct TooltipZone {
@@ -38,6 +49,21 @@ pub const TAB_COLORS: [[f32; 3]; 6] = [
     [0.25, 0.50, 0.85], // Blue
     [0.60, 0.35, 0.75], // Violet
 ];
+
+/// Saturation kept on an inactive colored tab (CSS `saturate(0.7)`).
+const DIM_SATURATION: f32 = 0.7;
+/// Brightness kept on an inactive colored tab (CSS `brightness(0.82)`).
+const DIM_BRIGHTNESS: f32 = 0.82;
+
+/// Dim a tab color so only the active tab shows its full hue, matching the
+/// CSS filter chain `saturate(0.7) brightness(0.82)`: pull the channels toward
+/// the luminance, then scale. The tint stays recognizable, but the active tab
+/// is the only saturated block in the bar.
+fn dim_inactive_tab(c: [f32; 3]) -> [f32; 3] {
+    let lum = 0.213 * c[0] + 0.715 * c[1] + 0.072 * c[2];
+    let mix = |v: f32| ((lum + (v - lum) * DIM_SATURATION) * DIM_BRIGHTNESS).clamp(0.0, 1.0);
+    [mix(c[0]), mix(c[1]), mix(c[2])]
+}
 
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -77,8 +103,27 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use vertex::Vertex;
 
-use crate::config::{Config, KeysConfig};
+use crate::config::{Config, DimMode, KeysConfig};
+use crate::terminal::paste_block::RowPaint;
 use crate::pane::PaneId;
+
+/// Color of the minimized-pane marker (status-bar counter and switcher ⊟ icon).
+/// Violet: distinct from the bell (orange) and completion (green) dots.
+const MINIMIZED_FG: [f32; 4] = [0.75, 0.55, 0.95, 1.0];
+
+/// Status-bar background of a pane holding a bookmarked conversation. Deep
+/// enough to sit under the bar's usual palette (cwd grey, branch green, scroll
+/// amber) without washing it out, and to read as a state rather than an alarm —
+/// the bell and completion bars own the loud end of the range.
+const BOOKMARKED_BAR_BG: [f32; 3] = [0.05, 0.09, 0.24];
+
+/// Color of the "Claude Code is working" marker (status-bar ✳ counter and
+/// switcher ✳ icon). Green: something is happening, nothing is owed.
+const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
+
+/// Color of the status-bar unread counter. Same amber as the per-pane bell dot:
+/// the counter and the dots it sums must read as one signal.
+const UNREAD_FG: [f32; 4] = [0.9, 0.6, 0.2, 1.0];
 
 /// Attention state for a non-focused pane (bell > completion > none).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -109,12 +154,15 @@ impl PaneAttention {
         }
     }
 }
-use crate::terminal::{CursorShape, FilterMatch, TerminalState};
+use crate::terminal::{CellAttrs, CursorShape, FilterMatch, TerminalState};
 
 /// Data passed to the renderer for drawing filter overlay.
 pub struct FilterRenderData {
     pub query: String,
     pub matches: Vec<FilterMatch>,
+    /// Shown instead of the match count when there is nothing to count yet —
+    /// how to get back a query filtered earlier in this run.
+    pub hint: Option<String>,
 }
 
 /// A single entry in the recent projects overlay.
@@ -173,8 +221,21 @@ pub struct SendToWindowRenderData<'a> {
 pub struct PaneSwitcherRowRender<'a> {
     pub text: &'a str,
     pub is_header: bool,
-    /// True for the row of the currently-focused pane (gets a marker).
-    pub is_current: bool,
+    /// Pending bell on this pane (unread) — drives an attention dot.
+    pub has_bell: bool,
+    /// A command completed on this pane (unread) — drives an attention dot.
+    pub has_completion: bool,
+    /// Pane is minimized (hidden from the layout) — drives a colored ⊟ icon.
+    pub minimized: bool,
+    /// Claude Code is actively working in this pane — drives a ✳ marker.
+    pub working: bool,
+    /// This pane is waiting for the user — drives a ? marker.
+    /// Binary running in the pane ("claude 2.1.226"), shown dim at the right
+    /// end of the row. `None` on headers and at a bare shell prompt.
+    pub process: Option<&'a str>,
+    /// This pane holds a bookmarked conversation — the row is painted light
+    /// blue on black text so a tracked project is spotted without reading.
+    pub bookmarked: bool,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -192,6 +253,10 @@ pub struct PaneSwitcherRenderData<'a> {
     pub selected_col: usize,
     /// Selected row within `columns[selected_col]` — always a pane row.
     pub selected_row: usize,
+    /// Attention-only list: every pane row shown is asking for something, and
+    /// the panes that are not have been left out. Changes the title and the
+    /// hint, so the list never looks like a truncated version of the full one.
+    pub filtered: bool,
 }
 
 /// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
@@ -203,6 +268,126 @@ pub struct OverlayListGeometry {
     pub max_visible: usize,
 }
 
+/// Geometry of the big directory label drawn over a flashing pane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FlashLabelLayout {
+    name_scale: f32,
+    name_x: f32,
+    name_y: f32,
+    parent_scale: f32,
+    parent_x: f32,
+    parent_y: f32,
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+}
+
+/// Lay out the flash label inside a pane rectangle: the directory name is
+/// blown up as far as it fits (never past `FLASH_NAME_MAX_SCALE`, where the
+/// upscaled atlas bitmap starts to smear), the path above it sits underneath
+/// at a fixed small scale, and the whole block is centered behind a padded
+/// backdrop. Pure geometry, so it can be checked without a GPU.
+fn flash_label_layout(
+    pane: (f32, f32, f32, f32),
+    name_chars: usize,
+    parent_chars: usize,
+    cell_w: f32,
+    cell_h: f32,
+) -> FlashLabelLayout {
+    const FLASH_NAME_MAX_SCALE: f32 = 3.0;
+    const FLASH_NAME_MIN_SCALE: f32 = 1.0;
+    const FLASH_PARENT_SCALE: f32 = 1.1;
+    /// Fraction of the pane width the name is allowed to span.
+    const FLASH_WIDTH_RATIO: f32 = 0.8;
+
+    let (px, py, pw, ph) = pane;
+    let name_chars = name_chars.max(1) as f32;
+    let name_scale = ((pw * FLASH_WIDTH_RATIO) / (name_chars * cell_w))
+        .clamp(FLASH_NAME_MIN_SCALE, FLASH_NAME_MAX_SCALE);
+    let name_w = name_chars * cell_w * name_scale;
+    let name_h = cell_h * name_scale;
+
+    // The path line shrinks below its nominal scale rather than being clipped
+    // in a narrow pane.
+    let parent_scale = if parent_chars == 0 {
+        FLASH_PARENT_SCALE
+    } else {
+        FLASH_PARENT_SCALE.min((pw * FLASH_WIDTH_RATIO) / (parent_chars as f32 * cell_w)).max(0.6)
+    };
+    let parent_w = parent_chars as f32 * cell_w * parent_scale;
+    let parent_h = if parent_chars == 0 { 0.0 } else { cell_h * parent_scale };
+    let gap = if parent_chars == 0 { 0.0 } else { name_h * 0.15 };
+
+    let block_h = name_h + gap + parent_h;
+    let top = py + (ph - block_h) / 2.0;
+    let pad_x = cell_w * name_scale;
+    let pad_y = name_h * 0.35;
+    let box_w = (name_w.max(parent_w) + pad_x * 2.0).min(pw);
+
+    FlashLabelLayout {
+        name_scale,
+        name_x: px + (pw - name_w) / 2.0,
+        name_y: top,
+        parent_scale,
+        parent_x: px + (pw - parent_w) / 2.0,
+        parent_y: top + name_h + gap,
+        box_x: px + (pw - box_w) / 2.0,
+        box_y: top - pad_y,
+        box_w,
+        box_h: block_h + pad_y * 2.0,
+    }
+}
+
+/// How far past `max_x` a glyph cell may end and still count as fitting.
+///
+/// A right-aligned run starts at `max_x - n * cell_w`, so its last cell ends
+/// exactly on `max_x` — in exact arithmetic. In f32 the subtraction and the
+/// n additions that walk the run back rarely cancel to the bit, and an
+/// overshoot of one ulp used to drop the last glyph: the pane switcher showed
+/// "claude 2.1.22" in one column and "claude 2.1.228" in the next, the two
+/// columns differing only by their right margin. A quarter pixel swamps that
+/// rounding and is invisible on screen.
+const GLYPH_FIT_EPSILON: f32 = 0.25;
+
+/// Whether a glyph cell starting at `x` still fits before `max_x`.
+fn glyph_fits(x: f32, cell_w: f32, max_x: f32) -> bool {
+    x + cell_w <= max_x + GLYPH_FIT_EPSILON
+}
+
+/// Horizontal split of a pane switcher row between its title (left) and the
+/// binary running in the pane (right).
+struct SwitcherRowSplit {
+    /// Where the title stops being drawn, so it never runs into the binary.
+    title_limit: f32,
+    /// Where the binary starts, or `None` when the column is too narrow to
+    /// carry both — a half-written program name is worse than none.
+    process_x: Option<f32>,
+}
+
+/// Lay out one pane switcher row. Pure geometry, so it can be checked without
+/// a GPU: the title keeps the left, the binary is parked flush right with a
+/// two-cell gap, and the binary is dropped entirely when that would leave the
+/// title less than a third of the row.
+fn switcher_row_split(
+    left_margin: f32,
+    right_margin: f32,
+    process_chars: usize,
+    cell_w: f32,
+) -> SwitcherRowSplit {
+    if process_chars == 0 {
+        return SwitcherRowSplit { title_limit: right_margin, process_x: None };
+    }
+    let process_x = right_margin - process_chars as f32 * cell_w;
+    let title_limit = process_x - cell_w * 2.0;
+    let min_title = left_margin + (right_margin - left_margin) / 3.0;
+    if title_limit < min_title {
+        SwitcherRowSplit { title_limit: right_margin, process_x: None }
+    } else {
+        SwitcherRowSplit { title_limit, process_x: Some(process_x) }
+    }
+}
+
 /// Per-pane data passed from window to renderer.
 pub struct PaneRenderData {
     pub terminal: Arc<RwLock<TerminalState>>,
@@ -211,12 +396,16 @@ pub struct PaneRenderData {
     pub is_focused: bool,
     pub pane_id: PaneId,
     pub custom_title: Option<String>,
-    /// Pre-computed display title (custom > OSC > CWD basename > "shell").
-    pub display_title: String,
     pub has_completion: bool,
     pub has_bell: bool,
     pub minimized: bool,
     pub input_chars: Arc<std::sync::atomic::AtomicU64>,
+    /// Foreground binary running in the pane (`claude`, `nvim`…), shown in the
+    /// status bar. `None` at a bare shell prompt.
+    pub fg_process: Option<String>,
+    /// This pane's conversation is bookmarked: its status bar is painted blue,
+    /// so a saved conversation is recognisable without opening the switcher.
+    pub bookmarked: bool,
 }
 
 /// Cached vertex list for one pane, with the conditions it was built under.
@@ -263,10 +452,20 @@ pub struct Renderer {
     /// Compact version of bg_color for comparing with Cell.bg ([u8; 3]).
     bg_color_u8: [u8; 3],
     cursor_color: [f32; 3],
+    /// Colour of a block tagged to be copied out (see `terminal::paste_block`).
+    paste_block_color: [f32; 3],
     font_size: f64,
     font_name: String,
+    /// Backing scale factor of the display the renderer currently draws on.
+    scale: f32,
     cursor_blink_frames: u32,
     status_bar_enabled: bool,
+    /// How much an unfocused pane is faded (see `DimMode`).
+    dim_opacity: f32,
+    dim_mode: DimMode,
+    /// Outline drawn around the focused pane; width 0.0 disables it.
+    focus_border_width: f32,
+    focus_border_color: [f32; 3],
     status_bar_bg: [f32; 3],
     status_bar_fg: [f32; 3],
     status_bar_cwd_color: [f32; 3],
@@ -294,11 +493,17 @@ pub struct Renderer {
     pub hovered_url_text: Option<String>,
     /// Resize mode feedback text, displayed on the left of the global status bar.
     pub resize_feedback_text: Option<String>,
+    /// Banner to paint across the focused pane's status bar (text, background):
+    /// which attention tier the last Cmd+J landed in. `None` most of the time.
+    pub pane_banner: Option<(String, [f32; 3])>,
     /// Boundary flash: (edge_x, top_y, bottom_y, alpha, is_right_edge). Set by window when navigation hits tab edge.
     pub boundary_flash: Option<(f32, f32, f32, f32, bool)>,
     /// Pane flash for search-palette jumps: (x, y, width, height, alpha).
     /// A pulsing rectangle drawn around a pane's viewport for ~half a second.
     pub pane_flash: Option<(f32, f32, f32, f32, f32)>,
+    /// Big label drawn inside the flashing pane: (directory name, path above
+    /// it). Set on Cmd+J jumps so a landing far from the eye names itself.
+    pub pane_flash_label: Option<(String, String)>,
     /// Loading progress: (ready_panes, total_panes). None when all loaded.
     pub loading_progress: Option<(u32, u32)>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
@@ -308,10 +513,13 @@ pub struct Renderer {
     /// Cached permanent shortcuts reminder for the global status bar
     /// (help + overlay combos), built once from the key config.
     cached_shortcuts_hint: String,
-    /// Cached formatted shortcuts for help overlay (label, formatted key combo).
-    cached_help_shortcuts: Vec<(String, String)>,
+    /// Cached help overlay rows, pre-split into two display columns.
+    cached_help_columns: [Vec<HelpRow>; 2],
     /// Hoverable zones in status bars (rebuilt each frame).
     tooltip_zones: Vec<TooltipZone>,
+    /// Clickable rect of the minimized-panes counter in the global status bar
+    /// (x, y, w, h); None when the counter is hidden. Click opens the switcher.
+    pub minimized_counter_zone: Option<(f32, f32, f32, f32)>,
     /// Last built vertices per pane. While a pane defers rendering inside a
     /// synchronized-output burst (DEC 2026), its previous frame is drawn from
     /// this cache instead of rebuilding from the mid-update grid — rebuilding
@@ -339,7 +547,7 @@ impl Renderer {
 
         let pixel_format = layer.pixelFormat();
         let pipeline = pipeline::create_pipeline(device, pixel_format);
-        let atlas = GlyphAtlas::new(device, config.font.size * scale, &config.font.family);
+        let atlas = GlyphAtlas::new(device, config.font.size * scale, scale, &config.font.family);
 
         let make_vertex_buf = || {
             device.newBufferWithLength_options(
@@ -385,10 +593,16 @@ impl Renderer {
             bg_color: config.colors.background,
             bg_color_u8: crate::terminal::color_to_u8(config.colors.background),
             cursor_color: config.colors.cursor,
+            paste_block_color: config.colors.paste_block,
             font_size: config.font.size,
             font_name: config.font.family.clone(),
+            scale: scale as f32,
             cursor_blink_frames: config.terminal.cursor_blink_frames,
             status_bar_enabled: config.status_bar.enabled,
+            dim_opacity: config.splits.dim_opacity,
+            dim_mode: config.splits.dim_mode,
+            focus_border_width: config.splits.focus_border_width,
+            focus_border_color: config.splits.focus_border_color,
             status_bar_bg: config.status_bar.bg_color,
             status_bar_fg: config.status_bar.fg_color,
             status_bar_cwd_color: config.status_bar.cwd_color,
@@ -412,14 +626,17 @@ impl Renderer {
             hovered_url: None,
             hovered_url_text: None,
             resize_feedback_text: None,
+            pane_banner: None,
             boundary_flash: None,
             pane_flash: None,
+            pane_flash_label: None,
             loading_progress: None,
             hovered_url_pane_id: None,
             cached_help_hint: String::new(),
             cached_shortcuts_hint: String::new(),
-            cached_help_shortcuts: Vec::new(),
+            cached_help_columns: [Vec::new(), Vec::new()],
             tooltip_zones: Vec::new(),
+            minimized_counter_zone: None,
             pane_vertex_cache: std::collections::HashMap::new(),
             active_tooltip: None,
             tooltip_visible: None,
@@ -466,11 +683,17 @@ impl Renderer {
                 let is_hover_pane = self.hovered_url_pane_id == Some(pane.pane_id);
                 self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
                 self.hovered_url = if is_hover_pane { saved_hover_segments.clone() } else { None };
+                // Minimized panes take no layout space and are never drawn;
+                // they surface via the status-bar counter and the pane switcher.
+                if pane.minimized {
+                    self.pane_vertex_cache.remove(&pane.pane_id);
+                    continue;
+                }
                 // Skip panes entirely off-screen (hidden by horizontal scroll)
                 if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
                     continue;
                 }
-                if pane.is_focused && has_filter && !pane.minimized {
+                if pane.is_focused && has_filter {
                     continue; // Skip: filter overlay covers focused pane
                 }
                 let in_sync = Self::in_sync_window(pane);
@@ -479,8 +702,7 @@ impl Renderer {
                 // Only valid while the viewport is unchanged (vertices are
                 // absolute pixels), the cached build itself wasn't torn
                 // (mid_sync) and it isn't the loading placeholder (ready).
-                let reuse_cached = !pane.minimized
-                    && pane.shell_ready
+                let reuse_cached = pane.shell_ready
                     && in_sync
                     && self.pane_vertex_cache.get(&pane.pane_id).is_some_and(|e| {
                         e.ready
@@ -491,16 +713,13 @@ impl Renderer {
                             && e.vp.height == vp.height
                     });
                 if !reuse_cached {
-                    // Build pane vertices (minimized bar or full content)
-                    let pane_verts = if pane.minimized {
-                        self.build_minimized_bar_vertices(vp, &pane.display_title, pane.has_bell, pane.has_completion)
-                    } else {
+                    let pane_verts = {
                         let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
                         let mut verts = if pane.shell_ready {
                             let t = pane.terminal.read();
                             let show_blink = if pane.is_focused { blink_on } else { true };
                             let pin = pane.input_chars.load(std::sync::atomic::Ordering::Relaxed);
-                            self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin)
+                            self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref(), pane.bookmarked)
                         } else {
                             self.build_loading_vertices(vp)
                         };
@@ -565,6 +784,9 @@ impl Renderer {
         active_tab: usize,
         total_tabs: usize,
         active_tab_name: &str,
+        working_agents: usize,
+        unread_panes: usize,
+        minimized_counts: (usize, usize),
         show_help: bool,
         show_mem_report: bool,
         recent_projects: Option<&RecentProjectsRenderData<'_>>,
@@ -658,7 +880,8 @@ impl Renderer {
         let tooltip_animating = self.tooltip_anim > 0 && self.tooltip_anim < TOOLTIP_ANIM_FRAMES;
         let has_loading = self.loading_progress.is_some();
         let has_pane_flash = self.pane_flash.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
+        let has_status_text = self.resize_feedback_text.is_some();
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
             return;
         }
 
@@ -746,7 +969,16 @@ impl Renderer {
         }
 
         // Draw global status bar
-        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, help_hint_remaining, keys_config);
+        self.build_global_status_bar_vertices(&mut overlay_vertices, viewport_w, viewport_h, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, active_tab_name, working_agents, unread_panes, minimized_counts.0, minimized_counts.1, help_hint_remaining, keys_config);
+
+        // Attention banner over the focused pane's status bar. Drawn in the
+        // overlay pass rather than inside the pane's own vertices: those are
+        // cached per pane and would keep a stale banner alive across frames.
+        if let (Some((text, color)), Some(focused)) =
+            (self.pane_banner.clone(), panes.iter().find(|p| p.is_focused))
+        {
+            self.build_pane_banner_vertices(&mut overlay_vertices, &focused.viewport, &text, color);
+        }
 
         // Draw filter overlay on focused pane
         if let Some(filter_data) = filter {
@@ -803,6 +1035,18 @@ impl Renderer {
             push_quad(x, y + h - thickness, w, thickness);
             push_quad(x, y, thickness, h);
             push_quad(x + w - thickness, y, thickness, h);
+
+            // The directory name in big over the pane, when the jump asked for
+            // it (Cmd+J): the border alone does not say where the eye landed.
+            if let Some((name, parent)) = self.pane_flash_label.clone() {
+                self.build_flash_label_vertices(
+                    &mut overlay_vertices,
+                    (x, y, w, h),
+                    alpha,
+                    &name,
+                    &parent,
+                );
+            }
         }
 
         // Draw search palette overlay (on top of everything except tooltip)
@@ -984,13 +1228,19 @@ impl Renderer {
         custom_title: Option<&str>,
         attention: PaneAttention,
         pane_input_chars: u64,
+        pane_id: PaneId,
+        fg_process: Option<&str>,
+        bookmarked: bool,
     ) -> Vec<Vertex> {
         // Pass 1: collect unknown chars/clusters for dynamic rasterization
         let display = term.visible_lines();
         let mut unknown_chars: Vec<char> = Vec::new();
+        let mut unknown_italic_chars: Vec<char> = Vec::new();
         let mut unknown_clusters: Vec<Box<str>> = Vec::new();
+        let has_italic = self.atlas.has_italic();
         {
             let mut seen_chars = std::collections::HashSet::new();
+            let mut seen_italic = std::collections::HashSet::new();
             let mut seen_clusters = std::collections::HashSet::new();
             for line in display.iter() {
                 for cell in line.iter() {
@@ -1000,8 +1250,20 @@ impl Renderer {
                         }
                     } else {
                         let c = cell.c;
-                        if c != ' ' && c != '\0' && self.atlas.glyph(c).is_none() && seen_chars.insert(c) {
+                        if c == ' ' || c == '\0' {
+                            continue;
+                        }
+                        // Regular glyph is always needed (non-italic cells, and the
+                        // synthetic-shear fallback for chars with no italic form).
+                        if self.atlas.glyph(c).is_none() && seen_chars.insert(c) {
                             unknown_chars.push(c);
+                        }
+                        if has_italic
+                            && cell.attrs.contains(CellAttrs::ITALIC)
+                            && self.atlas.italic_glyph(c).is_none()
+                            && seen_italic.insert(c)
+                        {
+                            unknown_italic_chars.push(c);
                         }
                     }
                 }
@@ -1012,16 +1274,28 @@ impl Renderer {
         for c in unknown_chars {
             self.atlas.rasterize_char(c);
         }
+        for c in unknown_italic_chars {
+            self.atlas.rasterize_italic_char(c);
+        }
         for cluster in unknown_clusters {
             self.atlas.rasterize_cluster(&cluster);
         }
 
         // Pass 3: build vertices
+        // Amount by which this pane's text is faded. Non-zero only for an
+        // unfocused pane in `text` dim mode; `full` mode fades with a veil
+        // quad at the end instead.
+        let text_fade = if !is_focused && self.dim_mode == DimMode::Text {
+            self.dim_opacity
+        } else {
+            0.0
+        };
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
+        let baseline_from_top = self.atlas.baseline_from_top();
         let atlas_w = self.atlas.atlas_width as f32;
         let atlas_h = self.atlas.atlas_height as f32;
-        let ox = vp.x + PANE_H_PADDING;
+        let ox = vp.x + self.h_padding();
         let oy = vp.y;
 
         // Push content to bottom when screen isn't full (single source of truth in Terminal)
@@ -1059,14 +1333,45 @@ impl Renderer {
             }
         }
 
+        // Rows holding a block Claude tagged as meant to be pasted elsewhere. Read from
+        // the cells rather than tracked as the bytes arrive: Claude Code redraws lines
+        // while it streams, and a state machine fed by those redraws would drift.
+        let paste_rows = {
+            let lines: Vec<&[crate::terminal::Cell]> = display.iter().map(|l| l.as_ref()).collect();
+            crate::terminal::paste_block::paste_block_rows(&lines, term.default_fg)
+        };
+
         // Pass 2: glyphs (on top of backgrounds and selection)
         for (row_idx, line) in display.iter().enumerate() {
+            // The line that closes a paste block: it delimited, it is done, and drawing it
+            // would put a marker on screen for every message.
+            if paste_rows[row_idx] == RowPaint::Hidden {
+                continue;
+            }
             for col_idx in 0..term.cols as usize {
                 let cell = if col_idx < line.len() {
                     &line[col_idx]
                 } else {
                     continue;
                 };
+
+                // Underline / strikethrough: horizontal rules in the cell's fg
+                // color. Drawn before the blank skip so runs of underlined
+                // spaces (and wide-char continuation cells) stay continuous.
+                if cell.attrs.intersects(CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH) {
+                    let lx = (ox + col_idx as f32 * cell_w).round();
+                    let ly = (oy + y_offset + row_idx as f32 * cell_h).round();
+                    let rule_fg = Self::fade_toward(crate::terminal::color_to_f32(cell.fg), self.bg_color, text_fade);
+                    let thickness = (cell_h * 0.07).max(1.0).round();
+                    if cell.attrs.contains(CellAttrs::UNDERLINE) {
+                        let uy = (ly + cell_h - thickness).round();
+                        Self::push_bg_quad(&mut vertices, lx, uy, cell_w, thickness, rule_fg);
+                    }
+                    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+                        let sy = (ly + cell_h * 0.5 - thickness * 0.5).round();
+                        Self::push_bg_quad(&mut vertices, lx, sy, cell_w, thickness, rule_fg);
+                    }
+                }
 
                 if cell.is_blank() {
                     continue;
@@ -1077,11 +1382,26 @@ impl Renderer {
                     log::trace!("render ─ at col={} row={} fg={:?} bg={:?}", col_idx, row_idx, cell.fg, cell.bg);
                 }
 
-                // Look up glyph: cluster first, then single char
+                // Look up glyph: cluster first, then single char. Italic cells
+                // prefer the real italic glyph; when there is none (no italic
+                // face, or a char with no italic form like box-drawing) we fall
+                // back to the upright glyph and shear it synthetically below.
+                let mut real_italic = false;
                 let glyph = if let Some(ref cluster) = cell.cluster {
                     match self.atlas.cluster_glyph(cluster) {
                         Some(g) => *g,
                         None => continue,
+                    }
+                } else if cell.attrs.contains(CellAttrs::ITALIC) {
+                    match self.atlas.italic_glyph(c) {
+                        Some(g) => {
+                            real_italic = true;
+                            *g
+                        }
+                        None => match self.atlas.glyph(c) {
+                            Some(g) => *g,
+                            None => continue,
+                        },
                     }
                 } else {
                     match self.atlas.glyph(c) {
@@ -1105,16 +1425,46 @@ impl Renderer {
                 let th = glyph.height as f32 / atlas_h;
 
                 let alpha = if glyph.is_color { 2.0 } else { 1.0 };
-                let fg_f = crate::terminal::color_to_f32(cell.fg);
+                // Inside a tagged block, text that carries no colour of its own takes the
+                // paste colour; anything Claude coloured itself keeps what it was given.
+                let fg_f = if paste_rows[row_idx] == RowPaint::Body && cell.fg == term.default_fg {
+                    self.paste_block_color
+                } else {
+                    crate::terminal::color_to_f32(cell.fg)
+                };
+                let fg_f = Self::fade_toward(fg_f, self.bg_color, text_fade);
                 let fg = [fg_f[0], fg_f[1], fg_f[2], alpha];
                 let no_bg = [0.0, 0.0, 0.0, 0.0];
 
-                vertices.push(Vertex { position: [gx, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx + gw, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx + gw, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx + gw, gy + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-                vertices.push(Vertex { position: [gx, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                // Synthetic italic: shear the glyph quad around the baseline —
+                // the top edge leans right, the descender edge leans left. Emoji
+                // and box-drawing keep their shape only insofar as the quad is
+                // slanted; color glyphs are left as-is to avoid smearing.
+                let italic = cell.attrs.contains(CellAttrs::ITALIC) && !glyph.is_color && !real_italic;
+                let (shear_top, shear_bot) = if italic {
+                    (ITALIC_SHEAR * baseline_from_top, ITALIC_SHEAR * (baseline_from_top - gh))
+                } else {
+                    (0.0, 0.0)
+                };
+
+                // Faux-bold: draw the glyph a second time shifted +1px in x. A
+                // real bold font would need a (char, bold)-keyed atlas; the
+                // synthetic double-draw is cheap and reads clearly as bold.
+                // Color emoji are already color glyphs — don't embolden them.
+                let bold = cell.attrs.contains(CellAttrs::BOLD) && !glyph.is_color;
+                let x_offsets: &[f32] = if bold { &[0.0, 1.0] } else { &[0.0] };
+                for &dx in x_offsets {
+                    let xtl = gx + dx + shear_top;
+                    let xtr = gx + gw + dx + shear_top;
+                    let xbl = gx + dx + shear_bot;
+                    let xbr = gx + gw + dx + shear_bot;
+                    vertices.push(Vertex { position: [xtl, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xtr, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xbl, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xtr, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xbr, gy + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
+                    vertices.push(Vertex { position: [xbl, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
+                }
             }
         }
 
@@ -1137,8 +1487,18 @@ impl Renderer {
                 let cx = (ox + term.cursor_x as f32 * cell_w).round();
                 let cy = (oy + y_offset + screen_y as f32 * cell_h).round();
                 match term.cursor_shape {
-                    CursorShape::Block => {
+                    // Filled block only where the keystrokes go. Elsewhere the
+                    // cursor is drawn hollow, the way a text field marks that it
+                    // no longer has the caret.
+                    CursorShape::Block if is_focused => {
                         Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, self.cursor_color);
+                    }
+                    CursorShape::Block => {
+                        let t = (cell_h * 0.08).max(1.0).round();
+                        Self::push_bg_quad(&mut vertices, cx, cy, cell_w, t, self.cursor_color);
+                        Self::push_bg_quad(&mut vertices, cx, cy + cell_h - t, cell_w, t, self.cursor_color);
+                        Self::push_bg_quad(&mut vertices, cx, cy + t, t, cell_h - 2.0 * t, self.cursor_color);
+                        Self::push_bg_quad(&mut vertices, cx + cell_w - t, cy + t, t, cell_h - 2.0 * t, self.cursor_color);
                     }
                     CursorShape::Underline => {
                         let thickness = (cell_h * 0.1).max(1.0);
@@ -1152,18 +1512,19 @@ impl Renderer {
             }
         }
 
-        // Dim overlay on unfocused panes
-        if !is_focused {
-            let dim = [0.0, 0.0, 0.0]; // black overlay
-            let dim4 = [dim[0], dim[1], dim[2], 0.3]; // 30% opacity
+        // Status bar. Built before the veil so the veil covers it too: leaving
+        // it out made every unfocused bar as bright as the focused one, and with
+        // four splits nothing pointed at the pane that had the keyboard.
+        if self.status_bar_enabled {
+            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id, fg_process, text_fade, bookmarked);
+        }
+
+        // Veil over an unfocused pane, status bar included.
+        if !is_focused && self.dim_mode == DimMode::Full && self.dim_opacity > 0.0 {
+            let dim4 = [0.0, 0.0, 0.0, self.dim_opacity]; // black overlay
             let no_tex = [0.0, 0.0];
             let white = [1.0, 1.0, 1.0, 0.0];
-            // Cover the whole pane area (excluding status bar)
-            let dim_h = if self.status_bar_enabled {
-                vp.height - self.atlas.cell_height
-            } else {
-                vp.height
-            };
+            let dim_h = vp.height;
             vertices.push(Vertex { position: [vp.x, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
             vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
             vertices.push(Vertex { position: [vp.x, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
@@ -1172,9 +1533,14 @@ impl Renderer {
             vertices.push(Vertex { position: [vp.x, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
         }
 
-        // Status bar
-        if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars);
+        // Outline around the focused pane, drawn last so nothing covers it.
+        if is_focused && self.focus_border_width > 0.0 {
+            let w = self.focus_border_width.min(vp.width * 0.5).min(vp.height * 0.5);
+            let c = self.focus_border_color;
+            Self::push_bg_quad(&mut vertices, vp.x, vp.y, vp.width, w, c);
+            Self::push_bg_quad(&mut vertices, vp.x, vp.y + vp.height - w, vp.width, w, c);
+            Self::push_bg_quad(&mut vertices, vp.x, vp.y + w, w, vp.height - 2.0 * w, c);
+            Self::push_bg_quad(&mut vertices, vp.x + vp.width - w, vp.y + w, w, vp.height - 2.0 * w, c);
         }
 
         vertices
@@ -1188,22 +1554,53 @@ impl Renderer {
         custom_title: Option<&str>,
         attention: PaneAttention,
         pane_input_chars: u64,
+        pane_id: PaneId,
+        fg_process: Option<&str>,
+        text_fade: f32,
+        bookmarked: bool,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let bar_y = vp.y + vp.height - cell_h;
 
-        // Background quad: orange for bell, green for completion, default otherwise
-        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, attention.bar_bg(self.status_bar_bg));
+        // Background quad: orange for bell, green for completion, default otherwise.
+        // In `text` dim mode the veil never comes, so the bar of an unfocused
+        // pane fades here — bar included, or the brightest thing on screen ends
+        // up being a pane nobody is typing in.
+        // A bookmarked pane paints its whole bar very dark blue: the mark has to
+        // be readable at a glance across four splits, and a single glyph is not.
+        // Darker than the default bar, so the usual text colors keep their
+        // contrast — the bar changes hue, not its readability. Attention still
+        // wins: a bell or a finished run is news, a bookmark is a standing fact.
+        let base_bar_bg = if bookmarked { BOOKMARKED_BAR_BG } else { self.status_bar_bg };
+        let bar_bg = Self::fade_toward(attention.bar_bg(base_bar_bg), self.bg_color, text_fade);
+        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, bar_bg);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let cwd_fg = [self.status_bar_cwd_color[0], self.status_bar_cwd_color[1], self.status_bar_cwd_color[2], 1.0];
-        let branch_fg = [self.status_bar_branch_color[0], self.status_bar_branch_color[1], self.status_bar_branch_color[2], 1.0];
-        let scroll_fg = [self.status_bar_scroll_color[0], self.status_bar_scroll_color[1], self.status_bar_scroll_color[2], 1.0];
-        let title_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 1.0];
+        let cwd = Self::fade_toward(self.status_bar_cwd_color, bar_bg, text_fade);
+        let branch = Self::fade_toward(self.status_bar_branch_color, bar_bg, text_fade);
+        let scroll = Self::fade_toward(self.status_bar_scroll_color, bar_bg, text_fade);
+        let fg = Self::fade_toward(self.status_bar_fg, bar_bg, text_fade);
+        let cwd_fg = [cwd[0], cwd[1], cwd[2], 1.0];
+        let branch_fg = [branch[0], branch[1], branch[2], 1.0];
+        let scroll_fg = [scroll[0], scroll[1], scroll[2], 1.0];
+        let title_fg = [fg[0], fg[1], fg[2], 1.0];
+        let id_fg = [fg[0], fg[1], fg[2], 0.6];
+        let process_fg = [fg[0], fg[1], fg[2], 0.9];
+
+        // Pane ID first, always visible: it is the handle used to address the
+        // pane over IPC, so it never gets dropped when the bar runs out of room.
+        let mut cursor_x = vp.x + self.h_padding() + cell_w; // 1 cell padding from left
+        {
+            let id_str = format!("#{}", pane_id);
+            let id_w = id_str.chars().count() as f32 * cell_w;
+            let id_x = cursor_x;
+            cursor_x = self.render_status_text(vertices, &id_str, id_x, bar_y, vp.x + vp.width, id_fg, no_bg);
+            cursor_x += cell_w; // 1 cell gap before the CWD
+            self.push_tooltip_zone(id_x, bar_y, id_w, cell_h, "Pane ID (KOVA_PANE_ID — use it with the IPC socket)");
+        }
 
         // Render CWD aligned to the left
-        let mut cursor_x = vp.x + PANE_H_PADDING + cell_w; // 1 cell padding from left
         if let Some(ref cwd) = term.cwd {
             let home = std::env::var("HOME").unwrap_or_default();
             let display_path = if !home.is_empty() && cwd.starts_with(&home) {
@@ -1224,7 +1621,17 @@ impl Renderer {
             Some(_) => branch_fg,
             None => [branch_fg[0] * 0.5, branch_fg[1] * 0.5, branch_fg[2] * 0.5, 0.5],
         };
-        let left_end = self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
+        let mut left_end = self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
+
+        // Foreground process after the branch: what is actually running in the
+        // pane right now (claude, nvim, ssh…). Absent at a bare shell prompt,
+        // so the bar stays quiet when nothing runs.
+        if let Some(process) = fg_process {
+            let proc_x = left_end + cell_w * 2.0;
+            let proc_w = process.chars().count() as f32 * cell_w;
+            left_end = self.render_status_text(vertices, process, proc_x, bar_y, vp.x + vp.width * 0.75, process_fg, no_bg);
+            self.push_tooltip_zone(proc_x, bar_y, proc_w, cell_h, "Foreground process running in this pane");
+        }
 
         // Right side: title (custom or hovered URL or OSC) + scroll indicator
         let right_edge = vp.x + vp.width - cell_w; // 1 cell padding from right
@@ -1291,6 +1698,28 @@ impl Renderer {
         }
     }
 
+    /// Paint `text` over the whole status-bar row of `vp`, on a solid `color`
+    /// background — the pane's own bar is hidden underneath for as long as it
+    /// lasts, so the message cannot be mistaken for one more field in the bar.
+    /// The text sits one cell in from the left, and is clipped at the right edge
+    /// like every other status-bar string.
+    fn build_pane_banner_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        vp: &PaneViewport,
+        text: &str,
+        color: [f32; 3],
+    ) {
+        let cell_h = self.atlas.cell_height;
+        let cell_w = self.atlas.cell_width;
+        let bar_y = vp.y + vp.height - cell_h;
+        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, color);
+        let fg = [1.0, 1.0, 1.0, 1.0];
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        let text_x = vp.x + self.h_padding() + cell_w;
+        self.render_status_text(vertices, text, text_x, bar_y, vp.x + vp.width - cell_w, fg, no_bg);
+    }
+
     fn build_global_status_bar_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
@@ -1303,12 +1732,17 @@ impl Renderer {
         active_tab: usize,
         total_tabs: usize,
         active_tab_name: &str,
+        working_agents: usize,
+        unread_panes: usize,
+        minimized_current: usize,
+        minimized_total: usize,
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let bar_y = viewport_h - cell_h;
+        self.minimized_counter_zone = None;
 
         // Background quad
         Self::push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.global_bar_bg);
@@ -1421,6 +1855,45 @@ impl Renderer {
             let proc_str = self.cached_proc_str.clone();
             self.render_status_text(vertices, &proc_str, left_edge, bar_y, viewport_w, proc_fg, no_bg);
             self.push_tooltip_zone(left_edge, bar_y, proc_w, cell_h, "Running child processes");
+
+            // Number of panes whose Claude Code is actively working (OSC-title
+            // activity marker present). Hidden when none are busy.
+            if working_agents > 0 {
+                let agents_str = format!("\u{2733}{}", working_agents);
+                let agents_w = agents_str.chars().count() as f32 * cell_w;
+                left_edge = left_edge - agents_w - gap;
+                self.render_status_text(vertices, &agents_str, left_edge, bar_y, viewport_w, WORKING_FG, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, agents_w, cell_h, "Claude Code panes currently working");
+            }
+
+            // Panes carrying output nobody has looked at yet — a bell, or a
+            // command that finished while the eye was elsewhere. Sits right of
+            // the working counter: together they read as "N running, M unread".
+            // Hidden when everything has been read.
+            if unread_panes > 0 {
+                let unread_str = format!("\u{25cf}{}", unread_panes);
+                let unread_w = unread_str.chars().count() as f32 * cell_w;
+                left_edge = left_edge - unread_w - gap;
+                self.render_status_text(vertices, &unread_str, left_edge, bar_y, viewport_w, UNREAD_FG, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, unread_w, cell_h, "Panes with unread output (bell or finished command)");
+            }
+
+            // Minimized panes: "⊟ current/total" (current tab / all windows).
+            // Hidden when there are none anywhere; dimmed when none in this tab.
+            // Clickable — opens the pane switcher (zone stored for hit-testing).
+            if minimized_total > 0 {
+                let min_str = format!("\u{229f} {}/{}", minimized_current, minimized_total);
+                let min_fg = if minimized_current > 0 {
+                    MINIMIZED_FG
+                } else {
+                    [MINIMIZED_FG[0], MINIMIZED_FG[1], MINIMIZED_FG[2], 0.4]
+                };
+                let min_w = min_str.chars().count() as f32 * cell_w;
+                left_edge = left_edge - min_w - gap;
+                self.render_status_text(vertices, &min_str, left_edge, bar_y, viewport_w, min_fg, no_bg);
+                self.push_tooltip_zone(left_edge, bar_y, min_w, cell_h, "Minimized panes — this tab / all windows (click: switcher)");
+                self.minimized_counter_zone = Some((left_edge, bar_y, min_w, cell_h));
+            }
         }
     }
 
@@ -1453,9 +1926,13 @@ impl Renderer {
         for (i, (title, is_active, color_idx, is_renaming, has_bell, has_completion, has_running)) in tab_titles.iter().enumerate() {
             let x = left_inset + i as f32 * tab_width;
 
-            // Tab background color
+            // Tab background color. Inactive colored tabs are dimmed: with
+            // every tab colored, a brighter marker on the active one drowns in
+            // the surrounding saturation — the contrast has to come from the
+            // others stepping back.
             let tab_bg: Option<[f32; 3]> = if let Some(idx) = color_idx {
-                Some(TAB_COLORS[*idx % TAB_COLORS.len()])
+                let c = TAB_COLORS[*idx % TAB_COLORS.len()];
+                Some(if *is_active { c } else { dim_inactive_tab(c) })
             } else if *is_active {
                 Some(self.tab_bar_active_bg)
             } else {
@@ -1466,16 +1943,10 @@ impl Renderer {
                 Self::push_bg_quad(vertices, x, 0.0, tab_width, bar_h, bg);
             }
 
-            // Active tab: bright border at bottom
+            // Active tab: white border at bottom, the same on every tab color
             if *is_active {
-                let border_h = 6.0_f32;
-                let border_color = if let Some(idx) = color_idx {
-                    let c = TAB_COLORS[*idx % TAB_COLORS.len()];
-                    [(c[0] + 1.0) * 0.5, (c[1] + 1.0) * 0.5, (c[2] + 1.0) * 0.5]
-                } else {
-                    [0.7, 0.7, 0.7]
-                };
-                Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, border_color);
+                let border_h = 4.0_f32;
+                Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, [1.0, 1.0, 1.0]);
             }
 
             // Tab indicator: bell (orange ●) > completion (green ●) > running
@@ -1511,9 +1982,12 @@ impl Renderer {
                 title
             };
             let label = format!("{}:{}", i + 1, display_title);
-            // White text on colored tabs (active or not), grey on default bg
-            let fg = if color_idx.is_some() || *is_active {
+            // White text on the active tab; on a dimmed colored tab the label
+            // dims by the same brightness factor as its background.
+            let fg = if *is_active {
                 [1.0, 1.0, 1.0, 1.0]
+            } else if color_idx.is_some() {
+                [DIM_BRIGHTNESS, DIM_BRIGHTNESS, DIM_BRIGHTNESS, 1.0]
             } else {
                 [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 1.0]
             };
@@ -1586,7 +2060,7 @@ impl Renderer {
 
         let mut x = start_x;
         for c in text.chars() {
-            if x + cell_w > max_x { break; }
+            if !glyph_fits(x, cell_w, max_x) { break; }
             let glyph = match self.atlas.glyph(c) {
                 Some(g) => *g,
                 None => { x += cell_w; continue; }
@@ -1650,7 +2124,7 @@ impl Renderer {
 
         let mut x = start_x;
         for c in text.chars() {
-            if x + cell_w > max_x { break; }
+            if !glyph_fits(x, cell_w, max_x) { break; }
             let glyph = match self.atlas.overlay_glyph(c) {
                 Some(g) => *g,
                 None => { x += cell_w; continue; }
@@ -1701,29 +2175,32 @@ impl Renderer {
         // 3. Search bar text: "/ query▏"
         let bar_text = format!("/ {}▏", &filter.query);
         let bar_fg = [1.0, 0.8, 0.2, 1.0]; // accent yellow
-        self.render_status_text(vertices, &bar_text, vp.x + PANE_H_PADDING, vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
+        self.render_status_text(vertices, &bar_text, vp.x + self.h_padding(), vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
 
-        // Match count
-        let count_text = format!("{} matches", filter.matches.len());
+        // Match count — or, on an empty query, how to recall an earlier one.
+        let count_text = match &filter.hint {
+            Some(h) => h.clone(),
+            None => format!("{} matches", filter.matches.len()),
+        };
         let count_fg = [0.6, 0.6, 0.6, 1.0];
         let count_w = count_text.chars().count() as f32 * cell_w;
-        self.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - PANE_H_PADDING, vp.y, vp.x + vp.width, count_fg, no_bg);
+        self.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - self.h_padding(), vp.y, vp.x + vp.width, count_fg, no_bg);
 
         // 4. List matched lines — truncate text to visible columns to limit vertices
         let max_visible = ((vp.height / cell_h).floor() as usize).saturating_sub(1);
         let match_fg = [0.85, 0.85, 0.85, 1.0];
         let highlight_fg = [1.0, 0.8, 0.2, 1.0];
         let query_lower = filter.query.to_lowercase();
-        let max_chars = ((vp.width - 2.0 * PANE_H_PADDING) / cell_w) as usize;
+        let max_chars = ((vp.width - 2.0 * self.h_padding()) / cell_w) as usize;
 
         for (i, m) in filter.matches.iter().take(max_visible).enumerate() {
             let y = vp.y + (i + 1) as f32 * cell_h;
-            let max_x = vp.x + vp.width - PANE_H_PADDING;
+            let max_x = vp.x + vp.width - self.h_padding();
 
             // Line number prefix
             let prefix = format!("{:>6}: ", m.abs_line);
             let prefix_fg = [0.5, 0.5, 0.5, 1.0];
-            let after_prefix = self.render_status_text(vertices, &prefix, vp.x + PANE_H_PADDING, y, max_x, prefix_fg, no_bg);
+            let after_prefix = self.render_status_text(vertices, &prefix, vp.x + self.h_padding(), y, max_x, prefix_fg, no_bg);
 
             // Truncate line text to what fits on screen
             let prefix_chars = prefix.chars().count();
@@ -1778,64 +2255,6 @@ impl Renderer {
         }
     }
 
-    /// Build vertices for a minimized pane bar (24px thin dimension).
-    /// Detects orientation from viewport aspect ratio:
-    /// - narrow & tall (HSplit minimized) → vertical bar, text rotated 90°
-    /// - wide & short (VSplit minimized) → horizontal bar, text horizontal
-    fn build_minimized_bar_vertices(
-        &mut self,
-        vp: &PaneViewport,
-        label: &str,
-        has_bell: bool,
-        has_completion: bool,
-    ) -> Vec<Vertex> {
-        let mut vertices = Vec::new();
-        let attention = PaneAttention::from_flags(has_bell, has_completion);
-        let bar_bg = attention.bar_bg(self.status_bar_bg);
-
-        // Background quad
-        Self::push_bg_quad_alpha(&mut vertices, vp.x, vp.y, vp.width, vp.height, bar_bg, 1.0);
-
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
-        let fg = [0.6, 0.6, 0.65, 1.0];
-        let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let is_vertical_bar = vp.width < vp.height;
-
-        if is_vertical_bar {
-            // Vertical bar: render each character top-to-bottom
-            let char_x = vp.x + (vp.width - cell_w) / 2.0;
-            let start_y = vp.y + cell_h * 0.5;
-            let max_chars = ((vp.height - cell_h) / cell_h).floor() as usize;
-            let dot = attention.dot_color();
-            let text_slots = if dot.is_some() { max_chars.saturating_sub(1) } else { max_chars };
-            let mut buf = [0u8; 4];
-
-            for (i, c) in label.chars().take(text_slots).enumerate() {
-                let cy = start_y + i as f32 * cell_h;
-                let s = c.encode_utf8(&mut buf);
-                self.render_status_text(&mut vertices, s, char_x, cy, char_x + cell_w, fg, no_bg);
-            }
-
-            if let Some(color) = dot {
-                let dot_y = start_y + text_slots as f32 * cell_h;
-                self.render_status_text(&mut vertices, "●", char_x, dot_y, char_x + cell_w, color, no_bg);
-            }
-        } else {
-            // Horizontal bar: render text left-to-right
-            let padding = PANE_H_PADDING;
-            let text_y = vp.y + (vp.height - cell_h) / 2.0;
-            self.render_status_text(&mut vertices, &label, vp.x + padding, text_y, vp.x + vp.width - padding, fg, no_bg);
-
-            if let Some(color) = attention.dot_color() {
-                let dot_x = vp.x + vp.width - cell_w * 2.0;
-                self.render_status_text(&mut vertices, "●", dot_x, text_y, vp.x + vp.width, color, no_bg);
-            }
-        }
-
-        vertices
-    }
-
     fn build_loading_vertices(&mut self, vp: &PaneViewport) -> Vec<Vertex> {
         let text = "starting...";
         let cell_w = self.atlas.cell_width;
@@ -1880,7 +2299,8 @@ impl Renderer {
 
     pub fn rebuild_atlas(&mut self, scale: f64) {
         let device = self.atlas.device.clone();
-        self.atlas = GlyphAtlas::new(&device, self.font_size * scale, &self.font_name);
+        self.scale = scale as f32;
+        self.atlas = GlyphAtlas::new(&device, self.font_size * scale, scale, &self.font_name);
         // Update atlas size buffer
         let atlas_size = [self.atlas.atlas_width as f32, self.atlas.atlas_height as f32];
         self.last_atlas_size = atlas_size;
@@ -1962,81 +2382,132 @@ impl Renderer {
         drop(font_line);
         y += och * 2.2;
 
-        // Build shortcut list (cached to avoid per-frame allocation)
-        if self.cached_help_shortcuts.is_empty() {
-            let raw: Vec<(&str, &str)> = vec![
-                ("New Tab", &keys_config.new_tab),
-                ("Close Pane/Tab", &keys_config.close_pane_or_tab),
-                ("Close Tab", &keys_config.close_tab),
-                ("Open Recent", &keys_config.open_recent_project),
-                ("Vertical Split", &keys_config.vsplit),
-                ("Horizontal Split", &keys_config.hsplit),
-                ("V Split (Root)", &keys_config.vsplit_root),
-                ("H Split (Root)", &keys_config.hsplit_root),
-                ("New Window", &keys_config.new_window),
-                ("Close Window", &keys_config.close_window),
-                ("Copy", &keys_config.copy),
-                ("Copy Raw", &keys_config.copy_raw),
-                ("Paste", &keys_config.paste),
-                ("Find", &keys_config.toggle_filter),
-                ("Global Search", &keys_config.open_search),
-                ("Switch Tab/Pane", &keys_config.open_pane_switcher),
-                ("Clear Scrollback", &keys_config.clear_scrollback),
-                ("Previous Tab", &keys_config.prev_tab),
-                ("Next Tab", &keys_config.next_tab),
-                ("Rename Tab", &keys_config.rename_tab),
-                ("Rename Pane", &keys_config.rename_pane),
-                ("Detach Tab", &keys_config.detach_tab),
-                ("Break Pane", &keys_config.break_pane),
-                ("Merge Tab", &keys_config.merge_tab),
-                ("Merge Window", &keys_config.merge_window),
-
-                ("Navigate", &keys_config.navigate_up),
-                ("Swap Pane", &keys_config.swap_up),
-                ("Reparent Pane", &keys_config.reparent_up),
-                ("Resize Pane", &keys_config.resize_up),
-                ("Edge Grow", &keys_config.edge_grow_right),
-                ("Minimize Pane", &keys_config.minimize_pane),
-                ("Restore Minimized", &keys_config.restore_minimized),
-                ("Equalize", &keys_config.equalize),
-                ("Repaint Pane", &keys_config.repaint_pane),
-                ("Kill Window", &keys_config.kill_window),
-                ("Memory Report", "cmd+shift+i"),
-                ("Help", &keys_config.toggle_help),
+        // Build the sectioned shortcut list (cached to avoid per-frame allocation).
+        // Each entry is (label, key combo, one-line "what it does / when it works").
+        // The two column groups are laid out left / right, sections kept intact.
+        if self.cached_help_columns[0].is_empty() && self.cached_help_columns[1].is_empty() {
+            let kc = keys_config;
+            type Section<'a> = (&'a str, Vec<(&'a str, &'a str, &'a str)>);
+            let left: Vec<Section> = vec![
+                ("TABS & WINDOWS", vec![
+                    ("New Tab", kc.new_tab.as_str(), ""),
+                    ("Close Pane/Tab", kc.close_pane_or_tab.as_str(), "pane, or tab if last one"),
+                    ("Close Tab", kc.close_tab.as_str(), "whole tab at once"),
+                    ("Previous Tab", kc.prev_tab.as_str(), ""),
+                    ("Next Tab", kc.next_tab.as_str(), ""),
+                    ("Rename Tab", kc.rename_tab.as_str(), ""),
+                    ("New Window", kc.new_window.as_str(), ""),
+                    ("Close Window", kc.close_window.as_str(), ""),
+                    ("Kill Window", kc.kill_window.as_str(), "force, no prompt"),
+                    ("Open Recent", kc.open_recent_project.as_str(), "recent projects"),
+                ]),
+                ("SPLITS", vec![
+                    ("Vertical Split", kc.vsplit.as_str(), "side by side"),
+                    ("Horizontal Split", kc.hsplit.as_str(), "stacked"),
+                    ("V Split (Root)", kc.vsplit_root.as_str(), "full column height"),
+                    ("H Split (Root)", kc.hsplit_root.as_str(), "full row width"),
+                    ("Equalize", kc.equalize.as_str(), "even out sizes"),
+                ]),
+                ("MOVE PANES & TABS", vec![
+                    ("Break Pane", kc.break_pane.as_str(), "pane → new tab (needs 2+ panes)"),
+                    ("Merge Tab", kc.merge_tab.as_str(), "fold this tab into another"),
+                    ("Detach Tab", kc.detach_tab.as_str(), "tab → new window"),
+                    ("Merge Window", kc.merge_window.as_str(), "fold window into another"),
+                    ("Swap Pane", kc.swap_up.as_str(), "trade two panes"),
+                    ("Reparent Pane", kc.reparent_up.as_str(), "move across the split tree"),
+                ]),
             ];
-            self.cached_help_shortcuts = raw.into_iter()
-                .map(|(label, key)| (label.to_string(), format_key_combo_arrows(key)))
-                .collect();
+            let right: Vec<Section> = vec![
+                ("PANES", vec![
+                    ("Navigate", kc.navigate_up.as_str(), "move focus"),
+                    ("Resize Pane", kc.resize_up.as_str(), "adjust split ratio"),
+                    ("Edge Grow", kc.edge_grow_right.as_str(), "grow one edge"),
+                    ("Minimize Pane", kc.minimize_pane.as_str(), ""),
+                    ("Restore Minimized", kc.restore_minimized.as_str(), ""),
+                    ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
+                    ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
+                    ("Next Waiting", kc.next_attention.as_str(), "waiting pane, else unread"),
+                    ("Back / Forward", kc.history_back.as_str(), "panes you visited"),
+                ]),
+                ("EDIT & SEARCH", vec![
+                    ("Copy", kc.copy.as_str(), ""),
+                    ("Copy Raw", kc.copy_raw.as_str(), ""),
+                    ("Paste", kc.paste.as_str(), ""),
+                    ("Find", kc.toggle_filter.as_str(), "search in this pane"),
+                    ("Global Search", kc.open_search.as_str(), "panes + closed Claude sessions"),
+                    ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher + bookmarks"),
+                    ("Bookmark Pane", kc.toggle_bookmark.as_str(), "keep this conversation"),
+                    ("Unread Panes", kc.open_unread_switcher.as_str(), "switcher, attention only"),
+                ]),
+                ("MISC", vec![
+                    ("Memory Report", "cmd+shift+i", ""),
+                    ("Help", kc.toggle_help.as_str(), "this screen"),
+                ]),
+            ];
+            let build = |sections: Vec<Section>| -> Vec<HelpRow> {
+                let mut rows = Vec::new();
+                for (header, items) in sections {
+                    rows.push(HelpRow::Header(header.to_string()));
+                    for (label, key, desc) in items {
+                        rows.push(HelpRow::Item {
+                            label: label.to_string(),
+                            key: format_key_combo_arrows(key),
+                            desc: desc.to_string(),
+                        });
+                    }
+                }
+                rows
+            };
+            self.cached_help_columns = [build(left), build(right)];
         }
-        // Take shortcuts out of self to avoid borrow conflict with render_text
-        let shortcuts = std::mem::take(&mut self.cached_help_shortcuts);
 
-        // Render in 2 columns
-        let col_width = viewport_w / 2.0;
-        let label_offset = ocw * 2.0;
-        let max_label_len = shortcuts.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0) as f32;
-        let key_offset = label_offset + (max_label_len + 2.0) * ocw;
+        // Take columns out of self to avoid borrow conflict with render_overlay_text.
+        let columns = std::mem::replace(&mut self.cached_help_columns, [Vec::new(), Vec::new()]);
 
-        let rows_per_col = (shortcuts.len() + 1) / 2;
-        for (i, (label, formatted)) in shortcuts.iter().enumerate() {
-            let col = if i < rows_per_col { 0 } else { 1 };
-            let row = if i < rows_per_col { i } else { i - rows_per_col };
-            let base_x = col as f32 * col_width;
-            let row_y = y + row as f32 * (och * 1.4);
-
-            if row_y + och > viewport_h - base_ch {
-                break; // Don't overflow past global status bar
+        // Global column alignment: line up the key combo and description across all rows.
+        let mut max_label = 0usize;
+        let mut max_key = 0usize;
+        for col in &columns {
+            for row in col {
+                if let HelpRow::Item { label, key, .. } = row {
+                    max_label = max_label.max(label.chars().count());
+                    max_key = max_key.max(key.chars().count());
+                }
             }
+        }
+        let col_width = viewport_w / 2.0;
+        let label_off = ocw * 2.0;
+        let key_off = label_off + (max_label as f32 + 1.0) * ocw;
+        let desc_off = key_off + (max_key as f32 + 2.0) * ocw;
+        let row_h = och * 1.4;
 
-            // Label
-            self.render_overlay_text(vertices, label, base_x + label_offset, row_y, base_x + key_offset - ocw, label_fg, no_bg, 1.0);
-
-            // Key combo
-            self.render_overlay_text(vertices, formatted, base_x + key_offset, row_y, base_x + col_width - ocw, key_fg, no_bg, 1.0);
+        for (ci, col) in columns.iter().enumerate() {
+            let base_x = ci as f32 * col_width;
+            let mut row_y = y;
+            for row in col {
+                if row_y + och > viewport_h - base_ch {
+                    break; // Don't overflow past global status bar
+                }
+                match row {
+                    HelpRow::Header(h) => {
+                        row_y += och * 0.5; // breathing room above each section
+                        self.render_overlay_text(vertices, h, base_x + label_off, row_y, base_x + col_width - ocw, title_fg, no_bg, 1.0);
+                        row_y += row_h;
+                    }
+                    HelpRow::Item { label, key, desc } => {
+                        self.render_overlay_text(vertices, label, base_x + label_off, row_y, base_x + key_off - ocw, label_fg, no_bg, 1.0);
+                        self.render_overlay_text(vertices, key, base_x + key_off, row_y, base_x + desc_off - ocw, key_fg, no_bg, 1.0);
+                        if !desc.is_empty() {
+                            self.render_overlay_text(vertices, desc, base_x + desc_off, row_y, base_x + col_width - ocw, dim_fg, no_bg, 1.0);
+                        }
+                        row_y += row_h;
+                    }
+                }
+            }
         }
 
-        // Put shortcuts back
-        self.cached_help_shortcuts = shortcuts;
+        // Put columns back.
+        self.cached_help_columns = columns;
     }
 
     fn build_mem_report_overlay_vertices(
@@ -2125,24 +2596,62 @@ impl Renderer {
         let title_fg = [1.0, 0.85, 0.3, 1.0];
         let header_fg = [0.55, 0.75, 1.0, 1.0];
         let label_fg = [0.85, 0.85, 0.9, 1.0];
-        let current_fg = [0.5, 0.85, 0.5, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
         let selected_bg = [0.25, 0.35, 0.55];
+        // Bookmarked panes: a light band, dark text on it. The selected variant
+        // is the same hue pushed harder, so selection still reads on a row that
+        // already has a background of its own.
+        let bookmark_bg = [0.62, 0.79, 0.95];
+        let bookmark_selected_bg = [0.40, 0.66, 0.95];
+        let bookmark_fg = [0.05, 0.07, 0.12, 1.0];
+        let bookmark_dim_fg = [0.22, 0.30, 0.42, 1.0];
 
         let title_scale = 1.8_f32;
         let body_scale = 1.3_f32;
         let scaled_cell_w = cell_w * body_scale;
 
-        // Title centered
-        let title = "Switch Tab / Pane";
+        // Title centered. The unread count rides along so the number is read
+        // before the eye starts scanning columns for the dots.
+        let unread: usize = data
+            .columns
+            .iter()
+            .flat_map(|c| c.rows.iter())
+            .filter(|r| !r.is_header && (r.has_bell || r.has_completion))
+            .count();
+        let title = if data.filtered {
+            // Filtered: the count is of everything the list holds, not just the
+            // waiting ones — a bell and a finished command are in here too, and
+            // an empty list has to say so rather than look like a bad draw.
+            let panes = data
+                .columns
+                .iter()
+                .flat_map(|c| c.rows.iter())
+                .filter(|r| !r.is_header)
+                .count();
+            match panes {
+                0 => "Nothing Unread".to_string(),
+                1 => "Unread Panes  —  1".to_string(),
+                n => format!("Unread Panes  —  {}", n),
+            }
+        } else {
+            match unread {
+                0 => "Switch Tab / Pane".to_string(),
+                1 => "Switch Tab / Pane  —  1 unread".to_string(),
+                n => format!("Switch Tab / Pane  —  {} unread", n),
+            }
+        };
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
-        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.render_text(vertices, &title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
         y += cell_h * title_scale * 2.0;
 
         // Subtitle
-        let subtitle = "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  esc Cancel";
+        let subtitle = if data.filtered {
+            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  u All panes  esc Cancel"
+        } else {
+            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next unread  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  u Unread only  esc Cancel"
+        };
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
         self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
@@ -2172,17 +2681,61 @@ impl Renderer {
                 let text_y = row_y + (row_height - scaled_cell_h) / 2.0;
 
                 let is_selected = c == data.selected_col && i == data.selected_row && !row.is_header;
-                if is_selected {
-                    Self::push_bg_quad_alpha(vertices, left_margin - pad * 0.5, row_y, right_margin - left_margin + pad, row_height, selected_bg, 0.8);
+                let band = match (row.bookmarked, is_selected) {
+                    (true, true) => Some(bookmark_selected_bg),
+                    (true, false) => Some(bookmark_bg),
+                    (false, true) => Some(selected_bg),
+                    (false, false) => None,
+                };
+                if let Some(color) = band {
+                    Self::push_bg_quad_alpha(vertices, left_margin - pad * 0.5, row_y, right_margin - left_margin + pad, row_height, color, 0.8);
                 }
 
                 if row.is_header {
                     self.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
                 } else {
-                    let fg = if row.is_current { current_fg } else { label_fg };
-                    let marker = if row.is_current { "\u{25cf} " } else { "  " };
-                    let text = format!("  {}{}", marker, row.text);
-                    self.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
+                    // No current-pane marker: the focused pane renders like any
+                    // other row (the blue selection highlight is the only cursor).
+                    // Attention (unread) dot for non-current panes, mirroring the
+                    // per-pane status-bar dot (bell > completion). is_current panes
+                    // are already suppressed upstream (has_bell/has_completion = false).
+                    let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
+                    let text = format!("    {}", row.text);
+                    let (row_fg, row_dim_fg) = if row.bookmarked {
+                        (if row.minimized { bookmark_dim_fg } else { bookmark_fg }, bookmark_dim_fg)
+                    } else {
+                        (if row.minimized { dim_fg } else { label_fg }, dim_fg)
+                    };
+                    // The running binary is parked at the right end of the row,
+                    // dim: it says what the pane *is* without competing with the
+                    // title, which is what the eye scans. The title is clipped
+                    // before it rather than drawn under it.
+                    let split = switcher_row_split(
+                        left_margin,
+                        right_margin,
+                        row.process.map_or(0, |p| p.chars().count()),
+                        scaled_cell_w,
+                    );
+                    self.render_text(vertices, &text, left_margin, text_y, split.title_limit, row_fg, no_bg, body_scale);
+                    if let (Some(process), Some(proc_x)) = (row.process, split.process_x) {
+                        self.render_text(vertices, process, proc_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                    }
+                    if row.minimized {
+                        // Minimized marker in the 1st char slot, in a color of
+                        // its own so hidden panes stand out in the list.
+                        self.render_text(vertices, "\u{229f}", left_margin, text_y, right_margin, MINIMIZED_FG, no_bg, body_scale);
+                    }
+                    if let Some(color) = attention.dot_color() {
+                        // Dot occupies the 3rd char slot (after the "    " lead-in).
+                        let dot_x = left_margin + 2.0 * scaled_cell_w;
+                        self.render_text(vertices, "\u{25cf}", dot_x, text_y, right_margin, color, no_bg, body_scale);
+                    }
+                    // Claude Code state in the 2nd char slot: "✳" while the
+                    // session works.
+                    if row.working {
+                        let state_x = left_margin + scaled_cell_w;
+                        self.render_text(vertices, "\u{2733}", state_x, text_y, right_margin, WORKING_FG, no_bg, body_scale);
+                    }
                 }
             }
 
@@ -2426,7 +2979,7 @@ impl Renderer {
         let status = if data.searching {
             format!("Searching for \"{}\"...", data.submitted_query)
         } else if data.submitted_query.is_empty() {
-            "Type to search across all panes.".to_string()
+            "Type to search across all panes and closed Claude sessions.".to_string()
         } else if hit_count == 0 {
             format!("No matches for \"{}\".", data.submitted_query)
         } else {
@@ -2480,6 +3033,11 @@ impl Renderer {
             let ax = (viewport_w - scaled_cell_w) / 2.0;
             self.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
         }
+    }
+
+    /// Horizontal pane padding in pixels for the current display scale.
+    pub fn h_padding(&self) -> f32 {
+        PANE_H_PADDING * self.scale
     }
 
     pub fn cell_size(&self) -> (f32, f32) {
@@ -2542,6 +3100,79 @@ impl Renderer {
         self.render_status_text(vertices, text_str, text_x, text_y, text_x + text_w + cell_w, fg, no_bg);
     }
 
+    /// Draw the big directory label of a pane flash: the directory name, the
+    /// path above it, and a padded backdrop so the terminal content underneath
+    /// does not fight the text. Both lines fade with `alpha`.
+    fn build_flash_label_vertices(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        pane: (f32, f32, f32, f32),
+        alpha: f32,
+        name: &str,
+        parent: &str,
+    ) {
+        let cell_w = self.atlas.overlay_cell_width;
+        let cell_h = self.atlas.overlay_cell_height;
+        let layout = flash_label_layout(
+            pane,
+            name.chars().count(),
+            parent.chars().count(),
+            cell_w,
+            cell_h,
+        );
+
+        let no_bg = [0.0, 0.0, 0.0, 0.0];
+        Self::push_bg_quad_alpha(
+            vertices,
+            layout.box_x,
+            layout.box_y,
+            layout.box_w,
+            layout.box_h,
+            self.bg_color,
+            alpha * 0.92,
+        );
+        let name_fg = [1.0, 0.85, 0.3, alpha];
+        let parent_fg = [0.75, 0.75, 0.75, alpha * 0.8];
+        let right = pane.0 + pane.2;
+        self.render_overlay_text(
+            vertices,
+            name,
+            layout.name_x,
+            layout.name_y,
+            right,
+            name_fg,
+            no_bg,
+            layout.name_scale,
+        );
+        if !parent.is_empty() {
+            self.render_overlay_text(
+                vertices,
+                parent,
+                layout.parent_x,
+                layout.parent_y,
+                right,
+                parent_fg,
+                no_bg,
+                layout.parent_scale,
+            );
+        }
+    }
+
+    /// Fade a colour toward `bg`. `t` is the dim amount: 0.0 leaves the colour
+    /// alone, 1.0 makes it the background. Used by `text` dim mode, which fades
+    /// glyphs instead of laying a veil over the pane.
+    fn fade_toward(c: [f32; 3], bg: [f32; 3], t: f32) -> [f32; 3] {
+        if t <= 0.0 {
+            return c;
+        }
+        let t = t.min(1.0);
+        [
+            c[0] + (bg[0] - c[0]) * t,
+            c[1] + (bg[1] - c[1]) * t,
+            c[2] + (bg[2] - c[2]) * t,
+        ]
+    }
+
     fn push_bg_quad(
         vertices: &mut Vec<Vertex>,
         x: f32,
@@ -2575,6 +3206,12 @@ impl Renderer {
     }
 }
 
+/// One row of the help overlay: either a section header or a shortcut entry.
+enum HelpRow {
+    Header(String),
+    Item { label: String, key: String, desc: String },
+}
+
 /// Format a key combo string like "cmd+shift+d" into "⌘⇧D" for display.
 /// Like `format_key_combo` but replaces a trailing arrow direction with "Arrows".
 fn format_key_combo_arrows(s: &str) -> String {
@@ -2599,32 +3236,40 @@ fn format_key_combo_arrows(s: &str) -> String {
 fn format_key_combo(s: &str) -> String {
     let mut result = String::new();
     let parts: Vec<&str> = s.split('+').collect();
-    for (i, part) in parts.iter().enumerate() {
+    // Same split rule as the keybinding parser: a trailing '+' means the key
+    // itself is '+' (e.g. "cmd+shift++" → modifiers=[cmd,shift], key='+').
+    let (modifier_parts, key_str) = if parts.last() == Some(&"") && parts.len() >= 2 {
+        (&parts[..parts.len() - 1], "+")
+    } else {
+        (&parts[..parts.len() - 1], parts[parts.len() - 1])
+    };
+    for part in modifier_parts {
         let trimmed = part.trim();
-        if i < parts.len() - 1 {
-            // Modifier
-            match trimmed.to_ascii_lowercase().as_str() {
-                "cmd" | "command" => result.push('\u{2318}'),
-                "ctrl" | "control" => result.push('\u{2303}'),
-                "option" | "alt" | "opt" => result.push('\u{2325}'),
-                "shift" => result.push('\u{21E7}'),
-                _ => { result.push_str(trimmed); }
-            }
-        } else {
-            // Key
-            match trimmed.to_ascii_lowercase().as_str() {
-                "up" => result.push('\u{2191}'),
-                "down" => result.push('\u{2193}'),
-                "left" => result.push('\u{2190}'),
-                "right" => result.push('\u{2192}'),
-                "backspace" | "delete" => result.push('\u{232B}'),
-                "enter" | "return" => result.push('\u{21A9}'),
-                "/" => result.push('/'),
-                "[" => result.push('['),
-                "]" => result.push(']'),
-                s => result.push_str(&s.to_ascii_uppercase()),
-            }
+        if trimmed.is_empty() {
+            // Artifact of splitting a literal '+' key on '+' — not a modifier.
+            continue;
         }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "cmd" | "command" => result.push('\u{2318}'),
+            "ctrl" | "control" => result.push('\u{2303}'),
+            "option" | "alt" | "opt" => result.push('\u{2325}'),
+            "shift" => result.push('\u{21E7}'),
+            _ => { result.push_str(trimmed); }
+        }
+    }
+    let key_trimmed = key_str.trim();
+    match key_trimmed.to_ascii_lowercase().as_str() {
+        "up" => result.push('\u{2191}'),
+        "down" => result.push('\u{2193}'),
+        "left" => result.push('\u{2190}'),
+        "right" => result.push('\u{2192}'),
+        "backspace" | "delete" => result.push('\u{232B}'),
+        "enter" | "return" => result.push('\u{21A9}'),
+        "/" => result.push('/'),
+        "[" => result.push('['),
+        "]" => result.push(']'),
+        "+" => result.push('+'),
+        k => result.push_str(&k.to_ascii_uppercase()),
     }
     result
 }
@@ -2632,6 +3277,123 @@ fn format_key_combo(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_dim_fades_toward_the_background_and_never_past_it() {
+        let bg = [0.1, 0.1, 0.12];
+        let fg = [1.0, 0.5, 0.0];
+        assert_eq!(Renderer::fade_toward(fg, bg, 0.0), fg);
+        assert_eq!(Renderer::fade_toward(fg, bg, -1.0), fg, "a negative amount is a no-op");
+        let close = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-6);
+        assert!(close(Renderer::fade_toward(fg, bg, 1.0), bg));
+        assert!(close(Renderer::fade_toward(fg, bg, 2.0), bg), "clamped, never past the background");
+        let half = Renderer::fade_toward(fg, bg, 0.5);
+        for i in 0..3 {
+            assert!((half[i] - (fg[i] + bg[i]) * 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_hollow_cursor_leaves_the_cell_centre_untouched() {
+        // The unfocused-pane cursor is four edge quads; the middle of the cell
+        // must stay clear, otherwise it reads as filled and the focused pane
+        // loses its only unique mark.
+        let (cell_w, cell_h) = (10.0_f32, 20.0_f32);
+        let t = (cell_h * 0.08_f32).max(1.0).round();
+        let edges = [
+            (0.0, 0.0, cell_w, t),
+            (0.0, cell_h - t, cell_w, t),
+            (0.0, t, t, cell_h - 2.0 * t),
+            (cell_w - t, t, t, cell_h - 2.0 * t),
+        ];
+        let (cx, cy) = (cell_w * 0.5, cell_h * 0.5);
+        for (x, y, w, h) in edges {
+            let inside = cx >= x && cx < x + w && cy >= y && cy < y + h;
+            assert!(!inside, "edge quad {:?} covers the cell centre", (x, y, w, h));
+        }
+        let covered: f32 = edges.iter().map(|(_, _, w, h)| w * h).sum();
+        assert!(covered < cell_w * cell_h, "the outline must not fill the cell");
+    }
+
+    #[test]
+    fn a_right_aligned_run_keeps_its_last_glyph() {
+        // Geometry read off the pane switcher: two columns of a two-window
+        // screen, same text, same cell width, different right margins. Both
+        // must draw all seven characters.
+        let cell_w = 10.2_f32;
+        let draw = |max_x: f32, n: usize| {
+            let mut x = max_x - n as f32 * cell_w;
+            let mut drawn = 0;
+            for _ in 0..n {
+                if !glyph_fits(x, cell_w, max_x) { break; }
+                drawn += 1;
+                x += cell_w;
+            }
+            drawn
+        };
+        assert_eq!(draw(861.4, 7), 7);
+        assert_eq!(draw(1713.4, 7), 7);
+    }
+
+    #[test]
+    fn a_glyph_past_the_limit_is_still_dropped() {
+        assert!(!glyph_fits(100.0, 10.0, 109.0));
+        assert!(glyph_fits(100.0, 10.0, 110.0));
+    }
+
+    #[test]
+    fn flash_label_fills_the_pane_without_overflowing_it() {
+        // Wide pane, short name: capped at the max scale, centered, and the
+        // backdrop stays inside the pane.
+        let l = flash_label_layout((100.0, 200.0, 800.0, 400.0), 4, 16, 10.0, 20.0);
+        assert_eq!(l.name_scale, 3.0);
+        let name_w = 4.0 * 10.0 * l.name_scale;
+        assert!((l.name_x - (100.0 + (800.0 - name_w) / 2.0)).abs() < 0.01);
+        assert!(l.box_x >= 100.0 && l.box_x + l.box_w <= 900.0 + 0.01);
+        // The path line sits under the name, never over it.
+        assert!(l.parent_y > l.name_y + 20.0 * l.name_scale - 0.01);
+    }
+
+    #[test]
+    fn flash_label_shrinks_a_long_name_to_the_pane_width() {
+        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 40, 0, 10.0, 20.0);
+        assert_eq!(l.name_scale, 1.0, "never shrinks below the overlay size");
+        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 12, 0, 10.0, 20.0);
+        assert!(l.name_scale < 3.0 && l.name_scale > 1.0);
+        assert!(12.0 * 10.0 * l.name_scale <= 300.0, "name must fit the pane");
+    }
+
+    #[test]
+    fn flash_label_without_a_path_line_centers_the_name_alone() {
+        let l = flash_label_layout((0.0, 0.0, 400.0, 100.0), 1, 0, 10.0, 20.0);
+        let name_h = 20.0 * l.name_scale;
+        assert!((l.name_y - (100.0 - name_h) / 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn switcher_row_without_a_binary_gives_the_title_the_whole_row() {
+        let split = switcher_row_split(0.0, 300.0, 0, 10.0);
+        assert_eq!(split.title_limit, 300.0);
+        assert_eq!(split.process_x, None);
+    }
+
+    #[test]
+    fn switcher_row_parks_the_binary_flush_right() {
+        // "claude 2.1.226" = 14 chars → starts 140px before the right margin,
+        // and the title stops two cells earlier.
+        let split = switcher_row_split(0.0, 300.0, 14, 10.0);
+        assert_eq!(split.process_x, Some(160.0));
+        assert_eq!(split.title_limit, 140.0);
+    }
+
+    #[test]
+    fn switcher_row_drops_the_binary_rather_than_squeeze_the_title() {
+        // A column barely wider than the binary itself: the title would be left
+        // with almost nothing, so the binary goes instead.
+        let split = switcher_row_split(0.0, 160.0, 14, 10.0);
+        assert_eq!(split.process_x, None);
+        assert_eq!(split.title_limit, 160.0);
+    }
 
     #[test]
     fn format_count_below_thousand_is_verbatim() {
@@ -2676,6 +3438,9 @@ mod tests {
         assert_eq!(format_key_combo("enter"), "\u{21A9}");
         assert_eq!(format_key_combo("backspace"), "\u{232B}");
         assert_eq!(format_key_combo("cmd+["), "\u{2318}[");
+        // A trailing '+' is the literal '+' key, not an empty modifier.
+        assert_eq!(format_key_combo("cmd+shift++"), "\u{2318}\u{21E7}+");
+        assert_eq!(format_key_combo_arrows("cmd+shift++"), "\u{2318}\u{21E7}+");
     }
 
     #[test]
@@ -2722,5 +3487,20 @@ mod tests {
         assert_eq!(PaneAttention::None.bar_bg(default), default);
         assert_ne!(PaneAttention::Bell.bar_bg(default), default);
         assert_ne!(PaneAttention::Completion.bar_bg(default), default);
+    }
+
+    #[test]
+    fn dim_inactive_tab_keeps_hue_but_steps_back() {
+        for c in TAB_COLORS {
+            let d = dim_inactive_tab(c);
+            let lum = |v: [f32; 3]| 0.213 * v[0] + 0.715 * v[1] + 0.072 * v[2];
+            // Always darker than the full-color version the active tab keeps.
+            assert!(lum(d) < lum(c), "{c:?} -> {d:?} should be darker");
+            // Still tinted: the widest channel gap survives the desaturation.
+            let spread = |v: [f32; 3]| v.iter().cloned().fold(f32::MIN, f32::max)
+                - v.iter().cloned().fold(f32::MAX, f32::min);
+            assert!(spread(d) > spread(c) * 0.4, "{c:?} -> {d:?} lost its hue");
+            assert!(d.iter().all(|v| (0.0..=1.0).contains(v)), "{d:?} out of range");
+        }
     }
 }

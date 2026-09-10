@@ -1,4 +1,5 @@
 pub mod parser;
+pub mod paste_block;
 pub mod pty;
 
 use std::borrow::Cow;
@@ -86,6 +87,9 @@ struct SavedCursor {
     bg: [u8; 3],
     bold: bool,
     dim: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
     reversed: bool,
     pending_wrap: bool,
     origin_mode: bool,
@@ -94,6 +98,23 @@ struct SavedCursor {
     g0_dec_graphics: bool,
     g1_dec_graphics: bool,
     active_charset_g1: bool,
+}
+
+bitflags::bitflags! {
+    /// Per-cell text attributes that affect rendering geometry (as opposed to
+    /// color, which is baked into fg/bg at write time). Packed into a single
+    /// byte so it fits in the struct's existing padding — no extra RAM/cell.
+    ///
+    /// - BOLD: synthetic faux-bold (glyph drawn a second time offset +1px in x)
+    /// - ITALIC: synthetic slant (glyph quad sheared ~12° around the baseline)
+    /// - UNDERLINE / STRIKETHROUGH: a horizontal rule under / through the cell
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    pub struct CellAttrs: u8 {
+        const BOLD          = 1 << 0;
+        const ITALIC        = 1 << 1;
+        const UNDERLINE     = 1 << 2;
+        const STRIKETHROUGH = 1 << 3;
+    }
 }
 
 /// Terminal cell — kept compact to minimize scrollback RAM usage.
@@ -111,6 +132,10 @@ pub struct Cell {
     pub bg: [u8; 3],
     /// OSC 8 hyperlink index into TerminalState::hyperlinks (0 = no link).
     pub hyperlink_id: u16,
+    /// SGR text attributes (bold/italic/underline/strikethrough). Fits in the
+    /// struct's existing padding, so it costs no extra bytes per cell — keep it
+    /// that way (see size_of test).
+    pub attrs: CellAttrs,
 }
 
 impl Cell {
@@ -127,6 +152,7 @@ impl Default for Cell {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             hyperlink_id: 0,
+            attrs: CellAttrs::empty(),
         }
     }
 }
@@ -198,6 +224,9 @@ pub struct TerminalState {
     reversed: bool,
     bold: bool,
     dim: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
     // Saved cursor
     saved_cursor: Option<SavedCursor>,
     // Scroll region
@@ -242,8 +271,14 @@ pub struct TerminalState {
     pub insert_mode: bool,
     // Bell received (BEL 0x07) — used for tab attention indicator
     pub bell: AtomicBool,
-    // Command completed (OSC 133;D) — used for pane/tab completion indicator
+    // Command completed (OSC 133;D) — sticky until the next OSC 133;C, because
+    // the IPC `wait-for-completion` contract reads it. Never clear it for UI
+    // purposes: acknowledge with `completion_seen` instead.
     pub command_completed: AtomicBool,
+    // The user has looked at this pane since the completion fired. Reset on
+    // every OSC 133;D, set on every frame the pane is focused. Gates the
+    // attention dot without disturbing `command_completed`.
+    pub completion_seen: AtomicBool,
     // Command running (between OSC 133;C and 133;D) — tab running indicator
     pub command_running: AtomicBool,
     // The first OSC 133;D after spawn comes from the shell's startup precmd
@@ -252,6 +287,12 @@ pub struct TerminalState {
     pub osc133_primed: bool,
     // Last command executed (set via OSC 7777 from shell integration)
     pub last_command: Option<String>,
+    // True between the shell announcing a command (OSC 133;C) and the one OSC
+    // 7777 it sends right after to name that command. Any program can print an
+    // OSC 7777 — it is just bytes on the tty — and `last_command` is replayed at
+    // the prompt on the next launch, so only the shell's own report is taken:
+    // one per started command, and none at all from a command's output.
+    pub last_command_slot_open: bool,
     // Mouse reporting modes
     // 0 = off, 1000 = button events, 1002 = button+motion, 1003 = all motion
     pub mouse_mode: u16,
@@ -278,6 +319,12 @@ pub struct TerminalState {
     current_hyperlink: u16,
     /// Hyperlink URL table, indexed by hyperlink_id (slot 0 unused).
     hyperlinks: Vec<String>,
+    /// Rows the app explicitly addressed (print/erase-line/ICH/DCH/ECH/IL/DL)
+    /// since the last winsize change. Bulk clears (ED) do NOT count: a
+    /// differential renderer that clears the screen then skips rows leaves
+    /// them blank — exactly the desync this tracks. Used to decide whether
+    /// the post-resize settle nudge is needed (see window.rs).
+    rows_touched: Vec<bool>,
 }
 
 /// A single line matching a filter query.
@@ -289,7 +336,7 @@ pub struct FilterMatch {
 
 impl TerminalState {
     pub fn new(cols: u16, rows: u16, scrollback_limit: usize, fg: [u8; 3], bg: [u8; 3]) -> Self {
-        let blank = Cell { c: ' ', cluster: None, fg, bg, hyperlink_id: 0 };
+        let blank = Cell { c: ' ', cluster: None, fg, bg, hyperlink_id: 0, attrs: CellAttrs::empty() };
         let grid = (0..rows as usize).map(|_| Row::new(cols as usize, &blank)).collect();
         let terminal_id = TERMINAL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         log::info!("TerminalState::new id={} cols={} rows={}", terminal_id, cols, rows);
@@ -313,6 +360,9 @@ impl TerminalState {
             reversed: false,
             bold: false,
             dim: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
             saved_cursor: None,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
@@ -338,9 +388,11 @@ impl TerminalState {
             insert_mode: false,
             bell: AtomicBool::new(false),
             command_completed: AtomicBool::new(false),
+            completion_seen: AtomicBool::new(false),
             command_running: AtomicBool::new(false),
             osc133_primed: false,
             last_command: None,
+            last_command_slot_open: false,
             last_printed: None,
             g0_dec_graphics: false,
             g1_dec_graphics: false,
@@ -353,11 +405,25 @@ impl TerminalState {
             last_activity_secs: std::sync::Arc::new(AtomicU64::new(0)),
             current_hyperlink: 0,
             hyperlinks: vec![String::new()], // slot 0 = no hyperlink
+            rows_touched: vec![false; rows as usize],
         }
     }
 
     pub fn kitty_flags(&self) -> u8 {
         self.kitty_keyboard_flags.last().copied().unwrap_or(0)
+    }
+
+    /// True if a command completed here and the user hasn't looked at the pane
+    /// since. This — not `command_completed` — drives every completion dot.
+    pub fn unread_completion(&self) -> bool {
+        self.command_completed.load(std::sync::atomic::Ordering::Relaxed)
+            && !self.completion_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mark the completion as seen (call while the pane is focused). Leaves
+    /// `command_completed` alone so IPC `wait-for-completion` still sees it.
+    pub fn ack_completion(&self) {
+        self.completion_seen.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set or clear the active OSC 8 hyperlink.
@@ -587,6 +653,18 @@ impl TerminalState {
         }
     }
 
+    /// Geometry-affecting text attributes currently active, to stamp onto cells
+    /// as they are written. Color effects (dim/bold-brighten/reverse) live in
+    /// effective_colors instead — those are baked into fg/bg.
+    fn current_attrs(&self) -> CellAttrs {
+        let mut a = CellAttrs::empty();
+        a.set(CellAttrs::BOLD, self.bold);
+        a.set(CellAttrs::ITALIC, self.italic);
+        a.set(CellAttrs::UNDERLINE, self.underline);
+        a.set(CellAttrs::STRIKETHROUGH, self.strikethrough);
+        a
+    }
+
     pub fn put_char(&mut self, c: char) {
         let c = self.map_charset(c);
         if c >= '\u{2500}' && c <= '\u{257F}' {
@@ -633,6 +711,7 @@ impl TerminalState {
             self.advance_line();
         }
 
+        self.touch_row();
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         if row < self.grid.len() && col < self.grid[row].cells.len() {
@@ -643,12 +722,14 @@ impl TerminalState {
                 cells.insert(col, self.blank.clone());
             }
             let (fg, bg) = self.effective_colors();
+            let attrs = self.current_attrs();
             self.grid[row].cells[col] = Cell {
                 c,
                 cluster: None,
                 fg,
                 bg,
                 hyperlink_id: self.current_hyperlink,
+                attrs,
             };
 
             // Wide char: write placeholder '\0' in the next column
@@ -659,6 +740,7 @@ impl TerminalState {
                     fg,
                     bg,
                     hyperlink_id: self.current_hyperlink,
+                    attrs,
                 };
             }
         }
@@ -740,6 +822,7 @@ impl TerminalState {
         let col = self.cursor_x as usize;
         if row < self.grid.len() && col < self.grid[row].cells.len() {
             let (fg, bg) = self.effective_colors();
+            let attrs = self.current_attrs();
 
             self.grid[row].cells[col] = Cell {
                 c: first,
@@ -747,6 +830,7 @@ impl TerminalState {
                 fg,
                 bg,
                 hyperlink_id: self.current_hyperlink,
+                attrs,
             };
 
             // Write '\0' sentinel for remaining columns
@@ -758,6 +842,7 @@ impl TerminalState {
                         fg,
                         bg,
                         hyperlink_id: self.current_hyperlink,
+                        attrs,
                     };
                 }
             }
@@ -823,9 +908,9 @@ impl TerminalState {
             UnicodeWidthStr::width(merged.as_str()).max(1)
         };
         if new_w > old_w && col + 1 < self.grid[row].cells.len() {
-            let (fg, bg, link) = {
+            let (fg, bg, link, attrs) = {
                 let c = &self.grid[row].cells[col];
-                (c.fg, c.bg, c.hyperlink_id)
+                (c.fg, c.bg, c.hyperlink_id, c.attrs)
             };
             self.grid[row].cells[col + 1] = Cell {
                 c: '\0',
@@ -833,6 +918,7 @@ impl TerminalState {
                 fg,
                 bg,
                 hyperlink_id: link,
+                attrs,
             };
             if !self.pending_wrap {
                 let end = (col as u16) + new_w as u16;
@@ -993,13 +1079,22 @@ impl TerminalState {
                     self.reversed = false;
                     self.bold = false;
                     self.dim = false;
+                    self.italic = false;
+                    self.underline = false;
+                    self.strikethrough = false;
                 }
                 1 => self.bold = true,
                 2 => self.dim = true,
+                3 => self.italic = true,
+                4 => self.underline = true,
+                9 => self.strikethrough = true,
                 22 => {
                     self.bold = false;
                     self.dim = false;
                 }
+                23 => self.italic = false,
+                24 => self.underline = false,
+                29 => self.strikethrough = false,
                 // Reverse video is a flag applied at write time (effective_colors),
                 // not a physical swap — a swap corrupts colors set while reversed.
                 7 => self.reversed = true,
@@ -1126,9 +1221,22 @@ impl TerminalState {
         }
     }
 
-    /// Clear scrollback buffer and visible screen, reset cursor to top-left.
+    /// Clear the scrollback buffer and the visible screen, cursor back to
+    /// top-left. Called when the user hits Ctrl+L: the app answers the key by
+    /// clearing its own screen, but the scrollback belongs to Kova and no
+    /// escape sequence a shell sends on Ctrl+L (`ESC[H ESC[2J`) touches it.
+    /// Blanking the grid here also matters for ordering — the `ED 2` that
+    /// follows pushes the visible screen into the scrollback, so it must find
+    /// nothing left to push.
+    ///
+    /// Also drops the title the app set with OSC 0/2: it describes what used to
+    /// be on the screen, so leaving it up after a wipe labels an empty pane with
+    /// a dead command. The pane falls back to its foreground process or cwd
+    /// until something sets a title again. A title the user set by hand
+    /// (`custom_title`) is deliberate and survives.
     pub fn clear_scrollback_and_screen(&mut self) {
         self.dirty.store(true, Ordering::Relaxed);
+        self.title = None;
         self.scrollback.clear();
         self.reset_scroll();
         self.selection = None;
@@ -1146,6 +1254,7 @@ impl TerminalState {
     pub fn erase_in_line(&mut self, mode: u16) {
         self.pending_wrap = false;
         self.dirty.store(true, Ordering::Relaxed);
+        self.touch_row();
         let row = self.cursor_y as usize;
         if row >= self.grid.len() {
             return;
@@ -1253,6 +1362,9 @@ impl TerminalState {
             bg: self.current_bg,
             bold: self.bold,
             dim: self.dim,
+            italic: self.italic,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
             reversed: self.reversed,
             pending_wrap: self.pending_wrap,
             origin_mode: self.origin_mode,
@@ -1273,6 +1385,9 @@ impl TerminalState {
             self.current_bg = sc.bg;
             self.bold = sc.bold;
             self.dim = sc.dim;
+            self.italic = sc.italic;
+            self.underline = sc.underline;
+            self.strikethrough = sc.strikethrough;
             self.reversed = sc.reversed;
             self.pending_wrap = sc.pending_wrap && self.cursor_x == self.cols.saturating_sub(1);
             self.origin_mode = sc.origin_mode;
@@ -1291,6 +1406,7 @@ impl TerminalState {
         if row < self.scroll_top || row > self.scroll_bottom {
             return;
         }
+        self.touch_row();
         let max_n = self.scroll_bottom - row + 1;
         let n = n.min(max_n);
         let row_u = row as usize;
@@ -1317,6 +1433,7 @@ impl TerminalState {
         if row < self.scroll_top || row > self.scroll_bottom {
             return;
         }
+        self.touch_row();
         let max_n = self.scroll_bottom - row + 1;
         let n = n.min(max_n);
         let row_u = row as usize;
@@ -1341,6 +1458,7 @@ impl TerminalState {
         // the next print wrap spuriously — at the bottom row it scrolls the
         // whole alt grid up by one, unmodeled by the app.
         self.pending_wrap = false;
+        self.touch_row();
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         let fill = self.bce_blank();
@@ -1359,6 +1477,7 @@ impl TerminalState {
         // Per xterm/DEC STD 070, ICH resets the Last Column Flag (pending wrap),
         // like erase_chars — see delete_chars for the spurious-scroll failure.
         self.pending_wrap = false;
+        self.touch_row();
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         let fill = self.bce_blank();
@@ -1376,6 +1495,7 @@ impl TerminalState {
 
     pub fn erase_chars(&mut self, n: u16) {
         self.pending_wrap = false;
+        self.touch_row();
         let row = self.cursor_y as usize;
         let col = self.cursor_x as usize;
         let fill = self.bce_blank();
@@ -1476,7 +1596,7 @@ impl TerminalState {
         if bg == self.blank.bg {
             self.blank.clone()
         } else {
-            Cell { c: ' ', cluster: None, fg: self.blank.fg, bg, hyperlink_id: 0 }
+            Cell { c: ' ', cluster: None, fg: self.blank.fg, bg, hyperlink_id: 0, attrs: CellAttrs::empty() }
         }
     }
 
@@ -1499,9 +1619,66 @@ impl TerminalState {
         self.reversed = false;
         self.bold = false;
         self.dim = false;
+        self.italic = false;
+        self.underline = false;
+        self.strikethrough = false;
         self.synchronized_output = false;
         self.sync_output_since = None;
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Mark the cursor row as addressed by the app (see `rows_touched`).
+    #[inline]
+    fn touch_row(&mut self) {
+        if let Some(t) = self.rows_touched.get_mut(self.cursor_y as usize) {
+            *t = true;
+        }
+    }
+
+    /// Restart row-coverage tracking. Called whenever the PTY winsize changes
+    /// (real resize, repaint nudge, nudge restore) so `row_coverage` measures
+    /// how much of the screen the app repainted since that event.
+    pub fn reset_rows_touched(&mut self) {
+        self.rows_touched.iter_mut().for_each(|t| *t = false);
+    }
+
+    /// Fraction of screen rows the app addressed since the last winsize change.
+    pub fn row_coverage(&self) -> f32 {
+        if self.rows_touched.is_empty() {
+            return 0.0;
+        }
+        let touched = self.rows_touched.iter().filter(|&&t| t).count();
+        touched as f32 / self.rows_touched.len() as f32
+    }
+
+    /// Largest run of fully-blank rows strictly between the first and last
+    /// rows with content, if it spans at least `min_rows`. This is the "hole"
+    /// signature: a differential TUI cleared the screen then skipped rows it
+    /// wrongly believed unchanged. A row counts as content if any cell has a
+    /// glyph, a cluster, a non-default background (BCE), or text attributes
+    /// (an underlined space renders a rule).
+    pub fn interior_blank_band(&self, min_rows: usize) -> Option<(usize, usize)> {
+        let blank_row = |row: &Row| {
+            row.cells.iter().all(|c| {
+                c.c == ' ' && c.cluster.is_none() && c.bg == self.default_bg && c.attrs.is_empty()
+            })
+        };
+        let blanks: Vec<bool> = self.grid.iter().map(|r| blank_row(r)).collect();
+        let first = blanks.iter().position(|&b| !b)?;
+        let last = blanks.iter().rposition(|&b| !b)?;
+        let mut best: Option<(usize, usize)> = None;
+        let mut run_start: Option<usize> = None;
+        for i in first..=last {
+            if blanks[i] {
+                run_start.get_or_insert(i);
+            } else if let Some(start) = run_start.take() {
+                let len = i - start;
+                if len >= min_rows && best.map_or(true, |(s, e)| e - s + 1 < len) {
+                    best = Some((start, i - 1));
+                }
+            }
+        }
+        best
     }
 
     pub fn resize(&mut self, new_cols: u16, new_rows: u16) {
@@ -1511,6 +1688,7 @@ impl TerminalState {
         // Reflow rebuilds the scrollback/grid — absolute line indices held by
         // the selection no longer point at the same content.
         self.selection = None;
+        self.rows_touched = vec![false; new_rows as usize];
 
         let old_cols = self.cols;
         self.cols = new_cols;
@@ -2050,6 +2228,11 @@ impl TerminalState {
                 }
                 continue;
             }
+            // A tag line is punctuation for the renderer, never part of the message it
+            // labels: swept over by a selection, it would land in the paste.
+            if paste_block::is_marker_line(cells, self.default_fg) {
+                continue;
+            }
             let col_start = if line_idx == start.line { start.col as usize } else { 0 };
             let col_end = if line_idx == end.line {
                 (end.col as usize).min(cells.len() - 1)
@@ -2417,6 +2600,148 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    #[test]
+    fn clear_scrollback_and_screen_drops_the_osc_title() {
+        let mut t = term(10, 3);
+        put_str(&mut t, "hello");
+        t.title = Some("vim notes.md".into());
+        t.clear_scrollback_and_screen();
+        assert_eq!(t.title, None, "a wiped pane must not keep the old app's title");
+        assert_eq!(row_text(&t, 0), "");
+    }
+
+    // --- Row coverage / interior blank band (hole detection) ---
+
+    fn put_line_at(t: &mut TerminalState, row: u16, s: &str) {
+        t.cursor_y = row;
+        t.cursor_x = 0;
+        put_str(t, s);
+    }
+
+    #[test]
+    fn interior_blank_band_detects_middle_hole() {
+        let mut t = term(10, 12);
+        for r in 0..3 {
+            put_line_at(&mut t, r, "top");
+        }
+        for r in 9..12 {
+            put_line_at(&mut t, r, "bottom");
+        }
+        // Rows 3..8 blank (6 rows) between content.
+        assert_eq!(t.interior_blank_band(3), Some((3, 8)));
+        assert_eq!(t.interior_blank_band(6), Some((3, 8)));
+        assert_eq!(t.interior_blank_band(7), None);
+    }
+
+    #[test]
+    fn interior_blank_band_ignores_leading_and_trailing_blanks() {
+        let mut t = term(10, 12);
+        put_line_at(&mut t, 5, "only");
+        put_line_at(&mut t, 6, "content");
+        // Blanks above and below are margins, not holes.
+        assert_eq!(t.interior_blank_band(3), None);
+    }
+
+    #[test]
+    fn interior_blank_band_counts_bce_background_as_content() {
+        let mut t = term(10, 12);
+        put_line_at(&mut t, 0, "top");
+        put_line_at(&mut t, 11, "bottom");
+        assert!(t.interior_blank_band(3).is_some());
+        // A BCE-colored row in the middle splits the 10-row band into
+        // rows 1..4 and 6..10 — proof the colored row counts as content.
+        t.current_bg = [10, 20, 30];
+        t.cursor_y = 5;
+        t.cursor_x = 0;
+        t.erase_in_line(2);
+        t.current_bg = t.default_bg;
+        assert_eq!(t.interior_blank_band(5), Some((6, 10)));
+        assert_eq!(t.interior_blank_band(6), None);
+    }
+
+    #[test]
+    fn row_coverage_tracks_addressed_rows_and_resets() {
+        let mut t = term(10, 10);
+        assert_eq!(t.row_coverage(), 0.0);
+        for r in 0..5 {
+            put_line_at(&mut t, r, "x");
+        }
+        assert!((t.row_coverage() - 0.5).abs() < 1e-6);
+        // Erase-line addresses a row too (differential renderers clear
+        // shortened lines without printing).
+        t.cursor_y = 7;
+        t.erase_in_line(2);
+        assert!((t.row_coverage() - 0.6).abs() < 1e-6);
+        t.reset_rows_touched();
+        assert_eq!(t.row_coverage(), 0.0);
+        // A grid resize restarts tracking at the new height.
+        t.resize(10, 20);
+        assert_eq!(t.row_coverage(), 0.0);
+        put_line_at(&mut t, 0, "x");
+        assert!((t.row_coverage() - 0.05).abs() < 1e-6);
+    }
+
+    // --- Cell layout / bold ---
+
+    #[test]
+    fn cell_stays_32_bytes() {
+        // The bold flag must fit in the struct's existing padding. Growing Cell
+        // multiplies across scrollback × panes (see the doc comment on Cell).
+        assert_eq!(std::mem::size_of::<Cell>(), 32);
+    }
+
+    #[test]
+    fn sgr_bold_marks_cells_then_resets() {
+        let mut t = term(10, 5);
+        t.set_sgr(&[1]); // bold on
+        put_str(&mut t, "AB");
+        t.set_sgr(&[22]); // bold off (SGR 22)
+        put_str(&mut t, "C");
+        t.set_sgr(&[1]);
+        put_str(&mut t, "D");
+        t.set_sgr(&[0]); // full reset
+        put_str(&mut t, "E");
+
+        let row = &t.visible_lines()[0];
+        let bold = |i: usize| row[i].attrs.contains(CellAttrs::BOLD);
+        assert!(bold(0), "A must be bold");
+        assert!(bold(1), "B must be bold");
+        assert!(!bold(2), "C must not be bold (SGR 22)");
+        assert!(bold(3), "D must be bold again");
+        assert!(!bold(4), "E must not be bold (SGR 0 reset)");
+    }
+
+    #[test]
+    fn sgr_italic_underline_strike_mark_and_reset() {
+        let mut t = term(10, 5);
+        t.set_sgr(&[3]); // italic on
+        put_str(&mut t, "A");
+        t.set_sgr(&[23]); // italic off
+        t.set_sgr(&[4]); // underline on
+        put_str(&mut t, "B");
+        t.set_sgr(&[24]); // underline off
+        t.set_sgr(&[9]); // strike on
+        put_str(&mut t, "C");
+        t.set_sgr(&[0]); // full reset
+        put_str(&mut t, "D");
+
+        let row = &t.visible_lines()[0];
+        assert_eq!(row[0].attrs, CellAttrs::ITALIC, "A: italic only");
+        assert_eq!(row[1].attrs, CellAttrs::UNDERLINE, "B: underline only");
+        assert_eq!(row[2].attrs, CellAttrs::STRIKETHROUGH, "C: strike only");
+        assert_eq!(row[3].attrs, CellAttrs::empty(), "D: reset clears all");
+    }
+
+    #[test]
+    fn sgr_attributes_combine() {
+        let mut t = term(10, 5);
+        t.set_sgr(&[1, 3, 4]); // bold + italic + underline in one SGR
+        put_str(&mut t, "X");
+        let cell = &t.visible_lines()[0][0];
+        assert!(cell.attrs.contains(CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE));
+        assert!(!cell.attrs.contains(CellAttrs::STRIKETHROUGH));
     }
 
     // --- Deferred autowrap (xterm "last column flag") ---

@@ -2,6 +2,124 @@
 
 ## En cours
 
+### Les bookmarks lus comme une liste de projets en cours
+
+**Statut** : 🔧 codé, 316 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova** pour voir le bleu.
+
+**D'où ça part** : Mickael se sert des bookmarks (Cmd+B, commit 15ca177) comme d'un rappel des projets en cours, pas comme d'une liste de favoris. Un bookmark dont le pane est ouvert apparaissait deux fois dans Cmd+P : une fois dans son tab, une fois dans la section Bookmarks.
+
+**Ce qui change** : la section Bookmarks ne liste plus que les conversations **non ouvertes** — donc ce qu'il reste à reprendre — et disparaît entièrement quand tout est ouvert (`bookmark_rows`, `src/window/switcher.rs`). Le pane qui porte un bookmark est peint en bleu clair sur texte noir dans l'overlay, avec un bleu plus soutenu quand la ligne est aussi sélectionnée, pour que la sélection reste lisible par-dessus (`build_pane_switcher_overlay_vertices`, `src/renderer/mod.rs`).
+
+**Décidé** : la couleur ne sort pas de l'overlay Cmd+P — ni status bar du pane, ni titre de tab. À rouvrir seulement si le repère manque à l'usage.
+
+### Durcissement de ce que Kova retape tout seul dans un pane
+
+**Statut** : 🔧 codé, 239 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova** pour que ça prenne. La release qui embarquera tout ça n'est pas faite.
+
+**D'où ça part** : revue de sécurité demandée le 22/08 sur le code IPC, `subscribe` en tête. Le flux d'events lui-même n'a rien donné (socket 0600 posée sous umask, ligne bornée à 64 Ko avant bufferisation, file d'abonné bornée avec abandon du client lent, écriture jamais faite sur le main thread). Les trois défauts trouvés sont ailleurs, tous sur la même idée : Kova retape du texte dans un pane à partir de sources qu'il n'écrit pas.
+
+**Ce qui a été corrigé** :
+- **L'identifiant de conversation Claude n'était pas validé** avant d'entrer dans la ligne `claude --resume <id>` écrite au PTY, alors que la commande d'à côté était filtrée contre `;|&`. Un `\n` dedans faisait partir la suite comme commande, sans Entrée. `is_safe_session_id` (`src/claude_session.rs`) le restreint à `[A-Za-z0-9_-]`, aux deux portes : à la lecture du fichier de Claude Code, et au moment de fabriquer la ligne — la seconde compte autant, l'identifiant étant relu depuis `session.json` au redémarrage, éventuellement écrit par une version d'avant. `resume_command` renvoie maintenant `Option`, et un refus fait retomber le pane sur sa dernière commande.
+- **N'importe quelle sortie pouvait décider de ce qui serait pré-tapé au prompt** : `last_command` est posé par un OSC 7777, que tout programme peut imprimer sur son tty. Kova n'en accepte plus qu'un par OSC 133;C, celui du hook `preexec` — la sortie d'une commande qui tourne arrive après et est ignorée. Pas d'exécution automatique dans ce cas (vte jette les octets de contrôle dans une chaîne OSC, donc pas de `\n`), mais du texte planté sous le curseur en attendant un Entrée.
+- **`~/.config/kova/session.json` était en 0644** avec les cwd et les dernières commandes de chaque pane, et douze rotations d'historique. Écriture désormais en 0600, resserrée aussi sur un fichier existant (`write_owner_only`, `src/session.rs`) ; les rotations se font par renommage donc héritent du mode. Les treize fichiers déjà sur le disque ont été passés en 0600 à la main.
+
+**Le modèle de confiance, inchangé et assumé** : `KOVA_SOCKET` est exporté dans chaque pane (`src/terminal/pty.rs`), donc tout process lancé dans un pane peut lire le scrollback de tous les autres et faire `send-keys` partout. C'est le périmètre de Kova, pas un défaut à corriger.
+
+**Reste ouvert** : `recent_projects.json`, dans le même dossier, est toujours en 0644 et liste tous les projets — même traitement à décider.
+
+**Prochaine action** : publier la release qui embarque ces gardes plus les 19 commits accumulés depuis v1.9.0 (4 août).
+
+### Le clic sur la notif de fin de session ne faisait rien
+
+**Statut** : 🔧 corrigé, 224 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova**, et accepter le prompt d'autorisation des notifications que macOS posera au lancement — refusé, plus aucune notif.
+
+**Le symptôme** : quand une session Claude Code se terminait, la notification de bureau s'affichait bien, mais cliquer dessus ne faisait rien — le pane concerné n'était jamais focus.
+
+**Cause, établie par test** : ce n'était ni le socket ni Kova. Le hook `Stop` passait par `terminal-notifier -execute`, et ce `-execute` ne tourne jamais. Vérifié en postant une notif dont l'action écrivait un fichier marqueur : cliquée, le fichier n'a jamais été créé (dossier vide et écrivable). `nm` sur le binaire (`/opt/homebrew/Cellar/terminal-notifier/2.0.0/`) ne montre que `NSUserNotification` / `NSUserNotificationCenter`, l'API dépréciée depuis 10.14. Sur macOS 26 la bannière est encore livrée, mais le mécanisme qui relance l'app au clic pour exécuter l'action est mort.
+
+**Le fix** : Kova poste ses notifications lui-même, puisqu'il est le seul process capable d'agir sur le clic. Nouveau `src/notification.rs` (`UNUserNotificationCenter`, dépendance `objc2-user-notifications`) ; nouvelle commande IPC `notify` (`pane_id`, `title`, `message`, `sound` — seul `message` est obligatoire) ; le pane id voyage dans le `userInfo` de la notif, et le clic pousse ce pane dans une file que le tick vide en appelant le même chemin que `focus-pane`.
+
+**Décisions structurantes** :
+- **Le clic ne focus pas dans le callback du délégué** : `UNUserNotificationCenter` ne documente pas sur quel thread il appelle son délégué, donc la file est un `Mutex` (avec un `AtomicBool` en garde pour ne pas prendre le verrou à chaque frame) et le focus se fait dans le tick, où le main thread est libre d'emprunter la liste des fenêtres.
+- **Garde-fou hors bundle** : `currentNotificationCenter` lève une exception ObjC si le process n'a pas de bundle identifier (binaire lancé depuis `~/.cargo/target/release/`). `center()` teste `NSBundle::mainBundle().bundleIdentifier()` d'abord et renvoie `None` — sinon l'app tombait au lancement en dev.
+- **`pane_id` n'est pas validé à la pose** : le pane peut légitimement avoir disparu au moment du clic, ce cas se loggue à ce moment-là plutôt que de refuser la notif.
+
+**Côté hooks** : le hook `Stop` de `~/.claude/settings.json` appelle maintenant `~/.claude/hooks/kova-notify.sh`, qui n'envoie rien hors d'un pane Kova et échappe le JSON. terminal-notifier sort de la boucle. Aucun autre outil perso ne l'utilisait (vérifié : seul `pomo/roadmap.md` le mentionne, sans code).
+
+**Documenté** : `docs/ipc.md` (section `notify`), le skill `kova` (21 commandes), et `CLAUDE.md` § Pièges récurrents — « une notif qui s'affiche ne prouve pas que son clic marche ».
+
+**Prochaine action** : redémarrer Kova, accepter le prompt de notifications, puis vérifier qu'un clic sur la notif de fin de session ramène bien au bon pane.
+
+### Crash sur Cmd+J : cast de fenêtre non vérifié
+
+**Statut** : 🔄 corrigé, 219 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova** — le process courant tourne encore sur le binaire d'avant.
+
+**Ce qui s'est passé** : Kova a segfaulté le 2026-08-14 à 11:16:58 sur un Cmd+J (`kova-2026-08-14-111702.ips`). Le PC tombe sur `Tab::for_each_pane` +32, `ldr x8, [x0, #32]` avec `x0 = 0` : `self` était nul, donc la liste d'onglets parcourue n'était pas la nôtre.
+
+**Cause** : `kova_view` castait le `contentView` de n'importe quelle `NSWindow` en `KovaView` sans vérification, et `do_focus_next_attention` boucle sur `NSApplication::windows()`, qui liste toutes les fenêtres du process — panneaux AppKit compris. Lire les ivars d'une autre classe donnait un `Vec` de tabs bidon. Quelle fenêtre étrangère était ouverte à cet instant n'est pas établi.
+
+**Fix** : `kova_view` (`src/app.rs`) interroge le runtime (`isKindOfClass`) et renvoie `None` si la fenêtre n'est pas à nous. Ça protège d'un coup les six boucles sur `app.windows()`, pas seulement Cmd+J. Le piège est noté dans `CLAUDE.md` § Pièges récurrents.
+
+
+### Blocs à coller peints en bleu (Kova + Kite)
+
+**Statut** : codé des deux côtés, 219 tests verts côté Kova, binaire reconstruit et signé ; APK Kite republié en 0.1.62. **Il faut redémarrer Kova** pour le voir, et installer la mise à jour depuis le téléphone pour la moitié Kite.
+
+**Le problème** : une réponse porte souvent deux choses à la fois — un message à coller dans Slack et les remarques adressées à Mickael autour. À l'écran, rien ne les séparait. Claude Code retire les fences d'un bloc et son renderer ne lui donne jamais qu'une seule des deux choses : la langue imprimée en dim au-dessus quand highlight.js ne la connaît pas, ou de la couleur dedans quand il la connaît. Une phrase en français n'obtient ni l'une ni l'autre.
+
+**Ce qui a été fait** : la ligne dim est le seul signal qui arrive, donc un bloc à coller s'écrit ```slack et se referme par un bloc vide ```/slack. `src/terminal/paste_block.rs` relit les cellules à l'affichage (et non le flux d'octets, que Claude Code réécrit pendant qu'il streame), peint le corps en `colors.paste_block` et **n'affiche pas** la ligne de fermeture. Les deux lignes de tag sont aussi exclues de `selected_text`, pour qu'une sélection trop large ne colle pas `slack` dans le message. Un tag laissé ouvert ne peint rien, exprès. Côté Kite, `CodeBlock` (`ChatScreen.kt`) affiche la langue en gris et le corps en bleu, couleurs ajoutées à `KitePalette` pour tenir aussi sur fond blanc, et un bloc vide est ignoré par le parseur.
+
+**La convention est écrite dans `~/.claude/CLAUDE.md`** (section « Écrire pour moi ») : sans elle, une autre session n'écrit pas les tags et la fonctionnalité est morte.
+
+**Deux pièges trouvés en regardant de vrais panes** (14/08/2026, contenu lu par l'IPC `get-pane-content`) : quand le bloc ouvre le message, l'étiquette partage sa ligne avec la puce `⏺` de Claude Code, donc la ligne n'est pas « rien qu'un tag » ; et Claude Code ne rend pas toujours le markdown, auquel cas les backticks restent bruts à l'écran. La détection tolère la puce et lit les deux formes.
+
+**Pourquoi le markdown est parfois abandonné** — la vraie cause, lue dans le binaire `claude 2.1.232` : avant de lexer, il renifle le texte avec `/[#*`|[>\-_~]|\n\n|(?:^|\n) {0,3}\d+\. |https?:\/\/|www\./`, **et seulement les 500 premiers caractères** au-delà de cette longueur. Sans correspondance, le message entier ressort en un seul paragraphe brut. Un message qui s'ouvre sur un paragraphe de prose française de plus de 500 caractères n'est donc jamais rendu. Levier d'écriture qui en découle : une ligne vide ou n'importe quel signe de cette liste dans les 500 premiers caractères suffit à rétablir le rendu.
+
+**Question ouverte** : l'étiquette grise du haut reste visible. Elle se cache d'une ligne si elle gêne.
+
+### IPC — `subscribe`, le flux d'events
+
+**Statut** : codé, `cargo test` vert (193 tests), buildé en release. Pas encore de client branché dessus.
+
+**Pourquoi** : un client qui veut suivre l'attention (track, `/pane-sweep`, Kite) n'avait que le polling de `list-panes`, qui coûte un `proc_pidinfo` + un walk de la table des process par pane. Le déclencheur est track : imputer le temps par projet quand Mickael passe d'une session Claude à l'autre toute la journée.
+
+**Ce que ça fait** : `{"cmd":"subscribe","events":[…]}` transforme la connexion en flux. La réponse est un **snapshot** (focus + tous les panes, mêmes objets que `list-panes`) — donc pas de bootstrap séparé ni de trou entre l'état et les changements — puis une ligne JSON par edge : `focus`, `pane-status`, `pane-working`, `pane-open`, `pane-close`, plus un `ping` toutes les 30 s de silence.
+
+**Décisions structurantes** :
+- **`focus` intègre « Kova est-il au premier plan »**. Partir sur Slack émet `pane: null` / `reason: "app-inactive"`. Sinon chaque client devrait recroiser ce flux avec les notifications d'app active du système pour savoir si l'utilisateur regarde vraiment le pane.
+- **Diff sur le tick, pas d'instrumentation des mutations**. Le focus bouge depuis une douzaine d'endroits et `working`/`awaiting` sont dérivés, pas posés : hooker chaque site aurait garanti d'en oublier un. `src/events.rs` garde le dernier état publié et le compare.
+- **Le main thread n'écrit jamais sur une socket**. Il pousse dans des files bornées (256), le thread de la connexion écrit. Un client lent est **déconnecté** plutôt que servi troué : il se reconnecte, le snapshot le resynchronise. C'est ce qui garantit qu'aucun abonné ne peut ralentir la boucle de rendu.
+- **Inscription avant snapshot** : un event qui tombe entre les deux est livré juste après le snapshot. Redondant parfois, jamais troué — chaque event porte un état absolu.
+- **Coût zéro quand personne n'écoute** : un load atomique par tick. Le focus est comparé chaque frame (deux lectures de `RefCell`), le balayage des panes est throttlé à ~4 Hz, et le JSON coûteux (CWD, process) n'est construit que sur un edge.
+
+**Fichiers** : `src/events.rs` (neuf — diff + snapshot), `src/ipc.rs` (registre d'abonnés, `publish`, `stream_events`, parsing), `src/window.rs` (`pane_json` extrait et partagé par `list-panes`, le snapshot et les events), `src/app.rs` (poll dans le tick, `applicationDidBecomeActive/ResignActive`).
+
+**À tester** : `printf '%s' '{"cmd":"subscribe"}' | nc -U $KOVA_SOCKET` puis bouger entre panes/onglets/apps et regarder les lignes tomber.
+
+**Limite connue** : le socket porte le pid de Kova, donc un redémarrage déplace le chemin — un abonné longue durée doit re-glob `/tmp/kova-*.sock` et se réabonner.
+
+**Suite (2026-08-12)** : `claude_session_id` et `claude_session_name` ajoutés à l'objet pane (donc dans `list-panes`, le snapshot et les events). Lus depuis `~/.claude/sessions/<pid>.json` sur le même probe throttlé que le reste ; `Pane.claude_name` devient `Pane.claude_session` et porte l'objet entier. Motif : c'est le **seul identifiant qui survive au pane** — le `pane_id` meurt avec l'onglet, le `cwd` est partagé par toutes les conversations d'un même repo. Track s'en sert pour attacher une conversation à une tâche.
+
+**Suite (2026-08-13)** : la conversation fait partie de l'**identité du focus** (`FocusKey.session` dans `src/events.rs`), pas seulement du payload. Sans ça, l'event `focus` ne partait qu'au changement de *pane* : lancer `claude` dans le pane où on est déjà n'annonçait rien, et track ne l'apprenait qu'en sortant puis revenant (constaté à l'usage par Mickael). Nouvelle valeur de `reason` : `session`. Nécessite un redémarrage de Kova pour prendre effet.
+
+### Restauration des sessions Claude Code au redémarrage
+
+**Statut** : mécanisme permanent en place et vérifié le 2026-08-04. Le bootstrap jetable qui l'accompagnait est retiré, c'est lui qui a causé la panne du 2026-08-04.
+
+**Ce que ça fait** : au snapshot de session, Kova repère le Claude Code qui tourne dans chaque pane et mémorise son identifiant de conversation. À la restauration, ce pane reçoit `claude --resume <id>` pré-tapé au lieu de la dernière commande shell, sans retour chariot, donc rien ne part sans un Entrée. Un pane qui était à l'invite du shell garde le comportement d'avant. Le titre de conversation est sauvé et réinjecté lui aussi, pour qu'un pane non relancé ne retombe pas sur le nom de son répertoire dans le switcher.
+
+**Comment le pane est relié à sa session** : Claude Code écrit `~/.claude/sessions/<pid>.json` (contient `sessionId`) tant que le process vit, et le supprime en sortant. Kova lit ce répertoire et remonte la filiation de chaque process `claude` jusqu'au shell du pane. La lecture doit donc précéder `pty::shutdown_all()`, c'est déjà l'ordre de `applicationWillTerminate`.
+
+**Contrainte vérifiée le 2026-07-29** : `claude --resume <uuid>` ne retrouve la conversation que depuis le répertoire où elle a démarré (les transcripts sont rangés par cwd dans `~/.claude/projects/<slug>/`). Testé dans les deux sens : même répertoire → la conversation revient ; autre répertoire → `No conversation found`. Kova restaure déjà le cwd du pane, donc l'injection tombe juste.
+
+**Piège de l'identité du process** : l'exécutable de Claude Code est un fichier au nom de version (`~/.local/share/claude/versions/2.1.220`), donc `proc_name` renvoie `2.1.220`, jamais `claude`. Un garde-fou anti-fichier-périmé basé sur le nom rejetait toutes les sessions. Il compare maintenant l'heure de démarrage du process au champ `startedAt` du fichier de session (dérive mesurée : moins d'une seconde). Même cause pour `foreground_process_name()`, **corrigé le 2026-08-10** : `process_info` lit `argv[0]` via `sysctl KERN_PROCARGS2` (`src/terminal/pty.rs:82`) et garde le nom du fichier exécuté comme version quand c'en est une, donc le nom est `claude` et la version est un champ à part.
+
+**Post-mortem du 2026-08-04 : le bootstrap a tiré 5 jours trop tard.** Un fichier jetable, `~/.config/kova/claude-sessions.json`, écrit hors de Kova le 2026-07-29 à 14:55 avec 26 sessions, servait à couvrir le tout premier redémarrage depuis un build qui ne savait pas encore enregistrer les identifiants. Il n'a été consommé que le 2026-08-04 à 14:16, sur une disposition de panes qui n'avait plus rien à voir : 19 captures sans pane correspondant, 7 panes pré-remplis avec des conversations vieilles de 5 jours. **Décision : le bootstrap est supprimé** (code de fusion, script de capture, format de fichier). Un fichier de reprise sans date de péremption ni lien avec l'état courant est un piège, et le mécanisme permanent n'en a plus besoin.
+
+**Vérifié le 2026-08-04** : la détection native marche, `~/.config/kova/session.json` porte l'identifiant réel des 4 sessions Claude vivantes ainsi que leur titre. Reste le fichier mort `~/.config/kova/claude-sessions.used.json`, supprimable.
+
+**Séquelle à connaître** : les 6 panes pré-remplis le 2026-08-04 portent une ligne `claude --resume` vers une conversation du 2026-07-29. Tant qu'aucune commande n'y est lancée, cette ligne se recopie de redémarrage en redémarrage. Effacer la ligne dans le pane suffit à s'en débarrasser.
+
 ### Pane switcher — rebind Cmd+P + layout 3 colonnes
 
 **Statut** : Rebind fait + layout 3 colonnes implémenté et buildé (2026-06-23) ; reste le test manuel.
@@ -80,20 +198,37 @@
 
 **Prochaine action** : a la prochaine repro, checker `~/Library/Logs/Kova/kova.log` : si le `term_id` de `SCROLL-BEGIN` (tab/pane ou on scrolle) ≠ le `term_id` de `SCROLL-START` (terminal qui scrolle reellement), le routage event→terminal est en cause ; si egaux mais contenu faux, c'est le scrollback lui-meme (reflow/corruption).
 
-### Bug: bande blanche (« trou ») dans Claude Code — repaint différentiel alt-screen
+### Bug: bande blanche (« trou ») dans Claude Code
 
-**Statut** : En cours — cause non élucidée, repro déterministe à faire. Détail complet : `notes/display-glitches.md` § Round 2.
+**Statut** : Round 6 — nouveau déclencheur identifié (le scroll, pas le resize). Fix côté entrée souris posé et buildé, à valider après redémarrage de Kova. Détail : `notes/display-glitches.md` § Round 6 (rounds 1-5 = historique).
 
-**Contexte** : Trou (bande de rangées vides) au milieu du texte d'une pane Claude Code ; Cmd+R répare ; re-scroller (haut puis bas) le ramène au même endroit. Rapporté 2026-06-17 sur Kova v1.8.0. Bug récurrent (déjà ~50 fixes en v1.8.0 sans le tuer).
+**Contexte** : Trou (bande de rangées vides) au milieu du texte d'une pane Claude Code ; Cmd+R répare. Récurrent depuis v1.8.0.
 
-**Faits établis (vérité-terrain par dump IPC, 2026-06-17)** :
-- Claude Code est en **alt-screen** (`count-pane-content mode=scrollback` = 0 octet sur 6 panes) → le bug n'a RIEN à voir avec le scrollback / la gravité / le cross-tab (tous innocentés).
-- Le trou = bande de N rangées vides dans la **grille alt** (pane 194 : 9 rangées vides, lignes 33-41, juste après un bloc `Update()` soft-wrappé, avant `⏺ Capitalisé`). Kova ne met pas à jour ces cellules pendant le repaint différentiel que Claude émet au scroll (molette → SGR mouse mode 1000+1006 → redraw, `window.rs:919`).
-- **Pas déjà corrigé** : process qui tourne lancé le 11/06 07:18 = binaire v1.8.0 ; seul commit terminal depuis (`48625d1`) sans rapport (search/URL/SGR/sélection). Bug présent dans HEAD (`0e30761`) aussi → rebuild ne corrige pas.
-- `reverse_index` (1930) / `scroll_down` (961) / IL (1281) / DL (1307) / régions (1376) corrects à la lecture ; renderer innocenté ; `y_offset_rows` renvoie 0 en alt-screen.
-- Une autre session a laissé des sondes `probe_*` **non-commitées** dans `src/terminal/mod.rs` (hypothèse scrollback, écartée par la vérité-terrain) — ne pas y toucher.
+**Ce qu'on sait maintenant** : le trou apparaît sans aucun resize, en scrollant vers le haut dans une session Claude Code. Le flux émis ne contient aucun effacement d'écran ; l'app redessine son bloc 4 rangées plus bas à chaque cran et laisse vides les rangées libérées. Rejoué hors app, tmux produit exactement la même grille que Kova : le rendu est fidèle, le trou est déjà dans les octets reçus.
 
-**Prochaine action** : repro déterministe — `script -q /tmp/kova_cap.raw claude` dans une pane neuve, faire apparaître le trou, puis rejouer le fichier dans `drive(cols, rows, chunks)` (`parser.rs:913`) à 85×65, bissecter → séquence fautive → test de régression + fix. Snapshots de la session : `/tmp/kova_hole_194.json`, `/tmp/kova_dump_194_{visible,all}.json`.
+**Différence Kova vs Terminal.app** : sur le même geste, Kova envoyait 37 % de rapports souris en double, Terminal.app aucun. Deux chemins de livraison de `mouseMoved:` étaient actifs en même temps. Corrigé.
+
+**Angle mort connu** : les garde-fous du round 5 ne s'arment qu'après un resize, donc ils ne verront jamais un trou né d'un scroll.
+
+**Prochaine action** : redémarrer Kova, relancer `scripts/mouse-probe.py` (zéro doublon de motion attendu), puis rescroller dans une session Claude Code chargée. Si le trou revient, suspect suivant : la rafale d'un événement par ligne de molette.
+
+**Question ouverte** : 7 s sans aucun événement au lancement du mouchard, cause non établie. Suspect : le verrou d'axe de scroll, global à la fenêtre et jamais réinitialisé pour une souris à molette.
+
+### Bug: le nombre de colonnes/lignes change au switch d'écran (scale 2x ↔ 1x)
+
+**Statut** : En cours — diagnostiqué (2026-07-03), aucun fix. Analyse par trace complète + relecture des lignes clés.
+
+**Symptôme** : en passant d'un écran externe au retina (ou l'inverse), la grille du terminal change de dimensions → une table affichée par un programme reflow avec une largeur différente. Pénible et récurrent.
+
+**Cause racine** : tout le calcul de grille se fait en **pixels physiques**, et la cellule est arrondie *après* multiplication par le scale, ce qui rend la taille de cellule ramenée au point logique dépendante de l'écran.
+- L'atlas est construit à `font.size * scale` (`src/renderer/mod.rs:342`, rebuild `:1883`).
+- Les métriques sont `ceil()` en physique : `cell_height` (`src/renderer/glyph_atlas.rs:88`), `cell_width` (`:109`).
+- `cols`/`rows` = viewport physique / cellule physique (`src/window.rs:4636-4638`, idem `viewport_to_grid` `:2004`). `cell_size()` renvoie du physique (`src/renderer/mod.rs:2485`).
+- Exemple police 14, avance 'M' ≈ 8,42 pt : 2x → `ceil(16.84)=17` phys = 8,5 px logiques/col ; 1x → `ceil(8.42)=9` phys = 9,0 px logiques/col. Même largeur logique → **plus de colonnes en retina** qu'en externe.
+- Chaîne au switch : `viewDidChangeBackingProperties` (`src/window.rs:748`) → `handle_resize` (rebuild atlas au nouveau scale) → `resize_all_panes` → `term.resize` + `pty.resize` → SIGWINCH → reflow.
+- Contributeur secondaire : `PANE_H_PADDING = 10.0` (`src/renderer/mod.rs:5`) est en px physiques, non scalé (5 px logiques à 2x, 10 à 1x).
+
+**Prochaine action** : choisir la direction de fix (calcul de grille en espace logique vs cellule arrondie en logique puis scalée pour l'atlas ; + scaler le padding), montrer le diff, builder.
 
 ## En attente
 

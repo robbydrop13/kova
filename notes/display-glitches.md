@@ -256,3 +256,263 @@ vérifiés rouges sur le code d'avant-fix (revert temporaire ciblé).
 Snapshots round 3 : `holes_report.json` + `hole_pane_{13,45,97,100}.json`
 (scratchpad de session). Journal du workflow (code des tests de repro, verdicts) :
 `subagents/workflows/wf_13ff246f-482/journal.jsonl`.
+
+---
+
+# Round 4 (juillet 2026) : le trou survit à une capture rejouée hors-app → piste RESIZE, fix débouncé (EN TEST)
+
+Point de départ : trou capturé **en direct** dans une pane Claude Code (tab mira,
+pane 229, 118×65) avec sa capture PTY fraîche encore vivante
+(`pty-capture-53097-229.raw`). Pour la première fois sur ce bug, on avait les
+octets exacts + le repro immédiat.
+
+## Faits établis (VÉRIFIÉS)
+
+1. **Le trou est déterministe à partir du flux d'octets.** Rejoué à froid via
+   `replay_capture_file` à 118×65 : même grille, même bande **rows 27..46 (20
+   lignes vides)**, curseur row 61. Ce n'est pas une race de rendu live.
+2. **La bande = un `CSI 20 B` (CUD) littéral** dans le flux. Séquence : fin du
+   bloc tableau → `\r` → `CSI 20 B` → `⏺ C'est fait`. Claude saute 20 rangées
+   par-dessus des cellules que rien ne remplit. Le trou est **hérité** de frames
+   antérieures (la dernière frame ne redessine que la ligne 1) — signature du
+   repaint différentiel.
+3. **tmux 3.6a reproduit le trou à l'identique** (mêmes octets, 118×65, `cat` du
+   `.raw` dans un pane 118×65) : bande vide lignes 28–47 avant `⏺ C'est fait`.
+   Deux émulateurs indépendants d'accord à partir du même flux.
+4. **Ce n'est PAS la table de largeur** (contrairement au suspect prioritaire du
+   round 3). Pour tous les glyphes de cet écran (⏺ ⎿ 🔧 ✅ ★ ❯ →), Kova
+   (`unicode-width` niveau cluster) et ink (`string-width` npm) donnent la MÊME
+   largeur. Et ink positionne l'horizontal en colonne absolue (`CSI n G`), donc
+   toute dérive horizontale se resynchronise — seule la dérive verticale compte.
+5. **Des resizes ont bien eu lieu** (log Kova de l'instance vivante) : rafales de
+   `Resize(*)`, dont un **round-trip vertical shrink→grow** (touche Up puis Down)
+   à 22:44 — exactement ce qui change le nombre de lignes. 38 events resize au
+   total. (Réserve : le log ne dit pas quel pane était focus, donc pas cloué sur
+   229 spécifiquement — mais le comportement est établi.)
+6. Positionnement absolu : **ligne max référencée = 65, jamais au-delà** → si la
+   pane a été resizée, elle n'est allée que ≤ 65 puis retour à 65 (round-trips
+   bornés à 65), cohérent avec l'habitude CTRL+OPTION+flèches de Mickael.
+
+## Piège méthodologique (une conclusion prématurée, retirée)
+
+« tmux reproduit le trou → donc pas un bug Kova » est **faux comme exonération** :
+le replay ET le test tmux tournaient à **taille FIXE 118×65**, alors que la vraie
+session était **redimensionnée**. Rejouer la sortie d'une session resizée dans un
+terminal de taille figée désynchronise par construction — ça ne distingue pas un
+bug du renderer de Claude d'un bug du chemin de resize de Kova. La capture PTY ne
+contient que la sortie, **pas** les resizes (ioctl hors-bande), donc on ne peut
+pas rejouer les resizes aux bons offsets depuis ce `.raw`.
+
+Donc **cause racine non isolée** : soit le chemin de resize alt-screen de Kova
+laisse un état non-standard que Claude ne rattrape pas en différentiel, soit le
+reconciler d'ink ne récupère pas d'un resize (et Kova le rend fidèlement, comme
+tmux). Les deux restent ouverts.
+
+## Fix posé (EN TEST, pas confirmé)
+
+Plutôt que de parier sur la cause non prouvée, on automatise le remède **fiable
+connu** : Cmd+R (`do_repaint_pane`) répare toujours le trou (soft_reset + nudge
+double-SIGWINCH → Claude repeint tout). On le déclenche désormais **tout seul
+après resize**, débouncé.
+
+- `resize_settle: HashMap<PaneId, u32>` (`window.rs`) : compteur de frames par
+  pane, (ré)armé à chaque resize (~150 ms). Constaté : chaque frappe
+  CTRL+OPTION+flèche appelait `resize_all_panes` immédiatement, sans debounce →
+  rafale de SIGWINCH que Claude coalesce → repaint partiel → bande.
+- Quand la rafale se calme (compteur à 0), `fire_resize_settle_repaints` →
+  `repaint_pane_settle(pane_id)` fait le même travail que Cmd+R (soft_reset +
+  `pty.resize(rows-1)` + restore différé), **sans** le flash de bordure.
+- Logique de debounce extraite en fonction pure `step_resize_settle` + **3 tests
+  de régression** (`window.rs` mod tests). Suite complète : 93 tests verts.
+- Nature du fix : **mitigation par repaint forcé**, pas un fix de parsing. Sûr
+  (soft_reset = DECSTR, ne touche pas au contenu ; s'applique à toutes les apps).
+
+## À valider (prochaine action)
+
+Redémarrer Kova (l'instance qui tournait pendant l'investigation = ancien
+binaire) puis resizer comme d'habitude pendant une session Claude et vérifier que
+le trou ne survit plus / se répare seul ~150 ms après la rafale. **Si le trou
+revient malgré le fix**, la cause est en amont du repaint (état post-resize de la
+grille Kova non-standard, OU renderer d'ink) et il faudra le test isolant :
+rejouer un flux AVEC les resizes injectés aux bons offsets dans Kova vs tmux et
+diffé les grilles — ce qui suppose d'instrumenter la capture PTY (`pty.rs`) pour
+logger les changements de winsize + offset.
+
+## Outillage (test-only)
+
+- `KOVA_REPLAY_BYTES=<n>` (tronque le flux) et `KOVA_REPLAY_QUIET` ajoutés à
+  `replay_capture_file` (`parser.rs`) pour la bissection par préfixes.
+- Snapshot du trou : scratchpad de session `kova_hole_229.json` ; capture
+  copiée `cap_229.raw`.
+
+---
+
+# Round 5 (2026-07-24) : CAUSE TROUVÉE — Claude Code émet `2J` + repaint PARTIEL quand la winsize flappe, et c'est notre nudge qui fait flapper
+
+Repro : pane 19 (everping, tab CTO), trou de 47 lignes (rangées 7..53) sur
+grille 89×65, capturé live avec sa capture PTY fraîche
+(`pty-capture-84103-19.raw`, copiée en scratchpad `cap_19.raw` +
+`kova_hole_19_visible.json`).
+
+## Faits établis (VÉRIFIÉS, offsets dans cap_19.raw)
+
+1. **Le trou est déterministe depuis les octets** : `replay_capture_file` à
+   89×65 reproduit exactement la grille live (bande 7..53, curseur row 61).
+   Kova rend fidèlement ce que l'app a émis — cohérent avec le test tmux du
+   round 4.
+2. **La frame fautive est dans le flux** : l'app émet `CSI 2J` (clear complet)
+   PUIS un repaint **partiel** (~2 Ko au lieu de ~4,3 Ko pour une frame
+   pleine) qui saute le milieu d'un `CSI 34/44 B`. Après un 2J tout est vide :
+   les rangées sautées restent vides. Offsets des frames `2J+partiel` :
+   956947 (64 lignes, CUD 34), 964702 (65 l., CUD 44), **972442** (65 l.,
+   CUD 44 — la dernière, celle qui laisse le trou définitif). Les frames
+   suivantes (différentielles, `[H` + ~6 lignes en haut + `CR`+`[46/47B` +
+   bloc du bas) ne repeignent jamais le milieu : l'app croit que ces rangées
+   contiennent encore le texte du transcript.
+3. **Le contexte déclencheur est un flapping 65↔64 de la winsize** : resize
+   réel 93×84 → 89×65 à l'offset ~939214 (dernier `[84;1H`) / 943484 (premier
+   `[65;1H`). Juste après, l'app fait DEUX repaints complets sains (2J pleins,
+   4,2 Ko, offsets 939288 et 943558) — le resize réel était déjà bien géré.
+   Puis les nudges rows±1 de NOTRE mitigation round 4 (`repaint_pane_settle`
+   + `PtyRestore`) font flapper 65→64→65 plusieurs fois (3 frames `[64;1H`,
+   947743..972368) : c'est sur ces allers-retours que l'app sort ses frames
+   `2J+partiel`. Le dernier nudge s'est terminé sur une frame cassée, plus
+   rien ne force de repaint ensuite → trou permanent.
+4. Bilan de responsabilité : **bug de renderer côté Claude Code/ink**
+   (différentiel calculé contre son cache alors qu'il vient d'effacer l'écran
+   physique avec 2J, quand la taille revient vite sur une valeur déjà vue) ;
+   **Kova est complice** parce que sa mitigation nudge crée exactement ce
+   pattern A→B→A, y compris quand elle était inutile (l'app avait déjà
+   full-repaint le resize réel).
+
+## Pourquoi les rounds 1-4 n'ont pas suffi
+
+Le round 4 avait la bonne piste (resize) mais la mauvaise arme : le repaint
+forcé par nudge répare le cas « app a coalescé les SIGWINCH et n'a rien
+redessiné », et EN MÊME TEMPS provoque le cas « 2J+partiel » chez ink. La
+mitigation guérit et réinfecte.
+
+## Fix posé (2026-07-24, EN TEST — build fait, redémarrage Kova requis)
+
+Deux volets défensifs, implémentés :
+
+1. **Nudge seulement si nécessaire** (`should_skip_settle_nudge`,
+   `window.rs`) : `repaint_pane_settle` saute le nudge quand l'app a déjà
+   adressé ≥ 80 % des rangées depuis le dernier changement de winsize
+   (`TerminalState::rows_touched`, remis à zéro à chaque `term.resize` /
+   nudge / restore ; alimenté par print, EL, ICH/DCH/ECH, IL/DL — PAS par
+   ED, un clear bulk n'est pas une peinture) ET que la grille n'a pas de
+   bande vide intérieure ≥ 8 rangées (`interior_blank_band`, une rangée
+   BCE-colorée ou attribuée compte comme contenu). Ce matin, c'est un nudge
+   inutile (l'app avait déjà full-repaint le resize réel) qui a déclenché
+   le trou.
+2. **Auto-guérison bornée** (`fire_post_restore_band_checks`, `window.rs`) :
+   ~0,5 s (30 frames) après chaque restore de winsize, scan de la grille ;
+   si bande vide intérieure ≥ 8 rangées en alt-screen → re-repaint forcé,
+   max 2 tentatives par pane entre deux resizes réels (log INFO à chaque
+   tentative, WARN à l'abandon). Dans cap_19.raw, 4 cycles nudge sur 6 se
+   terminent en repaint complet sain → une retentative converge presque
+   toujours.
+
+Tests : 111 verts, dont `cleared_screen_plus_partial_repaint_leaves_interior_band`
+(parser.rs — la signature distillée de cap_19.raw : full paint → `2J` +
+repaint partiel → bande détectée aux rangées exactes), les tests de
+`interior_blank_band` / `row_coverage` (mod.rs) et de
+`should_skip_settle_nudge` (window.rs).
+
+Validation : redémarrer Kova (l'instance en cours = binaire du 22/07 sans le
+fix), puis vivre normalement (resizes, minimize/restore, scroll dans des
+panes Claude Code). Si un trou apparaît et reste > 1 s, chercher dans le log
+`post-restore check:` — s'il dit « giving up », l'app a répondu 3 frames
+cassées d'affilée ; récupérer la capture PTY du pane et bissecter comme ici.
+
+Upstream : le pattern exact (flap 65→64→65 rapide → `2J` + frame
+différentielle partielle) est reportable à Anthropic avec `cap_19.raw` comme
+repro byte-for-byte (rejouable via `replay_capture_file` à 89×65).
+
+# Round 6 (2026-07-29) : le trou arrive AUSSI sans resize — déclencheur = le scroll, et Kova doublait les rapports de souris
+
+Repro live : pane 11 (session self/), grille 98×65, bande vide rangées 9..49
+(41 rangées), curseur row=61 col=2, alt-screen. Capture
+`pty-capture-63758-11.raw`, 1 652 462 octets.
+
+Mécanisme DIFFÉRENT du round 5 : ici l'app n'efface jamais l'écran (aucun `2J`)
+et aucun resize n'est en jeu. Le round 5 reste valable pour son cas (flap de
+winsize provoqué par nos nudges) ; il ne couvre pas celui-ci.
+
+## Faits établis (VÉRIFIÉS)
+
+1. **Le trou est dans la grille, pas au rendu** : `get-pane-content` mode
+   `visible` lit `self.grid` (`terminal/mod.rs:465`) et montre les 41 rangées
+   vides. Ce n'est donc pas un problème de framebuffer Metal.
+2. **Il suit la position de scroll de l'app** : scrollé vers le haut → trou ;
+   redescendu en bas → grille propre. Vérifié sur trois dumps successifs du
+   même pane. Claude Code est en alt-screen et a le mouse tracking actif, donc
+   la molette lui est transmise et c'est LUI qui repeint
+   (`window.rs:820-832`) — le scrollback Kova n'est pas impliqué.
+3. **Déterministe hors app** : `replay_capture_file` à 98×65 reproduit
+   exactement la grille live (bande 9..49, curseur row=61 col=2).
+4. **tmux 3.6a donne la même chose** : mêmes octets, même taille, bande 9..49
+   et mêmes longueurs de ligne. Kova rend fidèlement ce que l'app a émis.
+5. **Aucun resize** : dernier événement du pane 11 dans `kova.log` =
+   `settle repaint skipped for pane 11 … no hole` à 13:42:59 ; le trou est
+   apparu vers 15:00 sans resize entre les deux.
+6. **Aucun effacement dans le flux du scroll** (208 956 octets) : 0 `CSI J`,
+   0 `IL`/`DL`, 0 `SU`/`SD`, 0 `LF`. Uniquement 9 164 `CHA`, 2 207 `CUD`,
+   2 207 `CR`, 998 `EL`, 189 `CUP`, encadrés par `?2026h`/`?2026l`.
+7. **Naissance datée à la frame près** (en rejouant à chaque `?2026l`) :
+   dernière frame propre à l'offset 1 564 755 ; la suivante (1 569 555) a déjà
+   6 rangées vides ; la bande grandit de 2 à 4 rangées par frame — 6, 10, 11,
+   15, 16, 20, 21, 25, 27, 31, 33, 37, 39 — puis sature à 41.
+8. **Mécanisme** : à chaque cran, l'app redessine son bloc 4 rangées plus bas
+   que la frame précédente et n'écrit jamais les rangées libérées en haut. La
+   trace de curseur de la frame de bascule n'écrit rien sur les rangées
+   0, 1, 2, 4, 6.
+9. **Différence Kova / Terminal.app sur l'ENTRÉE** (mouchard, même geste) :
+   Kova 676 rapports en 17,8 s dont 250 doublons exacts (même bouton, même
+   colonne, même ligne) à moins de 2 ms, soit 37 % ; Terminal.app 147 rapports,
+   0 doublon, une écriture de 12 octets par rapport. Débit ~38/s contre ~19/s.
+10. **Cause du doublement** : `setAcceptsMouseMovedEvents(true)` sur la fenêtre
+    ET une `NSTrackingArea` avec `MouseMoved` sur la vue → `mouseMoved:` livré
+    deux fois par mouvement physique. Corrigé en retirant le flag fenêtre
+    (`window.rs:6154`) ; la tracking area est la source la plus précise (bornée
+    à la vue, key window seulement). Les ~35 doublons de molette restants
+    viennent de la boucle un-événement-par-ligne (`window.rs:826-831`), non
+    touchée.
+
+## Non élucidé
+
+- **Lien de causalité doublement → trou : NON prouvé.** Ce qui est établi, c'est
+  une différence de comportement mesurée entre Kova et un terminal où le bug
+  n'a jamais été observé, dans le sens attendu (l'app reçoit deux fois plus
+  d'ordres). La validation est le test ci-dessous.
+- **7,2 s sans aucun événement au lancement du mouchard**, alors que le pointeur
+  était bien dans le pane. Le log Kova ne journalise le scroll que dans la
+  branche scrollback (`window.rs:840-846`), donc la branche souris est muette et
+  on ne peut pas distinguer « macOS n'a rien délivré » de « Kova a filtré ».
+  Suspect lisible mais non prouvé : `scroll_axis_lock` est global à la fenêtre
+  et n'est réinitialisé qu'aux phases trackpad (`window.rs:782-801`) — une
+  souris à molette ne le remet jamais à `None`, et le vertical est ignoré tant
+  qu'il vaut `Horizontal`. Pour trancher il faudrait un log dans la branche
+  souris.
+
+## Angle mort des garde-fous du round 5
+
+`resize_settle` et `post_restore_checks` ne sont armés que dans le chemin de
+resize (`window.rs:4797` et le restore de winsize). Un trou né d'un scroll n'est
+donc jamais détecté ni réparé — cohérent avec l'observation qu'il reste à
+l'écran jusqu'à ce qu'on redescende.
+
+## Outillage
+
+`scripts/mouse-probe.py` : active les modes 1000/1002/1003/1006, passe le tty en
+brut, décode les rapports SGR et trace pour chacun l'écart en millisecondes et
+la taille de l'écriture. Trace dans `~/Downloads/mouse-probe-<label>.log`. Sert
+à comparer deux terminaux sur le même geste — c'est lui qui a produit les 37 %.
+
+## À valider (prochaine action)
+
+Redémarrer Kova (le binaire en cours est d'avant le fix), relancer le mouchard →
+zéro doublon de motion attendu, puis rescroller vers le haut dans une session
+Claude Code bien remplie. Si le trou revient malgré tout, suspect suivant : la
+rafale d'un événement par ligne de molette.

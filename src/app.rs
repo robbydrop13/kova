@@ -3,6 +3,11 @@ use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow};
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
+use objc2_user_notifications::{
+    UNNotification, UNNotificationPresentationOptions, UNNotificationResponse,
+    UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+};
+use objc2::runtime::ProtocolObject;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::ptr::NonNull;
 
@@ -26,6 +31,12 @@ pub struct AppDelegateIvars {
     ipc_rx: RefCell<Option<std::sync::mpsc::Receiver<crate::ipc::IpcRequest>>>,
     /// `wait-for-completion` requests that haven't fired yet — checked on each tick.
     pending_waits: RefCell<Vec<PendingWait>>,
+    /// Last state published to IPC event subscribers — diffed on each tick.
+    events: RefCell<crate::events::EventState>,
+    /// Whether Kova is the active app. Kept by the two activation delegate
+    /// methods rather than polled: the tick has no `MainThreadMarker` to ask
+    /// `NSApplication` with, and an edge-driven flag is exact anyway.
+    app_active: Cell<bool>,
 }
 
 /// A `wait-for-completion` request the main thread is still polling.
@@ -85,6 +96,14 @@ define_class!(
 
             let app = NSApplication::sharedApplication(mtm);
             app.activate();
+            // Seed the flag: `activate()` above usually makes AppKit call
+            // `applicationDidBecomeActive:` right after, but a launch that stays
+            // in the background never gets that call.
+            self.ivars().app_active.set(app.isActive());
+
+            // Desktop notifications: Kova posts them itself so that clicking one
+            // can focus the pane it came from.
+            crate::notification::init(ProtocolObject::from_ref(self));
 
             // Start IPC server (Unix socket for external process control)
             let ipc_rx = crate::ipc::start();
@@ -120,6 +139,16 @@ define_class!(
             true
         }
 
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn did_become_active(&self, _notification: &NSNotification) {
+            self.ivars().app_active.set(true);
+        }
+
+        #[unsafe(method(applicationDidResignActive:))]
+        fn did_resign_active(&self, _notification: &NSNotification) {
+            self.ivars().app_active.set(false);
+        }
+
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
             log::info!("Kova shutting down");
@@ -132,6 +161,36 @@ define_class!(
             crate::terminal::pty::shutdown_all();
             crate::ipc::cleanup();
             log::logger().flush();
+        }
+    }
+
+    unsafe impl UNUserNotificationCenterDelegate for AppDelegate {
+        /// A notification was clicked. The pane is focused on the next tick —
+        /// see `crate::notification::take_pending_focus`.
+        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+        fn did_receive_notification_response(
+            &self,
+            _center: &UNUserNotificationCenter,
+            response: &UNNotificationResponse,
+            completion_handler: &block2::DynBlock<dyn Fn()>,
+        ) {
+            crate::notification::handle_response(response);
+            completion_handler.call(());
+        }
+
+        /// Show the banner even when Kova is the frontmost app: the pane that
+        /// finished is usually not the one being looked at, so the notification
+        /// is still news.
+        #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
+        fn will_present_notification(
+            &self,
+            _center: &UNUserNotificationCenter,
+            _notification: &UNNotification,
+            completion_handler: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
+        ) {
+            completion_handler.call((UNNotificationPresentationOptions::Banner
+                | UNNotificationPresentationOptions::List
+                | UNNotificationPresentationOptions::Sound,));
         }
     }
 );
@@ -147,6 +206,8 @@ impl AppDelegate {
             session_backup,
             ipc_rx: RefCell::new(None),
             pending_waits: RefCell::new(Vec::new()),
+            events: RefCell::new(crate::events::EventState::new()),
+            app_active: Cell::new(false),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -201,6 +262,31 @@ impl AppDelegate {
                         let rx_borrow = ivars.ipc_rx.borrow();
                         if let Some(ref rx) = *rx_borrow {
                             while let Ok((cmd, responder)) = rx.try_recv() {
+                                // `subscribe` is the one command that needs the
+                                // event state, so it is served here rather than in
+                                // `handle_ipc_command`.
+                                if let crate::ipc::IpcCommand::Subscribe { topics } = cmd {
+                                    let app_active = ivars.app_active.get();
+                                    // Flush what is already pending first: the
+                                    // subscribers that were here before this one
+                                    // must not learn of a change *after* the new
+                                    // client has been handed it as settled state.
+                                    ivars.events.borrow_mut().poll(
+                                        &ivars.windows,
+                                        app_active,
+                                        fps,
+                                        true,
+                                    );
+                                    let data = crate::events::snapshot(
+                                        &ivars.windows,
+                                        app_active,
+                                        topics,
+                                    );
+                                    let _ = responder.send(crate::ipc::IpcResponse::Ok {
+                                        data: Some(data),
+                                    });
+                                    continue;
+                                }
                                 match handle_ipc_command(cmd, &ivars.windows, &ivars.config) {
                                     Disposition::Reply(response) => {
                                         let _ = responder.send(response);
@@ -216,6 +302,26 @@ impl AppDelegate {
                             }
                         }
                     }
+
+                    // Focus the panes whose notification was clicked. Done here
+                    // rather than in the delegate callback because this is the
+                    // point where the main thread is free to borrow the windows.
+                    for pane_id in crate::notification::take_pending_focus() {
+                        if let crate::ipc::IpcResponse::Error { message } =
+                            handle_ipc_focus_pane(&ivars.windows, pane_id)
+                        {
+                            log::warn!("Notifications: click ignored: {}", message);
+                        }
+                    }
+
+                    // Publish whatever changed this tick to IPC event subscribers.
+                    // Costs one atomic load when nobody is subscribed.
+                    ivars.events.borrow_mut().poll(
+                        &ivars.windows,
+                        ivars.app_active.get(),
+                        fps,
+                        false,
+                    );
 
                     // Periodic session save (every ~30s) to survive crashes.
                     // Serialization + I/O is offloaded to a thread to avoid frame drops.
@@ -386,13 +492,22 @@ pub fn send_tabs_to_window(mtm: MainThreadMarker, tabs: Vec<crate::pane::Tab>, w
     }
 }
 
-/// Cast the window's contentView to our KovaView.
-/// SAFETY: contentView is always a KovaView (set in `create_window`).
+/// Cast the window's contentView to our KovaView, or `None` when the window
+/// isn't one of ours.
 pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
-    window.contentView().map(|cv| {
-        let ptr: *const objc2_app_kit::NSView = &*cv;
-        unsafe { &*(ptr as *const crate::window::KovaView) }
-    })
+    let cv = window.contentView()?;
+    // Ask the runtime before casting. Several call sites walk
+    // `NSApplication::windows()`, which lists every window the process owns —
+    // AppKit's own panels and tooltip carriers included. Their content view is
+    // not a KovaView, and reading another class's memory as our ivars handed
+    // out a `tabs` Vec with a null pointer: Cmd+J then called
+    // `Tab::for_each_pane` on a null `self` and segfaulted (crash of
+    // 2026-08-14, kova 1.9.0).
+    if !cv.isKindOfClass(<crate::window::KovaView as objc2::ClassType>::class()) {
+        return None;
+    }
+    let ptr: *const objc2_app_kit::NSView = &*cv;
+    Some(unsafe { &*(ptr as *const crate::window::KovaView) })
 }
 
 /// What `handle_ipc_command` decided to do with the request.
@@ -454,6 +569,9 @@ fn handle_ipc_command_sync(
         IpcCommand::SetTabTitle { pane_id, title } => {
             handle_ipc_set_tab_title(windows, pane_id, title)
         }
+        IpcCommand::SetTabColor { pane_id, color } => {
+            handle_ipc_set_tab_color(windows, pane_id, color)
+        }
         IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines } => {
             handle_ipc_get_pane_content(windows, panes, &mode, trim_trailing_blank_lines)
         }
@@ -482,11 +600,26 @@ fn handle_ipc_command_sync(
         IpcCommand::RenamePane { pane_id, title } => {
             handle_ipc_rename_pane(windows, pane_id, title)
         }
+        IpcCommand::SetPaneStatus { pane_id, waiting } => {
+            handle_ipc_set_pane_status(windows, pane_id, waiting)
+        }
         IpcCommand::DispatchAction { action, pane_id } => {
             handle_ipc_dispatch_action(windows, &action, pane_id)
         }
         IpcCommand::MergeWindow { source_window, target_window } => {
             handle_ipc_merge_window(windows, source_window, target_window)
+        }
+        IpcCommand::Notify { pane_id, title, message, sound } => {
+            handle_ipc_notify(pane_id, &title, &message, sound)
+        }
+        // Intercepted in the tick, before this dispatcher — it needs the event
+        // state, which lives on the delegate. Reaching here means that branch was
+        // lost in a refactor.
+        IpcCommand::Subscribe { .. } => {
+            log::error!("IPC: subscribe reached the generic dispatcher");
+            crate::ipc::IpcResponse::Error {
+                message: "internal: subscribe was not intercepted".to_string(),
+            }
         }
     }
 }
@@ -737,6 +870,28 @@ fn handle_ipc_set_tab_title(
     IpcResponse::Error { message: format!("pane {} not found", pane_id) }
 }
 
+/// IPC: set the color of the tab holding `pane_id`.
+fn handle_ipc_set_tab_color(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    color: Option<usize>,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_set_tab_color(pane_id, color) {
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
 /// IPC: split the focused pane in the key window.
 fn handle_ipc_split(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
@@ -872,6 +1027,24 @@ fn handle_ipc_focus_pane(
     }
 
     IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: post a desktop notification whose click focuses `pane_id`.
+///
+/// Nothing is checked about `pane_id` here: the pane may legitimately be gone by
+/// the time the user clicks, and that case is reported then, not now.
+fn handle_ipc_notify(
+    pane_id: Option<u32>,
+    title: &str,
+    message: &str,
+    sound: bool,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    match crate::notification::post(title, message, pane_id, sound) {
+        Ok(()) => IpcResponse::Ok { data: None },
+        Err(e) => IpcResponse::Error { message: e },
+    }
 }
 
 /// IPC: create a new tab in the key window.
@@ -1061,6 +1234,27 @@ fn handle_ipc_resize_pane(
 }
 
 /// IPC: rename a pane (set sticky custom title, like OSC 1).
+fn handle_ipc_set_pane_status(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    waiting: bool,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        if view.ipc_set_pane_status(pane_id, waiting) {
+            return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
 fn handle_ipc_rename_pane(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
     pane_id: u32,

@@ -31,6 +31,19 @@ Cmd+hover highlights URLs with an underline and pointer cursor. Cmd+click opens 
 
 Cmd+F opens an inline search overlay with match highlighting. Click a match to jump to it.
 
+Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code sessions that are no longer open: closed transcripts are indexed by the prompts you typed in them, and picking one reopens it with `claude --resume` in its own project directory. An empty input offers what you searched earlier in the run.
+
+### Attention routing
+
+Kova tracks which panes have something you have not seen — a bell, or a command that finished while you were looking elsewhere — and routes you to them instead of making you hunt.
+
+- Cmd+J jumps to the next unread pane, across tabs and windows, and falls back to an idle Claude Code session when nothing is unread. A banner names the tier it landed in.
+- Cmd+P opens the tab/pane switcher: every tab with its panes, arrows or click to pick, Enter to focus. `u` flips it to the panes asking for something; Cmd+Shift+J opens that filtered list directly.
+- Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order.
+- The status bar counts working Claude sessions (`✳N`) and unread panes (`●N`).
+- Cmd+Shift+Option+Left/Right walks the panes you visited, back then forward.
+- Desktop notifications are posted by Kova itself, so clicking one focuses the pane it came from.
+
 ### Status bar
 
 Displays CWD, git branch (auto-polling every ~2s), scroll position indicator, and time. Each element's color is independently configurable.
@@ -77,7 +90,11 @@ branch_color = [0.4, 0.7, 0.5]
 active_bg = [0.22, 0.22, 0.26]
 
 [splits]
-min_width = 300.0  # minimum pane width in points before horizontal scroll activates
+min_width = 300.0                     # minimum pane width in points before horizontal scroll activates
+dim_opacity = 0.3                     # how much an unfocused pane is faded (0.0 .. 1.0)
+dim_mode = "full"                     # "full" veils the whole pane, "text" fades only its glyphs
+focus_border_width = 2.0              # outline around the focused pane, 0.0 to disable
+focus_border_color = [0.4, 0.6, 1.0]
 ```
 
 ### Keyboard shortcuts
@@ -108,11 +125,15 @@ min_width = 300.0  # minimum pane width in points before horizontal scroll activ
 | Cmd+Shift+= | Equalize all splits |
 | Cmd+R | Repaint focused pane (force redraw via SIGWINCH) |
 | Cmd+F | Search scrollback |
-| Cmd+Shift+F | Global search (all tabs and panes) |
+| Ctrl+L | Passed to the app as usual, and clears Kova's scrollback with it (not in alt-screen) |
+| Cmd+Shift+F | Global search (all tabs and panes, plus closed Claude sessions) |
+| Cmd+P | Tab/pane switcher |
+| Cmd+Shift+J | Pane switcher, unread panes only |
+| Cmd+J | Jump to the next unread pane |
+| Cmd+Shift+Option+Left/Right | Walk the panes you visited, back and forward |
 | Cmd+O | Open recent project |
 | Cmd+Shift+W | Close tab |
 | Cmd+Shift+C | Copy selection (raw) |
-| Cmd+K | Clear scrollback and screen |
 | Cmd+C | Copy selection |
 | Cmd+V | Paste |
 | Cmd+Q | Close window |

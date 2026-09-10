@@ -1,16 +1,27 @@
 //! Unix socket IPC server for external process control.
 //!
 //! Listens on `/tmp/kova-{pid}.sock` and accepts JSON commands from clients.
-//! Each connection is one request → one response (newline-delimited JSON).
-//! All window/pane mutations are forwarded to the main thread via mpsc channel.
+//! A connection is a stream of newline-delimited JSON requests, each answered by
+//! one response line. All window/pane mutations are forwarded to the main thread
+//! via mpsc channel.
+//!
+//! One command breaks that shape: `subscribe` turns the connection into a
+//! one-way event stream (see the "Event subscriptions" section at the bottom).
+//! After its response — a snapshot of the current state — Kova pushes one JSON
+//! line per state change and never reads from that connection again.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex};
 
 /// Maximum length of a single JSON line from a client (64 KB).
 const MAX_LINE_LEN: usize = 65536;
+
+/// How many colors the tab palette holds. Mirrors `renderer::TAB_COLORS`, which is what
+/// the right-click menu offers; an index outside it would be silently wrapped at draw time.
+const TAB_COLOR_COUNT: usize = crate::renderer::TAB_COLORS.len();
 
 /// Filter for commands that act on a set of panes.
 pub enum PaneFilter {
@@ -46,6 +57,12 @@ pub enum IpcCommand {
     SetTabTitle {
         pane_id: u32,
         title: Option<String>,
+    },
+    /// Set the color of the tab containing the given pane.
+    /// `color: None` clears it (tab falls back to the default background).
+    SetTabColor {
+        pane_id: u32,
+        color: Option<usize>,
     },
     /// Return the rendered text of the requested panes.
     GetPaneContent {
@@ -97,6 +114,14 @@ pub enum IpcCommand {
         pane_id: u32,
         title: Option<String>,
     },
+    /// Set/clear the "this pane is waiting for the user" flag. Pushed by the
+    /// app running in the pane (Claude Code's hooks) rather than guessed by
+    /// Kova. `waiting: false` retracts it; Kova also retracts it on its own
+    /// when the pane contradicts the claim (see `Pane::is_awaiting`).
+    SetPaneStatus {
+        pane_id: u32,
+        waiting: bool,
+    },
     /// Trigger any keyboard action by its stable name (see `action_from_ipc_name`).
     /// `pane_id` optionally targets (and focuses) a specific pane's window first;
     /// without it, the action runs against the key window.
@@ -110,6 +135,21 @@ pub enum IpcCommand {
     MergeWindow {
         source_window: usize,
         target_window: usize,
+    },
+    /// Post a desktop notification. Clicking it focuses `pane_id`.
+    /// Kova posts it itself because it is the only process that can act on the
+    /// click — see `crate::notification`.
+    Notify {
+        pane_id: Option<u32>,
+        title: String,
+        message: String,
+        sound: bool,
+    },
+    /// Turn this connection into an event stream for the given topics.
+    /// The main thread answers with a snapshot of the current state; every
+    /// change after that is pushed as its own line. See `topic`.
+    Subscribe {
+        topics: u32,
     },
 }
 
@@ -279,24 +319,31 @@ fn handle_connection(
         }
 
         let response = match parse_command(&line) {
-            Ok(cmd) => {
-                let timeout = command_recv_timeout(&cmd);
-                // Create a one-shot response channel
-                let (resp_tx, resp_rx) = mpsc::channel::<IpcResponse>();
-                if tx.send((cmd, resp_tx)).is_err() {
-                    IpcResponse::Error {
-                        message: "app shutting down".to_string(),
-                    }
-                } else {
-                    // Block until the main thread sends a response (or channel drops)
-                    match resp_rx.recv_timeout(timeout) {
-                        Ok(r) => r,
-                        Err(_) => IpcResponse::Error {
-                            message: "timeout waiting for response".to_string(),
-                        },
-                    }
+            Ok(IpcCommand::Subscribe { topics }) => {
+                // Register BEFORE asking the main thread for the snapshot. An event
+                // that fires in between then lands in this subscriber's queue and is
+                // delivered just after the snapshot: the client may see an edge it
+                // already knows about (harmless — every event carries absolute state,
+                // so applying it twice changes nothing), but it can never miss one.
+                // The reverse order would open a real gap.
+                let (sub_id, events) = register_subscriber(topics);
+                let response = dispatch(&tx, IpcCommand::Subscribe { topics });
+                // Only stream behind a snapshot the client actually got. If the
+                // main thread refused (shutting down, timed out), streaming would
+                // park this thread on a subscription no tick will ever feed.
+                let live = matches!(response, IpcResponse::Ok { .. });
+                let sent = writeln!(writer, "{}", response.to_json()).is_ok()
+                    && writer.flush().is_ok();
+                if live && sent {
+                    // From here the connection is one-way: we never read from it
+                    // again. A client that also needs to issue commands opens a
+                    // second connection.
+                    stream_events(&stream, events);
                 }
+                unregister_subscriber(sub_id);
+                return;
             }
+            Ok(cmd) => dispatch(&tx, cmd),
             Err(msg) => IpcResponse::Error { message: msg },
         };
 
@@ -305,6 +352,27 @@ fn handle_connection(
             break;
         }
         let _ = writer.flush();
+    }
+}
+
+/// Hand one command to the main thread and block on its answer.
+///
+/// The main thread drains these in its render tick, so the wait is normally
+/// microseconds; `command_recv_timeout` gives `wait-for-completion` the longer
+/// deadline it legitimately needs.
+fn dispatch(tx: &mpsc::Sender<IpcRequest>, cmd: IpcCommand) -> IpcResponse {
+    let timeout = command_recv_timeout(&cmd);
+    let (resp_tx, resp_rx) = mpsc::channel::<IpcResponse>();
+    if tx.send((cmd, resp_tx)).is_err() {
+        return IpcResponse::Error {
+            message: "app shutting down".to_string(),
+        };
+    }
+    match resp_rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(_) => IpcResponse::Error {
+            message: "timeout waiting for response".to_string(),
+        },
     }
 }
 
@@ -323,6 +391,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "focus-pane" => &["pane_id"],
         "new-tab" => &["cwd", "command"],
         "set-tab-title" => &["pane_id", "title"],
+        "set-tab-color" => &["pane_id", "color"],
         "get-pane-content" | "count-pane-content" => {
             &["panes", "mode", "trim_trailing_blank_lines"]
         }
@@ -333,8 +402,11 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "swap-pane" => &["pane_id_a", "pane_id_b"],
         "resize-pane" => &["pane_id", "axis", "direction", "amount_pct"],
         "rename-pane" => &["pane_id", "title"],
+        "set-pane-status" => &["pane_id", "status"],
         "dispatch-action" => &["action", "pane_id"],
         "merge-window" => &["source_window", "target_window"],
+        "notify" => &["pane_id", "title", "message", "sound"],
+        "subscribe" => &["events"],
         _ => return None,
     })
 }
@@ -437,6 +509,30 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 Some(_) => return Err("\"title\" must be a string or null".to_string()),
             };
             Ok(IpcCommand::SetTabTitle { pane_id, title })
+        }
+        "set-tab-color" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            let color = match v.get("color") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Number(n)) => {
+                    let index = n
+                        .as_u64()
+                        .ok_or_else(|| "\"color\" must be a palette index".to_string())?;
+                    if index as usize >= TAB_COLOR_COUNT {
+                        return Err(format!(
+                            "\"color\" must be 0..{} or null",
+                            TAB_COLOR_COUNT - 1
+                        ));
+                    }
+                    Some(index as usize)
+                }
+                Some(_) => return Err("\"color\" must be a number or null".to_string()),
+            };
+            Ok(IpcCommand::SetTabColor { pane_id, color })
         }
         "get-pane-content" => {
             let (panes, mode, trim) = parse_pane_content_args(&v)?;
@@ -560,6 +656,23 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
             };
             Ok(IpcCommand::RenamePane { pane_id, title })
         }
+        "set-pane-status" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            let waiting = match v.get("status").and_then(|s| s.as_str()) {
+                Some("waiting") => true,
+                Some("none") => false,
+                _ => {
+                    return Err(
+                        "\"status\" must be \"waiting\" or \"none\"".to_string()
+                    )
+                }
+            };
+            Ok(IpcCommand::SetPaneStatus { pane_id, waiting })
+        }
         "dispatch-action" => {
             let action = v
                 .get("action")
@@ -591,6 +704,65 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 return Err("source_window and target_window must differ".to_string());
             }
             Ok(IpcCommand::MergeWindow { source_window, target_window })
+        }
+        "notify" => {
+            let message = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .ok_or_else(|| "missing \"message\" field".to_string())?
+                .to_string();
+            let title = v
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("Kova")
+                .to_string();
+            // Optional: a notification with no pane just brings Kova to the front.
+            let pane_id = match v.get("pane_id") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(p) => Some(
+                    p.as_u64()
+                        .ok_or_else(|| "\"pane_id\" must be a number".to_string())?
+                        as u32,
+                ),
+            };
+            let sound = match v.get("sound") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => return Err("\"sound\" must be a boolean".to_string()),
+            };
+            Ok(IpcCommand::Notify { pane_id, title, message, sound })
+        }
+        "subscribe" => {
+            // Omitted / null = every topic. An explicit list is validated name by
+            // name: a typo must fail loudly, exactly like an unknown field, rather
+            // than leave the client waiting forever for events it will never get.
+            let topics = match v.get("events") {
+                None | Some(serde_json::Value::Null) => topic::ALL,
+                Some(serde_json::Value::Array(items)) => {
+                    if items.is_empty() {
+                        return Err("\"events\" must not be empty (omit it to get every topic)".to_string());
+                    }
+                    let mut mask = 0u32;
+                    for item in items {
+                        let name = item
+                            .as_str()
+                            .ok_or_else(|| "\"events\" must be an array of strings".to_string())?;
+                        match topic::from_name(name) {
+                            Some(bit) => mask |= bit,
+                            None => {
+                                return Err(format!(
+                                    "unknown event \"{}\" — known events: {}",
+                                    name,
+                                    topic::ALL_NAMES.join(", ")
+                                ))
+                            }
+                        }
+                    }
+                    mask
+                }
+                Some(_) => return Err("\"events\" must be an array of strings".to_string()),
+            };
+            Ok(IpcCommand::Subscribe { topics })
         }
         other => Err(format!("unknown command: {}", other)),
     }
@@ -665,6 +837,168 @@ pub fn cleanup() {
     }
 }
 
+// ─── Event subscriptions ────────────────────────────────────────────────────
+
+/// The topics a client can subscribe to.
+///
+/// A bitmask rather than a list of strings because the publisher's "is anyone
+/// listening?" test runs on Kova's render tick: it has to be one relaxed atomic
+/// load, and cost nothing at all when nobody is subscribed (the normal case).
+pub mod topic {
+    /// The pane holding the user's attention changed — including losing it
+    /// entirely when Kova stops being the active app.
+    pub const FOCUS: u32 = 1 << 0;
+    /// A pane's `awaiting` flag was raised or retracted.
+    pub const PANE_STATUS: u32 = 1 << 1;
+    /// A pane started or stopped working (the Braille spinner in its title).
+    pub const PANE_WORKING: u32 = 1 << 2;
+    /// A pane appeared.
+    pub const PANE_OPEN: u32 = 1 << 3;
+    /// A pane went away.
+    pub const PANE_CLOSE: u32 = 1 << 4;
+
+    pub const ALL: u32 = FOCUS | PANE_STATUS | PANE_WORKING | PANE_OPEN | PANE_CLOSE;
+
+    /// Wire names, in bit order — `names()` relies on that ordering.
+    pub const ALL_NAMES: [&str; 5] = [
+        "focus",
+        "pane-status",
+        "pane-working",
+        "pane-open",
+        "pane-close",
+    ];
+
+    pub fn from_name(name: &str) -> Option<u32> {
+        let bit = ALL_NAMES.iter().position(|n| *n == name)?;
+        Some(1 << bit)
+    }
+
+    /// The names covered by `mask`, in bit order (echoed back in the subscribe
+    /// snapshot so a client can see what it actually got).
+    pub fn names(mask: u32) -> Vec<&'static str> {
+        ALL_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| mask & (1 << bit) != 0)
+            .map(|(_, name)| *name)
+            .collect()
+    }
+}
+
+/// How many events a subscriber may fall behind before Kova gives up on it.
+const EVENT_QUEUE_CAP: usize = 256;
+
+/// Silence after which a subscribed connection is sent a `ping`.
+const EVENT_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a write to a subscriber may block before we call the client dead.
+/// Only reached if it stopped reading and the socket buffer filled up.
+const EVENT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct Subscriber {
+    id: u64,
+    topics: u32,
+    /// Bounded on purpose: `publish` runs on the main thread and must never
+    /// block, so it `try_send`s and drops the client when the queue is full.
+    tx: mpsc::SyncSender<String>,
+}
+
+static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+/// Union of every subscriber's topics — what `has_subscribers` reads.
+static SUBSCRIBED_TOPICS: AtomicU32 = AtomicU32::new(0);
+static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A poisoned lock must not disable the event system for the rest of the run:
+/// the data behind it is a plain Vec, and a panic mid-publish leaves it valid.
+fn subscribers() -> std::sync::MutexGuard<'static, Vec<Subscriber>> {
+    SUBSCRIBERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn refresh_topic_mask(subs: &[Subscriber]) {
+    let mask = subs.iter().fold(0u32, |acc, sub| acc | sub.topics);
+    SUBSCRIBED_TOPICS.store(mask, Ordering::Relaxed);
+}
+
+fn register_subscriber(topics: u32) -> (u64, mpsc::Receiver<String>) {
+    let (tx, rx) = mpsc::sync_channel::<String>(EVENT_QUEUE_CAP);
+    let id = NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
+    let mut subs = subscribers();
+    subs.push(Subscriber { id, topics, tx });
+    refresh_topic_mask(&subs);
+    log::info!("IPC: subscriber {} listening on {:?}", id, topic::names(topics));
+    (id, rx)
+}
+
+fn unregister_subscriber(id: u64) {
+    let mut subs = subscribers();
+    subs.retain(|sub| sub.id != id);
+    refresh_topic_mask(&subs);
+    log::info!("IPC: subscriber {} gone", id);
+}
+
+/// True if at least one client wants any of `topics`. Lets the main thread skip
+/// the whole state-diffing pass when nobody is listening.
+pub fn has_subscribers(topics: u32) -> bool {
+    SUBSCRIBED_TOPICS.load(Ordering::Relaxed) & topics != 0
+}
+
+/// Push one event to every subscriber of `topic`. Called from the main thread.
+///
+/// Never blocks and never touches a socket: it fills bounded queues that the
+/// connection threads drain. A client too slow to keep up is dropped rather than
+/// served a hole — it must reconnect, and a fresh `subscribe` hands it a
+/// snapshot, so it resyncs instead of carrying a silently wrong view of the world.
+pub fn publish(topic: u32, event: serde_json::Value) {
+    if !has_subscribers(topic) {
+        return;
+    }
+    let line = event.to_string();
+    let mut subs = subscribers();
+    let before = subs.len();
+    subs.retain(|sub| {
+        if sub.topics & topic == 0 {
+            return true;
+        }
+        match sub.tx.try_send(line.clone()) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                log::warn!(
+                    "IPC: subscriber {} fell {} events behind — dropping it",
+                    sub.id,
+                    EVENT_QUEUE_CAP
+                );
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    });
+    if subs.len() != before {
+        refresh_topic_mask(&subs);
+    }
+}
+
+/// Pump queued events to a subscribed client until its connection dies.
+///
+/// Runs on that connection's own thread, which is the whole point: the socket
+/// write happens here, never on the main thread that produced the event.
+fn stream_events(stream: &UnixStream, events: mpsc::Receiver<String>) {
+    let mut writer = stream;
+    let _ = stream.set_write_timeout(Some(EVENT_WRITE_TIMEOUT));
+    loop {
+        let line = match events.recv_timeout(EVENT_HEARTBEAT) {
+            Ok(line) => line,
+            // Nothing happened for a while. The ping is how we notice a client
+            // that died without closing (the write fails), and how a client
+            // notices Kova is gone (silence past its own watchdog).
+            Err(mpsc::RecvTimeoutError::Timeout) => r#"{"event":"ping"}"#.to_string(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if writeln!(writer, "{}", line).is_err() || writer.flush().is_err() {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,7 +1047,129 @@ mod tests {
     }
 
     #[test]
+    fn set_pane_status_parses_both_states() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-pane-status","pane_id":7,"status":"waiting"}"#),
+            Ok(IpcCommand::SetPaneStatus { pane_id: 7, waiting: true })
+        ));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-pane-status","pane_id":7,"status":"none"}"#),
+            Ok(IpcCommand::SetPaneStatus { pane_id: 7, waiting: false })
+        ));
+    }
+
+    #[test]
+    fn notify_defaults_title_pane_and_sound() {
+        // A hook only has to supply the message; the rest has sane defaults so
+        // that the shortest possible call still produces a usable notification.
+        let parsed = parse_command(r#"{"cmd":"notify","message":"done"}"#);
+        match parsed {
+            Ok(IpcCommand::Notify { pane_id, title, message, sound }) => {
+                assert_eq!(pane_id, None);
+                assert_eq!(title, "Kova");
+                assert_eq!(message, "done");
+                assert!(!sound);
+            }
+            _ => panic!("notify should parse with only a message"),
+        }
+    }
+
+    #[test]
+    fn notify_reads_pane_title_and_sound() {
+        let parsed = parse_command(
+            r#"{"cmd":"notify","pane_id":42,"title":"Claude Code","message":"terminé","sound":true}"#,
+        );
+        match parsed {
+            Ok(IpcCommand::Notify { pane_id, title, message, sound }) => {
+                assert_eq!(pane_id, Some(42));
+                assert_eq!(title, "Claude Code");
+                assert_eq!(message, "terminé");
+                assert!(sound);
+            }
+            _ => panic!("notify should parse all its fields"),
+        }
+    }
+
+    #[test]
+    fn notify_rejects_a_missing_or_mistyped_message() {
+        assert_eq!(
+            err(r#"{"cmd":"notify","pane_id":1}"#),
+            "missing \"message\" field"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"notify","message":"x","sound":"yes"}"#),
+            "\"sound\" must be a boolean"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"notify","message":"x","pane":1}"#),
+            "unknown field \"pane\" for command \"notify\""
+        );
+    }
+
+    #[test]
+    fn set_pane_status_rejects_anything_else() {
+        // A hook that mistypes the state must fail loudly rather than silently
+        // clearing (or setting) the flag.
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-status","pane_id":7,"status":"busy"}"#),
+            "\"status\" must be \"waiting\" or \"none\""
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-status","pane_id":7}"#),
+            "\"status\" must be \"waiting\" or \"none\""
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-status","status":"waiting"}"#),
+            "missing \"pane_id\" field"
+        );
+    }
+
+    #[test]
     fn unknown_command_takes_precedence_over_field_check() {
         assert_eq!(err(r#"{"cmd":"bogus","whatever":1}"#), "unknown command: bogus");
+    }
+
+    #[test]
+    fn subscribe_without_events_takes_every_topic() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"subscribe"}"#),
+            Ok(IpcCommand::Subscribe { topics }) if topics == topic::ALL
+        ));
+    }
+
+    #[test]
+    fn subscribe_builds_the_mask_from_the_named_events() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"subscribe","events":["focus","pane-close"]}"#),
+            Ok(IpcCommand::Subscribe { topics }) if topics == topic::FOCUS | topic::PANE_CLOSE
+        ));
+    }
+
+    #[test]
+    fn subscribe_rejects_an_unknown_event() {
+        // A typo here would otherwise leave the client waiting forever for events
+        // that will never come — the failure has to be loud and immediate.
+        assert_eq!(
+            err(r#"{"cmd":"subscribe","events":["focous"]}"#),
+            "unknown event \"focous\" — known events: focus, pane-status, pane-working, pane-open, pane-close"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"subscribe","events":[]}"#),
+            "\"events\" must not be empty (omit it to get every topic)"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"subscribe","events":"focus"}"#),
+            "\"events\" must be an array of strings"
+        );
+    }
+
+    #[test]
+    fn topic_names_round_trip_through_the_mask() {
+        for name in topic::ALL_NAMES {
+            let bit = topic::from_name(name).expect("every listed name must parse");
+            assert_eq!(topic::names(bit), vec![name]);
+        }
+        assert_eq!(topic::names(topic::ALL), topic::ALL_NAMES.to_vec());
+        assert_eq!(topic::from_name("nope"), None);
     }
 }

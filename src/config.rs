@@ -28,6 +28,9 @@ pub struct ColorsConfig {
     pub foreground: [f32; 3],
     pub background: [f32; 3],
     pub cursor: [f32; 3],
+    /// The body of a tagged block (see `terminal::paste_block`): the part of an
+    /// answer meant to leave the terminal rather than be read in it.
+    pub paste_block: [f32; 3],
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,11 +77,35 @@ pub struct GlobalStatusBarConfig {
 #[serde(default)]
 pub struct SplitsConfig {
     pub min_width: f32,
+    /// How much an unfocused pane is faded, 0.0 (not at all) .. 1.0 (invisible).
+    pub dim_opacity: f32,
+    /// What the fade applies to: the whole pane, or only its text.
+    pub dim_mode: DimMode,
+    /// Thickness in points of the outline drawn around the focused pane.
+    /// 0.0 disables it.
+    pub focus_border_width: f32,
+    pub focus_border_color: [f32; 3],
+}
+
+/// How an unfocused pane is faded. `Full` lays a veil over everything, which
+/// also washes out the colours a TUI painted; `Text` leaves every background
+/// alone and only fades the glyphs, so a colourful pane stays readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DimMode {
+    Full,
+    Text,
 }
 
 impl Default for SplitsConfig {
     fn default() -> Self {
-        SplitsConfig { min_width: 300.0 }
+        SplitsConfig {
+            min_width: 300.0,
+            dim_opacity: 0.3,
+            dim_mode: DimMode::Full,
+            focus_border_width: 2.0,
+            focus_border_color: [0.4, 0.6, 1.0],
+        }
     }
 }
 
@@ -155,6 +182,7 @@ impl Default for ColorsConfig {
             foreground: [1.0, 1.0, 1.0],
             background: [0.1, 0.1, 0.12],
             cursor: [0.8, 0.8, 0.8],
+            paste_block: [0.60, 0.80, 1.0],
         }
     }
 }
@@ -223,6 +251,15 @@ impl Config {
         if self.terminal.fps == 0 {
             self.terminal.fps = d.fps;
         }
+        let ds = SplitsConfig::default();
+        if !(0.0..=1.0).contains(&self.splits.dim_opacity) {
+            log::warn!("config: splits.dim_opacity out of 0..1, using default {}", ds.dim_opacity);
+            self.splits.dim_opacity = ds.dim_opacity;
+        }
+        if !(0.0..=64.0).contains(&self.splits.focus_border_width) {
+            log::warn!("config: splits.focus_border_width out of 0..64, using default {}", ds.focus_border_width);
+            self.splits.focus_border_width = ds.focus_border_width;
+        }
         if self.font.size <= 0.0 {
             let ds = FontConfig::default().size;
             log::warn!("config: font.size<=0, using default {}", ds);
@@ -253,7 +290,6 @@ pub struct KeysConfig {
     pub copy_raw: String,
     pub paste: String,
     pub toggle_filter: String,
-    pub clear_scrollback: String,
     pub prev_tab: String,
     pub next_tab: String,
     pub rename_tab: String,
@@ -297,8 +333,13 @@ pub struct KeysConfig {
     pub open_recent_project: String,
     pub open_search: String,
     pub open_pane_switcher: String,
+    pub open_unread_switcher: String,
+    pub toggle_bookmark: String,
     pub equalize: String,
     pub repaint_pane: String,
+    pub next_attention: String,
+    pub history_back: String,
+    pub history_forward: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -318,7 +359,6 @@ impl Default for KeysConfig {
             copy_raw: "cmd+shift+c".into(),
             paste: "cmd+v".into(),
             toggle_filter: "cmd+f".into(),
-            clear_scrollback: "cmd+k".into(),
             prev_tab: "cmd+shift+[".into(),
             next_tab: "cmd+shift+]".into(),
             rename_tab: "cmd+shift+r".into(),
@@ -362,8 +402,13 @@ impl Default for KeysConfig {
             open_recent_project: "cmd+o".into(),
             open_search: "cmd+shift+f".into(),
             open_pane_switcher: "cmd+p".into(),
+            open_unread_switcher: "cmd+shift+j".into(),
+            toggle_bookmark: "cmd+b".into(),
             equalize: "cmd+shift++".into(),
             repaint_pane: "cmd+r".into(),
+            next_attention: "cmd+j".into(),
+            history_back: "cmd+shift+option+left".into(),
+            history_forward: "cmd+shift+option+right".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

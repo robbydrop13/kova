@@ -1,11 +1,11 @@
 [package]
 name = "kova"
-version = "1.8.1"
+version = "1.10.0"
 edition = "2024"
 
 [dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSNotification", "NSRunLoop", "NSThread", "NSArray", "NSDictionary", "NSValue", "NSRange", "NSData", "NSAttributedString"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSNotification", "NSRunLoop", "NSThread", "NSArray", "NSDictionary", "NSValue", "NSRange", "NSData", "NSAttributedString", "NSBundle", "NSError"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSWindow",
@@ -47,7 +47,7 @@ objc2-metal = { version = "0.3", features = [
 ] }
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
 objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFArray"] }
-objc2-core-text = { version = "0.3", features = ["CTFont", "CTFontDescriptor", "CTLine", "CTRun"] }
+objc2-core-text = { version = "0.3", features = ["CTFont", "CTFontDescriptor", "CTFontTraits", "CTLine", "CTRun"] }
 objc2-core-graphics = { version = "0.3", features = ["CGContext", "CGColorSpace", "CGBitmapContext", "CGFont", "CGPath"] }
 vte = "0.15"
 rustix = { version = "1.0", features = ["termios", "process", "stdio"] }
@@ -63,3 +63,4 @@ block2 = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotification", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNNotificationSettings", "UNError"] }

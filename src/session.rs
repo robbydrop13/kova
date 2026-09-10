@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::pane::{alloc_tab_id, Column, Pane, PaneId, Tab};
 
-const SESSION_VERSION: u32 = 4;
+const SESSION_VERSION: u32 = 6;
 
 /// Multi-window session format (v3 — flat columns).
 #[derive(Serialize, Deserialize)]
@@ -56,6 +56,13 @@ pub struct SavedTab {
     pub virtual_width_override: Option<f32>,
     #[serde(default)]
     pub scroll_offset_x: Option<f32>,
+    /// Backing scale factor in effect when `virtual_width_override` and
+    /// `scroll_offset_x` were captured — both are in pixels, so they mean a
+    /// different physical size on a display with another scale. `restore_saved_tab`
+    /// converts them to the target display. Absent in sessions written before
+    /// this field existed: they are then taken as already matching.
+    #[serde(default)]
+    pub geometry_scale: Option<f32>,
 }
 
 /// Flat column format (v4): a column is a list of panes with row weights.
@@ -77,6 +84,32 @@ pub struct SavedPane {
     pub custom_title: Option<String>,
     #[serde(default)]
     pub minimized: bool,
+    /// Title the running app had set (OSC 0/2) — for Claude Code, the name of
+    /// the conversation. Restored so a pane that has not been resumed yet still
+    /// says what it was, instead of falling back to its directory name. The
+    /// first title the app emits once relaunched replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Claude Code session running in this pane when the snapshot was taken
+    /// (v5). Superseded by `agent_session`, which names the agent instead of
+    /// assuming Claude; still read so a session file written before v6 restores
+    /// its conversations, and no longer written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session: Option<String>,
+    /// Agent conversation running in this pane when the snapshot was taken
+    /// (v6) — Claude Code or Codex. On restore the pane gets that agent's
+    /// resume line instead of the last typed command, so the conversation can
+    /// be picked up where it stopped. `None` for a pane that was at a shell
+    /// prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<SavedAgentSession>,
+}
+
+/// The conversation a pane was holding, and which agent to hand it back to.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct SavedAgentSession {
+    pub agent: crate::agent_session::Agent,
+    pub id: String,
 }
 
 /// Legacy column format (v3) — kept for backward compat reading.
@@ -134,6 +167,14 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
             last_command: p.last_command(),
             custom_title: p.custom_title.clone(),
             minimized: p.minimized,
+            title: p.osc_title(),
+            claude_session: None,
+            // Must run while the pane's children are alive: Claude Code deletes
+            // its session file on exit, and a dead Codex no longer holds its
+            // transcript open, so this is unreadable once the PTYs are reaped.
+            // `will_terminate` saves before `shutdown_all` for this.
+            agent_session: crate::agent_session::for_shell(p.pty.pid())
+                .map(|s| SavedAgentSession { agent: s.agent, id: s.id }),
         }).collect(),
         row_weights: col.row_weights.clone(),
         custom_row_weights: if col.custom_row_weights.iter().any(|&cw| cw) {
@@ -173,11 +214,58 @@ pub fn snapshot_tab(tab: &Tab) -> SavedTab {
         color: tab.color,
         virtual_width_override: if tab.virtual_width_override > 0.0 { Some(tab.virtual_width_override) } else { None },
         scroll_offset_x: if tab.scroll_offset_x != 0.0 { Some(tab.scroll_offset_x) } else { None },
+        geometry_scale: if tab.geometry_scale > 0.0 { Some(tab.geometry_scale) } else { None },
     }
 }
 
 /// Maximum number of session backups to keep.
 const SESSION_HISTORY_COUNT: usize = 10;
+
+fn session_lock_path() -> PathBuf {
+    session_path().with_file_name("session.lock")
+}
+
+/// Take the session lock, or `None` if another Kova already holds it.
+///
+/// The lock lives on its own file rather than on `session.json`, which `load`
+/// deletes: a lock held on a deleted inode protects nothing.
+fn try_acquire_lock(path: &std::path::Path) -> Option<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Whether this process owns the session file.
+///
+/// One session file cannot describe two Kova at once: both would autosave into
+/// it every 30s and the last one to quit would be the only one restored, while
+/// the second instance would also have started by restoring a clone of the
+/// first one's tabs. So the first Kova to start owns the session, and any other
+/// one neither reads nor writes it — it opens a fresh window and forgets it on
+/// quit. The lock is released by the kernel when the process dies, crash
+/// included, so a stale lock file is never a problem.
+pub fn owns_session() -> bool {
+    static LOCK: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| {
+        let held = try_acquire_lock(&session_lock_path());
+        if held.is_none() {
+            log::warn!(
+                "Another Kova owns {}: this instance starts fresh and will not save its session",
+                session_path().display()
+            );
+        }
+        held
+    })
+    .is_some()
+}
 
 /// Save all windows to a single session file.
 /// Save the current session, rotating backups (`session.1.json` → … → `session.10.json`).
@@ -194,6 +282,9 @@ pub fn save_periodic(windows: &[WindowSession]) {
 }
 
 fn save_internal(windows: &[WindowSession], rotate: bool) {
+    if !owns_session() {
+        return;
+    }
     let session = Session {
         version: SESSION_VERSION,
         windows: windows.to_vec(),
@@ -218,7 +309,7 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
                     return;
                 }
             }
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = write_owner_only(&path, &json) {
                 log::warn!("Failed to write session file: {}", e);
             } else {
                 log::info!("Session saved to {} ({} window(s))", path.display(), windows.len());
@@ -226,6 +317,28 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
         }
         Err(e) => log::warn!("Failed to serialize session: {}", e),
     }
+}
+
+/// Write the session file so only its owner can read it.
+///
+/// It holds every pane's cwd and the last command line typed in it — a secret
+/// passed on a command line ends up here — and the rotated backups keep months of
+/// them. A macOS home directory is world-readable, so the file has to carry its
+/// own mode. `mode()` only applies when the file is created, hence the explicit
+/// tightening for a file written before this, done before the new bytes land.
+pub fn write_owner_only(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(json.as_bytes())
 }
 
 /// Rotate session.json -> session.1.json -> session.2.json -> ...
@@ -293,7 +406,21 @@ fn print_session_entry(path: &std::path::Path, label: &str) {
     println!("  {}  {} {}", label, modified, summary);
 }
 
+/// Whether a session file of this version can still be read. Every format
+/// from v2 up to the current one is: the fields added by later versions are
+/// all `#[serde(default)]`, and the ones dropped (`claude_session`) are still
+/// deserialized. Comparing against `SESSION_VERSION` rather than listing the
+/// versions one by one means a bump no longer silently drops the session it
+/// was meant to migrate — v5 was left out of the list when v6 landed, and a
+/// whole window of tabs came back as a single empty tab.
+fn is_readable_version(v: u32) -> bool {
+    (2..=SESSION_VERSION).contains(&v)
+}
+
 pub fn load(backup: Option<usize>) -> Option<Session> {
+    if !owns_session() {
+        return None;
+    }
     let path = match backup {
         Some(n) => {
             let dir = session_path().parent().unwrap().to_path_buf();
@@ -307,7 +434,7 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 
     // Try v4/v3 first, then v2, then v1
     let session: Session = if let Ok(s) = serde_json::from_str::<Session>(&data) {
-        if s.version == SESSION_VERSION || s.version == 3 || s.version == 2 {
+        if is_readable_version(s.version) {
             s
         } else if s.version == 1 {
             log::warn!("Session v1 with windows field, ignoring");
@@ -348,6 +475,33 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 // ---------------------------------------------------------------
 
 /// Restore a flat column (v4 format).
+/// The command line to pre-type into a restored pane.
+///
+/// A pane that was running an agent when the snapshot was taken gets that
+/// agent's resume line; any other pane keeps the last command that was actually
+/// run in it. The session id recorded at snapshot time always wins over one the
+/// last command happens to name, because that older line can be several
+/// restarts old while the recorded id is the conversation that was live at quit.
+///
+/// Nothing is executed: the caller writes the command without a newline, so it
+/// waits for the user to press Enter.
+fn restore_command(sp: &SavedPane) -> Option<String> {
+    // A file written before v6 only knew about Claude.
+    let session = sp.agent_session.clone().or_else(|| {
+        sp.claude_session.as_ref().map(|id| SavedAgentSession {
+            agent: crate::agent_session::Agent::Claude,
+            id: id.clone(),
+        })
+    });
+    match session {
+        // A refused id (see `is_safe_session_id`) leaves the pane exactly where a
+        // pane that was never running an agent lands: its own last command.
+        Some(s) => crate::agent_session::resume_command(s.agent, &s.id, sp.last_command.as_deref())
+            .or_else(|| sp.last_command.clone()),
+        None => sp.last_command.clone(),
+    }
+}
+
 fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &Config) -> Option<(Column, Vec<PaneId>)> {
     let mut panes = Vec::new();
     let mut ids = Vec::new();
@@ -360,9 +514,14 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
             }
         };
         let id = pane.id;
-        if let Some(ref cmd) = sp.last_command {
-            pane.pending_command.set(Some(cmd.clone()));
-            pane.terminal.write().last_command = Some(cmd.clone());
+        let command = restore_command(sp);
+        {
+            let mut term = pane.terminal.write();
+            if let Some(cmd) = command {
+                pane.pending_command.set(Some(cmd.clone()));
+                term.last_command = Some(cmd);
+            }
+            term.title = sp.title.clone();
         }
         pane.custom_title = sp.custom_title.clone();
         pane.minimized = sp.minimized;
@@ -604,6 +763,9 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         minimized_stack: Vec::new(),
         scroll_offset_x: saved.scroll_offset_x.unwrap_or(0.0),
         virtual_width_override: saved.virtual_width_override.unwrap_or(0.0),
+        // Pixels of the display this tab was saved on; `normalize_tab_geometry`
+        // converts them to the display it actually lands on.
+        geometry_scale: saved.geometry_scale.unwrap_or(0.0),
         cell_h: std::cell::Cell::new(0.0),
     };
     tab.rebuild_minimized_stack();
@@ -683,4 +845,146 @@ pub fn restore_session(session: Session, config: &Config) -> Option<Vec<Restored
     }
 
     Some(windows)
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn a_second_holder_of_the_session_lock_is_refused() {
+        let path = std::env::temp_dir().join(format!("kova-lock-{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let first = try_acquire_lock(&path).expect("the first Kova takes the lock");
+        assert!(try_acquire_lock(&path).is_none(), "a second Kova must be refused");
+        drop(first);
+        assert!(try_acquire_lock(&path).is_some(), "the lock is free once the owner is gone");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn every_version_up_to_the_current_one_is_still_readable() {
+        for v in 2..=SESSION_VERSION {
+            assert!(is_readable_version(v), "v{v} must still load");
+        }
+        assert!(!is_readable_version(1), "v1 is handled by the legacy path");
+        assert!(!is_readable_version(SESSION_VERSION + 1));
+    }
+    use super::*;
+
+    fn pane(cwd: &str) -> SavedPane {
+        SavedPane {
+            cwd: Some(cwd.to_string()),
+            last_command: Some("claude".to_string()),
+            custom_title: None,
+            minimized: false,
+            title: None,
+            claude_session: None,
+            agent_session: None,
+        }
+    }
+
+    #[test]
+    fn a_pane_saved_before_v5_still_loads() {
+        let saved: SavedPane = serde_json::from_str(
+            r#"{"cwd":"/a","last_command":"ls","custom_title":null,"minimized":false}"#,
+        )
+        .expect("a v4 pane must still parse");
+        assert_eq!(saved.cwd.as_deref(), Some("/a"));
+        assert_eq!(saved.title, None);
+        assert_eq!(saved.claude_session, None);
+    }
+
+    #[test]
+    fn a_pane_with_nothing_to_add_serializes_like_before() {
+        let json: serde_json::Value = serde_json::to_value(pane("/a")).unwrap();
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert!(!keys.contains(&&"title".to_string()), "unexpected keys: {keys:?}");
+        assert!(!keys.contains(&&"claude_session".to_string()), "unexpected keys: {keys:?}");
+    }
+
+    #[test]
+    fn the_session_file_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("kova-session-mode-{}.json", std::process::id()));
+        // A file an older build left world-readable must be tightened, not just
+        // created tight.
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_owner_only(&path, "{}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pane_that_was_at_a_shell_prompt_keeps_its_last_command() {
+        let mut sp = pane("/a");
+        sp.last_command = Some("npm run dev".into());
+        assert_eq!(restore_command(&sp).as_deref(), Some("npm run dev"));
+    }
+
+    #[test]
+    fn a_pane_that_was_running_claude_code_gets_its_resume_line() {
+        let mut sp = pane("/a");
+        sp.claude_session = Some("live-id".into());
+        assert_eq!(restore_command(&sp).as_deref(), Some("claude --resume live-id"));
+    }
+
+    #[test]
+    fn the_session_recorded_at_quit_beats_the_one_the_last_command_names() {
+        // The pane came back with a resume line at some earlier restart and was
+        // never run; a newer conversation has been live in it since.
+        let mut sp = pane("/a");
+        sp.last_command = Some("claude --resume days-old-id".into());
+        sp.claude_session = Some("live-id".into());
+        assert_eq!(restore_command(&sp).as_deref(), Some("claude --resume live-id"));
+    }
+
+    #[test]
+    fn a_session_id_that_could_carry_a_second_command_falls_back_to_the_last_command() {
+        // The id is replayed from a file on disk, so this guard has to hold even
+        // when the file predates the one that refuses to write such an id.
+        let mut sp = pane("/a");
+        sp.last_command = Some("npm run dev".into());
+        sp.claude_session = Some("live-id\nrm -rf ~".into());
+        assert_eq!(restore_command(&sp).as_deref(), Some("npm run dev"));
+    }
+
+    #[test]
+    fn a_pane_that_was_running_codex_gets_a_codex_resume_line() {
+        let mut sp = pane("/a");
+        sp.last_command = Some("codex".into());
+        sp.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Codex,
+            id: "01a07651-015e-78a3-97f2-2eaf0f0cd663".into(),
+        });
+        assert_eq!(
+            restore_command(&sp).as_deref(),
+            Some("codex resume 01a07651-015e-78a3-97f2-2eaf0f0cd663")
+        );
+    }
+
+    #[test]
+    fn the_agent_recorded_at_quit_beats_the_legacy_claude_field() {
+        // A file written by an older build carries `claude_session`; one written
+        // now carries `agent_session`, and that is the pane's real agent.
+        let mut sp = pane("/a");
+        sp.claude_session = Some("old-claude-id".into());
+        sp.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Codex,
+            id: "codex-id".into(),
+        });
+        assert_eq!(restore_command(&sp).as_deref(), Some("codex resume codex-id"));
+    }
+
+    #[test]
+    fn a_pane_with_nothing_recorded_is_left_alone() {
+        let mut sp = pane("/a");
+        sp.last_command = None;
+        assert_eq!(restore_command(&sp), None);
+    }
+
 }
