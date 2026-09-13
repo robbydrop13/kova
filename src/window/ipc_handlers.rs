@@ -20,6 +20,13 @@ pub enum IpcMergeTabResult {
     TargetMissing,
 }
 
+/// Outcome of `KovaView::ipc_move_tab`. `NotFound` lets the caller keep scanning
+/// across windows; `Moved` is the final answer.
+pub enum IpcMoveTabResult {
+    Moved,
+    NotFound,
+}
+
 /// Outcome of `KovaView::ipc_swap_pane`. Same pattern as merge: only `AMissing` keeps
 /// scanning across windows.
 pub enum IpcSwapPaneResult {
@@ -569,6 +576,33 @@ impl KovaView {
         self.merge_active_tab_into(target_idx);
         log::info!("IPC: merged tab {} into tab {}", source_tab_id, target_tab_id);
         IpcMergeTabResult::Merged
+    }
+
+    /// IPC: move the tab `tab_id` to position `index` in this window's tab bar.
+    /// Remove + insert (not a swap) so the other tabs keep their relative order,
+    /// like a mouse drag across several tabs. The active tab is re-resolved by
+    /// identity afterwards so the visible tab never changes. `index` is clamped
+    /// to the last position.
+    pub fn ipc_move_tab(&self, tab_id: u32, index: usize) -> IpcMoveTabResult {
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let from = match tabs.iter().position(|t| t.id == tab_id) {
+            Some(i) => i,
+            None => return IpcMoveTabResult::NotFound,
+        };
+        let to = index.min(tabs.len() - 1);
+        let active_id = tabs.get(self.ivars().active_tab.get()).map(|t| t.id);
+        if from != to {
+            let tab = tabs.remove(from);
+            tabs.insert(to, tab);
+        }
+        let new_active = active_id
+            .and_then(|id| tabs.iter().position(|t| t.id == id))
+            .unwrap_or_else(|| self.ivars().active_tab.get().min(tabs.len() - 1));
+        drop(tabs);
+        self.ivars().active_tab.set(new_active);
+        self.mark_dirty();
+        log::info!("IPC: moved tab {} from index {} to {}", tab_id, from, to);
+        IpcMoveTabResult::Moved
     }
 
     /// IPC: swap two panes. Both must live in the same tab.

@@ -93,6 +93,13 @@ pub enum IpcCommand {
         source_tab_id: u32,
         target_tab_id: u32,
     },
+    /// Move the tab `tab_id` to position `index` in its window's tab bar
+    /// (clamped to the last position). The other tabs keep their relative
+    /// order and the visible tab does not change.
+    MoveTab {
+        tab_id: u32,
+        index: usize,
+    },
     /// Swap two panes. Both must live in the same tab.
     /// Same column → swap inside the column. Different columns → swap the whole columns.
     SwapPane {
@@ -399,6 +406,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "list-tabs" => &[],
         "close-tab" => &["tab_id"],
         "merge-tab" => &["source_tab_id", "target_tab_id"],
+        "move-tab" => &["tab_id", "index"],
         "swap-pane" => &["pane_id_a", "pane_id_b"],
         "resize-pane" => &["pane_id", "axis", "direction", "amount_pct"],
         "rename-pane" => &["pane_id", "title"],
@@ -589,6 +597,19 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 return Err("source_tab_id and target_tab_id must differ".to_string());
             }
             Ok(IpcCommand::MergeTab { source_tab_id, target_tab_id })
+        }
+        "move-tab" => {
+            let tab_id = v
+                .get("tab_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"tab_id\" field".to_string())?
+                as u32;
+            let index = v
+                .get("index")
+                .and_then(|i| i.as_u64())
+                .ok_or_else(|| "\"index\" must be a non-negative integer".to_string())?
+                as usize;
+            Ok(IpcCommand::MoveTab { tab_id, index })
         }
         "swap-pane" => {
             let pane_id_a = v
@@ -1056,6 +1077,35 @@ mod tests {
             parse_command(r#"{"cmd":"set-pane-status","pane_id":7,"status":"none"}"#),
             Ok(IpcCommand::SetPaneStatus { pane_id: 7, waiting: false })
         ));
+    }
+
+    #[test]
+    fn move_tab_parses_and_requires_both_fields() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"move-tab","tab_id":42,"index":0}"#),
+            Ok(IpcCommand::MoveTab { tab_id: 42, index: 0 })
+        ));
+        // Clamping is a runtime concern: any non-negative index parses.
+        assert!(matches!(
+            parse_command(r#"{"cmd":"move-tab","tab_id":42,"index":9999}"#),
+            Ok(IpcCommand::MoveTab { tab_id: 42, index: 9999 })
+        ));
+        assert_eq!(
+            err(r#"{"cmd":"move-tab","index":1}"#),
+            "missing \"tab_id\" field"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"move-tab","tab_id":42}"#),
+            "\"index\" must be a non-negative integer"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"move-tab","tab_id":42,"index":-1}"#),
+            "\"index\" must be a non-negative integer"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"move-tab","tab_id":42,"index":1,"window":0}"#),
+            "unknown field \"window\" for command \"move-tab\""
+        );
     }
 
     #[test]

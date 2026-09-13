@@ -605,6 +605,9 @@ fn handle_ipc_command_sync(
         IpcCommand::MergeTab { source_tab_id, target_tab_id } => {
             handle_ipc_merge_tab(windows, source_tab_id, target_tab_id)
         }
+        IpcCommand::MoveTab { tab_id, index } => {
+            handle_ipc_move_tab(windows, tab_id, index)
+        }
         IpcCommand::SwapPane { pane_id_a, pane_id_b } => {
             handle_ipc_swap_pane(windows, pane_id_a, pane_id_b)
         }
@@ -1174,6 +1177,30 @@ fn handle_ipc_merge_tab(
     }
 
     IpcResponse::Error { message: format!("source tab {} not found", source_tab_id) }
+}
+
+/// IPC: move a tab to a new position among the tabs of its window.
+fn handle_ipc_move_tab(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    tab_id: u32,
+    index: usize,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+    use crate::window::IpcMoveTabResult;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let view = match kova_view(win) {
+            Some(v) => v,
+            None => continue,
+        };
+        match view.ipc_move_tab(tab_id, index) {
+            IpcMoveTabResult::Moved => return IpcResponse::Ok { data: None },
+            IpcMoveTabResult::NotFound => continue,
+        }
+    }
+
+    IpcResponse::Error { message: format!("tab {} not found", tab_id) }
 }
 
 /// IPC: swap two panes.

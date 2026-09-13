@@ -108,7 +108,7 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 }
 ```
 
-`id` is the stable tab ID (use for `close-tab` / `merge-tab`; note `set-tab-title` is addressed by `pane_id`, not tab ID); `tab_index` is the positional index in its window's tab bar (changes when tabs are reordered/closed). `active: true` only on the tab of the key window.
+`id` is the stable tab ID (use for `close-tab` / `merge-tab` / `move-tab`; note `set-tab-title` is addressed by `pane_id`, not tab ID); `tab_index` is the positional index in its window's tab bar (changes when tabs are reordered/closed). `active: true` only on the tab of the key window.
 
 ---
 
@@ -264,6 +264,20 @@ Response: `{ "ok": true }`.
 
 ---
 
+### `move-tab`: reorder a tab within its window
+
+```json
+{ "cmd": "move-tab", "tab_id": 7, "index": 0 }
+```
+
+Moves the tab to position `index` in its window's tab bar (the `tab_index` reported by `list-tabs`). `index` is clamped to the last position. The other tabs keep their relative order (remove + insert, not a swap), and the tab that was visible stays visible: only its `tab_index` changes. This is the scriptable counterpart of dragging a tab with the mouse.
+
+Errors: `tab 7 not found`, `missing "tab_id" field`, `"index" must be a non-negative integer`.
+
+Response: `{ "ok": true }`.
+
+---
+
 ### `merge-window` — merge a whole window into another
 
 ```json
@@ -334,7 +348,7 @@ Response: `{ "ok": true }`.
 { "cmd": "dispatch-action", "action": "next-tab", "pane_id": 42 }
 ```
 
-Runs the exact same handler as the corresponding keyboard shortcut — this is the generic bridge that makes **every** keybinding scriptable, so Kova can be fully driven from Claude Code / shell. The typed commands above (`split`, `resize-pane`, `swap-pane`, `merge-tab`, `merge-window`, `rename-pane`, `close-tab`, `close-pane`) remain the preferred path when you want to address a specific pane/tab/window by ID; `dispatch-action` covers everything else and acts on the *focused* pane / active tab.
+Runs the exact same handler as the corresponding keyboard shortcut — this is the generic bridge that makes **every** keybinding scriptable, so Kova can be fully driven from Claude Code / shell. The typed commands above (`split`, `resize-pane`, `swap-pane`, `merge-tab`, `move-tab`, `merge-window`, `rename-pane`, `close-tab`, `close-pane`) remain the preferred path when you want to address a specific pane/tab/window by ID; `dispatch-action` covers everything else and acts on the *focused* pane / active tab.
 
 | Field | Default | Meaning |
 |---|---|---|
