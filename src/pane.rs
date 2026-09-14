@@ -795,6 +795,7 @@ impl Tab {
             if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
                 osc_any = true;
             }
+            pane.probe_prompt();
             if refresh_fg {
                 pane.refresh_agent_session();
                 // Cmd+J's idle-Claude tier re-arms as soon as the pane stops
@@ -1696,7 +1697,26 @@ pub struct Pane {
     /// every frame while resolving it costs two syscalls: it is refreshed on the
     /// same ~0.5s throttle as the running-state probe, in `Tab::check_running`.
     fg_process: RefCell<Option<ProcessInfo>>,
+    /// What the Claude here asked or said when it last stopped working, read
+    /// off the screen (permission prompt) or the transcript (turn end) by
+    /// `probe_prompt`. Runtime state like the waiting flag: never saved.
+    pub prompt_preview: RefCell<Option<crate::prompt_preview::PromptPreview>>,
+    /// The edge detector behind `probe_prompt`.
+    prompt_probe: Cell<PromptProbe>,
 }
+
+/// Where the prompt probe stands for a pane: the last `is_working` it saw and
+/// the moment a pending read of the screen is due (a falling edge arms it,
+/// `PROMPT_DEBOUNCE` later; a rising edge disarms it).
+#[derive(Clone, Copy, Default)]
+struct PromptProbe {
+    was_working: bool,
+    due: Option<std::time::Instant>,
+}
+
+/// The TUI paints the prompt frame in the same frame `working` drops: one
+/// second is plenty, and a tool that hands back briefly is skipped.
+const PROMPT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// True if `title` begins with a Claude Code *working* marker immediately
 /// followed by a space: an animated Braille spinner glyph (U+2800–U+28FF), or a
@@ -1836,6 +1856,8 @@ impl Pane {
             agent_session: RefCell::new(None),
             idle_agent_seen: Cell::new(false),
             fg_process: RefCell::new(None),
+            prompt_preview: RefCell::new(None),
+            prompt_probe: Cell::new(PromptProbe::default()),
         })
     }
 
@@ -1867,6 +1889,8 @@ impl Pane {
             agent_session: RefCell::new(None),
             idle_agent_seen: Cell::new(false),
             fg_process: RefCell::new(None),
+            prompt_preview: RefCell::new(None),
+            prompt_probe: Cell::new(PromptProbe::default()),
         })
     }
 
@@ -2017,9 +2041,87 @@ impl Pane {
         self.awaiting.set(self.awaiting.get().armed(now_epoch_secs()));
     }
 
-    /// Drop the waiting flag — the user engaged, or the session is gone.
+    /// Drop the waiting flag (the user engaged, or the session is gone). The
+    /// prompt preview goes with it: it described the question just answered.
     pub fn clear_awaiting(&self) {
         self.awaiting.set(AwaitingFlag::default());
+        self.prompt_preview.replace(None);
+    }
+
+    /// A permission prompt is on this pane's screen (`probe_prompt` read it)
+    /// and the agent has not gone back to work since.
+    pub fn has_permission_prompt(&self) -> bool {
+        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::Permission { .. }))
+            && !self.is_working()
+    }
+
+    /// The last turn ended with an answer nobody has looked at yet.
+    pub fn is_turn_end_unseen(&self) -> bool {
+        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::TurnEnd { seen: false, .. }))
+    }
+
+    /// Record that the turn-end answer here has been looked at (called by the
+    /// frame loop on the focused pane, alongside `mark_awaiting_seen`).
+    pub fn mark_turn_end_seen(&self) {
+        if let Some(crate::prompt_preview::PromptPreview::TurnEnd { seen, .. }) = self.prompt_preview.borrow_mut().as_mut() {
+            *seen = true;
+        }
+    }
+
+    /// Follow `is_working` from tick to tick and, one second after it drops
+    /// on a Claude pane, read the screen once: a permission prompt becomes a
+    /// `Permission` preview, anything else the transcript's last answer as a
+    /// `TurnEnd`. A rising edge drops whatever was shown: Claude got its
+    /// answer. Called from `Tab::check_running` on every tick.
+    pub fn probe_prompt(&self) {
+        let mut probe = self.prompt_probe.get();
+        let working = self.is_working();
+        if working != probe.was_working {
+            probe.was_working = working;
+            if working {
+                probe.due = None;
+                self.prompt_preview.replace(None);
+            } else {
+                probe.due = Some(std::time::Instant::now() + PROMPT_DEBOUNCE);
+            }
+            self.prompt_probe.set(probe);
+            return;
+        }
+        let Some(due) = probe.due else { return };
+        if std::time::Instant::now() < due {
+            return;
+        }
+        probe.due = None;
+        self.prompt_probe.set(probe);
+        if working || self.agent_kind() != Some(crate::agent_session::Agent::Claude) {
+            return;
+        }
+        let visible = self.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+        let preview = match crate::prompt_preview::parse_permission_prompt(&visible) {
+            Some(p) => Some(crate::prompt_preview::PromptPreview::Permission {
+                header: p.header,
+                question: p.question,
+                detail: p.detail,
+                since: now_epoch_secs(),
+            }),
+            None => self.transcript_summary().map(|summary| crate::prompt_preview::PromptPreview::TurnEnd { summary, seen: false }),
+        };
+        log::debug!("pane {}: prompt probe -> {:?}", self.id, preview.as_ref().map(|p| match p {
+            crate::prompt_preview::PromptPreview::Permission { question, .. } => format!("permission: {question}"),
+            crate::prompt_preview::PromptPreview::TurnEnd { summary, .. } => format!("turn end: {summary}"),
+        }));
+        self.prompt_preview.replace(preview);
+    }
+
+    /// The last thing Claude said in this pane's transcript, if the session
+    /// and its file are known.
+    fn transcript_summary(&self) -> Option<String> {
+        let session_id = self.agent_session_id()?;
+        let cwd = self.cwd()?;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = crate::prompt_preview::transcript_path(&home, &cwd, &session_id);
+        let tail = crate::prompt_preview::read_transcript_tail(&path)?;
+        crate::prompt_preview::turn_end_summary(&tail)
     }
 
     /// Record that the pane has been looked at while waiting (called by the
@@ -2077,6 +2179,27 @@ impl Pane {
     /// Put this pane back in the idle-Claude tier next time it falls idle.
     pub fn rearm_idle_agent(&self) {
         self.idle_agent_seen.set(false);
+    }
+
+    /// A restore command still waits for the shell to be ready.
+    pub fn has_pending_command(&self) -> bool {
+        let cmd = self.pending_command.take();
+        let pending = cmd.is_some();
+        self.pending_command.set(cmd);
+        pending
+    }
+
+    /// A shell with nothing in it: no agent, no foreground process, no
+    /// restore command pending. The only place `Start Claude` applies.
+    pub fn is_bare_shell(&self) -> bool {
+        self.agent_kind().is_none() && self.fg_process().is_none() && !self.has_pending_command()
+    }
+
+    /// Claude launched here but its session is not resolved yet: a restore
+    /// command pending, or a `claude` foreground process without a session.
+    pub fn is_starting_agent(&self) -> bool {
+        self.has_pending_command()
+            || (self.agent_kind().is_none() && self.fg_process().is_some_and(|p| p.name == "claude"))
     }
 
     /// If the shell is ready and there's a pending command, write it to the PTY

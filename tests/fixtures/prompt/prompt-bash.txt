@@ -1,0 +1,25 @@
+
+ ▐▛███▛█   Claude Code v2.1.268
+▝▜██████▀  Opus 5 (1M context) · Claude Max
+  ▝▝ ▝▝    /private/tmp/kovalink-fixture · /rc
+
+
+❯ Run exactly these two shell commands with the Bash tool, one call each, in this order, nothing else: first 'echo bonjour > hello.txt', then 'cat hello.txt'
+
+  Writing "bonjour" to hello.txt
+  ⎿  $ echo bonjour > hello.txt
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+
+   echo bonjour > hello.txt
+   Write "bonjour" to hello.txt
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /private/tmp/kovalink-fixture from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend

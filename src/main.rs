@@ -12,6 +12,7 @@ mod keybindings;
 mod notification;
 mod pane;
 mod pane_history;
+mod prompt_preview;
 mod recent_projects;
 mod renderer;
 mod search_history;
