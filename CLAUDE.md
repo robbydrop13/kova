@@ -6,7 +6,7 @@ Terminal Mac ultra-rapide en Rust + Metal.
 
 - **Rust** — langage principal
 - **Metal** — rendu GPU natif macOS
-- **AppKit** — fenêtre et events (via `objc2`), et la sidebar (vue native `drawRect:` à côté de la vue Metal)
+- **AppKit** : fenêtre et events (via `objc2`), et la sidebar (vue native `drawRect:` à côté de la vue Metal)
 - **CoreText** — glyph shaping
 - **`vte`** — parsing séquences VT
 
@@ -73,7 +73,7 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 - **Tout ce que Kova retape dans un PTY vient d'ailleurs et se valide avant** — la ligne pré-tapée à la restauration (`src/session.rs`, `restore_command`) est fabriquée à partir de deux sources que Kova n'écrit pas : le `sessionId` de `~/.claude/sessions/*.json`, et `last_command`, que n'importe quel programme peut poser en imprimant un OSC 7777 sur son propre tty. Un `\n` dans la première suffit à faire partir une commande sans que personne n'appuie sur Entrée. D'où deux gardes à ne pas retirer : `is_safe_session_id` (`src/claude_session.rs`) refuse tout ce qui sort de `[A-Za-z0-9_-]`, et `last_command_slot_open` (`src/terminal/`) n'accepte qu'un seul OSC 7777 par OSC 133;C, celui que le hook `preexec` du shell envoie — la sortie d'une commande qui tourne n'a plus le droit de nommer la commande suivante. Toute nouvelle source de texte injecté passe par la même question : qui peut l'écrire ? Troisième source depuis, même garde : la reprise d'une session fermée depuis la palette de recherche (`src/claude_history.rs`) prend l'id dans le **nom du fichier** de transcript, donc un nom de fichier posé par n'importe qui dans `~/.claude/projects/` — il passe par `resume_command`, qui refuse tout id hors `[A-Za-z0-9_-]`, à l'indexation comme à l'ouverture.
 
-- **`NSApplication::windows()` liste des fenêtres qui ne sont pas les nôtres** — panneaux AppKit, porteurs de tooltip, etc. Caster leur `contentView` en `KovaView` sans vérifier lit les ivars d'une autre classe : le `Vec` de tabs obtenu portait un pointeur nul, et `Cmd+J` a segfaulté dans `Tab::for_each_pane` avec `self = 0` (crash du 2026-08-14, v1.9.0). `kova_view` (`src/app.rs`) demande maintenant `isKindOfClass` avant de caster — passer par lui, jamais par un cast direct. Depuis la sidebar AppKit, le `contentView` est un conteneur : la `KovaView` est une de ses sous-vues, et `kova_view` la cherche là.
+- **`NSApplication::windows()` liste des fenêtres qui ne sont pas les nôtres** : panneaux AppKit, porteurs de tooltip, etc. Caster leur `contentView` en `KovaView` sans vérifier lit les ivars d'une autre classe : le `Vec` de tabs obtenu portait un pointeur nul, et `Cmd+J` a segfaulté dans `Tab::for_each_pane` avec `self = 0` (crash du 2026-08-14, v1.9.0). `kova_view` (`src/app.rs`) demande maintenant `isKindOfClass` avant de caster — passer par lui, jamais par un cast direct. Depuis la sidebar AppKit, le `contentView` est un conteneur : la `KovaView` est une de ses sous-vues, et `kova_view` la cherche là.
 
 - **Un deuxième Kova démarre sans tabs, et ce n'est ni la conf ni le fichier de session** — la première instance verrouille `~/.config/kova/session.json` (`owns_session`, `src/session.rs`), les suivantes ouvrent une fenêtre vierge et ne sauvent rien. Le log le dit en clair : « Another Kova owns … : this instance starts fresh and will not save its session ». Symptôme trompeur : on relance `kova &` alors qu'un Kova tourne encore, on ne retrouve pas ses tabs, et le diagnostic part vers la lecture de la conf. Lire `~/Library/Logs/Kova/kova.log` avant de chercher ailleurs.
 
