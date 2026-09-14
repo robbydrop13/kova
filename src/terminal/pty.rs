@@ -230,6 +230,7 @@ impl Pty {
                 .stderr(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
                 .env("TERM", "xterm-256color")
                 .env("TERM_PROGRAM", "Kova")
+                .envs(shell_lang().map(|lang| ("LANG", lang)))
                 .env("KOVA_SHELL_INTEGRATION", "1")
                 .env("KOVA_SOCKET", crate::ipc::socket_path())
                 .env("KOVA_PANE_ID", pane_id.to_string())
@@ -682,9 +683,60 @@ impl Drop for Pty {
     }
 }
 
+/// The `LANG` every shell gets, unless the user set a locale themselves.
+///
+/// A GUI app inherits no locale from launchd, so without this every shell runs
+/// in the C locale: `pbcopy` then reads its UTF-8 input as Mac Roman and "€"
+/// pastes as "‚Ç¨". Terminal.app and iTerm derive `LANG` from the system
+/// locale on startup; so do we, once per process.
+fn shell_lang() -> Option<&'static str> {
+    static LANG: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LANG.get_or_init(|| {
+        let user_set = ["LANG", "LC_ALL", "LC_CTYPE"].iter().any(|k| std::env::var_os(k).is_some());
+        if user_set {
+            return None;
+        }
+        let system = objc2_foundation::NSLocale::currentLocale().localeIdentifier().to_string();
+        let shipped = |lang: &str| std::path::Path::new("/usr/share/locale").join(lang).is_dir();
+        Some(lang_for(&system, shipped))
+    })
+    .as_deref()
+}
+
+/// `<system locale>.UTF-8` when macOS ships that locale, `en_US.UTF-8`
+/// otherwise. A locale identifier can carry `@` variants (`fr_FR@rg=uszzzz`)
+/// that no `/usr/share/locale` entry spells out; only the `lang_REGION` part
+/// counts.
+fn lang_for(system_locale: &str, shipped: impl Fn(&str) -> bool) -> String {
+    let base = system_locale.split('@').next().unwrap_or("");
+    let candidate = format!("{base}.UTF-8");
+    if !base.is_empty() && shipped(&candidate) {
+        candidate
+    } else {
+        "en_US.UTF-8".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lang_for_uses_the_system_locale_when_macos_ships_it() {
+        assert_eq!(lang_for("fr_FR", |l| l == "fr_FR.UTF-8"), "fr_FR.UTF-8");
+    }
+
+    #[test]
+    fn lang_for_falls_back_to_en_us_for_a_locale_macos_does_not_ship() {
+        // "en_FR" is a common macOS setting with no /usr/share/locale entry.
+        assert_eq!(lang_for("en_FR", |l| l == "fr_FR.UTF-8"), "en_US.UTF-8");
+        assert_eq!(lang_for("", |_| true), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn lang_for_drops_the_variant_suffix_before_looking_it_up() {
+        assert_eq!(lang_for("fr_FR@rg=uszzzz", |l| l == "fr_FR.UTF-8"), "fr_FR.UTF-8");
+    }
 
     /// Build a KERN_PROCARGS2-shaped buffer: argc, exec path, padding, argv.
     fn procargs_buffer(exe_path: &str, argv: &[&str]) -> Vec<u8> {
