@@ -97,11 +97,19 @@ pub fn process_info(pid: u32) -> ProcessInfo {
 /// The executable path and argv[0] of `pid`, via `KERN_PROCARGS2`.
 ///
 /// The area is laid out as: argc (i32), the executable path, NUL padding, then
-/// argv[0], argv[1]… Only the first two fields are wanted and they sit at the
-/// front, so a small buffer is enough — the kernel copies out what fits instead
-/// of failing, which avoids allocating `KERN_ARGMAX` (1 MiB) per probe.
+/// argv[0], argv[1]…, then the environment. Only the first two fields are
+/// wanted, but the buffer still has to hold the whole area: handed a smaller
+/// one, the kernel does not truncate, it copies out the *tail* — and a process
+/// whose environment tops 4 KiB (cargo test, a shell under nvm and a few
+/// tools) then reads as a fragment of some variable. One `KERN_ARGMAX` buffer
+/// (1 MiB, pages untouched until written) is allocated once and reused, so no
+/// probe allocates.
 fn proc_args(pid: u32) -> Option<(String, String)> {
-    let mut buf = vec![0u8; 4096];
+    static BUF: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
+    let mut buf = BUF.lock();
+    if buf.is_empty() {
+        buf.resize(arg_max(), 0);
+    }
     let mut len = buf.len();
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let rc = unsafe {
@@ -118,6 +126,24 @@ fn proc_args(pid: u32) -> Option<(String, String)> {
         return None;
     }
     parse_proc_args(&buf[..len])
+}
+
+/// `KERN_ARGMAX`: the most an argument area can take, 1 MiB on macOS.
+fn arg_max() -> usize {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && value > 0 { value as usize } else { 1 << 20 }
 }
 
 /// Split a `KERN_PROCARGS2` buffer into (executable path, argv[0]).
