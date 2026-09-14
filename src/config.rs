@@ -131,21 +131,24 @@ pub enum LayoutMode {
 #[serde(default)]
 pub struct LayoutConfig {
     pub mode: LayoutMode,
-    /// Sidebar width in terminal cells, clamped to `SIDEBAR_WIDTH_RANGE`, so it
-    /// keeps the same apparent size across font sizes and displays.
+    /// Sidebar width in points, clamped to `SIDEBAR_WIDTH_RANGE`. The AppKit
+    /// sidebar is laid out in points, independent of the terminal font.
     pub sidebar_width: u16,
     /// New tabs start folded in the sidebar when true.
     pub sidebar_collapsed_default: bool,
 }
 
-/// Bounds of `LayoutConfig::sidebar_width`, in cells.
-pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<u16> = 22..=56;
+/// Bounds of `LayoutConfig::sidebar_width`, in points.
+pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<u16> = 200..=520;
+/// Widths below this are the v2 unit (terminal cells) left in an old
+/// `prefs.json` or `config.toml`, converted at about 8 pt per cell.
+const LEGACY_CELL_WIDTH_MAX: u16 = 100;
 
 impl Default for LayoutConfig {
     fn default() -> Self {
         LayoutConfig {
             mode: LayoutMode::Tabs,
-            sidebar_width: 32,
+            sidebar_width: 280,
             sidebar_collapsed_default: false,
         }
     }
@@ -373,9 +376,11 @@ impl Config {
     }
 }
 
-/// Snap a sidebar width (in cells) into `SIDEBAR_WIDTH_RANGE`.
-pub fn clamp_sidebar_width(cells: u16) -> u16 {
-    cells.clamp(*SIDEBAR_WIDTH_RANGE.start(), *SIDEBAR_WIDTH_RANGE.end())
+/// Snap a sidebar width (in points) into `SIDEBAR_WIDTH_RANGE`; a v2 value
+/// in cells is converted first.
+pub fn clamp_sidebar_width(width: u16) -> u16 {
+    let pts = if width < LEGACY_CELL_WIDTH_MAX { width.saturating_mul(8) } else { width };
+    pts.clamp(*SIDEBAR_WIDTH_RANGE.start(), *SIDEBAR_WIDTH_RANGE.end())
 }
 
 
@@ -557,14 +562,19 @@ mod tests {
     #[test]
     fn layout_prefs_override_the_toml_table_field_by_field() {
         let mut config = Config::default();
-        config.layout.sidebar_width = 30;
+        config.layout.sidebar_width = 300;
         config.apply_layout_prefs(&LayoutPrefs { mode: Some(LayoutMode::Sidebar), sidebar_width: None });
         assert_eq!(config.layout.mode, LayoutMode::Sidebar);
-        assert_eq!(config.layout.sidebar_width, 30);
+        assert_eq!(config.layout.sidebar_width, 300);
         // An out-of-range width in the prefs is snapped, not refused.
-        config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(200) });
+        config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(900) });
         assert_eq!(config.layout.mode, LayoutMode::Sidebar);
-        assert_eq!(config.layout.sidebar_width, 56);
+        assert_eq!(config.layout.sidebar_width, 520);
+        // A v2 width in cells (a prefs.json from before the AppKit sidebar)
+        // is read as about 8 pt per cell.
+        config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(32) });
+        assert_eq!(config.layout.sidebar_width, 256);
+        assert_eq!(clamp_sidebar_width(4), 200);
     }
 
     #[test]
@@ -574,7 +584,7 @@ mod tests {
         ).unwrap();
         config.sanitize();
         assert_eq!(config.layout.mode, LayoutMode::Sidebar);
-        assert_eq!(config.layout.sidebar_width, 22);
+        assert_eq!(config.layout.sidebar_width, 200);
         assert!(config.layout.sidebar_collapsed_default);
         // Absent table: the tab bar, as before.
         let config: Config = toml::from_str("").unwrap();

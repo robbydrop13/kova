@@ -513,17 +513,18 @@ pub fn send_tabs_to_window(mtm: MainThreadMarker, tabs: Vec<crate::pane::Tab>, w
 /// isn't one of ours.
 pub fn kova_view(window: &NSWindow) -> Option<&crate::window::KovaView> {
     let cv = window.contentView()?;
-    // Ask the runtime before casting. Several call sites walk
-    // `NSApplication::windows()`, which lists every window the process owns —
-    // AppKit's own panels and tooltip carriers included. Their content view is
-    // not a KovaView, and reading another class's memory as our ivars handed
-    // out a `tabs` Vec with a null pointer: Cmd+J then called
-    // `Tab::for_each_pane` on a null `self` and segfaulted (crash of
-    // 2026-08-14, kova 1.9.0).
-    if !cv.isKindOfClass(<crate::window::KovaView as objc2::ClassType>::class()) {
-        return None;
-    }
-    let ptr: *const objc2_app_kit::NSView = &*cv;
+    // The content view is a plain container holding the sidebar and the
+    // KovaView side by side: look one level down. Ask the runtime before
+    // casting. Several call sites walk `NSApplication::windows()`, which
+    // lists every window the process owns, AppKit's own panels and tooltip
+    // carriers included. Their content view is not ours, and reading another
+    // class's memory as our ivars handed out a `tabs` Vec with a null
+    // pointer: Cmd+J then called `Tab::for_each_pane` on a null `self` and
+    // segfaulted (crash of 2026-08-14, kova 1.9.0).
+    let class = <crate::window::KovaView as objc2::ClassType>::class();
+    let subviews = cv.subviews();
+    let view = subviews.iter().find(|v| v.isKindOfClass(class))?;
+    let ptr: *const objc2_app_kit::NSView = &*view;
     Some(unsafe { &*(ptr as *const crate::window::KovaView) })
 }
 

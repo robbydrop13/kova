@@ -146,7 +146,7 @@ impl KovaView {
         if let Some(tab) = tabs.get_mut(idx) {
             match direction {
                 SplitDirection::Horizontal => {
-                    let screen = self.content_viewport().width;
+                    let screen = self.drawable_viewport().width;
                     let min_w = self.min_split_width_px();
                     let old_virtual = tab.virtual_width(screen, min_w);
                     tab.insert_column_after_focused(new_pane);
@@ -162,7 +162,7 @@ impl KovaView {
                 }
             }
             tab.focused_pane = new_id;
-            self.scroll_to_reveal_pane(tab, new_id, self.content_viewport().width);
+            self.scroll_to_reveal_pane(tab, new_id, self.drawable_viewport().width);
         }
         drop(tabs);
 
@@ -230,7 +230,7 @@ impl KovaView {
         tabs[tab_idx].focused_pane = new_focus;
         let new_columns = tabs[tab_idx].num_visible_columns();
         tabs[tab_idx].scale_virtual_width(old_columns, new_columns);
-        let full = self.content_viewport();
+        let full = self.drawable_viewport();
         let min_w = self.min_split_width_px();
         tabs[tab_idx].clamp_scroll(full.width, min_w);
         let tab = &mut tabs[tab_idx];
@@ -369,7 +369,7 @@ impl KovaView {
 
         // Focusing a minimized (hidden) pane restores it first — it has no
         // layout footprint, so focus alone would land on an invisible pane.
-        let full = self.content_viewport();
+        let full = self.drawable_viewport();
         let min_w = self.min_split_width_px();
         if tabs[tab_idx].pane(pane_id).is_some_and(|p| p.minimized) {
             tabs[tab_idx].restore_pane_adjust_virtual(pane_id, full.width, min_w);
@@ -706,7 +706,7 @@ impl KovaView {
         if !changed {
             return Some(false);
         }
-        let full = self.content_viewport();
+        let full = self.drawable_viewport();
         let min_w = self.min_split_width_px();
         self.cap_virtual_width(tab, full.width, min_w);
         tab.clamp_scroll(full.width, min_w);

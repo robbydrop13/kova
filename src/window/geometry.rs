@@ -1,6 +1,7 @@
 //! Where a pixel lands: the viewport a tab's panes are drawn into, the bars
-//! (and, in sidebar mode, the sidebar) that eat into it, and the conversions
-//! from a mouse position to a pane, a cell, a separator or a tab.
+//! that eat into it, and the conversions from a mouse position to a pane, a
+//! cell, a separator or a tab. In sidebar mode the sidebar is a sibling
+//! AppKit view, so this view's own frame is the whole pane area.
 
 use super::*;
 
@@ -32,17 +33,17 @@ impl KovaView {
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get(idx) {
-            let screen_w = self.content_viewport().width;
+            let screen_w = self.drawable_viewport().width;
             let vw = tab.virtual_width(screen_w, self.min_split_width_px());
             self.panes_viewport_inner(tab.scroll_offset_x, vw)
         } else {
-            self.panes_viewport_inner(0.0, self.content_viewport().width)
+            self.panes_viewport_inner(0.0, self.drawable_viewport().width)
         }
     }
 
     /// Viewport for panes using a tab reference (no extra borrow on tabs).
     pub(super) fn panes_viewport_for_tab(&self, tab: &crate::pane::Tab) -> PaneViewport {
-        let screen_w = self.content_viewport().width;
+        let screen_w = self.drawable_viewport().width;
         let vw = tab.virtual_width(screen_w, self.min_split_width_px());
         self.panes_viewport_inner(tab.scroll_offset_x, vw)
     }
@@ -50,37 +51,20 @@ impl KovaView {
     /// Scroll the tab so that the given pane is visible on screen.
     pub(super) fn scroll_to_reveal_pane(&self, tab: &mut Tab, pane_id: PaneId, screen_w: f32) {
         let panes_vp = self.panes_viewport_for_tab(tab);
-        if let Some(mut vp) = tab.viewport_for_pane(pane_id, panes_vp) {
-            // `scroll_to_reveal` reasons in the tab's own space, where 0 is
-            // the left edge of the pane area, not of the window.
-            vp.x -= self.content_viewport().x;
+        if let Some(vp) = tab.viewport_for_pane(pane_id, panes_vp) {
             tab.scroll_to_reveal(&vp, screen_w);
         }
     }
 
-    /// The part of the drawable the panes live in: everything right of the
-    /// sidebar, or the whole width in tabs mode. Its width is what a tab's
-    /// virtual width and horizontal scroll are measured against.
-    pub(super) fn content_viewport(&self) -> PaneViewport {
-        let full = self.drawable_viewport();
-        let left = self.sidebar_total_width();
-        PaneViewport {
-            x: left,
-            y: full.y,
-            width: full.width - left,
-            height: full.height,
-        }
-    }
-
     pub(super) fn panes_viewport_inner(&self, scroll_offset_x: f32, virtual_width: f32) -> PaneViewport {
-        let content = self.content_viewport();
+        let full = self.drawable_viewport();
         let tab_bar_h = self.tab_bar_height();
         let global_bar_h = self.global_bar_height();
         PaneViewport {
-            x: content.x - scroll_offset_x,
-            y: content.y + tab_bar_h,
+            x: -scroll_offset_x,
+            y: full.y + tab_bar_h,
             width: virtual_width,
-            height: content.height - tab_bar_h - global_bar_h,
+            height: full.height - tab_bar_h - global_bar_h,
         }
     }
 
@@ -262,10 +246,6 @@ impl KovaView {
         let idx = self.ivars().active_tab.get();
         let tab = tabs.get(idx)?;
         let (px, py) = self.event_to_pixel(event);
-        // A pane scrolled under the sidebar is covered, not clickable.
-        if px < self.content_viewport().x {
-            return None;
-        }
         // Viewport is already in screen space (x: -scroll_offset_x), so use px directly
         let (pane, vp) = tab.hit_test(px, py, self.panes_viewport_for_tab(tab))?;
         Some((unsafe { &*(pane as *const Pane) }, vp))
@@ -284,9 +264,6 @@ impl KovaView {
         let scale = self.backing_scale();
         let px = local.x as f32 * scale;
         let py = (frame.size.height as f32 - local.y as f32) * scale;
-        if px < self.content_viewport().x {
-            return None;
-        }
         let (pane, vp) = tab.hit_test(px, py, self.panes_viewport_for_tab(tab))?;
         Some((unsafe { &*(pane as *const Pane) }, vp))
     }

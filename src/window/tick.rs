@@ -259,22 +259,10 @@ impl KovaView {
             ivars.tab_bar_left_inset.set(inset);
             inset
         };
-        // Sidebar (sidebar mode only): built before the renderer lock, it only
-        // reads the tabs. Also where the list follows a focus change.
-        let sidebar_frame = self.sidebar_frame();
-        let content_left = self.content_viewport().x;
-        let sidebar_data = sidebar_frame.as_ref().map(|f| crate::renderer::SidebarRenderData {
-            geometry: &f.geometry,
-            rows: &f.rows,
-            summary: &f.summary,
-            sort: f.sort,
-            pill: f.pill,
-            hovered: f.hovered,
-            pressed: f.pressed,
-            insertion_y: f.insertion_y,
-            pane_insertion_y: f.pane_insertion_y,
-            lifted: f.lifted,
-        });
+        // The AppKit sidebar (sidebar mode only): reads the tabs into its
+        // model before the renderer lock, redraws only on a change.
+        self.sync_sidebar();
+        let show_tab_bar = !self.sidebar_active();
         let (hover_segments, hover_text, hover_pane_id) = {
             let h = ivars.hovered_url.borrow();
             (
@@ -289,10 +277,8 @@ impl KovaView {
         r.hovered_url_pane_id = hover_pane_id;
         // Count hidden panes (fully off-screen). Minimized panes are excluded:
         // they are zero-sized by design, not hidden by horizontal scroll.
-        // Measured from the left edge of the pane area, which in sidebar mode
-        // is the sidebar's right edge, not the window's.
         let (hidden_left, hidden_right) = hidden_pane_counts(
-            pane_data.iter().map(|p| (p.viewport.x - content_left, p.viewport.width, p.minimized)),
+            pane_data.iter().map(|p| (p.viewport.x, p.viewport.width, p.minimized)),
             screen_width,
         );
         let keys_config = ivars.config.get().map(|c| &c.keys);
@@ -502,7 +488,7 @@ impl KovaView {
             }
         }
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, sidebar_data.as_ref(), hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, show_tab_bar, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
@@ -799,7 +785,7 @@ impl KovaView {
                 );
                 ivars.active_tab.set(active);
                 let tab = &mut tabs[active];
-                let screen_w = self.content_viewport().width;
+                let screen_w = self.drawable_viewport().width;
                 tab.clamp_scroll(screen_w, self.min_split_width_px());
                 self.scroll_to_reveal_pane(tab, tab.focused_pane, screen_w);
                 tab.mark_all_dirty();
@@ -832,8 +818,7 @@ impl KovaView {
                 let bookmark_keys = ivars.bookmark_keys.borrow();
                 let cell_h = renderer.read().cell_size().1;
                 tab.cell_h.set(cell_h);
-                // The pane area: the whole drawable, or what the sidebar leaves.
-                let content = self.content_viewport();
+                let content = self.drawable_viewport();
                 let screen_width = content.width;
                 let virtual_width = tab.virtual_width(screen_width, split_min_w);
                 let panes_vp = self.panes_viewport_inner(tab.scroll_offset_x, virtual_width);
