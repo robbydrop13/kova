@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12,6 +12,7 @@ pub struct Config {
     pub tab_bar: TabBarConfig,
     pub splits: SplitsConfig,
     pub global_status_bar: GlobalStatusBarConfig,
+    pub layout: LayoutConfig,
     pub keys: KeysConfig,
 }
 
@@ -117,6 +118,92 @@ pub struct TabBarConfig {
     pub active_bg: [f32; 3],
 }
 
+/// How the tabs of a window are presented: the strip across the top, or a
+/// sticky column down the left listing every tab with its panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    Tabs,
+    Sidebar,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LayoutConfig {
+    pub mode: LayoutMode,
+    /// Sidebar width in terminal cells, clamped to `SIDEBAR_WIDTH_RANGE`, so it
+    /// keeps the same apparent size across font sizes and displays.
+    pub sidebar_width: u16,
+    /// New tabs start folded in the sidebar when true.
+    pub sidebar_collapsed_default: bool,
+}
+
+/// Bounds of `LayoutConfig::sidebar_width`, in cells.
+pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<u16> = 18..=48;
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        LayoutConfig {
+            mode: LayoutMode::Tabs,
+            sidebar_width: 28,
+            sidebar_collapsed_default: false,
+        }
+    }
+}
+
+/// The layout settings Kova changes at runtime (View menu, the sidebar edge
+/// drag), kept in their own small file rather than written back into
+/// `config.toml`: rewriting the user's TOML would need a comment-preserving
+/// editor and is not worth a dependency. A value present here overrides the
+/// `[layout]` table on load; absent values leave the table alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LayoutPrefs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<LayoutMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<u16>,
+}
+
+fn prefs_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config/kova/prefs.json")
+}
+
+impl LayoutPrefs {
+    /// Read the overrides. A missing or unreadable file is no override at all.
+    pub fn load() -> Self {
+        let path = prefs_path();
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            return LayoutPrefs::default();
+        };
+        match serde_json::from_str(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Invalid {} ({}); ignoring it", path.display(), e);
+                LayoutPrefs::default()
+            }
+        }
+    }
+
+    pub fn save(&self) {
+        let path = prefs_path();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("Failed to create {}: {}", parent.display(), e);
+                return;
+            }
+        }
+        match serde_json::to_string_pretty(self) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    log::warn!("Failed to write {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => log::warn!("Failed to serialize layout prefs: {}", e),
+        }
+    }
+}
+
 impl Default for TabBarConfig {
     fn default() -> Self {
         TabBarConfig {
@@ -162,6 +249,7 @@ impl Default for Config {
             tab_bar: TabBarConfig::default(),
             splits: SplitsConfig::default(),
             global_status_bar: GlobalStatusBarConfig::default(),
+            layout: LayoutConfig::default(),
             keys: KeysConfig::default(),
         }
     }
@@ -214,26 +302,38 @@ impl Default for TerminalConfig {
 impl Config {
     pub fn load() -> Self {
         let path = config_path();
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
+        let mut config = match std::fs::read_to_string(&path) {
+            Ok(content) => match toml::from_str::<Config>(&content) {
+                Ok(mut config) => {
+                    log::info!("Loaded config from {}", path.display());
+                    config.sanitize();
+                    config
+                }
+                Err(e) => {
+                    log::warn!("Invalid config at {}: {}. Using defaults.", path.display(), e);
+                    Config::default()
+                }
+            },
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     log::warn!("Failed to read config at {}: {}", path.display(), e);
                 }
-                return Config::default();
-            }
-        };
-        match toml::from_str::<Config>(&content) {
-            Ok(mut config) => {
-                log::info!("Loaded config from {}", path.display());
-                config.sanitize();
-                config
-            }
-            Err(e) => {
-                log::warn!("Invalid config at {}: {}. Using defaults.", path.display(), e);
                 Config::default()
             }
+        };
+        config.apply_layout_prefs(&LayoutPrefs::load());
+        config
+    }
+
+    /// Lay the runtime layout overrides over the `[layout]` table.
+    pub fn apply_layout_prefs(&mut self, prefs: &LayoutPrefs) {
+        if let Some(mode) = prefs.mode {
+            self.layout.mode = mode;
         }
+        if let Some(width) = prefs.sidebar_width {
+            self.layout.sidebar_width = width;
+        }
+        self.layout.sidebar_width = clamp_sidebar_width(self.layout.sidebar_width);
     }
 
     /// Clamp fields that would break the app if left at pathological values
@@ -265,7 +365,17 @@ impl Config {
             log::warn!("config: font.size<=0, using default {}", ds);
             self.font.size = ds;
         }
+        let width = clamp_sidebar_width(self.layout.sidebar_width);
+        if width != self.layout.sidebar_width {
+            log::warn!("config: layout.sidebar_width out of {:?}, using {}", SIDEBAR_WIDTH_RANGE, width);
+            self.layout.sidebar_width = width;
+        }
     }
+}
+
+/// Snap a sidebar width (in cells) into `SIDEBAR_WIDTH_RANGE`.
+pub fn clamp_sidebar_width(cells: u16) -> u16 {
+    cells.clamp(*SIDEBAR_WIDTH_RANGE.start(), *SIDEBAR_WIDTH_RANGE.end())
 }
 
 
@@ -340,6 +450,7 @@ pub struct KeysConfig {
     pub next_attention: String,
     pub history_back: String,
     pub history_forward: String,
+    pub toggle_sidebar: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -409,6 +520,7 @@ impl Default for KeysConfig {
             next_attention: "cmd+j".into(),
             history_back: "cmd+shift+option+left".into(),
             history_forward: "cmd+shift+option+right".into(),
+            toggle_sidebar: "cmd+option+s".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }
@@ -435,5 +547,47 @@ impl Default for TerminalKeysConfig {
             word_forward: "option+right".into(),
             shift_enter: "shift+enter".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_prefs_override_the_toml_table_field_by_field() {
+        let mut config = Config::default();
+        config.layout.sidebar_width = 30;
+        config.apply_layout_prefs(&LayoutPrefs { mode: Some(LayoutMode::Sidebar), sidebar_width: None });
+        assert_eq!(config.layout.mode, LayoutMode::Sidebar);
+        assert_eq!(config.layout.sidebar_width, 30);
+        // An out-of-range width in the prefs is snapped, not refused.
+        config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(200) });
+        assert_eq!(config.layout.mode, LayoutMode::Sidebar);
+        assert_eq!(config.layout.sidebar_width, 48);
+    }
+
+    #[test]
+    fn layout_table_parses_and_a_bad_width_is_clamped() {
+        let mut config: Config = toml::from_str(
+            "[layout]\nmode = \"sidebar\"\nsidebar_width = 4\nsidebar_collapsed_default = true\n",
+        ).unwrap();
+        config.sanitize();
+        assert_eq!(config.layout.mode, LayoutMode::Sidebar);
+        assert_eq!(config.layout.sidebar_width, 18);
+        assert!(config.layout.sidebar_collapsed_default);
+        // Absent table: the tab bar, as before.
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.layout.mode, LayoutMode::Tabs);
+        assert_eq!(config.keys.toggle_sidebar, "cmd+option+s");
+    }
+
+    #[test]
+    fn layout_prefs_serialize_only_what_is_set() {
+        let json = serde_json::to_string(&LayoutPrefs { mode: Some(LayoutMode::Tabs), sidebar_width: None }).unwrap();
+        assert_eq!(json, "{\"mode\":\"tabs\"}");
+        let prefs: LayoutPrefs = serde_json::from_str("{\"sidebar_width\": 22}").unwrap();
+        assert_eq!(prefs.mode, None);
+        assert_eq!(prefs.sidebar_width, Some(22));
     }
 }

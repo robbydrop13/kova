@@ -483,6 +483,9 @@ pub struct Tab {
     pub fg_running_cache: bool,
     /// FILO stack of minimized pane IDs.
     pub minimized_stack: Vec<PaneId>,
+    /// The tab's group is folded in the sidebar (its pane rows are hidden).
+    /// Saved with the tab, since tab ids do not survive a relaunch.
+    pub collapsed: bool,
     /// Horizontal scroll offset in pixels (0 = no scroll).
     pub scroll_offset_x: f32,
     /// Manual override of virtual width (0.0 = auto from min_split_width).
@@ -600,6 +603,7 @@ impl Tab {
             has_running: false,
             fg_running_cache: false,
             minimized_stack: Vec::new(),
+            collapsed: config.layout.sidebar_collapsed_default,
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
@@ -625,6 +629,7 @@ impl Tab {
             has_running: false,
             fg_running_cache: false,
             minimized_stack: Vec::new(),
+            collapsed: false,
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
@@ -649,6 +654,7 @@ impl Tab {
             has_running: false,
             fg_running_cache: false,
             minimized_stack: Vec::new(),
+            collapsed: config.layout.sidebar_collapsed_default,
             scroll_offset_x: 0.0,
             virtual_width_override: 0.0,
             geometry_scale: 0.0,

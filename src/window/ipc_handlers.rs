@@ -146,7 +146,7 @@ impl KovaView {
         if let Some(tab) = tabs.get_mut(idx) {
             match direction {
                 SplitDirection::Horizontal => {
-                    let screen = self.drawable_viewport().width;
+                    let screen = self.content_viewport().width;
                     let min_w = self.min_split_width_px();
                     let old_virtual = tab.virtual_width(screen, min_w);
                     tab.insert_column_after_focused(new_pane);
@@ -162,7 +162,7 @@ impl KovaView {
                 }
             }
             tab.focused_pane = new_id;
-            self.scroll_to_reveal_pane(tab, new_id, self.drawable_viewport().width);
+            self.scroll_to_reveal_pane(tab, new_id, self.content_viewport().width);
         }
         drop(tabs);
 
@@ -230,7 +230,7 @@ impl KovaView {
         tabs[tab_idx].focused_pane = new_focus;
         let new_columns = tabs[tab_idx].num_visible_columns();
         tabs[tab_idx].scale_virtual_width(old_columns, new_columns);
-        let full = self.drawable_viewport();
+        let full = self.content_viewport();
         let min_w = self.min_split_width_px();
         tabs[tab_idx].clamp_scroll(full.width, min_w);
         let tab = &mut tabs[tab_idx];
@@ -350,6 +350,17 @@ impl KovaView {
 
     /// IPC: focus a pane by ID (switch tab if needed). Returns true if found.
     pub fn ipc_focus_pane(&self, pane_id: PaneId) -> bool {
+        let found = self.focus_pane_in_window(pane_id);
+        if found {
+            log::info!("IPC: focused pane {}", pane_id);
+        }
+        found
+    }
+
+    /// Focus a pane wherever it sits in this window: its tab becomes active,
+    /// a minimized pane is restored, the tab scrolls to show it. Returns false
+    /// when no tab of this window holds the pane.
+    pub(super) fn focus_pane_in_window(&self, pane_id: PaneId) -> bool {
         let mut tabs = self.ivars().tabs.borrow_mut();
         let tab_idx = match tabs.iter().position(|tab| tab.contains(pane_id)) {
             Some(i) => i,
@@ -358,7 +369,7 @@ impl KovaView {
 
         // Focusing a minimized (hidden) pane restores it first — it has no
         // layout footprint, so focus alone would land on an invisible pane.
-        let full = self.drawable_viewport();
+        let full = self.content_viewport();
         let min_w = self.min_split_width_px();
         if tabs[tab_idx].pane(pane_id).is_some_and(|p| p.minimized) {
             tabs[tab_idx].restore_pane_adjust_virtual(pane_id, full.width, min_w);
@@ -372,7 +383,6 @@ impl KovaView {
 
         self.ivars().active_tab.set(tab_idx);
         self.resize_all_panes();
-        log::info!("IPC: focused pane {}", pane_id);
         true
     }
 
@@ -696,7 +706,7 @@ impl KovaView {
         if !changed {
             return Some(false);
         }
-        let full = self.drawable_viewport();
+        let full = self.content_viewport();
         let min_w = self.min_split_width_px();
         self.cap_virtual_width(tab, full.width, min_w);
         tab.clamp_scroll(full.width, min_w);

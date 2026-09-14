@@ -33,7 +33,7 @@ fn should_skip_settle_nudge(row_coverage: f32, has_interior_band: bool) -> bool 
 impl KovaView {
     /// Mode 2: adjust the virtual width override of the active tab (all panes scale proportionally).
     pub(super) fn adjust_virtual_width(&self, dir: f32) {
-        let screen_w = self.drawable_viewport().width;
+        let screen_w = self.content_viewport().width;
         let step = (0.33 * screen_w).max(200.0 * self.backing_scale());
         let min_w = self.min_split_width_px();
         let mut tabs = self.ivars().tabs.borrow_mut();
@@ -372,7 +372,7 @@ impl KovaView {
         // the tab scrolls horizontally instead. Capping them here mutated
         // column_weights and dropped virtual_width_override for good, so coming
         // back to the wide display never restored the layout.
-        let screen_w = self.drawable_viewport().width;
+        let screen_w = self.content_viewport().width;
         let min_w = self.min_split_width_px();
         {
             let mut tabs = self.ivars().tabs.borrow_mut();

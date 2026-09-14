@@ -73,6 +73,8 @@ pub enum Action {
     NextAttention,
     HistoryBack,
     HistoryForward,
+    /// Switch the window layout between the tab bar and the sidebar.
+    ToggleSidebar,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -154,7 +156,7 @@ fn keycode_to_digit(code: u16) -> Option<char> {
 }
 
 /// Parse a string like "cmd+shift+d" into a KeyCombo.
-fn parse_key_combo(s: &str) -> KeyCombo {
+pub fn parse_key_combo(s: &str) -> KeyCombo {
     let mut combo = KeyCombo {
         cmd: false,
         ctrl: false,
@@ -294,6 +296,7 @@ impl Keybindings {
         bind(&keys.next_attention, Action::NextAttention);
         bind(&keys.history_back, Action::HistoryBack);
         bind(&keys.history_forward, Action::HistoryForward);
+        bind(&keys.toggle_sidebar, Action::ToggleSidebar);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);
@@ -394,6 +397,7 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "next-attention" => Action::NextAttention,
         "history-back" => Action::HistoryBack,
         "history-forward" => Action::HistoryForward,
+        "toggle-sidebar" => Action::ToggleSidebar,
 
         _ => return None,
     };

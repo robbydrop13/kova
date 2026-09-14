@@ -10,6 +10,9 @@ use recent_projects_overlay::RecentProjectsState;
 mod resize;
 mod search_palette;
 use search_palette::{is_typed_char, SearchPaletteState, SearchRow};
+pub mod sidebar;
+mod sidebar_ui;
+use sidebar_ui::SidebarState;
 mod switcher;
 mod tabs;
 mod tick;
@@ -177,6 +180,8 @@ pub struct KovaViewIvars {
     /// snapshot the placeholder's *original* data rather than its empty live
     /// state — otherwise periodic autosave silently overwrites the user's tab.
     tab_backup: RefCell<std::collections::HashMap<TabId, crate::session::SavedTab>>,
+    /// Sidebar layout state (scroll, hover, drag, sort). See `sidebar_ui`.
+    sidebar: RefCell<SidebarState>,
 }
 
 #[derive(Clone, Copy)]
@@ -756,6 +761,11 @@ define_class!(
                 return;
             }
 
+            // Over the sidebar the wheel scrolls its list, nothing else.
+            if self.sidebar_scroll(event, is_trackpad) {
+                return;
+            }
+
             // Phase-based axis lock (trackpad only)
             if is_trackpad {
                 let phase = event.phase();
@@ -836,7 +846,7 @@ define_class!(
             if lock != ScrollAxisLock::Vertical && is_trackpad {
                 let dx = event.scrollingDeltaX();
                 if dx != 0.0 {
-                    let screen_w = self.drawable_viewport().width;
+                    let screen_w = self.content_viewport().width;
                     let min_w = self.min_split_width_px();
                     let mut tabs = ivars.tabs.borrow_mut();
                     let idx = ivars.active_tab.get();
@@ -869,7 +879,10 @@ define_class!(
                 return;
             }
 
-            // Check tab bar click
+            // Sidebar click (sidebar mode), then tab bar click
+            if self.hit_test_sidebar(px, py, event) {
+                return;
+            }
             if self.hit_test_tab_bar(px, py, event) {
                 return;
             }
@@ -909,7 +922,7 @@ define_class!(
                     let mut tabs = self.ivars().tabs.borrow_mut();
                     let idx = self.ivars().active_tab.get();
                     if let Some(tab) = tabs.get_mut(idx) {
-                        let full = self.drawable_viewport();
+                        let full = self.content_viewport();
                         let min_w = self.min_split_width_px();
                         tab.restore_pane_adjust_virtual(pane_id, full.width, min_w);
                         tab.focused_pane = pane_id;
@@ -997,6 +1010,11 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
+            // Sidebar drags: edge resize, header reorder
+            if self.sidebar_mouse_dragged(event) {
+                return;
+            }
+
             // Handle tab drag
             if let Some(mut drag) = self.ivars().drag_tab.get() {
                 let (px, _py) = self.event_to_pixel(event);
@@ -1168,6 +1186,9 @@ define_class!(
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
             self.ivars().auto_scroll_speed.set(0);
+            if self.sidebar_mouse_up(event) {
+                return;
+            }
             if self.ivars().drag_tab.get().is_some() {
                 self.ivars().drag_tab.set(None);
                 return;
@@ -1206,6 +1227,35 @@ define_class!(
             }
         }
 
+        /// View menu: "Show Tab Bar" / "Show Sidebar" (tag = mode).
+        #[unsafe(method(setLayoutMode:))]
+        fn set_layout_mode_from_menu(&self, sender: &objc2_app_kit::NSMenuItem) {
+            let mode = if sender.tag() == crate::app::LAYOUT_MENU_TAG_SIDEBAR {
+                crate::config::LayoutMode::Sidebar
+            } else {
+                crate::config::LayoutMode::Tabs
+            };
+            self.set_layout_mode(mode);
+        }
+
+        /// Keep the View menu's radio mark on the current layout.
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &objc2_app_kit::NSMenuItem) -> bool {
+            if item.action() == Some(objc2::sel!(setLayoutMode:)) {
+                let current = match sidebar::layout_mode() {
+                    crate::config::LayoutMode::Tabs => crate::app::LAYOUT_MENU_TAG_TABS,
+                    crate::config::LayoutMode::Sidebar => crate::app::LAYOUT_MENU_TAG_SIDEBAR,
+                };
+                let state = if item.tag() == current {
+                    objc2_app_kit::NSControlStateValueOn
+                } else {
+                    objc2_app_kit::NSControlStateValueOff
+                };
+                item.setState(state);
+            }
+            true
+        }
+
         #[unsafe(method(tabColorSelected:))]
         fn tab_color_selected(&self, sender: &objc2_app_kit::NSMenuItem) {
             const PALETTE_SIZE: isize = 6;
@@ -1226,8 +1276,11 @@ define_class!(
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
             let (px, py) = self.event_to_pixel(event);
+            if self.sidebar_right_click(px, py, event) {
+                return;
+            }
             let tab_bar_h = self.tab_bar_height();
-            if py <= tab_bar_h {
+            if tab_bar_h > 0.0 && py <= tab_bar_h {
                 if let Some(tab_idx) = self.tab_index_at_x(px) {
                     self.show_tab_color_menu(event, tab_idx);
                     return;
@@ -1239,6 +1292,10 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
+            // Over the sidebar: hover highlight and resize cursor, no pane work
+            if self.sidebar_mouse_moved(event) {
+                return;
+            }
             // Forward move to PTY if all-motion tracking (mode 1003) is active
             if let Some((pane, vp)) = self.pane_at_event(event) {
                 let term = pane.terminal.read();
@@ -1380,6 +1437,7 @@ impl KovaView {
             post_restore_checks: RefCell::new(Vec::new()),
             band_repair_attempts: RefCell::new(std::collections::HashMap::new()),
             tab_backup: RefCell::new(std::collections::HashMap::new()),
+            sidebar: RefCell::new(SidebarState::new()),
         });
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         // Accept file drags from Finder (legacy filenames type; AppKit bridges
@@ -1867,7 +1925,7 @@ impl KovaView {
                 // Scroll the virtual viewport so the pane is on-screen if it
                 // sits outside the visible horizontal span (e.g. jumped to from
                 // global search).
-                let screen_w = self.drawable_viewport().width;
+                let screen_w = self.content_viewport().width;
                 let min_w = self.min_split_width_px();
                 tab.clamp_scroll(screen_w, min_w);
                 self.scroll_to_reveal_pane(tab, pane_id, screen_w);
@@ -1985,6 +2043,7 @@ impl KovaView {
             Action::NextAttention => self.do_focus_next_attention(),
             Action::HistoryBack => do_history_step(false),
             Action::HistoryForward => do_history_step(true),
+            Action::ToggleSidebar => self.toggle_layout_mode(),
             Action::PrevTab => self.do_switch_tab_relative(-1),
             Action::NextTab => self.do_switch_tab_relative(1),
             Action::RenameTab => self.start_rename_tab(),
@@ -2008,7 +2067,7 @@ impl KovaView {
                     let focused_id = tab.focused_pane;
                     if tab.adjust_ratio_directional(focused_id, *delta, *axis)
                         || tab.adjust_ratio_nearest(focused_id, *delta, *axis) {
-                        let full = self.drawable_viewport();
+                        let full = self.content_viewport();
                         let min_w = self.min_split_width_px();
                         self.cap_virtual_width(tab, full.width, min_w);
                         tab.clamp_scroll(full.width, min_w);
@@ -2025,7 +2084,7 @@ impl KovaView {
                 let idx = self.ivars().active_tab.get();
                 if let Some(tab) = tabs.get_mut(idx) {
                     let focused_id = tab.focused_pane;
-                    let full = self.drawable_viewport();
+                    let full = self.content_viewport();
                     let min_w = self.min_split_width_px();
                     let screen_w = full.width;
                     // Don't grow if focused pane is already at screen width
@@ -2175,7 +2234,7 @@ impl KovaView {
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
             let focused_id = tab.focused_pane;
-            let full = self.drawable_viewport();
+            let full = self.content_viewport();
             let min_w = self.min_split_width_px();
             if tab.minimize_pane_adjust_virtual(focused_id, full.width, min_w) {
                 tab.mark_all_dirty();
@@ -2193,7 +2252,7 @@ impl KovaView {
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
-            let full = self.drawable_viewport();
+            let full = self.content_viewport();
             let min_w = self.min_split_width_px();
             if tab.restore_last_minimized(full.width, min_w) {
                 tab.mark_all_dirty();
@@ -2230,7 +2289,7 @@ impl KovaView {
                 t.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             // Auto-scroll to reveal the newly focused pane
-            self.scroll_to_reveal_pane(tab, neighbor_id, self.drawable_viewport().width);
+            self.scroll_to_reveal_pane(tab, neighbor_id, self.content_viewport().width);
         } else {
             // No neighbor in this direction → tab boundary guard
             let count = tabs.len();
@@ -2259,7 +2318,7 @@ impl KovaView {
                             NavDirection::Left | NavDirection::Up => new_tab.last_pane().id,
                         };
                         new_tab.focused_pane = target_id;
-                        self.scroll_to_reveal_pane(new_tab, target_id, self.drawable_viewport().width);
+                        self.scroll_to_reveal_pane(new_tab, target_id, self.content_viewport().width);
                     }
                     return;
                 }
@@ -2308,7 +2367,7 @@ impl KovaView {
                     p.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Auto-scroll to reveal the focused pane in its new position
-                self.scroll_to_reveal_pane(tab, focused_id, self.drawable_viewport().width);
+                self.scroll_to_reveal_pane(tab, focused_id, self.content_viewport().width);
                 drop(tabs);
                 self.resize_all_panes();
             }
@@ -2385,6 +2444,7 @@ impl KovaView {
             tabs: saved_tabs,
             active_tab,
             frame,
+            sidebar_sort: self.sidebar_sort(),
         });
     }
 

@@ -50,6 +50,32 @@ pub const TAB_COLORS: [[f32; 3]; 6] = [
     [0.60, 0.35, 0.75], // Violet
 ];
 
+// Sidebar palette (see docs/sidebar-spec.md, section 5). The ground, the
+// dim text and the active row reuse the tab bar's own tokens.
+const SIDEBAR_SEPARATOR: [f32; 3] = [0.20, 0.20, 0.23];
+const SIDEBAR_HOVER_BG: [f32; 3] = [0.16, 0.16, 0.19];
+const SIDEBAR_PRESSED_BG: [f32; 3] = [0.19, 0.19, 0.22];
+const SIDEBAR_PRIMARY: [f32; 3] = [1.0, 1.0, 1.0];
+const SIDEBAR_ACTIVE_TAB: [f32; 3] = [0.80, 0.80, 0.85];
+const SIDEBAR_OTHER_TAB: [f32; 3] = [0.60, 0.60, 0.66];
+const SIDEBAR_HEADER_TITLE: [f32; 3] = [0.72, 0.72, 0.78];
+const SIDEBAR_DIM: [f32; 3] = [0.45, 0.45, 0.50];
+const SIDEBAR_SECONDARY: [f32; 3] = [0.45, 0.45, 0.50];
+
+fn rgba(c: [f32; 3]) -> [f32; 4] {
+    [c[0], c[1], c[2], 1.0]
+}
+
+/// A filled quad cut to a vertical band `(top, bottom)`: sidebar rows are
+/// clipped to the list region by geometry, not by a scissor.
+fn push_clipped_quad(vertices: &mut Vec<Vertex>, x: f32, y: f32, w: f32, h: f32, bg: [f32; 3], clip: (f32, f32)) {
+    let top = y.max(clip.0);
+    let bottom = (y + h).min(clip.1);
+    if bottom > top {
+        Renderer::push_bg_quad(vertices, x, top, w, bottom - top, bg);
+    }
+}
+
 /// Saturation kept on an inactive colored tab (CSS `saturate(0.7)`).
 const DIM_SATURATION: f32 = 0.7;
 /// Brightness kept on an inactive colored tab (CSS `brightness(0.82)`).
@@ -261,6 +287,55 @@ pub struct PaneSwitcherRenderData<'a> {
     /// the panes that are not have been left out. Changes the title and the
     /// hint, so the list never looks like a truncated version of the full one.
     pub filtered: bool,
+}
+
+/// Background of a sidebar row, from the mouse's point of view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SidebarRowBg {
+    Plain,
+    Hover,
+    Pressed,
+}
+
+/// One sidebar row as the window describes it: a group header (tab) or a
+/// pane. Parallel to `SidebarGeometry::rows`, which carries the positions.
+pub struct SidebarRowRender {
+    /// Tab title or pane title, already the edit buffer while renaming.
+    pub title: String,
+    /// Pane rows: "{agent} · {cwd}" line, already truncated to fit.
+    pub secondary: String,
+    /// Headers: the 1-based tab number (the Cmd+N shortcut).
+    pub number: usize,
+    /// Index into `TAB_COLORS`, painted as the group's colour bar.
+    pub color: Option<usize>,
+    /// The row belongs to the active tab.
+    pub active_tab: bool,
+    /// Pane rows: the focused pane of the active tab.
+    pub focused: bool,
+    /// Pane rows: the state square. Headers: the folded group's summary.
+    pub square: crate::window::sidebar::StateSquare,
+    /// Headers: how many panes the group holds (shown when folded).
+    pub pane_count: usize,
+    pub bg: SidebarRowBg,
+    /// Pane rows: the secondary line goes blue.
+    pub bookmarked: bool,
+    /// The title is an edit buffer: show its end, where the cursor is.
+    pub renaming: bool,
+}
+
+/// Everything the sidebar is drawn from, for one frame.
+pub struct SidebarRenderData<'a> {
+    pub geometry: &'a crate::window::sidebar::SidebarGeometry,
+    pub rows: &'a [SidebarRowRender],
+    /// "N waiting · M working", empty when both are zero.
+    pub summary: &'a str,
+    pub summary_color: [f32; 3],
+    pub sort: crate::window::sidebar::SidebarSort,
+    pub hovered: Option<crate::window::sidebar::SidebarHit>,
+    /// Screen y of the drop line while a header is dragged.
+    pub insertion_y: Option<f32>,
+    /// (row index, screen y) of the floating copy of a dragged header.
+    pub lifted: Option<(usize, f32)>,
 }
 
 /// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
@@ -781,6 +856,7 @@ impl Renderer {
         tab_titles: &[(String, bool, Option<usize>, bool, bool, bool, bool)],
         filter: Option<&FilterRenderData>,
         tab_bar_left_inset: f32,
+        sidebar: Option<&SidebarRenderData<'_>>,
         hidden_left: usize,
         hidden_right: usize,
         focused_column: usize,
@@ -960,8 +1036,12 @@ impl Renderer {
             overlay_vertices.push(Vertex { position: [lx, bottom_y], tex_coords: no_tex, color: white, bg_color: flash_color });
         }
 
-        // Draw tab bar
-        if tab_titles.len() > 0 {
+        // Draw the tab bar, or the sidebar in sidebar mode. The sidebar comes
+        // after the panes and their separators: painting it last, with an
+        // opaque ground, is what makes it sticky over a column scrolled under it.
+        if let Some(sidebar) = sidebar {
+            self.build_sidebar_vertices(&mut overlay_vertices, sidebar);
+        } else if tab_titles.len() > 0 {
             self.build_tab_bar_vertices(&mut overlay_vertices, viewport_w, tab_titles, tab_bar_left_inset);
         }
 
@@ -2038,6 +2118,245 @@ impl Renderer {
         }
     }
 
+    /// The sidebar (sidebar mode): opaque ground and separator, summary row
+    /// with the sort toggle, the group and pane rows clipped to the list
+    /// region, overflow lines, the empty-state hint, the footer, and the drag
+    /// feedback. Geometry comes from the window (`SidebarGeometry`), so the
+    /// mouse and the paint agree on every row. See `docs/sidebar-spec.md`.
+    fn build_sidebar_vertices(&mut self, vertices: &mut Vec<Vertex>, data: &SidebarRenderData<'_>) {
+        use crate::window::sidebar::{SidebarHit, SidebarRowKind, SidebarSort, TEXT_COL};
+
+        let g = data.geometry;
+        let cell_w = g.cell_w;
+        let cell_h = g.cell_h;
+        let w = g.width;
+        let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
+        let dim = rgba(self.tab_bar_fg);
+        let secondary = rgba(SIDEBAR_SECONDARY);
+
+        // Ground and separator.
+        Self::push_bg_quad(vertices, 0.0, 0.0, w, g.height, self.tab_bar_bg);
+        Self::push_bg_quad(vertices, w, 0.0, g.sep_w, g.height, SIDEBAR_SEPARATOR);
+
+        // Summary row: counts on the left, sort toggle on the right.
+        {
+            let text_y = g.top_h + (g.summary_h - cell_h) / 2.0;
+            let label = data.sort.label();
+            let label_x = w - cell_w - label.chars().count() as f32 * cell_w;
+            let label_fg = if data.hovered == Some(SidebarHit::SortToggle) {
+                rgba(SIDEBAR_PRIMARY)
+            } else if data.sort == SidebarSort::Activity {
+                rgba(crate::window::sidebar::WORKING_COLOR)
+            } else {
+                dim
+            };
+            self.render_status_text(vertices, label, label_x, text_y, w - cell_w, label_fg, no_bg);
+            if !data.summary.is_empty() {
+                self.render_status_text(vertices, data.summary, cell_w, text_y, label_x - cell_w, rgba(data.summary_color), no_bg);
+            }
+        }
+
+        // List rows, clipped to the list region.
+        let list_top = g.list_y;
+        let list_bottom = g.list_y + g.list_h;
+        for (i, row) in g.rows.iter().enumerate() {
+            let Some(render) = data.rows.get(i) else { continue };
+            let y = g.row_screen_y(i);
+            if y + row.h <= list_top || y >= list_bottom {
+                continue;
+            }
+            match row.kind {
+                SidebarRowKind::Header { collapsed, .. } => {
+                    self.sidebar_header_row(vertices, g, render, y, collapsed, (list_top, list_bottom), false);
+                }
+                SidebarRowKind::Pane { .. } => {
+                    self.sidebar_pane_row(vertices, g, render, y, (list_top, list_bottom));
+                }
+            }
+        }
+
+        // Hidden overflow: a hairline at the edge rows disappear under.
+        let (above, below) = g.overflow();
+        let hairline = g.scale.round().max(1.0);
+        if above {
+            Self::push_bg_quad(vertices, 0.0, list_top, w, hairline, SIDEBAR_SEPARATOR);
+        }
+        if below {
+            Self::push_bg_quad(vertices, 0.0, list_bottom - hairline, w, hairline, SIDEBAR_SEPARATOR);
+        }
+
+        // Empty-state hint under the last group, while the window holds few panes.
+        if let Some(hy) = g.hint_screen_y() {
+            let text_y = hy + (g.header_h - cell_h) / 2.0;
+            if text_y >= list_top && text_y + cell_h <= list_bottom {
+                self.render_status_text(vertices, "\u{2318}T new tab \u{b7} \u{2318}D split", TEXT_COL * cell_w, text_y, w - cell_w, secondary, no_bg);
+            }
+        }
+
+        // Footer: version on the left, the way back to the tab bar on the right.
+        {
+            let text_y = g.height - g.footer_h + (g.footer_h - cell_h) / 2.0;
+            let version = format!("Kova v{}", env!("CARGO_PKG_VERSION"));
+            let version_fg = [self.tab_bar_fg[0], self.tab_bar_fg[1], self.tab_bar_fg[2], 0.5];
+            let button = "\u{ab} tab bar";
+            let button_x = w - cell_w - button.chars().count() as f32 * cell_w;
+            let button_fg = if data.hovered == Some(SidebarHit::ModeButton) { rgba(SIDEBAR_PRIMARY) } else { dim };
+            self.render_status_text(vertices, &version, cell_w, text_y, button_x - cell_w, version_fg, no_bg);
+            self.render_status_text(vertices, button, button_x, text_y, w - cell_w, button_fg, no_bg);
+        }
+
+        // Drag feedback: the drop line, then the lifted header on top.
+        if let Some(y) = data.insertion_y {
+            let thickness = 2.0 * g.scale;
+            Self::push_bg_quad(vertices, 0.0, y - thickness / 2.0, w, thickness, self.focus_border_color);
+        }
+        if let Some((idx, y)) = data.lifted {
+            if let (Some(row), Some(render)) = (g.rows.get(idx), data.rows.get(idx)) {
+                if let SidebarRowKind::Header { collapsed, .. } = row.kind {
+                    self.sidebar_header_row(vertices, g, render, y, collapsed, (list_top, list_bottom), true);
+                }
+            }
+        }
+    }
+
+    /// One group header at screen `y`. `clip` bounds the quads and drops any
+    /// text line that would stick out of the list.
+    fn sidebar_header_row(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        g: &crate::window::sidebar::SidebarGeometry,
+        row: &SidebarRowRender,
+        y: f32,
+        collapsed: bool,
+        clip: (f32, f32),
+        lifted: bool,
+    ) {
+        use crate::window::sidebar::{truncate_title, TEXT_COL};
+        let cell_w = g.cell_w;
+        let cell_h = g.cell_h;
+        let w = g.width;
+        let h = g.header_h;
+        let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
+
+        let bg: Option<[f32; 3]> = if lifted {
+            Some(SIDEBAR_PRESSED_BG)
+        } else {
+            match row.bg {
+                SidebarRowBg::Pressed => Some(SIDEBAR_PRESSED_BG),
+                _ if row.active_tab => Some(self.tab_bar_active_bg),
+                SidebarRowBg::Hover => Some(SIDEBAR_HOVER_BG),
+                SidebarRowBg::Plain => None,
+            }
+        };
+        if let Some(bg) = bg {
+            push_clipped_quad(vertices, 0.0, y, w, h, bg, clip);
+        }
+        if let Some(idx) = row.color {
+            let c = TAB_COLORS[idx % TAB_COLORS.len()];
+            let c = if row.active_tab { c } else { dim_inactive_tab(c) };
+            push_clipped_quad(vertices, 0.0, y, (cell_w * 0.25).round(), h, c, clip);
+        }
+
+        let text_y = y + (h - cell_h) / 2.0;
+        if text_y < clip.0 - 0.5 || text_y + cell_h > clip.1 + 0.5 {
+            return;
+        }
+        let dim = rgba(self.tab_bar_fg);
+        let chevron = if collapsed { "\u{25b8}" } else { "\u{25be}" };
+        self.render_status_text(vertices, chevron, cell_w, text_y, cell_w * 2.0, dim, no_bg);
+        let number_fg = if row.active_tab { rgba(SIDEBAR_ACTIVE_TAB) } else { dim };
+        self.render_status_text(vertices, &row.number.to_string(), cell_w * 2.0, text_y, cell_w * TEXT_COL, number_fg, no_bg);
+
+        let title_cells = g.title_cells(collapsed);
+        let title = if row.renaming { row.title.clone() } else { truncate_title(&row.title, title_cells) };
+        let title_fg = if lifted || row.active_tab { rgba(SIDEBAR_PRIMARY) } else { rgba(SIDEBAR_HEADER_TITLE) };
+        let title_max_x = cell_w * (TEXT_COL + title_cells as f32);
+        self.render_status_text(vertices, &title, cell_w * TEXT_COL, text_y, title_max_x, title_fg, no_bg);
+
+        // Folded: "[square] count", right aligned.
+        if collapsed {
+            let count = row.pane_count.to_string();
+            let count_x = w - cell_w - count.chars().count() as f32 * cell_w;
+            self.render_status_text(vertices, &count, count_x, text_y, w - cell_w, rgba(SIDEBAR_DIM), no_bg);
+            if let Some(color) = row.square.color() {
+                let s = (cell_w * 0.5).round();
+                let sq_x = count_x - cell_w * 2.0 + (cell_w - s) / 2.0;
+                let sq_y = text_y + (cell_h - s) / 2.0;
+                Self::push_bg_quad(vertices, sq_x, sq_y, s, s, color);
+            }
+        }
+    }
+
+    /// One pane row at screen `y`, two text lines.
+    fn sidebar_pane_row(
+        &mut self,
+        vertices: &mut Vec<Vertex>,
+        g: &crate::window::sidebar::SidebarGeometry,
+        row: &SidebarRowRender,
+        y: f32,
+        clip: (f32, f32),
+    ) {
+        use crate::window::sidebar::{truncate_title, TEXT_COL};
+        let cell_w = g.cell_w;
+        let cell_h = g.cell_h;
+        let w = g.width;
+        let h = g.row_h;
+        let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
+        let bar_w = (cell_w * 0.25).round();
+
+        let bg: Option<[f32; 3]> = match row.bg {
+            SidebarRowBg::Pressed => Some(SIDEBAR_PRESSED_BG),
+            _ if row.focused => Some(self.tab_bar_active_bg),
+            SidebarRowBg::Hover => Some(SIDEBAR_HOVER_BG),
+            SidebarRowBg::Plain => None,
+        };
+        if let Some(bg) = bg {
+            push_clipped_quad(vertices, bar_w, y, w - bar_w, h, bg, clip);
+        }
+        if let Some(idx) = row.color {
+            let c = TAB_COLORS[idx % TAB_COLORS.len()];
+            let c = if row.active_tab { c } else { dim_inactive_tab(c) };
+            push_clipped_quad(vertices, 0.0, y, bar_w, h, c, clip);
+        }
+
+        let line1_y = y + (cell_h * 0.25).round();
+        let line2_y = y + (cell_h * 1.25).round();
+        let line_visible = |ly: f32| ly >= clip.0 - 0.5 && ly + cell_h <= clip.1 + 0.5;
+        let title_cells = g.title_cells(false);
+        let title_max_x = cell_w * (TEXT_COL + title_cells as f32);
+
+        if line_visible(line1_y) {
+            // State square, centred in cell 2.
+            if let Some(color) = row.square.color() {
+                let s = (cell_w * 0.5).round();
+                let sq_x = cell_w * 2.5 - s / 2.0;
+                let sq_y = line1_y + (cell_h - s) / 2.0;
+                if row.square.hollow() {
+                    let t = g.scale.round().max(1.0);
+                    Self::push_bg_quad(vertices, sq_x, sq_y, s, t, color);
+                    Self::push_bg_quad(vertices, sq_x, sq_y + s - t, s, t, color);
+                    Self::push_bg_quad(vertices, sq_x, sq_y, t, s, color);
+                    Self::push_bg_quad(vertices, sq_x + s - t, sq_y, t, s, color);
+                } else {
+                    Self::push_bg_quad(vertices, sq_x, sq_y, s, s, color);
+                }
+            }
+            let title = if row.renaming { row.title.clone() } else { truncate_title(&row.title, title_cells) };
+            let title_fg = if row.focused {
+                rgba(SIDEBAR_PRIMARY)
+            } else if row.active_tab {
+                rgba(SIDEBAR_ACTIVE_TAB)
+            } else {
+                rgba(SIDEBAR_OTHER_TAB)
+            };
+            self.render_status_text(vertices, &title, cell_w * TEXT_COL, line1_y, title_max_x, title_fg, no_bg);
+        }
+        if line_visible(line2_y) && !row.secondary.is_empty() {
+            let fg = if row.bookmarked { rgba(self.paste_block_color) } else { rgba(SIDEBAR_SECONDARY) };
+            self.render_status_text(vertices, &row.secondary, cell_w * TEXT_COL, line2_y, title_max_x, fg, no_bg);
+        }
+    }
+
     /// Render a string at the given position with optional scale factor.
     /// Returns the x position after the last rendered character.
     /// Stops rendering if x exceeds max_x.
@@ -2416,6 +2735,7 @@ impl Renderer {
                     ("Break Pane", kc.break_pane.as_str(), "pane → new tab (needs 2+ panes)"),
                     ("Merge Tab", kc.merge_tab.as_str(), "fold this tab into another"),
                     ("Detach Tab", kc.detach_tab.as_str(), "tab → new window"),
+                    ("Toggle Sidebar", kc.toggle_sidebar.as_str(), "tabs and panes as a side list"),
                     ("Merge Window", kc.merge_window.as_str(), "fold window into another"),
                     ("Swap Pane", kc.swap_up.as_str(), "trade two panes"),
                     ("Reparent Pane", kc.reparent_up.as_str(), "move across the split tree"),

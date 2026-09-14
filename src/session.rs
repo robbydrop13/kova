@@ -20,6 +20,9 @@ pub struct WindowSession {
     /// Window frame: (x, y, width, height) in screen points.
     #[serde(default)]
     pub frame: Option<(f64, f64, f64, f64)>,
+    /// How the sidebar orders this window's tabs.
+    #[serde(default)]
+    pub sidebar_sort: crate::window::sidebar::SidebarSort,
 }
 
 /// Legacy single-window session format (v1) — kept for backward compat loading.
@@ -63,6 +66,9 @@ pub struct SavedTab {
     /// this field existed: they are then taken as already matching.
     #[serde(default)]
     pub geometry_scale: Option<f32>,
+    /// The tab's group is folded in the sidebar.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
 }
 
 /// Flat column format (v4): a column is a list of panes with row weights.
@@ -215,6 +221,7 @@ pub fn snapshot_tab(tab: &Tab) -> SavedTab {
         virtual_width_override: if tab.virtual_width_override > 0.0 { Some(tab.virtual_width_override) } else { None },
         scroll_offset_x: if tab.scroll_offset_x != 0.0 { Some(tab.scroll_offset_x) } else { None },
         geometry_scale: if tab.geometry_scale > 0.0 { Some(tab.geometry_scale) } else { None },
+        collapsed: tab.collapsed,
     }
 }
 
@@ -370,6 +377,7 @@ pub struct RestoredWindow {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub frame: Option<(f64, f64, f64, f64)>,
+    pub sidebar_sort: crate::window::sidebar::SidebarSort,
     /// Tabs not yet spawned (deferred for progressive loading).
     pub deferred_tabs: Vec<(usize, SavedTab)>,
 }
@@ -452,6 +460,7 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
                     tabs: v1.tabs,
                     active_tab: v1.active_tab,
                     frame: None,
+                    sidebar_sort: Default::default(),
                 }],
             }
         } else {
@@ -761,6 +770,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         has_running: false,
         fg_running_cache: false,
         minimized_stack: Vec::new(),
+        collapsed: saved.collapsed,
         scroll_offset_x: saved.scroll_offset_x.unwrap_or(0.0),
         virtual_width_override: saved.virtual_width_override.unwrap_or(0.0),
         // Pixels of the display this tab was saved on; `normalize_tab_geometry`
@@ -813,6 +823,7 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
                     // Copy visual metadata so the tab bar looks right
                     placeholder.custom_title = saved_tab.custom_title.clone();
                     placeholder.color = saved_tab.color;
+                    placeholder.collapsed = saved_tab.collapsed;
                     tabs.push(placeholder);
                     deferred.push((i, saved_tab.clone()));
                 }
@@ -835,6 +846,7 @@ pub fn restore_session(session: Session, config: &Config) -> Option<Vec<Restored
                 tabs,
                 active_tab,
                 frame: ws.frame,
+                sidebar_sort: ws.sidebar_sort,
                 deferred_tabs,
             });
         }

@@ -194,7 +194,7 @@ impl KovaView {
                     // are already scrolling (virtual width > screen), grow the
                     // virtual space by the new column's width instead of
                     // shrinking the existing panes.
-                    let screen = self.drawable_viewport().width;
+                    let screen = self.content_viewport().width;
                     let min_w = self.min_split_width_px();
                     let old_virtual = tab.virtual_width(screen, min_w);
                     tab.insert_column_after_focused(new_pane);
@@ -214,7 +214,7 @@ impl KovaView {
             }
             tab.focused_pane = new_id;
             // Auto-scroll to reveal the new pane
-            self.scroll_to_reveal_pane(tab, new_id, self.drawable_viewport().width);
+            self.scroll_to_reveal_pane(tab, new_id, self.content_viewport().width);
         }
         drop(tabs);
 
@@ -273,7 +273,7 @@ impl KovaView {
         let mut tabs = self.ivars().tabs.borrow_mut();
         let idx = self.ivars().active_tab.get();
         if let Some(tab) = tabs.get_mut(idx) {
-            let screen = self.drawable_viewport().width;
+            let screen = self.content_viewport().width;
             let min_w = self.min_split_width_px();
             let old_virtual = tab.virtual_width(screen, min_w);
             // Width of the pane we split from, to size the new column like a sibling.
@@ -377,7 +377,7 @@ impl KovaView {
         let new_columns = tabs[idx].num_visible_columns();
         tabs[idx].scale_virtual_width(old_columns, new_columns);
         // Clamp scroll and auto-scroll to reveal focused pane
-        let full = self.drawable_viewport();
+        let full = self.content_viewport();
         let min_w = self.min_split_width_px();
         tabs[idx].clamp_scroll(full.width, min_w);
         let tab = &mut tabs[idx];
@@ -682,7 +682,7 @@ impl KovaView {
                 tabs[idx].scale_virtual_width(old_columns, new_columns);
                 tabs[idx].minimized_stack.retain(|&pid| pid != focused_id);
 
-                let full = self.drawable_viewport();
+                let full = self.content_viewport();
                 let min_w = self.min_split_width_px();
                 tabs[idx].clamp_scroll(full.width, min_w);
                 let tab = &mut tabs[idx];
@@ -702,6 +702,7 @@ impl KovaView {
                     has_running: false,
                     fg_running_cache: false,
                     minimized_stack: Vec::new(),
+                    collapsed: false,
                     scroll_offset_x: 0.0,
                     virtual_width_override: 0.0,
                     geometry_scale: self.backing_scale(),

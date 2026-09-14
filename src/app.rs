@@ -59,10 +59,10 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = MainThreadMarker::from(self);
-            setup_menu(mtm);
-
             let config = self.ivars().config.get().expect("config must be set before applicationDidFinishLaunching");
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
+            window::sidebar::init(&config.layout);
+            setup_menu(mtm, config);
 
             // Restore session (all windows) or create a single fresh window
             let restored = crate::session::load(self.ivars().session_backup)
@@ -74,6 +74,9 @@ define_class!(
                     let mut win_vec = self.ivars().windows.borrow_mut();
                     for (i, rw) in windows.into_iter().enumerate() {
                         let win = window::create_window(mtm, config, rw.tabs, rw.active_tab, rw.deferred_tabs);
+                        if let Some(view) = kova_view(&win) {
+                            view.set_sidebar_sort(rw.sidebar_sort);
+                        }
                         // Restore saved window position if available
                         if let Some((x, y, w, h)) = rw.frame {
                             let frame = objc2_core_foundation::CGRect {
@@ -1402,7 +1405,11 @@ fn handle_ipc_merge_window(
     IpcResponse::Ok { data: None }
 }
 
-fn setup_menu(mtm: MainThreadMarker) {
+/// Tags of the View menu's layout items (`setLayoutMode:` reads them).
+pub const LAYOUT_MENU_TAG_TABS: isize = 0;
+pub const LAYOUT_MENU_TAG_SIDEBAR: isize = 1;
+
+fn setup_menu(mtm: MainThreadMarker, config: &Config) {
     let menu_bar = NSMenu::new(mtm);
     let app_menu_item = NSMenuItem::new(mtm);
     let app_menu = NSMenu::new(mtm);
@@ -1434,6 +1441,57 @@ fn setup_menu(mtm: MainThreadMarker) {
     app_menu_item.setSubmenu(Some(&app_menu));
     menu_bar.addItem(&app_menu_item);
 
+    // View menu: the two layouts as radio items. No target: the action walks
+    // the responder chain to the key window's KovaView, which also keeps the
+    // check mark current in `validateMenuItem:`. The shortcut is displayed on
+    // "Show Sidebar" but handled in `performKeyEquivalent` like every other
+    // binding (it toggles); the menu only ever sees it if the view declines.
+    let view_menu_item = NSMenuItem::new(mtm);
+    let view_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("View"));
+    let layout_item = |title: &str, tag: isize, key: Option<&str>| {
+        let (key_eq, mask) = key
+            .map(menu_key_equivalent)
+            .unwrap_or((String::new(), objc2_app_kit::NSEventModifierFlags::empty()));
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &NSString::from_str(title),
+                Some(objc2::sel!(setLayoutMode:)),
+                &NSString::from_str(&key_eq),
+            )
+        };
+        item.setTag(tag);
+        if !key_eq.is_empty() {
+            item.setKeyEquivalentModifierMask(mask);
+        }
+        item
+    };
+    view_menu.addItem(&layout_item("Show Tab Bar", LAYOUT_MENU_TAG_TABS, None));
+    view_menu.addItem(&layout_item("Show Sidebar", LAYOUT_MENU_TAG_SIDEBAR, Some(&config.keys.toggle_sidebar)));
+    view_menu_item.setSubmenu(Some(&view_menu));
+    menu_bar.addItem(&view_menu_item);
+
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&menu_bar));
+}
+
+/// The key equivalent and modifier mask an NSMenuItem needs to display a
+/// binding such as "cmd+option+s". Empty for a binding on a non-character
+/// key, which the menu cannot show.
+fn menu_key_equivalent(binding: &str) -> (String, objc2_app_kit::NSEventModifierFlags) {
+    use crate::keybindings::{parse_key_combo, Key};
+    use objc2_app_kit::NSEventModifierFlags;
+    let combo = parse_key_combo(binding);
+    let Key::Char(c) = combo.key else {
+        return (String::new(), NSEventModifierFlags::empty());
+    };
+    if c == '\0' {
+        return (String::new(), NSEventModifierFlags::empty());
+    }
+    let mut mask = NSEventModifierFlags::empty();
+    if combo.cmd { mask |= NSEventModifierFlags::Command; }
+    if combo.ctrl { mask |= NSEventModifierFlags::Control; }
+    if combo.option { mask |= NSEventModifierFlags::Option; }
+    if combo.shift { mask |= NSEventModifierFlags::Shift; }
+    (c.to_string(), mask)
 }
