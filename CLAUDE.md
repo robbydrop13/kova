@@ -76,6 +76,10 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 - **Un deuxième Kova démarre sans tabs, et ce n'est ni la conf ni le fichier de session** — la première instance verrouille `~/.config/kova/session.json` (`owns_session`, `src/session.rs`), les suivantes ouvrent une fenêtre vierge et ne sauvent rien. Le log le dit en clair : « Another Kova owns … : this instance starts fresh and will not save its session ». Symptôme trompeur : on relance `kova &` alors qu'un Kova tourne encore, on ne retrouve pas ses tabs, et le diagnostic part vers la lecture de la conf. Lire `~/Library/Logs/Kova/kova.log` avant de chercher ailleurs.
 
+- **Des caractères bizarres au collage (`€` → `‚Ç¨`, `é` → `√©`) ne viennent pas du pasteboard** — c'est de l'UTF-8 relu en Mac Roman, et le coupable est `pbcopy` lancé sans locale : une app GUI n'hérite d'aucun `LANG` de launchd, donc sans rien faire tous les shells de Kova tournent en locale C. Le diagnostic partait à tort vers `copy_to_pasteboard` (`src/window/mod.rs`). Kova pose maintenant `LANG=<locale système>.UTF-8` à chaque shell (`shell_lang`, `src/terminal/pty.rs`), comme Terminal.app. Vérifier `echo $LANG` dans un pane avant de chercher ailleurs.
+
+- **`KERN_PROCARGS2` ne tronque pas, il rend la fin** — un buffer plus petit que la zone d'arguments reçoit ses derniers octets, pas les premiers : un process dont l'environnement dépasse la taille du buffer se fait nommer d'après un fragment de variable (`cargo test` s'appelait `CARGO_PKG_AUTHORS=`). `proc_args` (`src/terminal/pty.rs`) lit donc toute la zone dans un buffer `KERN_ARGMAX` alloué une fois — ne pas revenir à un petit buffer « parce qu'on ne veut que argv[0] ».
+
 ## Tests
 
 - **Lancer les tests automatisés après chaque modification de code.** Dès qu'une modif touche le code Rust, exécuter `cargo test` (le target est global, pas besoin de `build.sh` pour ça) et vérifier que tout est vert avant de considérer la modif terminée. Un test rouge fait partie du diff : le corriger, ne pas le laisser de côté.
