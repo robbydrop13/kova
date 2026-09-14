@@ -377,6 +377,7 @@ open-recent-project  open-search  open-pane-switcher   (open an overlay)
 open-unread-switcher               (the pane switcher, listing only panes with a bell, an unread completion or a question)
 copy  copy-raw  paste  toggle-filter
 toggle-help  mem-report
+toggle-sidebar                     (switch the layout between the tab bar and the sidebar, see sidebar-spec.md)
 ```
 
 Note: a few actions open an **interactive overlay** that then expects keyboard input — `merge-tab`, `merge-window`, `detach-tab` (when several windows exist), `rename-tab`, `rename-pane`, `open-recent-project`, `open-search`, `open-pane-switcher`, `open-unread-switcher`. For headless automation, prefer the deterministic typed commands where one exists (e.g. `merge-window` with explicit indices, `rename-pane` with a title).
