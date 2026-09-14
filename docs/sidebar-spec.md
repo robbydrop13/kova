@@ -1,170 +1,218 @@
-# Sidebar layout mode
+# Sidebar layout mode (v2)
 
 A second way to show a window's tabs: instead of the strip across the top, a
-sticky column down the left edge listing every tab as a collapsible group and
-every pane as a row with its state at a glance. Mirrors the KovaLink Sessions
-list. Everything below is expressed in terminal cell units (`cw` = cell width,
-`ch` = cell height, from `renderer.cell_size()`); every row height is
-`(k * ch).round()` so glyphs sit on the atlas grid. Only two drawing
-primitives are used: filled quads and monospace glyph runs.
+sticky column down the left edge listing every tab as a coloured band and
+every pane as a tile with its state at a glance, the way the KovaLink home
+screen does it. v2 replaces the dim text list of v1 with tiles, chips, a
+summary line and a Next pill, and adds the phone's actions (stop, close,
+rename, bookmark, minimize, start Claude, add a pane) one click away.
 
-Code: `src/window/sidebar.rs` (pure: setting, geometry, hit test, sort, text
-rules, unit tests), `src/window/sidebar_ui.rs` (state, mouse, per-frame data),
-`Renderer::build_sidebar_vertices` (`src/renderer/mod.rs`).
+Everything below is expressed in terminal cell units (`cw` = cell width, `ch`
+= cell height, from `renderer.cell_size()`); every y and height is
+`(k * ch).round()` so glyphs sit on the atlas grid. Only two drawing
+primitives are used: filled quads (with alpha) and monospace glyph runs. No
+radius, no images, no bold: weight comes from fills, bars and chips.
+
+Code: `src/window/sidebar.rs` (pure: setting, tokens, geometry, hit test,
+tile states, chips, buttons, pane drag arithmetic, text rules, unit tests),
+`src/window/sidebar_ui.rs` (state, mouse, actions, context menus, per-frame
+data), `Renderer::build_sidebar_vertices` (`src/renderer/mod.rs`),
+`src/prompt_preview.rs` (the permission-prompt parser and the turn-end
+summary), `Pane::probe_prompt` (`src/pane.rs`).
 
 ## 1. Principles
 
-1. The sidebar is a terminal surface, not a Finder clone: the terminal font at
-   1x, the tab bar palette, quads. Its one signature is the state square, a
-   filled `0.5 cw` square whose colour is the pane's state, the same vocabulary
-   as the tab bar dots and the Cmd+J banner.
-2. Structure encodes truth. Indentation = "this pane lives in that tab". The
-   colour bar on the left of a group = the tab colour the user chose. Numbers on
-   headers = the Cmd+N shortcut, and they never change with the sort mode.
-3. One click, one meaning. Header click switches tab; chevron click folds; row
-   click focuses the pane. No hidden modifier behaviours.
-4. Nothing animates; the hover highlight is the only transient effect.
+1. Readable from across the room. The state must be legible at 2 m (a solid
+   colour bar and an inverted chip per tile, a solid colour band per tab), the
+   title at 1 m.
+2. Same structure and vocabulary as KovaLink: tab groups, tiles, `waiting` /
+   `working` / `starting` / `done` / `idle` / `shell` chips, the awaiting tile
+   with its question, the Next pill, the sort toggle, the collapsed summary,
+   the `+` on a group. Same colour tokens (`sidebar::tokens`).
+3. Same actions as the phone's swipes and sheets, one click away: Open, Stop,
+   Close, Rename, Bookmark, Minimize / Restore, Start Claude, Add a pane.
+4. Everything v1 got right stays: sticky, resizable, wheel scroll, collapse
+   persisted per tab, tab drag reorder, narrow fallback, View menu, ⌥⌘S, pure
+   `SidebarGeometry` with unit tests.
 5. Zero cost when off: `layout.mode = "tabs"` keeps the tab bar byte for byte.
+   The darker ground is the sidebar's only; the tab bar and status bar are
+   untouched.
 
 ## 2. Layout
 
-### 2.1 Window in sidebar mode
+### 2.1 Window in sidebar mode (W = 32 cells)
 
 ```
-+---------------------------+-------------------------------------------------+
-| ooo             (drag)    | column 0              | column 1        | col 2 |  top: 2 ch
-+---------------------------+                       |                 |       |
-| 1 waiting · 2 working  kova|                       |                 |       |  summary: 1.5 ch
-+---------------------------+                       |                 |       |
-|▾ 1  link                  |                       |                 |       |  header 1.5 ch
-|   ■  fix-voice-input      |                       |                 |       |  pane row 2.5 ch
-|      claude · ~/link      |                       |                 |       |
-|   □  zsh                  |                       |                 |       |
-|      ~/link/app           |                       |                 |       |
-|▸ 2  kova            ■ 3   |                       |                 |       |  collapsed
-|▾ 3  perso                 |                       |                 |       |
-|   ■  daemon rewrite       |  <- list scrolls      |                 |       |
-|      codex · ~/perso      |     vertically        |                 |       |
-|                           |                       |                 |       |
-| Kova v1.9.0     « tab bar |                       |                 |       |  footer 1.5 ch
-+---------------------------+-------------------------------------------------+
-| global status bar (full window width, unchanged)                             |  1 ch
-+-----------------------------------------------------------------------------+
++---------------------------------+-----------------------------------------+
+| ooo                             | column 0              | column 1        |  2 ch
+| 2 waiting · 3 working · 4 idle ⇅|                       |                 |  1.5 ch
+|  ▶ Next unread          [3] ⌘J  |  <- accent fill, white text            |  2 ch
+|▾ 1  Claap                     + |  <- solid tab colour band (active tab) |  2 ch
+| ▌fix-voice-input            4m  |                       |                 |
+| ▌Should I overwrite hello.txt   |  <- awaiting tile, 5 ch, amber ground  |
+| ▌with the new content?          |                       |                 |
+| ▌Open ⏎              ■ Stop     |                       |                 |
+| ▌daemon rewrite      [working]  |  <- working tile, 3 ch                 |
+| ▌claude · ~/link/daemon         |                       |                 |
+| ▌zsh                  [shell]   |  <- bare shell tile, 3 ch              |
+| ▌~/link/app       ▶ Start Claude|                       |                 |
+|▸ 2  Perso          [1] 4 panes +|  <- collapsed, tinted band, chips      |  2 ch
+|▾ 3  Marketing                 + |                       |                 |
+| ▌claude              [● done]   |  <- unread tile, 4 ch                  |
+| ▌claude · ~/Claap/Marketing     |                       |                 |
+| ▌Pushed the landing page copy   |  <- turn-end summary, 1 line           |
+| Kova v1.12.0          « tab bar |                       |                 |  1.5 ch
++---------------------------------+-----------------------------------------+
+| global status bar                                                         |  1 ch
++---------------------------------------------------------------------------+
 ```
 
-`ooo` = the macOS traffic lights; they live inside the sidebar's top area. The
-1 px (scaled) column at the sidebar's right edge is the separator and the
-resize handle. Panes start at `x = sidebar_w + sep_w`, `y = 0`: there is no
-tab bar over the content area (`tab_bar_height()` is 0). The "content
-viewport" (`KovaView::content_viewport`) is everything right of the sidebar;
-a tab's virtual width and horizontal scroll are measured against its width,
-not the window's.
-
-The sidebar lists the tabs of its own window only, like the tab bar.
+`ooo` = the macOS traffic lights; they live inside the sidebar's top area.
+`▌` = the tile's state bar. `[...]` = a filled chip with inverted text
+(bracket and box characters are notation, chips are quads). The `1 px`
+(scaled) column at the sidebar's right edge is the separator and the resize
+handle. Panes start at `x = sidebar_w + sep_w`, `y = 0`: there is no tab bar
+over the content area. The sidebar lists the tabs of its own window only.
 
 ### 2.2 Width
 
 Resizable by dragging the separator, snapped to whole cells.
 
-- Default `28` cells, clamped to `[18, 48]` (`config::SIDEBAR_WIDTH_RANGE`).
-  Stored in cells so it keeps the same apparent size across font sizes and
-  displays.
-- Separator: `round(1 px * scale)`, colour `[0.20, 0.20, 0.23]`. Hit tolerance
+- Default `32` cells, clamped to `[22, 56]` (`config::SIDEBAR_WIDTH_RANGE`).
+- Separator: `round(1 px * scale)`, `border.subtle`. Hit tolerance
   `4 pt * scale` either side, cursor `resizeLeftRight`.
-- Drop rule: `cells = (px / cw).round().clamp(18, 48)` on every drag event;
+- Drop rule: `cells = (px / cw).round().clamp(22, 56)` on every drag event;
   panes are resized live; persisted on mouse up.
 
 ### 2.3 Vertical regions (top to bottom)
 
-| Region      | Height   | Content                                                  |
-|-------------|----------|----------------------------------------------------------|
-| Top area    | `2 ch`   | Traffic lights, window drag region, double click = zoom  |
-| Summary row | `1.5 ch` | Left: "N waiting · M working"; right: sort toggle        |
-| List        | rest     | Groups and rows, vertical scroll                         |
-| Footer      | `1.5 ch` | Left: "Kova vX.Y.Z" dim; right: "« tab bar" button       |
+| Region      | Height   | Content                                                       |
+|-------------|----------|---------------------------------------------------------------|
+| Top area    | `2 ch`   | Traffic lights, window drag region, double click = zoom       |
+| Summary     | `1.5 ch` | Left: `2 waiting · 3 working · 4 idle`; right: `⇅ kova` / `⇅ activity` |
+| Next pill   | `2 ch`   | A `1.5 ch` button with `0.25 ch` margins, `x = 1 cw .. W - 1 cw` |
+| List        | rest     | Groups: header `2 ch`, tiles, gaps; vertical scroll           |
+| Footer      | `1.5 ch` | Left: `Kova vX.Y.Z` dim; right: `« tab bar` button            |
 
-The global status bar (1 ch) stays full window width below both. Text in the
-summary row and footer is vertically centred. The summary row is always shown
-(it also carries the sort toggle).
+`list_y = 5.5 ch`, `list_h = sidebar_h - 5.5 ch - 1.5 ch`. The global status
+bar (1 ch) stays full window width below both.
 
-### 2.4 Group header (one per tab), `1.5 ch`
-
-```
-x (in cw):  0    1    2    3    4 ..................... W-5   W-1
-            |bar| ▾  | 1  |    | title (truncated)       |■ 3  |
-```
-
-- Colour bar `round(0.25 cw)` wide at `x = 0` on the header and every row of
-  the group: `TAB_COLORS[color]`, `dim_inactive_tab()` on a non-active tab.
-  Absent when the tab has no colour.
-- Chevron at cell 1: `▾` expanded, `▸` collapsed, `tab_bar.fg_color`.
-- Tab number at cell 2 (two digits spill into cell 3): `tab_bar.fg_color`,
-  `[0.80, 0.80, 0.85]` on the active tab.
-- Title from cell 4 to `W-1` (expanded) or `W-5` (collapsed). Active tab
-  `[1, 1, 1]`, others `[0.72, 0.72, 0.78]`.
-- Collapsed summary, right aligned ending at cell `W-1`: `[square] count`.
-  Square amber if any pane is awaiting, else blue if any is working, else
-  omitted; count = number of panes, `[0.45, 0.45, 0.50]`.
-- Active tab header background: `tab_bar.active_bg` across the full width.
-  Hover `[0.16, 0.16, 0.19]`, pressed `[0.19, 0.19, 0.22]`.
-
-### 2.5 Pane row, `2.5 ch`, two text lines
+### 2.4 Group header (one per tab), `2 ch`, full width
 
 ```
-x (in cw):  0    1    2    3    4 ....................................... W-1
-line 1:     |bar|    | sq |    | title (truncated with …)                   |
-line 2:     |bar|    |    |    | secondary (dim)                            |
+x (cw):  0   1   2   3   4   5 ................... W-12  W-4  W-3  W-1
+         |   | ▾ |   | 1 |   | title (truncated)     |chips|  + |   |
+text_y = y + 0.5 ch
 ```
 
-- `line1_y = row_y + 0.25 ch`, `line2_y = row_y + 1.25 ch`.
-- State square: side `s = round(0.5 cw)`, centred in cell 2 on line 1. Hollow
-  variant = four `1 px * scale` quads on the same box.
-- Title from cell 4 to `W-1`: `pane.display_title("shell")` (agent name >
-  custom title > OSC title > process > cwd basename), activity marker
-  stripped. Focused pane of the active tab `[1, 1, 1]`; other panes of the
-  active tab `[0.80, 0.80, 0.85]`; panes of other tabs `[0.60, 0.60, 0.66]`. A
-  minimized pane's title is prefixed by `⊟ `.
-- Secondary line, `[0.45, 0.45, 0.50]`: `"{agent} · {cwd_short}"` when the pane
-  runs Claude or Codex, else `"{fg_process} · {cwd_short}"`, else `cwd_short`.
-  `cwd_short` = the OSC 7 cwd with `$HOME` folded to `~`, tail-truncated. A
-  bookmarked pane paints its secondary line in `colors.paste_block` blue.
-- Row background: focused pane of the active tab `tab_bar.active_bg`, hover
-  `[0.16, 0.16, 0.19]`, pressed `[0.19, 0.19, 0.22]`, spanning `0.25 cw .. W`.
+- Band fill: active tab `TAB_COLORS[c]`; other tabs `band_tint(dim_inactive_tab(c))`
+  = `ground + (dim(c) - ground) * 0.22` (KovaLink `${tint}22`). No colour:
+  active `bg.overlay`, others `bg.raised`.
+- Text on an active band: `on_band(c)` = `text.inverse` when the band's
+  luminance is above 0.55 (yellow, green), white otherwise; without a colour,
+  `text.primary`. Other tabs: chevron, number, title in `dim_inactive_tab(c)`
+  (no colour: `text.secondary`).
+- Number = the Cmd+N slot, never the sort rank. Title from cell 5, ending
+  `W - 4` cells in when expanded; when collapsed the chips take what they
+  need first (`CollapsedSummary::cells`) and the title gets the rest.
+- `+` at cell `W - 3`, hit zone `W - 4 .. W - 1`: the band's text colour at
+  70 %, full on hover with a white 12 % box behind it. Action: add a pane.
+- Collapsed summary, right-aligned ending at cell `W - 4`: chip `[n]` amber
+  when n panes are awaiting, chip `[n]` working blue when n are working,
+  then `k panes` (`1 pane`) in the text colour at 75 %. Expanded: nothing.
+- Hover: white 6 % overlay on the band. Pressed: 12 %.
+- Spacing: `0.5 ch` above every tile (after the header and between tiles),
+  `1 ch` between the last tile and the next header, nothing after a
+  collapsed header.
 
-### 2.6 State square (priority order, first match wins)
+### 2.5 Pane tile
 
-| Condition (from `Pane`)     | Square         | RGB                  |
-|-----------------------------|----------------|----------------------|
-| `is_awaiting()`             | filled, amber  | `[1.00, 0.69, 0.13]` |
-| bell (unread)               | filled, orange | `[1.00, 0.45, 0.10]` |
-| `unread_completion()`       | filled, green  | `[0.20, 0.80, 0.30]` |
-| `is_working()`              | filled, blue   | `[0.22, 0.74, 0.97]` |
-| `is_idle_agent()`           | hollow, grey   | `[0.50, 0.50, 0.55]` |
-| shell, no agent             | none           |                      |
+```
+tile_x = 1 cw     tile_w = (W - 2) cw     bar_w = round(0.5 cw)
+content_x = tile_x + 1.5 cw     content_right = tile_x + tile_w - 1 cw
+line k y = tile_y + round((0.5 + k) ch)     tile_h = (lines + 1) ch
+```
 
-Amber and blue are the KovaLink `status.awaiting` / `status.working` tokens.
-Bell and completion never paint on the focused pane of the active tab.
+| Kind                 | lines | Line 0                         | Line 1                                    | Lines 2, 3                                   |
+|----------------------|-------|--------------------------------|-------------------------------------------|----------------------------------------------|
+| agent (idle/working) | 2     | title + chip                   | `claude · ~/cwd` secondary                |                                              |
+| unread (done / bell) | 3     | title + `[● done]` accent chip | `claude · ~/cwd`                          | turn-end summary, 1 line, secondary (2 lines when there is none) |
+| bare shell           | 2     | title + `[shell]` neutral chip | `~/cwd` + `▶ Start Claude` accent, right  |                                              |
+| awaiting             | 4     | title + age right (`4m`)       | question line 1, primary                  | question line 2 (or the detail, secondary) / `Open ⏎` accent + `■ Stop` interrupt red |
+| minimized            | as above | `⊟ title` + chip            |                                           | tile fill = ground, border only              |
+
+- Fill `bg.raised`; border `1 px * scale` `border.subtle` (four quads inside
+  the tile bounds). The state bar covers the left border. Awaiting: fill
+  `status.awaitingBg`, border `status.awaiting` at alpha 0.35 (0.8 on hover).
+- State bar colour = the chip colour; neutral states use `border.strong` so
+  every tile has a bar.
+- Chip: quad `(chars + 2) cw` wide, `1 ch` tall, right-aligned at
+  `content_right`, text inset `1 cw`, fill = state colour, text
+  `text.inverse`; neutral chip fill `bg.pressed`, text `text.secondary`. Chip
+  copy: `working`, `starting`, `● done`, `● bell`, `idle`, `shell`. The
+  awaiting tile shows its age instead of a chip.
+- Title: `pane.display_title("shell")`, `text.primary` on every tab (the band
+  already says which tab is active), truncated to the room left of the chip,
+  the age or the glyph boxes.
+- Line 1: `secondary_line(agent, process, cwd_short)` as v1, `text.secondary`;
+  a bookmarked pane paints it `accent.primary`.
+- Focused pane of the active tab: ring `2 px * scale` `border.focus` over
+  the border, fill `bg.overlay`.
+- Hover: fill `bg.overlay` and the quick actions replace the chip on line 0
+  (3.1). Pressed: `bg.pressed`.
+- Awaiting age: `now - since` as `Ns` / `Nm` / `Nh` in `text.tertiary`;
+  older than 10 min: `status.error` (KovaLink `aging`). Actions line:
+  `Open ⏎` in `accent.primary` at `content_x`, `■ Stop` in
+  `action.interrupt.text` right-aligned; both `1 ch` tall click targets,
+  `text.primary` on hover.
+- Question preview: word-wrapped into at most 2 lines of
+  `content_right - content_x` cells (`wrap_text`), the last line ending with
+  `…` when cut. Line 2 shows the detail (the command, the file name; the
+  header when there is none) only if the question took one line. Turn-end
+  summary on unread tiles: the first non-empty line of Claude's last answer,
+  markdown marks stripped, tail-truncated with `…` (`summary_line`).
+
+### 2.6 Summary, sort, Next pill
+
+- Summary runs: `N waiting` in `status.awaiting`, `N working` in
+  `status.working` (starting panes count as working), `N idle` in
+  `text.tertiary`, `·` in tertiary. Zero counts are omitted; all zero:
+  `nothing running`. Counts cover this window (like the list); the Next pill
+  counts cover every window (like Cmd+J).
+- Sort toggle: `⇅ kova` in tertiary, `⇅ activity` in `accent.primary`,
+  `text.primary` on hover. Hit zone: the last 12 cells of the summary row.
+- Next pill states (`sidebar::NextPill`, from KovaLink `NextPill.tsx`):
+
+| State     | Condition                             | Fill                                 | Text                              | Badge                              |
+|-----------|---------------------------------------|--------------------------------------|-----------------------------------|------------------------------------|
+| next      | Cmd+J's unread tier is not empty      | `accent.primary`                     | white `▶ Next unread`             | white chip, accent digits          |
+| idle      | unread empty, idle tier not           | `bg.overlay` + 1 px `border.strong`  | secondary `▶ Next idle`           | `bg.pressed` chip, secondary digits|
+| caught up | both empty, unread just dropped to 0  | `bg.overlay`                         | `status.success` `✓ All caught up` | none; 1.6 s, then `nothing`       |
+| nothing   | both empty                            | `bg.overlay`                         | tertiary `✓ Nothing to read`      | none, not clickable                |
+
+  `⌘J` right-aligned inside the pill in the text colour at alpha 0.6, the
+  badge to its left. Hover: `accent.primaryPressed` (next) / `bg.pressed`
+  (idle). Pressed: same plus text alpha 0.85. The tiers come from
+  `KovaView::collect_attention` (`src/window/attention.rs`), the same
+  collection `do_focus_next_attention` jumps with, rebuilt once per frame.
 
 ### 2.7 List geometry
 
-- `gap = round(0.5 ch)` after the last row of an expanded group; none after a
-  collapsed header.
-- `list_y = 3.5 ch`, `list_h = sidebar_h - 3.5 ch - 1.5 ch` where
-  `sidebar_h` = window height minus the global bar.
-- Content height = headers + rows + gaps (+ one header height for the hint).
-  `scroll_y` clamped to `[0, max(0, content_h - list_h)]`. Rows are clipped to
-  the list region by geometry (quads cut, a text line that would overflow is
-  skipped), not by a scissor.
+- Content height = headers + tiles + gaps (+ one header height for the hint).
+  `scroll_y` clamped to `[0, max(0, content_h - list_h)]`. Rows are clipped
+  to the list region by geometry (quads cut, a text line that would overflow
+  is skipped), not by a scissor.
 - Draw order: panes first (clipped by their own viewports), then the sidebar
-  with an opaque ground, then the global bar. Painting the sidebar last is what
-  makes it sticky: a column scrolled under it is simply covered. Hit tests
-  reject `px < sidebar_w + sep_w` before consulting `tab.hit_test`.
+  with an opaque ground, then the global bar. Painting the sidebar last is
+  what makes it sticky. Hit tests reject `px < sidebar_w + sep_w` before
+  consulting `tab.hit_test`.
 
 ### 2.8 Truncation (char based, never byte slices)
 
 - Titles: as is when `chars <= n`, else the first `n - 1` chars and `…`.
 - Paths: from the left, `…` and the last chars, advanced to the next `/` so
   the line starts on a segment boundary (`…/personal-tools/kova`).
+- Questions: `wrap_text`, on spaces, a word longer than a line split.
 - Rename in progress: the edit buffer with its last `n` chars visible and a
   `▏` cursor glyph (same rule as the tab bar).
 
@@ -172,83 +220,188 @@ Bell and completion never paint on the focused pane of the active tab.
 
 ### 3.1 Mouse
 
-| Target                  | Click                                                  | Double click | Right click     |
-|-------------------------|--------------------------------------------------------|--------------|-----------------|
-| Header, cells 0..2      | Toggle collapse (no tab switch)                         |              | tab colour menu |
-| Header, cells 2..W      | switch tab; on the active tab: toggle collapse          | rename tab   | tab colour menu |
-| Pane row                | switch to its tab, focus it, reveal it, restore if minimized | rename pane |            |
-| Sort toggle             | kova ↔ activity                                         |              |                 |
-| "« tab bar" footer      | switch `layout.mode` to tabs                            |              |                 |
-| Top area                | window drag                                             | zoom         |                 |
-| Separator ±4 pt         | drag resizes the sidebar                                |              |                 |
+| Target                            | Click                                                        | Double click       | Right click  |
+|-----------------------------------|--------------------------------------------------------------|--------------------|--------------|
+| Header cells 0..3 (chevron)       | toggle collapse, no tab switch                               | same               | header menu  |
+| Header cells 3..W-4               | `do_switch_tab(idx)`; on the active tab: toggle collapse     | `start_rename_tab` | header menu  |
+| Header `+` (W-4..W-1)             | add a pane (3.4)                                             |                    | header menu  |
+| Tile body                         | `focus_pane_in_window(id)` (switches tab, restores, reveals) | rename pane        | tile menu    |
+| Tile hover glyphs (line 0)        | the action, without focusing the pane                        |                    | tile menu    |
+| Awaiting `Open ⏎`                 | same as tile body                                            |                    | tile menu    |
+| Awaiting `■ Stop`                 | interrupt (3.4)                                              |                    | tile menu    |
+| Shell `▶ Start Claude`            | start Claude (3.4)                                           |                    | tile menu    |
+| Next pill                         | `do_focus_next_attention()` (not when `nothing`)             |                    |              |
+| Sort toggle                       | kova ↔ activity                                              |                    |              |
+| `« tab bar` footer                | switch `layout.mode` to tabs                                 |                    |              |
+| Top area                          | window drag                                                  | zoom               |              |
+| Separator ±4 pt                   | drag resizes the sidebar                                     |                    |              |
 
-Pressed state paints on mouse down, the action fires on mouse up inside the
-same target; a drag that leaves the target cancels the click. Hover is
-tracked in `mouseMoved`; only the row under the cursor repaints differently.
+Hover glyph buttons, right-aligned on line 0 in place of the chip, each a
+`3 cw` hit box with a `bg.overlay` quad (`bg.pressed` while pressed), the
+glyph in `text.secondary`, `text.primary` on hover, `action.interrupt.text`
+for `■`, `status.error` for `×`. Shown only when they apply, in this order
+from the right: `×` close, `⊟` minimize / `⊞` restore, `■` stop (working or
+awaiting), `▶` start Claude (bare shell). Each box is a tooltip zone
+(`Close`, `Minimize`, `Restore`, `Stop`, `Start Claude here`) through the
+renderer's `push_tooltip_zone`, read back in `sidebar_mouse_moved`. Pressed
+paints on mouse down, the action fires on mouse up inside the same box (a
+leave cancels), as v1. The hit test knows the boxes whether or not the tile
+is hovered, since a mouse over them means it is.
 
-### 3.2 Wheel
+### 3.2 Wheel, reveal
 
 Over the sidebar, the vertical delta scrolls the list (trackpad:
 `dy * scale * scroll_sensitivity / 6`; mouse wheel: `dy * ch` per notch). The
-horizontal delta is dropped: the sidebar never forwards wheel events to the
-panes. On every focus change (Cmd+J, Cmd+P, click, Cmd+N, IPC) the list
-scrolls the minimum amount that shows the focused pane's row; if its group is
-collapsed the header is what gets revealed (the group is not auto-expanded).
+horizontal delta is dropped. On every focus change the list scrolls the
+minimum amount that shows the focused pane's tile; if its group is collapsed
+the header is what gets revealed.
 
-### 3.3 Tab drag reorder
+### 3.3 Drag
 
-Mouse down on a header (cells 2..W), move 3 px: the header lifts (background
-`[0.19, 0.19, 0.22]`, title white) and follows the cursor as a floating copy
-drawn last. An insertion line, `2 px * scale` tall, `splits.focus_border_color`,
-spans the sidebar between the two groups the cursor is over (midpoint rule:
-above a header's vertical centre inserts before it). The drop goes through the
-same code as the `move-tab` IPC command; the active tab keeps its identity.
-While the cursor is within `1.5 ch` of the list's top or bottom edge the list
-scrolls one header height every 100 ms. Drag is disabled in activity sort.
+- Tab drag: as v1. Mouse down on a header, move 3 px: the header lifts (its
+  band at alpha 0.9, a floating copy drawn last) and an insertion line
+  `2 px * scale` `border.focus` spans the sidebar between the two groups the
+  cursor is over (midpoint rule). The drop goes through the `move-tab` IPC
+  path. Auto-scroll within `1.5 ch` of the list edges. Disabled in activity
+  sort.
+- Pane drag (new): mouse down on a tile body, move 3 px: the tile lifts
+  (alpha 0.9, drawn last) and an insertion line indented to `tile_x` appears
+  between tiles of the SAME column of the same tab (`SidebarGeometry::pane_run`:
+  the sidebar order is column-major, so the candidates are the contiguous run
+  of tiles sharing the pane's column). Drop = the adjacent swaps of
+  `swap_chain` replayed through `Tab::swap_panes` (the primitive behind the
+  `swap-pane` IPC command), then `mark_all_dirty` + `resize_all_panes`. A
+  drop more than `1 ch` above or below the run snaps back. Cross-column and
+  cross-tab drops are v3.
 
-### 3.4 Keys
+### 3.4 Actions and the Kova functions behind them
 
-- `Cmd+1..9`, `Cmd+Shift+[`/`]`, `Cmd+J`, `Cmd+P`: unchanged; the sidebar follows.
-- `toggle_sidebar = "cmd+option+s"` (new `[keys]` entry): toggles `layout.mode`
-  between `tabs` and `sidebar` and persists it. Also reachable over IPC as
-  `dispatch-action` `toggle-sidebar`.
+Right click on a tile opens an `NSMenu` (`sidebarPaneAction:`, tag =
+`PaneAction`), items dispatched through `dispatch_pane_action(pane_id, action)`;
+the hover glyphs and the tile's own buttons go through the same function.
 
-### 3.5 Sort
+| Item              | When                                                   | Kova call                                                                 |
+|-------------------|--------------------------------------------------------|---------------------------------------------------------------------------|
+| Open              | always                                                 | `focus_pane_in_window(id)`                                                |
+| Stop              | `is_working()` or a permission prompt is on screen     | `interrupt_pane(id)`: `pane.pty.write(b"\x03")`, `pane.clear_awaiting()` (drops the prompt preview), `set_transient_status("Stopped")` |
+| Start Claude here | `Pane::is_bare_shell()`: no agent, no foreground process, nothing pending | `pane.pty.write(b"claude\r")`; refused with a status line otherwise (the daemon's 409). The tile shows `starting` until the session resolves |
+| Rename…           | always                                                 | `focus_pane_in_window(id)` then `start_rename_pane()`                     |
+| Bookmark / Unbookmark | always                                             | focus then `do_toggle_bookmark()`; label from `bookmark_keys`             |
+| Minimize / Restore| not minimized / minimized                              | focus then `do_minimize_pane()`; restore = `focus_pane_in_window`, which restores |
+| Close             | always                                                 | `ipc_close_pane(id)`; when `is_working()` an `NSAlert` first: `Close {title}?`, `The agent is working right now: closing interrupts the task.`, `Close and interrupt` / `Keep working`. Refused on the last pane with a status line |
 
-`kova` (tab order, dim label) or `activity` (blue label): tabs ordered by the
-most urgent state of any of their panes, in the square's priority order, ties
-keeping tab order. Header numbers are the tab's real Cmd+N number either way.
+Header menu (`sidebarTabAction:`, tag = `TabAction`): the six colours +
+`No colour`, separator, `Rename tab…` (`start_rename_tab`), `Add a pane`
+(`do_switch_tab(idx)` then `do_split(Horizontal)`, the ⌘D path: side by
+side), `Collapse others`, separator, `Close tab` (`do_switch_tab(idx)` then
+`do_close_tab()`, with its confirmation).
 
-## 4. Tokens
+### 3.5 Keys
+
+- `Cmd+J` = `next_attention`, already bound; the pill is its button.
+- `Cmd+1..9`, `Cmd+Shift+[ ]`, `Cmd+P`, `Cmd+O`: unchanged; the sidebar follows.
+- `toggle_sidebar = "cmd+option+s"` (`[keys]`): toggles `layout.mode` and
+  persists it. Also reachable over IPC as `dispatch-action` `toggle-sidebar`.
+
+### 3.6 Sort
+
+`⇅ kova` (tab order) or `⇅ activity`: tabs ordered by the most urgent state of
+any of their panes, in the tile state's priority order, ties keeping tab
+order. Header numbers are the tab's real Cmd+N number either way.
+
+## 4. State mapping (Kova accessors -> tile)
+
+Evaluated per frame from `Pane` reads (`sidebar_ui::pane_state`,
+`TileState::from_flags`). First match wins; the order doubles as the activity
+sort key and the collapsed chip priority.
+
+| # | Condition                                                                                          | Tile     | Bar / chip                           |
+|---|----------------------------------------------------------------------------------------------------|----------|--------------------------------------|
+| 1 | `has_permission_prompt()` (a parsed prompt preview) and `!is_working()`                            | awaiting | amber, age instead of a chip         |
+| 2 | not focused and (`unread_completion()` or bell or `is_awaiting_unseen()` or `is_turn_end_unseen()`) | unread | accent `● done` (`● bell` for a bell) |
+| 3 | `is_working()`                                                                                     | working  | blue `working`                       |
+| 4 | `is_starting_agent()`: a pending restore command, or `claude` in the foreground without a session  | starting | blue `starting`                      |
+| 5 | `is_idle_agent()`                                                                                  | idle     | `border.strong`, neutral `idle`      |
+| 6 | else                                                                                               | shell    | `border.strong`, neutral `shell`, `▶ Start Claude` when bare |
+
+The hook's waiting flag alone (`is_awaiting_unseen()` without a parsed
+prompt) paints `● done`, never amber: the `Stop` hook raises it at every
+turn end (see `docs/ipc.md`), and amber is reserved for a detected permission
+prompt, as on the phone. `minimized` adds the `⊟` prefix and the hollow fill
+on top of any state. Bell / completion / seen flags clear on focus as before
+(`ack_completion`, `mark_awaiting_seen`, `mark_idle_agent_seen`,
+`mark_turn_end_seen`); the sidebar never acks anything itself.
+
+### 4.1 Where the question text comes from
+
+Kova has no prompt text of its own: `is_awaiting()` is the hook claim set over
+`set-pane-status`. KovaLink's daemon reads the screen instead
+(`daemon/src/prompt/detector.ts`), and v2 ports that to Rust in
+`src/prompt_preview.rs` (pure) and `Pane::probe_prompt` (the trigger):
+
+- `Pane.prompt_preview: RefCell<Option<PromptPreview>>`, with
+  `Permission { header, question, detail, since }` and
+  `TurnEnd { summary, seen }`. Runtime state, never saved.
+- Trigger: `probe_prompt` runs from `Tab::check_running` on every tick and
+  follows `is_working()`. On a falling edge it arms a 1 s debounce; when it
+  fires and the pane is still not working and `agent_kind() == Some(Claude)`,
+  it reads `terminal.dump_text(DumpMode::Visible, true)` once (the
+  `get-pane-content` path) and runs `parse_permission_prompt`. The grammar is
+  the daemon's, observed on Claude Code 2.1.268, not invented: a `─` frame
+  line, a header line (`Bash command`, `Create file`), detail lines, the
+  question ending with `?`, numbered options from 1 (`❯ 1. Yes`), and
+  `Esc to cancel` as the last non-empty line. Any deviation yields `None`.
+- Fallback: `transcript_path(home, cwd, agent_session_id)` =
+  `~/.claude/projects/<slug>/<id>.jsonl` (the daemon's `projectSlug`), the
+  last 64 KB read from a line boundary, the last `assistant` record's last
+  non-empty `text` block -> `TurnEnd { summary }` (`turn_end_summary`).
+- Cleared: a rising edge of `is_working()` (Claude got its answer), and with
+  the waiting flag in `Pane::clear_awaiting` (a keystroke into the pane,
+  `send-keys`, `interrupt_pane`, the shell back at a bare prompt, pane
+  death). `TurnEnd.seen` is set on the focused pane of the key window, in
+  the same place as `mark_awaiting_seen`.
+- Tests: the daemon's fixtures copied under `tests/fixtures/prompt/`
+  (`prompt-bash`, `prompt-bash-consecutive-1/2`, `prompt-write`,
+  `screen-idle` and `screen-trust-dialog` -> `None`, `transcript-echo.jsonl`),
+  asserted verbatim in `src/prompt_preview.rs`.
+
+## 5. Tokens (`sidebar::tokens`, RGB floats from `link/app/src/theme/tokens.ts`)
 
 ```
-sidebar.bg              = tab_bar.bg_color        [0.12, 0.12, 0.14]
-sidebar.separator                                 [0.20, 0.20, 0.23]
-sidebar.row.active_bg   = tab_bar.active_bg       [0.22, 0.22, 0.26]
-sidebar.row.hover_bg                              [0.16, 0.16, 0.19]
-sidebar.row.pressed_bg                            [0.19, 0.19, 0.22]
-sidebar.text.primary                              [1.00, 1.00, 1.00]
-sidebar.text.active_tab                           [0.80, 0.80, 0.85]
-sidebar.text.other_tab                            [0.60, 0.60, 0.66]
-sidebar.text.header                               [0.72, 0.72, 0.78]
-sidebar.text.dim        = tab_bar.fg_color        [0.50, 0.50, 0.55]
-sidebar.text.secondary                            [0.45, 0.45, 0.50]
-sidebar.text.bookmark   = colors.paste_block      [0.60, 0.80, 1.00]
-sidebar.insertion       = splits.focus_border     [0.40, 0.60, 1.00]
-summary.text            = state.awaiting when N waiting > 0, else state.working
+ground           bg.base           [0.043 0.051 0.063]   #0B0D10
+tile             bg.raised         [0.078 0.090 0.110]   #14171C
+tile.hover       bg.overlay        [0.106 0.122 0.149]   #1B1F26
+tile.pressed     bg.pressed        [0.122 0.141 0.169]   #1F242B
+border.subtle                      [0.137 0.153 0.184]   #23272F   (= separator)
+border.strong                      [0.200 0.224 0.267]   #333944
+border.focus     accent.primary    [0.298 0.553 1.000]   #4C8DFF   (= unread)
+accent.pressed                     [0.227 0.475 0.902]   #3A79E6
+text.primary                       [0.910 0.918 0.929]   #E8EAED
+text.secondary                     [0.608 0.639 0.686]   #9BA3AF
+text.tertiary                      [0.486 0.522 0.576]   #7C8593
+text.inverse                       [0.043 0.051 0.063]   #0B0D10
+text.onFill                        [1.000 1.000 1.000]
+status.awaiting                    [1.000 0.690 0.125]   #FFB020
+status.awaitingBg                  [0.165 0.122 0.031]   #2A1F08
+status.working                     [0.220 0.741 0.973]   #38BDF8
+status.success                     [0.239 0.839 0.549]   #3DD68C
+status.error                       [1.000 0.361 0.361]   #FF5C5C
+action.interrupt.text              [1.000 0.478 0.478]   #FF7A7A
+tab band          TAB_COLORS[c] (Kova palette); tint = ground + (dim(c) - ground) * 0.22
 
-top_h = round(2 ch)   summary_h = header_h = footer_h = round(1.5 ch)
-row_h = round(2.5 ch) group_gap = round(0.5 ch)   text_col = 4 cw
-color_bar_w = round(0.25 cw)   square = round(0.5 cw)
-sidebar_w = cells * cw, cells in [18, 48], default 28   sep_w = round(scale)
+top_h = 2 ch   summary_h = 1.5 ch   pill_h = 1.5 ch (+0.25 ch margins)   header_h = 2 ch
+tile_h = 3 / 4 / 5 ch   tile_gap = 0.5 ch   group_gap = 1 ch   footer_h = 1.5 ch
+tile_x = 1 cw   bar_w = 0.5 cw   content_x = 2.5 cw   chip_h = 1 ch   glyph_box = 3 cw
+border = 1 px * scale   focus_ring = 2 px * scale   width 32 cells, clamp 22..56
 ```
 
-Typography: the terminal font at 1x everywhere. The only glyphs outside ASCII
-are `▾ ▸ … · ⊟ « ⌘ ▏`, rasterised on demand by the atlas.
+Typography: the terminal font at 1x only. Hierarchy = primary / secondary /
+tertiary greys plus inverted chips. Non-ASCII glyphs used:
+`▾ ▸ ▶ ■ × ⊟ ⊞ ● ✓ ⇅ ⌘ ⏎ … · « ▏`, rasterised on demand by the atlas.
 
-## 5. Mode switch and persistence
+## 6. Mode switch and persistence
 
-### 5.1 View menu
+### 6.1 View menu
 
 ```
 View
@@ -258,16 +411,14 @@ View
 
 Both items send `setLayoutMode:` up the responder chain with the mode as tag;
 the key window's `KovaView` handles it and refreshes the check mark in
-`validateMenuItem:`. The shortcut shown is the configured `toggle_sidebar`
-binding; the key itself is handled in `performKeyEquivalent` like every other
-Kova binding (and toggles), the menu only ever sees it if no Kova window is key.
+`validateMenuItem:`.
 
-### 5.2 Config (`~/.config/kova/config.toml`)
+### 6.2 Config (`~/.config/kova/config.toml`)
 
 ```toml
 [layout]
 mode = "sidebar"              # "tabs" | "sidebar", default "tabs"
-sidebar_width = 28            # cells, clamped to 18..48
+sidebar_width = 32            # cells, clamped to 22..56
 sidebar_collapsed_default = false   # new tabs start folded when true
 
 [keys]
@@ -275,56 +426,52 @@ toggle_sidebar = "cmd+option+s"
 ```
 
 Runtime changes (menu, ⌥⌘S, edge drag, footer button) are NOT written back
-into `config.toml`: rewriting the user's TOML would need a comment-preserving
-editor, which is not worth a dependency. They go to
-`~/.config/kova/prefs.json`:
-
-```json
-{ "mode": "sidebar", "sidebar_width": 30 }
-```
-
-Values present there override the `[layout]` table on load
-(`Config::apply_layout_prefs`); delete the file to go back to what the TOML
-says. `sidebar_collapsed_default` is config only.
+into `config.toml`: they go to `~/.config/kova/prefs.json`
+(`{ "mode": "sidebar", "sidebar_width": 30 }`), whose values override the
+`[layout]` table on load (`Config::apply_layout_prefs`). Delete the file to
+go back to what the TOML says. `sidebar_collapsed_default` is config only.
 
 Per-tab state (collapsed) and the sort mode are session state: `SavedTab`
 carries `collapsed` and `WindowSession` carries `sidebar_sort` (`"kova"` |
-`"activity"`), saved in `session.json` alongside everything else and restored
-with the tabs. Tab ids are not stable across launches, so collapse is
-persisted inside the saved tab rather than keyed by id.
+`"activity"`), saved in `session.json` and restored with the tabs. Prompt
+previews are runtime state like the waiting flag and are not saved.
 
-### 5.3 Geometry contract
+### 6.3 Geometry contract
 
 `SidebarGeometry::new(cell, scale, width_cells, height, scroll_y, kinds,
 show_hint)` in `src/window/sidebar.rs` lays out a list of `SidebarRowKind`
-(`Header { tab_idx, collapsed }` | `Pane { tab_idx, pane_id }`) and answers
-`hit(px, py) -> Option<SidebarHit>` where `SidebarHit = Chevron(tab) |
-Header(tab) | Pane(pane_id) | SortToggle | ModeButton | Edge | TopArea |
-Empty`, plus `reveal`, `insertion_index`, `insertion_line_y`,
-`autoscroll_direction` and `overflow`. The renderer and the mouse handlers both
-consume it (`KovaView::sidebar_geometry`), rebuilt from the tab list on demand.
+(`Header { tab_idx, collapsed }` | `Pane { tab_idx, pane_id, column, tile:
+TileLayout }`) and answers `hit(px, py) -> Option<SidebarHit>` where
+`SidebarHit = Chevron(tab) | Header(tab) | HeaderAdd(tab) | Pane(pane_id) |
+PaneButton(pane_id, TileButton) | SortToggle | NextPill | ModeButton | Edge |
+TopArea | Empty`, plus `reveal`, `insertion_index`, `insertion_line_y`,
+`pane_run`, `pane_insertion_slot`, `pane_insertion_line_y`,
+`autoscroll_direction`, `overflow`, and the tile metrics (`tile_x`, `tile_w`,
+`bar_w`, `content_x`, `content_right`, `line_y`, `glyph_boxes`). The renderer
+and the mouse handlers both consume it (`KovaView::sidebar_geometry`),
+rebuilt from the tab list on demand.
 
-## 6. Edge and empty states
+## 7. Edge and empty states
 
-- One tab, one pane: still a header and one row. Below the last group, when the
-  window has fewer than 3 panes in total, a dim hint at `text_col`:
-  `⌘T new tab · ⌘D split`. It disappears at 3 panes.
+- One tab, one pane: still a band and one tile. Below the last group, when
+  the window has fewer than 3 panes in total, a dim hint: `⌘T new tab · ⌘D split`.
 - More rows than height: wheel scroll; no scrollbar. Hidden overflow is
-  signalled by a `1 px * scale` line in `sidebar.separator` colour at the top
-  edge of the list when `scroll_y > 0` and at the bottom edge when more content
-  is below.
+  signalled by a `1 px * scale` line in `border.strong` at the top edge of the
+  list when `scroll_y > 0` and at the bottom edge when more content is below.
 - Narrow window: the sidebar auto-hides when
-  `window_w - sidebar_w - sep_w < splits.min_width * scale` (300 pt by default).
-  The window then renders in tabs mode for as long as it is that narrow;
-  `layout.mode` is not touched and the sidebar comes back on the first resize
-  that makes room. The window's minimum size stays 200 x 150 pt.
+  `window_w - sidebar_w - sep_w < splits.min_width * scale`. The window then
+  renders in tabs mode for as long as it is that narrow; `layout.mode` is not
+  touched.
 - Second instance without the session lock: one tab, the hint shows.
 
-## 7. Not in v1
+## 8. Not in v2 (v3)
 
-- Pane row drag reorder (column-major mapping to swap / reparent).
-- Right click context menu on a pane row.
-- Collapse / expand all, ⌥⌘[ and ⌥⌘].
-- Working square breathing.
-- Collapsed rail for narrow windows; compact single-line rows.
-- Tooltip with the full title and cwd on hover.
+- Cross-column / cross-tab pane drop (reparent), `⌥⌘[` `⌥⌘]` collapse /
+  expand all, a `Collapse others` shortcut.
+- `stale session` badge + `↻ Relaunch` (needs the child-process probe the
+  daemon has).
+- Closed sessions section with `Resume` (⌘O already covers it).
+- Working bar breathing behind a config flag; compact density (2 ch tiles);
+  collapsed rail.
+- Answer buttons inside the awaiting tile: never (KovaLink rule A7:
+  approving requires reading the prompt in the pane).

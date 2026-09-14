@@ -61,7 +61,7 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 ## Notes techniques
 
 - `notes/pty-spawn.md` — pourquoi `Command + pre_exec` plutôt que `posix_spawn` ou `fork` brut pour le controlling terminal
-- `docs/sidebar-spec.md` : le mode sidebar (menu View, `cmd+option+s`, `[layout]` dans la conf). Les changements de layout faits à chaud vont dans `~/.config/kova/prefs.json`, qui prend le pas sur `[layout]` de `config.toml` au chargement : Kova ne réécrit jamais le TOML.
+- `docs/sidebar-spec.md` : le mode sidebar (menu View, `cmd+option+s`, `[layout]` dans la conf), en v2 des tuiles façon KovaLink avec actions au survol et au clic droit, la pilule Next (le bouton de Cmd+J) et la question d'un prompt de permission lue à l'écran (`src/prompt_preview.rs`, grammaire du daemon KovaLink, fixtures dans `tests/fixtures/prompt/`). Les changements de layout faits à chaud vont dans `~/.config/kova/prefs.json`, qui prend le pas sur `[layout]` de `config.toml` au chargement : Kova ne réécrit jamais le TOML.
 
 ## Pièges récurrents
 
