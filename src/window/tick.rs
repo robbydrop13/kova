@@ -267,10 +267,12 @@ impl KovaView {
             geometry: &f.geometry,
             rows: &f.rows,
             summary: &f.summary,
-            summary_color: f.summary_color,
             sort: f.sort,
+            pill: f.pill,
             hovered: f.hovered,
+            pressed: f.pressed,
             insertion_y: f.insertion_y,
+            pane_insertion_y: f.pane_insertion_y,
             lifted: f.lifted,
         });
         let (hover_segments, hover_text, hover_pane_id) = {
@@ -735,6 +737,7 @@ impl KovaView {
                 if let Some(pane) = tab.pane(tab.focused_pane) {
                     pane.mark_awaiting_seen();
                     pane.mark_idle_agent_seen();
+                    pane.mark_turn_end_seen();
                 }
             }
         }

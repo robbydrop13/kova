@@ -139,13 +139,13 @@ pub struct LayoutConfig {
 }
 
 /// Bounds of `LayoutConfig::sidebar_width`, in cells.
-pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<u16> = 18..=48;
+pub const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<u16> = 22..=56;
 
 impl Default for LayoutConfig {
     fn default() -> Self {
         LayoutConfig {
             mode: LayoutMode::Tabs,
-            sidebar_width: 28,
+            sidebar_width: 32,
             sidebar_collapsed_default: false,
         }
     }
@@ -564,7 +564,7 @@ mod tests {
         // An out-of-range width in the prefs is snapped, not refused.
         config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(200) });
         assert_eq!(config.layout.mode, LayoutMode::Sidebar);
-        assert_eq!(config.layout.sidebar_width, 48);
+        assert_eq!(config.layout.sidebar_width, 56);
     }
 
     #[test]
@@ -574,7 +574,7 @@ mod tests {
         ).unwrap();
         config.sanitize();
         assert_eq!(config.layout.mode, LayoutMode::Sidebar);
-        assert_eq!(config.layout.sidebar_width, 18);
+        assert_eq!(config.layout.sidebar_width, 22);
         assert!(config.layout.sidebar_collapsed_default);
         // Absent table: the tab bar, as before.
         let config: Config = toml::from_str("").unwrap();

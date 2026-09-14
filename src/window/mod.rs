@@ -1273,6 +1273,18 @@ define_class!(
             self.mark_dirty();
         }
 
+        /// Sidebar tile context menu (`sidebarPaneAction:`, tag = action).
+        #[unsafe(method(sidebarPaneAction:))]
+        fn sidebar_pane_action(&self, sender: &objc2_app_kit::NSMenuItem) {
+            self.sidebar_pane_menu_picked(sender.tag());
+        }
+
+        /// Sidebar header context menu (`sidebarTabAction:`, tag = action).
+        #[unsafe(method(sidebarTabAction:))]
+        fn sidebar_tab_action(&self, sender: &objc2_app_kit::NSMenuItem) {
+            self.sidebar_tab_menu_picked(sender.tag());
+        }
+
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
             let (px, py) = self.event_to_pixel(event);

@@ -70,6 +70,23 @@ fn next_id_after(ids: &[PaneId], current: Option<PaneId>) -> Option<PaneId> {
     ids.iter().find(|&&id| current.is_none() || id > after).or_else(|| ids.first()).copied()
 }
 
+/// What `collect_attention` gathers: the two draining tiers, the ring of
+/// every open session, and how many sessions are working.
+#[derive(Default)]
+pub(super) struct AttentionSets {
+    pub(super) unread: Vec<(PaneLocality, PaneId)>,
+    pub(super) idle_agent: Vec<(PaneLocality, PaneId)>,
+    /// Every open session, idle or working, looked at or not: what the
+    /// post-message loop walks once the draining tiers are empty. No locality
+    /// here, that ring never drains and a nearest-first rule would trap it in
+    /// one tab.
+    pub(super) session_ring: Vec<PaneId>,
+    /// Claude sessions actively working: what the dead-end message counts,
+    /// for the two spots the ring never reaches (the focused pane and the
+    /// minimized ones).
+    pub(super) thinking: usize,
+}
+
 /// Which of Cmd+J's tiers a jump landed in — what the banner across the focused
 /// pane's status bar names, and what colours it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -238,6 +255,75 @@ impl KovaView {
         self.mark_dirty();
     }
 
+    /// Every pane Cmd+J could land on, across every window, sorted into its
+    /// tiers. The jump consumes it; the sidebar's summary and Next pill read
+    /// its counts. Walking every window costs a few dozen reads: fine per
+    /// frame.
+    pub(super) fn collect_attention(&self) -> AttentionSets {
+        let active_tab = self.ivars().active_tab.get();
+        let mut sets = AttentionSets::default();
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let app = NSApplication::sharedApplication(mtm);
+        let ns_windows = app.windows();
+        for i in 0..ns_windows.count() {
+            let win = ns_windows.objectAtIndex(i);
+            let view = match crate::app::kova_view(&win) {
+                Some(v) => v,
+                None => continue,
+            };
+            let is_current_window = std::ptr::eq(view as *const KovaView, self as *const KovaView);
+            let tabs = view.ivars().tabs.borrow();
+            for (tab_idx, tab) in tabs.iter().enumerate() {
+                let locality = match (is_current_window, tab_idx == active_tab) {
+                    (true, true) => PaneLocality::CurrentTab,
+                    (true, false) => PaneLocality::CurrentWindow,
+                    (false, _) => PaneLocality::OtherWindow,
+                };
+                tab.for_each_pane(&mut |pane| {
+                    // Counted before every early return, minimized included: a
+                    // session chewing away behind a collapsed pane is exactly
+                    // what the user wants to hear about when nothing else waits.
+                    if pane.is_working_agent() {
+                        sets.thinking += 1;
+                    }
+                    // A minimized pane is never a landing spot: jumping to it
+                    // would have to give it its space back, and the user
+                    // collapsed it on purpose. It keeps running and keeps its
+                    // marker: Cmd+J simply walks past it. Restoring one is
+                    // `restore-minimized`, or the IPC `focus-pane` command.
+                    if pane.minimized {
+                        return;
+                    }
+                    // Scoped: `is_idle_agent_unseen` reads the terminal too,
+                    // and holding two read guards on the same lock deadlocks
+                    // the moment a writer queues between them.
+                    let has_unread = {
+                        let term = pane.terminal.read();
+                        term.bell.load(std::sync::atomic::Ordering::Relaxed)
+                            || term.unread_completion()
+                    };
+                    if has_unread {
+                        sets.unread.push((locality, pane.id));
+                        return;
+                    }
+                    if pane.has_agent_session() {
+                        // Working sessions ride the ring too: one still chewing
+                        // is as much an open loop as an idle one, and landing on
+                        // it is how the eye gets back to the answer it will
+                        // print. Only the draining tier stays idle-only, so a
+                        // working session is never announced as something to
+                        // deal with now.
+                        sets.session_ring.push(pane.id);
+                        if pane.is_idle_agent_unseen() {
+                            sets.idle_agent.push((locality, pane.id));
+                        }
+                    }
+                });
+            }
+        }
+        sets
+    }
+
     /// Jump to the next pane asking for attention, across every tab and every
     /// window, in two tiers: first a pane left unread — a bell, or a command that
     /// finished while the eye was elsewhere (the same signal the switcher's Tab
@@ -277,77 +363,7 @@ impl KovaView {
             let tabs = self.ivars().tabs.borrow();
             tabs.get(active_tab).map(|t| t.focused_pane)
         };
-
-        let mut unread: Vec<(PaneLocality, PaneId)> = Vec::new();
-        let mut idle_agent: Vec<(PaneLocality, PaneId)> = Vec::new();
-        // Every open session — idle or working, looked at or not: what the
-        // post-message loop walks once the draining tiers are empty. No locality
-        // here, that ring never drains and a nearest-first rule would trap it in
-        // one tab.
-        let mut session_ring: Vec<PaneId> = Vec::new();
-        // Claude sessions actively working: what the dead-end message counts,
-        // for the two spots the ring never reaches (the focused pane and the
-        // minimized ones).
-        let mut thinking = 0usize;
-        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let app = NSApplication::sharedApplication(mtm);
-        let ns_windows = app.windows();
-        for i in 0..ns_windows.count() {
-            let win = ns_windows.objectAtIndex(i);
-            let view = match crate::app::kova_view(&win) {
-                Some(v) => v,
-                None => continue,
-            };
-            let is_current_window = std::ptr::eq(view as *const KovaView, self as *const KovaView);
-            let tabs = view.ivars().tabs.borrow();
-            for (tab_idx, tab) in tabs.iter().enumerate() {
-                let locality = match (is_current_window, tab_idx == active_tab) {
-                    (true, true) => PaneLocality::CurrentTab,
-                    (true, false) => PaneLocality::CurrentWindow,
-                    (false, _) => PaneLocality::OtherWindow,
-                };
-                tab.for_each_pane(&mut |pane| {
-                    // Counted before every early return, minimized included: a
-                    // session chewing away behind a collapsed pane is exactly
-                    // what the user wants to hear about when nothing else waits.
-                    if pane.is_working_agent() {
-                        thinking += 1;
-                    }
-                    // A minimized pane is never a landing spot: jumping to it
-                    // would have to give it its space back, and the user
-                    // collapsed it on purpose. It keeps running and keeps its
-                    // marker — Cmd+J simply walks past it. Restoring one is
-                    // `restore-minimized`, or the IPC `focus-pane` command.
-                    if pane.minimized {
-                        return;
-                    }
-                    // Scoped: `is_idle_agent_unseen` reads the terminal too,
-                    // and holding two read guards on the same lock deadlocks
-                    // the moment a writer queues between them.
-                    let has_unread = {
-                        let term = pane.terminal.read();
-                        term.bell.load(std::sync::atomic::Ordering::Relaxed)
-                            || term.unread_completion()
-                    };
-                    if has_unread {
-                        unread.push((locality, pane.id));
-                        return;
-                    }
-                    if pane.has_agent_session() {
-                        // Working sessions ride the ring too: one still chewing
-                        // is as much an open loop as an idle one, and landing on
-                        // it is how the eye gets back to the answer it will
-                        // print. Only the draining tier stays idle-only, so a
-                        // working session is never announced as something to
-                        // deal with now.
-                        session_ring.push(pane.id);
-                        if pane.is_idle_agent_unseen() {
-                            idle_agent.push((locality, pane.id));
-                        }
-                    }
-                });
-            }
-        }
+        let AttentionSets { mut unread, mut idle_agent, mut session_ring, thinking } = self.collect_attention();
 
         let hit = next_attention_pane(&mut unread, &mut idle_agent, current);
         let (tier, target) = match hit {
