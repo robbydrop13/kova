@@ -1,7 +1,7 @@
 //! The sidebar as an AppKit view: KovaLink's home screen in SF Pro, rounded
 //! tiles and tinted chips, drawn with Cocoa (`drawRect:`) next to the Metal
 //! terminal view. Two classes: `SidebarView` owns the chrome (traffic-light
-//! strip, summary row, Next pill, footer, resize edge) and an `NSScrollView`;
+//! strip, summary row, Next pill, resize edge) and an `NSScrollView`;
 //! `SidebarListView` is the scroll view's document and draws the groups and
 //! tiles. Both share one `Shared` cell holding the `SidebarModel`, the
 //! layouts and the transient mouse state.
@@ -35,7 +35,6 @@ use super::sidebar::{
 use super::sidebar_model::{GroupVm, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
 use super::KovaView;
-use crate::config::LayoutMode;
 use crate::pane::{PaneId, TabId};
 
 // ---------------------------------------------------------------
@@ -51,8 +50,14 @@ const TOP_H: f64 = 36.0;
 const SUMMARY_H: f64 = 24.0;
 const PILL_REGION_H: f64 = 36.0;
 const PILL_H: f64 = 28.0;
+/// The pill's distance from the sidebar's right edge, and the padding
+/// inside it on either side of its content.
 const PILL_INSET: f64 = 12.0;
-const FOOTER_H: f64 = 24.0;
+const PILL_PAD: f64 = 12.0;
+/// Inside the pill: icon to label, and label to badge.
+const PILL_ICON_GAP: f64 = 5.0;
+const PILL_BADGE_GAP: f64 = 8.0;
+const PILL_BADGE_H: f64 = 18.0;
 /// Horizontal padding of the chrome and the list content.
 const PAD_H: f64 = 12.0;
 const LIST_TOP: f64 = 6.0;
@@ -124,7 +129,6 @@ pub enum Style {
     Pill,
     PillBadge,
     Link,
-    Footer,
     Hint,
     Number,
 }
@@ -139,7 +143,7 @@ pub enum Weight {
 }
 
 impl Style {
-    pub const ALL: [Style; 13] = [
+    pub const ALL: [Style; 12] = [
         Style::Title,
         Style::Secondary,
         Style::Chip,
@@ -150,7 +154,6 @@ impl Style {
         Style::Pill,
         Style::PillBadge,
         Style::Link,
-        Style::Footer,
         Style::Hint,
         Style::Number,
     ];
@@ -161,7 +164,7 @@ impl Style {
             Style::Secondary | Style::Question => 13.0,
             Style::Detail | Style::Link | Style::Pill => 12.0,
             Style::Chip | Style::Summary | Style::Hint | Style::Number => 11.0,
-            Style::Sort | Style::PillBadge | Style::Footer => 10.0,
+            Style::Sort | Style::PillBadge => 10.0,
         }
     }
 
@@ -518,7 +521,7 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
     let right = x + w - pad_h;
     let text_w = (right - text_x).max(10.0);
     let line1_y = y + pad_v;
-    let glyphs = TileButton::hover_glyphs(tile.state, tile.minimized, tile.bare_shell, tile.resumable, tile.unread)
+    let glyphs = TileButton::hover_glyphs(tile.state, tile.minimized, tile.unread)
         .into_iter()
         .enumerate()
         .map(|(k, b)| {
@@ -583,7 +586,6 @@ pub enum ChromeHit {
     TopArea,
     SortToggle,
     NextPill,
-    ModeButton,
     /// The resize handle at the right edge.
     Edge,
     Empty,
@@ -596,25 +598,39 @@ pub struct ChromeLayout {
     pub height: f64,
     pub summary: Rect,
     pub sort: Rect,
+    /// The Next pill: sized to its content, against the right edge. Also
+    /// its hit region.
     pub pill: Rect,
     pub list: Rect,
-    pub footer: Rect,
-    pub mode_button: Rect,
+}
+
+/// The width of the Next pill around its content: the side padding, the
+/// filled play and its gap when the pill is clickable, the label, and the
+/// count badge with its gap when there is a count.
+pub fn pill_width(pill: NextPill, m: &dyn TextMetrics) -> f64 {
+    let icon = if pill.icon().is_some() { PILL_ICON_D + PILL_ICON_GAP } else { 0.0 };
+    let badge = pill.badge().map_or(0.0, |n| PILL_BADGE_GAP + badge_width(n, m));
+    2.0 * PILL_PAD + icon + m.width(pill.label(), Style::Pill) + badge
+}
+
+/// The count badge: a circle at least, wider for two digits and more.
+fn badge_width(n: usize, m: &dyn TextMetrics) -> f64 {
+    (m.width(&n.to_string(), Style::PillBadge) + 8.0).max(PILL_BADGE_H)
 }
 
 impl ChromeLayout {
-    pub fn new(width: f64, height: f64, sort_label_w: f64, mode_label_w: f64) -> Self {
+    pub fn new(width: f64, height: f64, sort_label_w: f64, pill_w: f64) -> Self {
         let inner_w = width - SEP_W;
         let summary = Rect::new(PAD_H, TOP_H, inner_w - 2.0 * PAD_H, SUMMARY_H);
         let sort_w = sort_label_w + 12.0;
         let sort = Rect::new(summary.right() - sort_w, TOP_H + (SUMMARY_H - 20.0) / 2.0, sort_w, 20.0);
-        let pill = Rect::new(PILL_INSET, TOP_H + SUMMARY_H + (PILL_REGION_H - PILL_H) / 2.0, inner_w - 2.0 * PILL_INSET, PILL_H);
+        // Right-aligned, never wider than the inset width on a narrow
+        // sidebar.
+        let pill_w = pill_w.min(inner_w - 2.0 * PILL_INSET).max(0.0);
+        let pill = Rect::new(inner_w - PILL_INSET - pill_w, TOP_H + SUMMARY_H + (PILL_REGION_H - PILL_H) / 2.0, pill_w, PILL_H);
         let list_y = TOP_H + SUMMARY_H + PILL_REGION_H;
-        let list = Rect::new(0.0, list_y, inner_w - EDGE_TOLERANCE, (height - list_y - FOOTER_H).max(0.0));
-        let footer = Rect::new(0.0, height - FOOTER_H, inner_w, FOOTER_H);
-        let mode_w = mode_label_w + 12.0;
-        let mode_button = Rect::new(inner_w - PAD_H - mode_w, footer.y + (FOOTER_H - 20.0) / 2.0, mode_w, 20.0);
-        ChromeLayout { width, height, summary, sort, pill, list, footer, mode_button }
+        let list = Rect::new(0.0, list_y, inner_w - EDGE_TOLERANCE, (height - list_y).max(0.0));
+        ChromeLayout { width, height, summary, sort, pill, list }
     }
 
     pub fn hit(&self, x: f64, y: f64) -> ChromeHit {
@@ -632,9 +648,6 @@ impl ChromeLayout {
         }
         if self.pill.contains(x, y) {
             return ChromeHit::NextPill;
-        }
-        if self.mode_button.contains(x, y) {
-            return ChromeHit::ModeButton;
         }
         ChromeHit::Empty
     }
@@ -1013,7 +1026,7 @@ define_class!(
             let (x, y) = local_point(self, event);
             let hit = self.ivars().shared.borrow().chrome.hit(x, y);
             let hovered = match hit {
-                ChromeHit::SortToggle | ChromeHit::NextPill | ChromeHit::ModeButton => hit,
+                ChromeHit::SortToggle | ChromeHit::NextPill => hit,
                 _ => ChromeHit::Empty,
             };
             let mut sh = self.ivars().shared.borrow_mut();
@@ -1062,7 +1075,7 @@ define_class!(
                         }
                     }
                 }
-                ChromeHit::SortToggle | ChromeHit::NextPill | ChromeHit::ModeButton => {
+                ChromeHit::SortToggle | ChromeHit::NextPill => {
                     self.ivars().shared.borrow_mut().chrome_pressed = hit;
                     self.setNeedsDisplay(true);
                 }
@@ -1113,7 +1126,6 @@ define_class!(
                         match pressed {
                             ChromeHit::SortToggle => kova.sidebar_toggle_sort(),
                             ChromeHit::NextPill => kova.sidebar_next_pill_clicked(),
-                            ChromeHit::ModeButton => kova.set_layout_mode(LayoutMode::Tabs),
                             _ => {}
                         }
                     }
@@ -1197,15 +1209,15 @@ impl SidebarView {
                 return false;
             }
         }
-        let sort_changed = {
+        let chrome_changed = {
             let mut sh = self.ivars().shared.borrow_mut();
-            let changed = sh.model.sort != model.sort;
+            let changed = sh.model.sort != model.sort || sh.model.pill != model.pill;
             sh.model = model;
             changed
         };
-        // A new sort label changes the chrome (and, through it, the list);
-        // anything else only moves the rows.
-        if sort_changed {
+        // A new sort label or pill content changes the chrome (and, through
+        // it, the list); anything else only moves the rows.
+        if chrome_changed {
             self.layout_chrome();
         } else {
             self.relayout_list();
@@ -1234,12 +1246,12 @@ impl SidebarView {
     /// Position the scroll view for the current size, and re-lay the list.
     fn layout_chrome(&self) {
         let b = self.bounds();
-        let (sort_w, mode_w) = {
+        let (sort_w, pill_w) = {
             let sh = self.ivars().shared.borrow();
             let m = AppKitMetrics(&sh);
-            (m.width(sh.model.sort.label(), Style::Sort), m.width(MODE_LABEL, Style::Link))
+            (m.width(sh.model.sort.label(), Style::Sort), pill_width(sh.model.pill, &m))
         };
-        let chrome = ChromeLayout::new(b.size.width, b.size.height, sort_w, mode_w);
+        let chrome = ChromeLayout::new(b.size.width, b.size.height, sort_w, pill_w);
         let list_rect = chrome.list;
         self.ivars().shared.borrow_mut().chrome = chrome;
         // Rows first, then the scroll view: the model changed already, and
@@ -1336,42 +1348,27 @@ impl SidebarView {
                 NextPill::Nothing => (tokens::TILE, tokens::TEXT_TERTIARY, None),
             };
             let text_alpha = if pressed && clickable { 0.85 } else { 1.0 };
+            // Content-sized (`pill_width`), so the parts are laid end to
+            // end from the left padding: play, label, badge.
             fill_round(&c.pill, PILL_H / 2.0, fill, 1.0);
-            let mut right = c.pill.right() - 12.0;
-            let hint_w = draw_text(&sh, "\u{2318}J", &Rect::new(c.pill.x, c.pill.y, right - c.pill.x, c.pill.h), Style::Sort, text, 0.6 * text_alpha, Align::Right, false);
-            right -= hint_w + 8.0;
+            let mut right = c.pill.right() - PILL_PAD;
             if let (Some(n), Some((bg, fg))) = (sh.model.pill.badge(), badge) {
                 let label = n.to_string();
-                let w = (AppKitMetrics(&sh).width(&label, Style::PillBadge) + 8.0).max(18.0);
-                let r = Rect::new(right - w, c.pill.y + (PILL_H - 18.0) / 2.0, w, 18.0);
-                fill_round(&r, 9.0, bg, text_alpha);
+                let w = badge_width(n, &AppKitMetrics(&sh));
+                let r = Rect::new(right - w, c.pill.y + (PILL_H - PILL_BADGE_H) / 2.0, w, PILL_BADGE_H);
+                fill_round(&r, PILL_BADGE_H / 2.0, bg, text_alpha);
                 draw_text(&sh, &label, &r, Style::PillBadge, fg, 1.0, Align::Center, false);
-                right -= w + 8.0;
+                right -= w + PILL_BADGE_GAP;
             }
-            let mut left = c.pill.x + 12.0;
+            let mut left = c.pill.x + PILL_PAD;
             if let Some(icon) = sh.model.pill.icon() {
                 fill_icon(icon, &Rect::new(left, c.pill.y, PILL_ICON_D, c.pill.h), PILL_ICON_D, text, text_alpha);
-                left += PILL_ICON_D + 5.0;
+                left += PILL_ICON_D + PILL_ICON_GAP;
             }
             draw_text(&sh, sh.model.pill.label(), &Rect::new(left, c.pill.y, (right - left).max(0.0), c.pill.h), Style::Pill, text, text_alpha, Align::Left, false);
         }
-
-        // Footer: version and the way back to the tab bar.
-        fill_rect(&Rect::new(0.0, c.footer.y, c.footer.w, 1.0), tokens::BORDER_SUBTLE, 1.0);
-        let version = format!("Kova v{}", env!("CARGO_PKG_VERSION"));
-        draw_text(&sh, &version, &Rect::new(PAD_H, c.footer.y, c.mode_button.x - PAD_H - 8.0, c.footer.h), Style::Footer, tokens::TEXT_TERTIARY, 1.0, Align::Left, false);
-        let mode_hovered = sh.chrome_hovered == ChromeHit::ModeButton;
-        let mode_pressed = sh.chrome_pressed == ChromeHit::ModeButton;
-        if mode_hovered || mode_pressed {
-            fill_round(&c.mode_button, 6.0, tokens::TILE_PRESSED, if mode_pressed { 1.0 } else { 0.7 });
-        }
-        let mode_fg = if mode_hovered { tokens::TEXT_PRIMARY } else { tokens::TEXT_SECONDARY };
-        draw_text(&sh, MODE_LABEL, &c.mode_button, Style::Link, mode_fg, 1.0, Align::Center, false);
     }
 }
-
-/// The footer button back to the tab bar.
-const MODE_LABEL: &str = "\u{ab} Tab bar";
 
 // ---------------------------------------------------------------
 // SidebarListView: groups and tiles
@@ -2027,7 +2024,6 @@ impl SidebarListView {
                 let (fg, fg_alpha) = match b {
                     TileButton::Close if b_hovered => (tokens::ERROR, 1.0),
                     TileButton::Stop => (tokens::INTERRUPT, 1.0),
-                    TileButton::StartClaude | TileButton::Resume => (tokens::ACCENT, 1.0),
                     _ if b_hovered => (tokens::TEXT_PRIMARY, 1.0),
                     _ => (sec_fg, sec_alpha),
                 };
@@ -2338,7 +2334,9 @@ mod tests {
         assert_eq!(resume.w, LINK_ICON_D + LINK_ICON_GAP + RESUME_LABEL.chars().count() as f64 * 6.0 + 8.0);
         assert_eq!(resume.right(), SR - TILE_PAD_H);
         assert_eq!(l.hit(resume.x + 5.0, resume.y + 5.0), ListHit::TileButton(7, TileButton::Resume));
-        assert_eq!(l.rows[1].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread, TileButton::Resume]);
+        // The link is the only play: no play among the hover glyphs.
+        assert_eq!(l.rows[1].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread]);
+        assert_eq!(l.rows[2].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread]);
         assert_eq!(l.rows[2].actions[0].0, TileButton::StartClaude);
         assert_eq!(l.rows[1].frame.h, l.rows[2].frame.h);
     }
@@ -2413,28 +2411,46 @@ mod tests {
     }
 
     #[test]
-    fn the_chrome_stacks_top_area_summary_pill_list_and_footer() {
-        let c = ChromeLayout::new(W, 600.0, 40.0, 50.0);
+    fn the_chrome_stacks_top_area_summary_pill_and_list_down_to_the_bottom() {
+        let c = ChromeLayout::new(W, 600.0, 40.0, 130.0);
         assert_eq!(c.summary, Rect::new(12.0, 36.0, W - 1.0 - 24.0, 24.0));
         assert_eq!(c.sort.right(), c.summary.right());
         assert_eq!(c.sort.w, 52.0);
-        assert_eq!(c.pill, Rect::new(12.0, 64.0, W - 1.0 - 24.0, 28.0));
-        assert_eq!(c.list, Rect::new(0.0, 96.0, W - 1.0 - 4.0, 600.0 - 96.0 - 24.0));
-        assert_eq!(c.footer.y, 576.0);
-        assert_eq!(c.mode_button.right(), W - 1.0 - 12.0);
+        // The pill is as wide as its content, 12 from the right edge, on
+        // its own row under the summary.
+        assert_eq!(c.pill, Rect::new(W - 1.0 - 12.0 - 130.0, 64.0, 130.0, 28.0));
+        // No footer: the list runs to the bottom.
+        assert_eq!(c.list, Rect::new(0.0, 96.0, W - 1.0 - 4.0, 600.0 - 96.0));
         assert_eq!(c.hit(10.0, 10.0), ChromeHit::TopArea);
         assert_eq!(c.hit(10.0, 45.0), ChromeHit::Empty);
         assert_eq!(c.hit(c.sort.x + 5.0, 45.0), ChromeHit::SortToggle);
-        assert_eq!(c.hit(100.0, 70.0), ChromeHit::NextPill);
-        assert_eq!(c.hit(100.0, 61.0), ChromeHit::Empty);
+        // The hit region is the pill's own rect: nothing left of it.
+        assert_eq!(c.hit(c.pill.x + 5.0, 70.0), ChromeHit::NextPill);
+        assert_eq!(c.hit(c.pill.right() - 1.0, 70.0), ChromeHit::NextPill);
+        assert_eq!(c.hit(c.pill.x - 5.0, 70.0), ChromeHit::Empty);
+        assert_eq!(c.hit(20.0, 70.0), ChromeHit::Empty);
+        assert_eq!(c.hit(c.pill.x + 5.0, 61.0), ChromeHit::Empty);
         assert_eq!(c.hit(100.0, 300.0), ChromeHit::Empty);
-        assert_eq!(c.hit(c.mode_button.x + 5.0, 585.0), ChromeHit::ModeButton);
-        assert_eq!(c.hit(10.0, 585.0), ChromeHit::Empty);
+        assert_eq!(c.hit(100.0, 585.0), ChromeHit::Empty);
+        // A pill wider than the sidebar is clamped to the inset width.
+        let narrow = ChromeLayout::new(200.0, 600.0, 40.0, 400.0);
+        assert_eq!(narrow.pill, Rect::new(12.0, 64.0, 200.0 - 1.0 - 24.0, 28.0));
         // The resize handle wins near the separator, on both sides.
         assert_eq!(c.hit(W - 4.0, 300.0), ChromeHit::Edge);
         assert_eq!(c.hit(W + 3.0, 300.0), ChromeHit::Edge);
         assert_eq!(c.hit(W - 6.0, 300.0), ChromeHit::Empty);
         assert_eq!(c.hit(W + 6.0, 300.0), ChromeHit::Empty);
+    }
+
+    #[test]
+    fn the_next_pill_is_as_wide_as_its_content() {
+        // Next unread, 3: pad 12, play 12 + 5, 11 chars x 6, gap 8, badge
+        // max(6 + 8, 18) = 18, pad 12.
+        assert_eq!(pill_width(NextPill::Next(3), &FakeMetrics), 12.0 + 17.0 + 66.0 + 8.0 + 18.0 + 12.0);
+        // Two digits widen the badge: 12 + 8 = 20.
+        assert_eq!(pill_width(NextPill::Next(12), &FakeMetrics), 12.0 + 17.0 + 66.0 + 8.0 + 20.0 + 12.0);
+        // Nothing to read: no play, no badge; 15 chars.
+        assert_eq!(pill_width(NextPill::Nothing, &FakeMetrics), 12.0 + 90.0 + 12.0);
     }
 
     #[test]
@@ -2447,7 +2463,7 @@ mod tests {
         assert_eq!(Style::Chip.size(), 11.0);
         assert_eq!(Style::Chip.weight(), Weight::Medium);
         assert_eq!(Style::PillBadge.weight(), Weight::Bold);
-        assert_eq!(Style::ALL.len(), 13);
+        assert_eq!(Style::ALL.len(), 12);
         let _ = PaneFlags::default();
     }
 }

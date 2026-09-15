@@ -24,7 +24,7 @@ Code:
   `ChromeLayout` (pure geometry in points, hit tests, drag slots; text widths
   through the `TextMetrics` trait, unit tests with a stand-in), then two
   `NSView` subclasses drawn with `drawRect:`: `SidebarView` (chrome: top
-  area, summary row, Next pill, footer, resize edge, and an `NSScrollView`)
+  area, summary row, Next pill, resize edge, and an `NSScrollView`)
   and `SidebarListView` (its document: groups and tiles, hover, press, drags,
   right click, tooltips).
 - `src/window/sidebar_ui.rs`: the window's side. `apply_layout` (the split
@@ -91,17 +91,19 @@ mouse up.
 |----------|--------|-----------------------------------------------------------------|
 | Top area | 36     | Traffic lights, window drag (`performWindowDragWithEvent`), double click = zoom |
 | Summary  | 24     | Left: `2 waiting · 3 working · 4 idle`; right: `⇅ kova` / `⇅ activity` |
-| Pill     | 36     | The Next pill, 28 tall, radius 14, inset 12                     |
-| List     | rest   | `NSScrollView`, width = inner width - 4 (the edge zone stays the chrome's) |
-| Footer   | 24     | 1 pt top hairline; `Kova vX.Y.Z` left; `« Tab bar` button right  |
+| Pill     | 36     | The Next pill, 28 tall, radius 14, content-sized, right-aligned 12 from the edge |
+| List     | rest   | `NSScrollView` down to the bottom, width = inner width - 4 (the edge zone stays the chrome's) |
+
+No footer: the way back to the tab bar is View > Show Tab Bar and ⌥⌘S
+(section 7); the version label stays in the tab bar of tabs mode.
 
 ### 3.3 Typography (`sidebar_view::Style`, `NSFont::systemFontOfSize_weight`)
 
 KovaLink's row scale, so the Mac reads like the phone: header and tile
 titles 15 semibold (`calloutStrong`); secondary line and question 13
 (`footnote`); detail, links and pill label 12 (links and pill semibold);
-chips, summary, hint, number 11 (chips medium, `caption`); sort toggle,
-footer, pill badge 10 (sort medium, badge bold); `+` 14 medium. Text colours
+chips, summary, hint, number 11 (chips medium, `caption`); sort toggle and
+pill badge 10 (sort medium, badge bold); `+` 14 medium. Text colours
 are the phone's: primary `#E8EAED`, secondary `#9BA3AF`, tertiary `#7C8593`.
 Truncation is AppKit's: titles and subtitles at the tail (never a head-cut
 `..rectory/Claap`), rename edit buffers at the head (so the `▏` cursor stays
@@ -203,14 +205,15 @@ IPC):
 
 Hover actions replace the chip on row 1, right to left: `x` close (error
 red on hover), `minimize-2` / `maximize-2` minimize / restore, `check` mark
-read (unread tile) or `mail` mark unread (read tile), `square` stop
-(interrupt colour; working or awaiting), `play` start Claude (accent; bare
-shell) or resume (accent; restored session). Each is a 24 pt button
-(radius 7, bare; white 12 % under the one hovered, 20 % pressed) holding a
-16 pt Feather icon, 2 apart, with a tooltip (`Close`, `Minimize`, `Restore`,
-`Stop`, `Start Claude here`, `Resume the session`) through
-`addToolTipRect:owner:userData:`. Pressed paints on mouse down, the action
-fires on mouse up inside the same button (a leave cancels).
+read (unread tile) or `mail` mark unread (read tile), and `square` stop
+(interrupt colour; working or awaiting only). No play glyph: `Start Claude`
+and `Resume` are the links on row 2, and a click on the tile already
+focuses the pane. Each is a 24 pt button (radius 7, bare; white 12 % under
+the one hovered, 20 % pressed) holding a 16 pt Feather icon, 2 apart, with
+a tooltip (`Close`, `Minimize`, `Restore`, `Mark read`, `Mark unread`,
+`Stop`) through `addToolTipRect:owner:userData:`. Pressed paints on mouse
+down, the action fires on mouse up inside the same button (a leave
+cancels).
 
 #### Icon set (`src/window/feather.rs`)
 
@@ -219,10 +222,10 @@ Feather icons, drawn as stroked `NSBezierPath`s on Feather's 24 pt grid
 button, so the stroke is 1.33 pt and the icon scales with the row. The
 views are flipped (y down, like SVG), so the published coordinates are used
 as they are. `chevron-down` / `chevron-right` (collapse caret), `plus`
-(header), `x` (close), `play` (focus, start, resume), `maximize-2` /
-`minimize-2` (restore / minimize), `square` (stop). The `Resume` and `Stop`
-links and the Next pill use the filled `play` and `square` (11 pt in the
-links, 12 pt in the pill). `Icon::segments` and the point mapping are pure
+(header), `x` (close), `maximize-2` / `minimize-2` (restore / minimize),
+`square` (stop), `check` / `mail` (mark read / unread). The `Start Claude`,
+`Resume` and `Stop` links and the Next pill use the filled `play` and
+`square` (11 pt in the links, 12 pt in the pill). `Icon::segments` and the point mapping are pure
 and unit-tested.
 
 ### 3.6 Awaiting card (`AwaitingCard.tsx`), radius 12, fill `awaitingBg`
@@ -252,10 +255,18 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
 | next    | unread count > 0   | `accent.primary` | white filled `play` + `Next unread` | white 18 pt circle, accent digits |
 | nothing | unread count == 0  | `bg.raised`      | tertiary `Nothing to read`          | none; not a button (no hover, no press) |
 
-  `⌘J` right-aligned inside at 60 % alpha, the badge to its left. Hover:
+  The pill is sized to its content (`sidebar_view::pill_width`: 12 pt
+  padding either side, the 12 pt play and a 5 pt gap when clickable, the
+  label, an 8 pt gap and the badge when there is a count; the badge is 18
+  wide at least, `digits + 8` beyond) and right-aligned 12 pt from the
+  sidebar's edge on its own row; a sidebar too narrow clamps it to the
+  inset width. The `nothing` state is content-sized and right-aligned the
+  same way. The hit region is the pill's rect. No `⌘J` inside the pill: the
+  shortcut lives in the help overlay and the README. Hover:
   `accent.primaryPressed`. Pressed: text alpha 0.85. The count is
   `KovaView::collect_unread` (`src/window/attention.rs`), the same list
-  `do_focus_next_attention` walks, read once per tick.
+  `do_focus_next_attention` walks, read once per tick. A change of the pill's
+  content re-lays the chrome, like a change of the sort label.
 
 ### 3.8 List extras
 
@@ -286,7 +297,6 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
 | Restored `Resume`          | resume (4.4)                                           |                    | tile menu    |
 | Next pill                  | `do_focus_next_attention()` (not when `nothing`)       |                    |              |
 | Sort toggle                | kova <-> activity                                      |                    |              |
-| `« Tab bar` footer         | switch `layout.mode` to tabs                           |                    |              |
 | Top area                   | window drag                                            | zoom               |              |
 | Separator +-4 pt           | drag resizes the sidebar                               |                    |              |
 
@@ -469,13 +479,13 @@ tab tint          TAB_COLORS[c] (Kova palette, mirrored by the phone)
 panel wash        tint at s -> s x 0.45 (42 %) -> s x 0.14, over bg.raised;
                   s = 0.40 on the selected tab, 0.20 on the others
 
-top 36  summary 24  pill region 36 (pill 28, radius 14)  footer 24
+top 36  summary 24  pill region 36 (pill 28, radius 14, content-sized, right inset 12, pad 12)
 list inset 12 (+6 top, +12 bottom)  group gap 16  header 28 (hover pill radius 14)
 panel radius 12, pad 12, row gap 12  dot box 16
 tile radius 10, pad 8/10  card radius 12, pad 10/12, bar 4
 rows: title 20, secondary 16, question 16/line, gap 2  chip 18 (radius 9, pad 7)
 hover button 24 (radius 7, gap 2, icon 16)  header + 24 (radius 8)
-link icon 11 (gap 4)  pill icon 12  actions row 20  hint 20  width 280, clamp 200..520
+link icon 11 (gap 4)  pill icon 12 (gap 5)  pill badge 18 (gap 8)  actions row 20  hint 20  width 280, clamp 200..520
 ```
 
 Motion: hover and pressed states are redrawn on the next frame (KovaLink's
@@ -509,7 +519,7 @@ sidebar_collapsed_default = false   # new tabs start folded when true
 toggle_sidebar = "cmd+option+s"
 ```
 
-Runtime changes (menu, ⌥⌘S, edge drag, footer button) are NOT written back
+Runtime changes (menu, ⌥⌘S, edge drag) are NOT written back
 into `config.toml`: they go to `~/.config/kova/prefs.json`
 (`{ "mode": "sidebar", "sidebar_width": 300 }`), whose values override the
 `[layout]` table on load (`Config::apply_layout_prefs`). Delete the file to

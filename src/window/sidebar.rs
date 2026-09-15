@@ -388,10 +388,11 @@ pub enum TileButton {
     Restore,
     /// Interrupt (`■`): the hover glyph, and the awaiting tile's `■ Stop`.
     Stop,
-    /// `▶`: the hover glyph, and the bare shell tile's `▶ Start Claude`.
+    /// The bare shell tile's `▶ Start Claude` link (a link only: the play
+    /// hover glyph was dropped, it duplicated the link).
     StartClaude,
-    /// `▶`: the hover glyph, and the `▶ Resume` of a shell holding an
-    /// agent's resume line.
+    /// The `▶ Resume` link of a shell holding an agent's resume line (a
+    /// link only, like `StartClaude`).
     Resume,
     /// The awaiting tile's `Open` button.
     Open,
@@ -430,9 +431,10 @@ impl TileButton {
     }
 
     /// The hover glyphs of a tile, right to left: close, minimize / restore,
-    /// mark read / unread, stop when something can be interrupted, start
-    /// Claude on a bare shell, resume on a shell holding a resume line.
-    pub fn hover_glyphs(state: TileState, minimized: bool, bare_shell: bool, resumable: bool, unread: bool) -> Vec<TileButton> {
+    /// mark read / unread, and stop when something can be interrupted. No
+    /// play: `Start Claude` and `Resume` are links on line 2, and a click
+    /// on the tile already focuses the pane.
+    pub fn hover_glyphs(state: TileState, minimized: bool, unread: bool) -> Vec<TileButton> {
         let mut out = vec![
             TileButton::Close,
             if minimized { TileButton::Restore } else { TileButton::Minimize },
@@ -440,11 +442,6 @@ impl TileButton {
         ];
         if matches!(state, TileState::Working | TileState::Awaiting) {
             out.push(TileButton::Stop);
-        }
-        if bare_shell {
-            out.push(TileButton::StartClaude);
-        } else if resumable {
-            out.push(TileButton::Resume);
         }
         out
     }
@@ -964,11 +961,12 @@ mod tests {
     #[test]
     fn hover_glyphs_follow_the_tile() {
         use TileButton::*;
-        assert_eq!(TileButton::hover_glyphs(TileState::Working, false, false, false, false), vec![Close, Minimize, MarkUnread, Stop]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Awaiting, true, false, false, true), vec![Close, Restore, MarkRead, Stop]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, true, false, false), vec![Close, Minimize, MarkUnread, StartClaude]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, false, true, false), vec![Close, Minimize, MarkUnread, Resume]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Idle, false, false, false, true), vec![Close, Minimize, MarkRead]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Working, false, false), vec![Close, Minimize, MarkUnread, Stop]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Awaiting, true, true), vec![Close, Restore, MarkRead, Stop]);
+        // A shell, bare or holding a resume line, gets no play glyph: its
+        // `Start Claude` / `Resume` link already sits on line 2.
+        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, false), vec![Close, Minimize, MarkUnread]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Idle, false, true), vec![Close, Minimize, MarkRead]);
         assert_eq!(MarkUnread.icon(), Icon::Mail);
         assert_eq!(MarkRead.icon(), Icon::Check);
     }
