@@ -627,6 +627,9 @@ fn handle_ipc_command_sync(
         IpcCommand::DispatchAction { action, pane_id } => {
             handle_ipc_dispatch_action(windows, &action, pane_id)
         }
+        IpcCommand::ResumePane(pane_id) => {
+            handle_ipc_resume_pane(windows, pane_id)
+        }
         IpcCommand::MergeWindow { source_window, target_window } => {
             handle_ipc_merge_window(windows, source_window, target_window)
         }
@@ -1315,6 +1318,28 @@ fn handle_ipc_rename_pane(
         };
         if view.ipc_rename_pane(pane_id, title.clone()) {
             return IpcResponse::Ok { data: None };
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: run a pane's resume line, as the sidebar's `Resume` button does.
+fn handle_ipc_resume_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let Some(view) = kova_view(win) else { continue };
+        match view.ipc_resume_pane(pane_id) {
+            Some(true) => return IpcResponse::Ok { data: None },
+            Some(false) => {
+                return IpcResponse::Error { message: format!("nothing to resume in pane {}", pane_id) }
+            }
+            None => continue,
         }
     }
 

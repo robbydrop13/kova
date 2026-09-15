@@ -129,6 +129,9 @@ pub enum IpcCommand {
         pane_id: u32,
         waiting: bool,
     },
+    /// Run the pane's resume line, exactly as the sidebar's `Resume` button
+    /// (`Pane::run_resume`). The line is Kova's own, never the client's.
+    ResumePane(u32),
     /// Trigger any keyboard action by its stable name (see `action_from_ipc_name`).
     /// `pane_id` optionally targets (and focuses) a specific pane's window first;
     /// without it, the action runs against the key window.
@@ -412,6 +415,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "rename-pane" => &["pane_id", "title"],
         "set-pane-status" => &["pane_id", "status"],
         "dispatch-action" => &["action", "pane_id"],
+        "resume-pane" => &["pane_id"],
         "merge-window" => &["source_window", "target_window"],
         "notify" => &["pane_id", "title", "message", "sound"],
         "subscribe" => &["events"],
@@ -709,6 +713,14 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 ),
             };
             Ok(IpcCommand::DispatchAction { action, pane_id })
+        }
+        "resume-pane" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            Ok(IpcCommand::ResumePane(pane_id))
         }
         "merge-window" => {
             let source_window = v
@@ -1065,6 +1077,17 @@ mod tests {
         )
         .is_ok());
         assert!(parse_command(r#"{"cmd":"list-panes"}"#).is_ok());
+    }
+
+    #[test]
+    fn resume_pane_takes_a_pane_id_and_nothing_else() {
+        assert!(matches!(parse_command(r#"{"cmd":"resume-pane","pane_id":7}"#), Ok(IpcCommand::ResumePane(7))));
+        assert_eq!(err(r#"{"cmd":"resume-pane"}"#), "missing \"pane_id\" field");
+        // The line is Kova's own: a client cannot hand one over.
+        assert_eq!(
+            err(r#"{"cmd":"resume-pane","pane_id":7,"command":"rm -rf ~"}"#),
+            "unknown field \"command\" for command \"resume-pane\""
+        );
     }
 
     #[test]

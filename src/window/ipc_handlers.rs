@@ -60,6 +60,7 @@ pub fn pane_json(
             })
         })
         .collect();
+    let resume = pane.resume_target();
     serde_json::json!({
         "id": pane.id,
         "window": win_idx,
@@ -90,6 +91,11 @@ pub fn pane_json(
         "agent_session_name": pane.agent_session_name(),
         "claude_session_id": pane.claude_session_id(),
         "claude_session_name": pane.claude_session_name(),
+        // The conversation the sidebar's `Resume` would reopen here (`Pane::resume_target`),
+        // all three null when it offers none. `resume-pane` runs exactly this line.
+        "resume_agent": resume.as_ref().map(|r| r.0.as_str()),
+        "resume_session_id": resume.as_ref().map(|r| r.1.clone()),
+        "resume_command": resume.as_ref().map(|r| r.2.clone()),
     })
 }
 
@@ -718,6 +724,19 @@ impl KovaView {
         self.mark_dirty();
         log::info!("IPC: resized pane {} ({:?} {}{}%)", pane_id, axis, if grow {"+"} else {"-"}, amount_pct);
         Some(true)
+    }
+
+    /// IPC: what the sidebar's `Resume` does (`Pane::run_resume`). `None` when the
+    /// pane is not in this window, `Some(false)` when it has nothing to resume
+    /// (something runs there, or no resume line), `Some(true)` once typed.
+    pub fn ipc_resume_pane(&self, pane_id: PaneId) -> Option<bool> {
+        let tabs = self.ivars().tabs.borrow();
+        let pane = tabs.iter().find_map(|tab| tab.pane(pane_id))?;
+        let ran = pane.run_resume();
+        log::info!("IPC: resume pane {} ran={}", pane_id, ran);
+        drop(tabs);
+        self.mark_dirty();
+        Some(ran)
     }
 
     /// IPC: set/clear a pane's sticky custom title (equivalent to OSC 1 / Cmd-Option-R).

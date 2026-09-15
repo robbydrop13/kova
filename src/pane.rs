@@ -2195,6 +2195,30 @@ impl Pane {
         self.last_command().as_deref().and_then(crate::agent_session::resumed_session)
     }
 
+    /// What `Resume` runs in this pane: the agent, the conversation id and the
+    /// command line rebuilt by `resume_command` (which refuses an id that could
+    /// carry a second command). `None` when there is nothing to resume, or the
+    /// id is refused. The sidebar button and the IPC `resume-pane` share it, and
+    /// `list-panes` exposes it, so a client never types a line of its own.
+    pub fn resume_target(&self) -> Option<(crate::agent_session::Agent, String, String)> {
+        let (agent, id) = self.restored_session()?;
+        let command = crate::agent_session::resume_command(agent, &id, self.last_command().as_deref())?;
+        Some((agent, id, command))
+    }
+
+    /// Run the resume line (`resume_target`) in the shell: Ctrl+U first, since
+    /// the pre-typed line may still sit at the prompt or have been cleared, then
+    /// the line and Enter. Returns false when there is nothing to resume.
+    pub fn run_resume(&self) -> bool {
+        match self.resume_target() {
+            Some((_, _, command)) => {
+                self.pty.write(resume_keystrokes(&command).as_bytes());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Claude launched here but its session is not resolved yet: a restore
     /// command pending, or a `claude` foreground process without a session.
     pub fn is_starting_agent(&self) -> bool {
@@ -2213,6 +2237,12 @@ impl Pane {
             self.pty.write(command.as_bytes());
         }
     }
+}
+
+/// The bytes `Resume` writes: Ctrl+U clears whatever sits at the prompt, then
+/// the resume line and Enter.
+pub fn resume_keystrokes(command: &str) -> String {
+    format!("\x15{command}\r")
 }
 
 // (split_sizes removed — replaced by Column::row_heights)
@@ -2853,6 +2883,35 @@ mod tests {
         let mut weights = vec![1.0, 1.0];
         assert!(reweight_for_scrolled_split(&mut weights, &[false, false], 5, 1000.0, 300.0).is_none());
         assert_eq!(weights, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_restored_resume_line_is_the_resume_target_and_nothing_else_is() {
+        use crate::agent_session::Agent;
+        let id = "0b6f1c2e-6a1d-4c8e-9f00-1234567890ab";
+        let pane = super::Pane::placeholder(80, 24, &crate::config::Config::default()).unwrap();
+        assert_eq!(pane.resume_target(), None);
+
+        pane.terminal.write().last_command = Some(format!("claude --resume {id}"));
+        let (agent, got, command) = pane.resume_target().expect("a resume target");
+        assert_eq!(agent, Agent::Claude);
+        assert_eq!(got, id);
+        assert!(command.starts_with("claude ") && command.contains(id), "got {command}");
+        assert_eq!(super::resume_keystrokes(&command), format!("\u{15}{command}\r"));
+
+        // Still waiting to be pre-typed: not a bare shell yet, nothing to resume.
+        pane.pending_command.set(Some(command.clone()));
+        assert_eq!(pane.resume_target(), None);
+        pane.pending_command.set(None);
+
+        pane.terminal.write().last_command = Some("codex resume 01a0".into());
+        assert_eq!(pane.resume_target().map(|t| (t.0, t.2)), Some((Agent::Codex, "codex resume 01a0".to_string())));
+
+        // A refused id, or a plain launch, offers nothing.
+        pane.terminal.write().last_command = Some("claude --resume id;rm".into());
+        assert_eq!(pane.resume_target(), None);
+        pane.terminal.write().last_command = Some("claude".into());
+        assert_eq!(pane.resume_target(), None);
     }
 
     #[test]

@@ -646,27 +646,12 @@ impl KovaView {
         }
     }
 
-    /// Run the resume line a restored pane holds (`Pane::restored_session`).
-    /// The line is rebuilt by `resume_command`, which refuses an id that could
-    /// carry a second command, and retyped after a Ctrl+U: the pre-typed one
-    /// may still sit at the prompt or have been cleared. Refused, like `Start
-    /// Claude`, when something already runs there.
+    /// Run the resume line a restored pane holds (`Pane::run_resume`, shared
+    /// with the IPC `resume-pane`). Refused, like `Start Claude`, when something
+    /// already runs there.
     fn resume_in_pane(&self, pane_id: PaneId) {
-        let tabs = self.ivars().tabs.borrow();
-        for tab in tabs.iter() {
-            if let Some(pane) = tab.pane(pane_id) {
-                let command = pane.restored_session().and_then(|(agent, id)| {
-                    crate::agent_session::resume_command(agent, &id, pane.last_command().as_deref())
-                });
-                match command {
-                    Some(command) => pane.pty.write(format!("\x15{command}\r").as_bytes()),
-                    None => {
-                        drop(tabs);
-                        self.set_transient_status("Nothing to resume in this pane");
-                    }
-                }
-                return;
-            }
+        if self.ipc_resume_pane(pane_id) == Some(false) {
+            self.set_transient_status("Nothing to resume in this pane");
         }
     }
 

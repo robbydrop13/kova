@@ -138,9 +138,14 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "agent_session_id": "0b6f…",
   "agent_session_name": "subscribe côté Kova",
   "claude_session_id": "0b6f…",
-  "claude_session_name": "subscribe côté Kova"
+  "claude_session_name": "subscribe côté Kova",
+  "resume_agent": null,
+  "resume_session_id": null,
+  "resume_command": null
 }
 ```
+
+`resume_agent`, `resume_session_id` and `resume_command` describe the conversation the sidebar's `Resume` button would reopen in this pane: a pane restored at launch (or one its agent has left) whose last command is a resume line (`claude --resume <id>`, `codex resume <id>`), with nothing running and no restore command still waiting to be pre-typed. `resume_agent` is `"claude"` or `"codex"`, `resume_session_id` the conversation id, `resume_command` the exact line Kova would run, rebuilt by Kova with the id validated (an id that could carry a second command is refused, and all three stay `null`). All three are `null` whenever there is nothing to resume. To act on them, send `resume-pane`: never type `resume_command` yourself.
 
 `is_idle` means the shell has no child process — useful to check whether a pane is "free to receive a new command".
 
@@ -340,6 +345,18 @@ Sets the pane's custom title — the same field that `Cmd+Option+R` and `OSC 1` 
 One thing outranks it in the pane's display title: the current Claude or Codex conversation name (`agent_session_name` in `list-panes`). A sticky title outlives whatever the pane is used for next, so a pane running a named session shows that name, and the custom title reappears once the session ends or its name is cleared. The per-pane status bar uses the separate rule described under `list-panes`.
 
 Response: `{ "ok": true }`.
+
+---
+
+### `resume-pane`: reopen the conversation a pane holds
+
+```json
+{ "cmd": "resume-pane", "pane_id": 42 }
+```
+
+Does exactly what the sidebar's `Resume` button does on that pane: Ctrl+U, then the line reported as `resume_command` in `list-panes`, then Enter. The line is rebuilt by Kova at that moment, so a client only names the pane and never supplies a command.
+
+Response: `{ "ok": true }` once typed. `{ "ok": false, "error": "nothing to resume in pane 42" }` when the pane offers no resume (`resume_command` is `null`: something runs there, the restore command is still pending, or the last command is not a resume line), and `pane 42 not found` for an unknown pane. An older Kova answers `unknown command: resume-pane`.
 
 ---
 
