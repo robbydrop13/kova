@@ -19,7 +19,7 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSColorSpace, NSCursor, NSEvent, NSFont, NSGradient, NSGraphicsContext,
-    NSLineBreakMode, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView, NSScrollerStyle,
+    NSImage, NSLineBreakMode, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView, NSScrollerStyle,
     NSShadow, NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTrackingArea,
     NSTrackingAreaOptions, NSView,
 };
@@ -28,8 +28,8 @@ use objc2_foundation::{NSArray, NSDictionary, NSObjectProtocol, NSString};
 
 use super::feather::{self, Icon};
 use super::sidebar::{
-    self, sel_tile_alpha, tab_tint, tokens, wash_stops, ChipStyle, NextPill, SidebarSort, SummaryRun,
-    TileButton, TileState, OPEN_LABEL, RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
+    self, sel_tile_alpha, tab_tint, tokens, wash_stops, wash_strength, ChipStyle, NextPill, SidebarSort,
+    SummaryRun, TileButton, TileState, OPEN_LABEL, RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
 };
 use super::sidebar_model::{GroupVm, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
@@ -57,19 +57,17 @@ const PAD_H: f64 = 12.0;
 const LIST_TOP: f64 = 6.0;
 const LIST_BOTTOM: f64 = 12.0;
 const GROUP_GAP: f64 = 16.0;
-const TILE_GAP: f64 = 6.0;
 const HEADER_H: f64 = 28.0;
 const HEADER_RADIUS: f64 = 6.0;
-/// The tint bar at the left of a group, and the content inset after it.
-const GROUP_BAR_W: f64 = 3.0;
-const GROUP_CONTENT_X: f64 = 12.0;
-/// The selected tab's panel: its radius, the padding around its header and
-/// tiles, and the gap between them.
-const SEL_RADIUS: f64 = 12.0;
-const SEL_PAD: f64 = 4.0;
-const SEL_GAP: f64 = 4.0;
-/// The chevron zone at the left of a header.
+/// A group's panel: its radius, the padding above the header, the padding
+/// at the sides and the bottom, and the gap between the rows.
+const PANEL_RADIUS: f64 = 12.0;
+const PANEL_PAD_TOP: f64 = 4.0;
+const PANEL_PAD: f64 = 12.0;
+const PANEL_GAP: f64 = 12.0;
+/// The chevron zone at the left of a header, then the colour dot's box.
 const CHEVRON_ZONE_W: f64 = 24.0;
+const DOT_BOX_D: f64 = 16.0;
 /// The header's `+` button and its hover ground.
 const ADD_D: f64 = 24.0;
 const ADD_RADIUS: f64 = 8.0;
@@ -244,6 +242,8 @@ pub struct Row {
 pub enum ListHit {
     /// The chevron zone of a header: fold or unfold, no tab switch.
     Chevron(usize),
+    /// The colour dot of a header: the colour menu.
+    HeaderDot(usize),
     /// The rest of a header: switch to the tab (or fold the active one).
     Header(usize),
     /// The `+` of a header: add a pane.
@@ -261,9 +261,10 @@ impl ListHit {
         }
     }
 
+    /// The group whose header row this is, whatever part of it.
     pub fn group(self) -> Option<usize> {
         match self {
-            ListHit::Chevron(g) | ListHit::Header(g) | ListHit::HeaderAdd(g) => Some(g),
+            ListHit::Chevron(g) | ListHit::HeaderDot(g) | ListHit::Header(g) | ListHit::HeaderAdd(g) => Some(g),
             _ => None,
         }
     }
@@ -284,8 +285,8 @@ impl ListLayout {
     pub fn new(model: &SidebarModel, width: f64, m: &dyn TextMetrics) -> Self {
         let x0 = PAD_H;
         let x1 = (width - (PAD_H - EDGE_TOLERANCE)).max(x0 + 40.0);
-        let content_x = x0 + GROUP_BAR_W + GROUP_CONTENT_X;
-        let content_w = x1 - content_x;
+        let content_x = x0 + PANEL_PAD;
+        let content_w = x1 - content_x - PANEL_PAD;
         let mut rows = Vec::new();
         let mut groups = Vec::with_capacity(model.groups.len());
         let mut y = LIST_TOP;
@@ -294,31 +295,26 @@ impl ListLayout {
                 y += GROUP_GAP;
             }
             let top = y;
-            // The selected tab is a panel: header and tiles sit `SEL_PAD`
-            // inside it, `SEL_GAP` apart. The others hang off their tint bar.
-            let (cx, cw, gap) = if g.active {
-                y += SEL_PAD;
-                (x0 + SEL_PAD, x1 - x0 - 2.0 * SEL_PAD, SEL_GAP)
-            } else {
-                (content_x, content_w, TILE_GAP)
-            };
+            // Every group is a panel: the header at its top (`PANEL_PAD_TOP`
+            // above it), the tiles `PANEL_GAP` apart, `PANEL_PAD` at the
+            // sides and under the last tile. A folded group keeps the small
+            // padding under its header so the panel stays balanced.
+            y += PANEL_PAD_TOP;
             rows.push(Row {
                 kind: RowKind::Header { group: gi },
-                frame: Rect::new(cx, y, cw, HEADER_H),
+                frame: Rect::new(content_x, y, content_w, HEADER_H),
                 glyphs: Vec::new(),
                 actions: Vec::new(),
                 question_lines: 0,
             });
             y += HEADER_H;
             for (ti, tile) in g.tiles.iter().enumerate() {
-                y += gap;
-                let row = tile_row(gi, ti, tile, cx, y, cw, m);
+                y += PANEL_GAP;
+                let row = tile_row(gi, ti, tile, content_x, y, content_w, m);
                 y += row.frame.h;
                 rows.push(row);
             }
-            if g.active {
-                y += SEL_PAD;
-            }
+            y += if g.tiles.is_empty() { PANEL_PAD_TOP } else { PANEL_PAD };
             groups.push(Rect::new(x0, top, x1 - x0, y - top));
         }
         let hint_y = model.show_hint.then(|| {
@@ -338,6 +334,18 @@ impl ListLayout {
         Rect::new(frame.right() - 4.0 - ADD_D, frame.y + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D)
     }
 
+    /// The colour dot's box in a header row: the dot is 8 pt, its click
+    /// target 16.
+    pub fn dot_button(frame: &Rect) -> Rect {
+        let (cx, cy) = Self::dot_centre(frame);
+        Rect::new(cx - DOT_BOX_D / 2.0, cy - DOT_BOX_D / 2.0, DOT_BOX_D, DOT_BOX_D)
+    }
+
+    /// The centre of the header's colour dot.
+    pub fn dot_centre(frame: &Rect) -> (f64, f64) {
+        (frame.x + CHEVRON_ZONE_W + 6.0, frame.y + frame.h / 2.0)
+    }
+
     pub fn hit(&self, x: f64, y: f64) -> ListHit {
         for row in &self.rows {
             if !row.frame.contains(x, y) {
@@ -347,6 +355,8 @@ impl ListLayout {
                 RowKind::Header { group } => {
                     if x < row.frame.x + CHEVRON_ZONE_W {
                         ListHit::Chevron(group)
+                    } else if Self::dot_button(&row.frame).contains(x, y) {
+                        ListHit::HeaderDot(group)
                     } else if Self::add_button(&row.frame).contains(x, y) {
                         ListHit::HeaderAdd(group)
                     } else {
@@ -445,13 +455,13 @@ impl ListLayout {
     /// between two tiles, or half a gap outside the run's ends.
     pub fn pane_insertion_line_y(&self, run: &std::ops::Range<usize>, slot: usize) -> f64 {
         if slot == 0 {
-            self.rows[run.start].frame.y - TILE_GAP / 2.0
+            self.rows[run.start].frame.y - PANEL_GAP / 2.0
         } else if slot < run.len() {
             let above = self.rows[run.start + slot - 1].frame.bottom();
             let below = self.rows[run.start + slot].frame.y;
             (above + below) / 2.0
         } else {
-            self.rows[run.end - 1].frame.bottom() + TILE_GAP / 2.0
+            self.rows[run.end - 1].frame.bottom() + PANEL_GAP / 2.0
         }
     }
 }
@@ -712,13 +722,13 @@ fn fill_icon(icon: Icon, r: &Rect, size: f64, c: [f32; 3], alpha: f64) {
     feather::path(icon, feather::centred_box((r.x, r.y, r.w, r.h), size)).fill();
 }
 
-/// The selected tab's wash: the tint fading down the panel (`wash_stops`)
-/// over the raised ground, inside the panel's rounded rect.
-fn draw_wash(r: &Rect, radius: f64, tint: [f32; 3], alpha: f64) {
+/// A group's wash: the tint fading down the panel (`wash_stops` at
+/// `strength`) over the raised ground, inside the panel's rounded rect.
+fn draw_wash(r: &Rect, radius: f64, tint: [f32; 3], strength: f64, alpha: f64) {
     let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r.cg(), radius, radius);
     color(tokens::TILE, alpha).setFill();
     path.fill();
-    let stops = wash_stops();
+    let stops = wash_stops(strength);
     let colors: Vec<Retained<NSColor>> = stops.iter().map(|&(a, _)| color(tint, a * alpha)).collect();
     let locations: Vec<f64> = stops.iter().map(|&(_, l)| l).collect();
     let gradient = unsafe {
@@ -733,6 +743,21 @@ fn draw_wash(r: &Rect, radius: f64, tint: [f32; 3], alpha: f64) {
         // The view is flipped: 90 degrees runs from the top edge down.
         gradient.drawInBezierPath_angle(&path, 90.0);
     }
+}
+
+/// A menu swatch: a 12 pt image holding a filled dot in `c`, or a hollow
+/// grey ring for "No colour". Drawn through a handler so it stays sharp on
+/// Retina.
+pub(super) fn swatch_image(c: Option<[f32; 3]>) -> Retained<NSImage> {
+    let size = CGSize { width: 12.0, height: 12.0 };
+    let handler = block2::RcBlock::new(move |_rect: CGRect| -> objc2::runtime::Bool {
+        match c {
+            Some(c) => fill_dot(6.0, 6.0, 10.0, c, 1.0),
+            None => stroke_ring(6.0, 6.0, 10.0, 1.5, tokens::TAB_NONE, 1.0),
+        }
+        objc2::runtime::Bool::YES
+    });
+    NSImage::imageWithSize_flipped_drawingHandler(size, false, &handler)
 }
 
 /// A rounded fill with the focused tile's soft shadow under it: 6 pt down,
@@ -1141,7 +1166,7 @@ impl SidebarView {
             row.map(|r| sh.layout.rows[r].frame)
         };
         if let Some(f) = frame {
-            list.scrollRectToVisible(Rect::new(f.x, f.y - TILE_GAP, f.w, f.h + 2.0 * TILE_GAP).cg());
+            list.scrollRectToVisible(Rect::new(f.x, f.y - PANEL_GAP, f.w, f.h + 2.0 * PANEL_GAP).cg());
         }
     }
 
@@ -1408,7 +1433,7 @@ define_class!(
                         }
                     }
                 }
-                ListHit::Chevron(_) | ListHit::HeaderAdd(_) | ListHit::TileButton(..) => {
+                ListHit::Chevron(_) | ListHit::HeaderDot(_) | ListHit::HeaderAdd(_) | ListHit::TileButton(..) => {
                     self.ivars().shared.borrow_mut().pressed = hit;
                 }
                 ListHit::Empty => {}
@@ -1537,6 +1562,17 @@ impl SidebarListView {
                     kova.sidebar_toggle_collapsed(t);
                 }
             }
+            ListHit::HeaderDot(g) => {
+                // Bind the anchor first: the menu blocks, and the tick may
+                // re-lay the list out meanwhile.
+                let anchor = {
+                    let sh = self.ivars().shared.borrow();
+                    sh.layout.row_for_group(g).map(|r| ListLayout::dot_button(&sh.layout.rows[r].frame))
+                };
+                if let (Some(t), Some(a)) = (tab_of(g), anchor) {
+                    kova.show_sidebar_color_menu(self, CGPoint { x: a.x, y: a.bottom() + 2.0 }, t);
+                }
+            }
             ListHit::Header(g) => {
                 if let Some(t) = tab_of(g) {
                     kova.sidebar_header_clicked(t);
@@ -1609,22 +1645,14 @@ impl SidebarListView {
         let dirty_bottom = dirty.origin.y + dirty.size.height;
         let visible = |r: &Rect| r.bottom() >= dirty_top && r.y <= dirty_bottom;
 
-        // Group blocks: the selected tab is a panel washed with its tint,
-        // the others carry a tint bar down the left, clipped to the block's
-        // rounded corners.
+        // Group panels, each washed with its tint: stronger on the
+        // selected tab.
         for (gi, block) in sh.layout.groups.iter().enumerate() {
             if !visible(block) {
                 continue;
             }
             let Some(g) = sh.model.groups.get(gi) else { continue };
-            if g.active {
-                draw_wash(block, SEL_RADIUS, tab_tint(g.color), 1.0);
-                continue;
-            }
-            NSGraphicsContext::saveGraphicsState_class();
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(block.cg(), HEADER_RADIUS, HEADER_RADIUS).addClip();
-            fill_rect(&Rect::new(block.x, block.y, GROUP_BAR_W, block.h), tab_tint(g.color), 0.55);
-            NSGraphicsContext::restoreGraphicsState_class();
+            draw_wash(block, PANEL_RADIUS, tab_tint(g.color), wash_strength(g.active), 1.0);
         }
 
         // The lifted header or tile, resolved against the current layout: a
@@ -1700,31 +1728,30 @@ impl SidebarListView {
         let body_pressed = matches!(sh.pressed, ListHit::Header(h) | ListHit::Chevron(h) if h == group);
         let add_hovered = sh.hovered == ListHit::HeaderAdd(group);
         let add_pressed = sh.pressed == ListHit::HeaderAdd(group);
-        // Ground: the selected header has none of its own (the panel's wash
-        // shows through) and lights up white 5 % under the mouse; the others
-        // take `HEADER_HOVER`.
-        if selected {
-            if body_pressed {
-                fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.10 * alpha);
-            } else if row_hovered {
-                fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.05 * alpha);
-            }
-        } else if body_pressed {
-            fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.12 * alpha);
+        let dot_hovered = sh.hovered == ListHit::HeaderDot(group);
+        let dot_pressed = sh.pressed == ListHit::HeaderDot(group);
+        // Ground: a header has none of its own (the panel's wash shows
+        // through) and lights up white 5 % under the mouse.
+        if body_pressed {
+            fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.10 * alpha);
         } else if row_hovered {
-            fill_round(frame, HEADER_RADIUS, tokens::HEADER_HOVER, alpha);
+            fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.05 * alpha);
         }
         let (muted, muted_alpha) = if selected { (tokens::WHITE, 0.72) } else { (tokens::TEXT_SECONDARY, 1.0) };
         let (number_fg, number_alpha) = if selected { (tokens::WHITE, 0.72) } else { (tokens::TEXT_TERTIARY, 1.0) };
         let cy = frame.y + frame.h / 2.0;
         let chevron = if g.collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
         stroke_icon(chevron, &Rect::new(frame.x + 4.0, cy - ICON_D / 2.0, ICON_D, ICON_D), ICON_D, muted, muted_alpha * alpha);
-        let dot_cx = frame.x + CHEVRON_ZONE_W + 6.0;
+        let (dot_cx, _) = ListLayout::dot_centre(frame);
         if selected {
             // A 3 pt halo of the tint around the dot.
             fill_dot(dot_cx, cy, GLYPH_D + 6.0, tint, 0.28 * alpha);
         }
         fill_dot(dot_cx, cy, GLYPH_D, tint, alpha);
+        if dot_hovered || dot_pressed {
+            // The dot is a button: a thin white ring says so under the mouse.
+            stroke_ring(dot_cx, cy, DOT_BOX_D, 1.0, tokens::WHITE, if dot_pressed { 0.35 } else { 0.20 } * alpha);
+        }
         let mut x = frame.x + CHEVRON_ZONE_W + 16.0;
         let number = (g.tab_idx + 1).to_string();
         let nw = draw_text(sh, &number, &Rect::new(x, frame.y, 30.0, frame.h), Style::Number, number_fg, number_alpha * alpha, Align::Left, false);
@@ -1977,39 +2004,37 @@ mod tests {
     }
 
     const W: f64 = 280.0;
-    /// Content x of a group hanging off its tint bar: 12 + 3 + 12.
-    const CX: f64 = 27.0;
-    /// Content x inside the selected panel: 12 + 4.
-    const SX: f64 = 16.0;
+    /// Content x inside a panel: 12 + 12.
+    const SX: f64 = 24.0;
+    /// Right edge of a panel's rows: the list's edge, 8 in, then the pad.
+    const SR: f64 = W - 8.0 - PANEL_PAD;
 
     #[test]
-    fn rows_stack_with_gaps_and_the_selected_tab_is_a_padded_panel() {
+    fn rows_stack_in_padded_panels() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
         let ys: Vec<f64> = l.rows.iter().map(|r| r.frame.y).collect();
-        // Selected panel from 6: pad 4, header 10..38, gap 4, tile 42..96,
-        // gap 4, tile 100..154, pad 4 (panel ends 158); group gap 16, header
-        // 174..202 (collapsed), gap 16, header 218..246, gap 6, tile
-        // 252..306, bottom 12.
-        assert_eq!(ys, vec![10.0, 42.0, 100.0, 174.0, 218.0, 252.0]);
+        // Panel from 6: pad 4, header 10..38, gap 12, tile 50..104, gap 12,
+        // tile 116..170, pad 12 (panel ends 182); group gap 16, panel 198:
+        // header 202..230 (folded, pad 4 under it, ends 234); gap 16, panel
+        // 250: header 254..282, gap 12, tile 294..348, pad 12 (ends 360);
+        // bottom 12.
+        assert_eq!(ys, vec![10.0, 50.0, 116.0, 202.0, 254.0, 294.0]);
         assert_eq!(l.rows[1].frame.h, 54.0);
-        // Inside the panel the rows are inset 4 from its edges; the others
-        // start after the tint bar and end at the list's edge.
-        assert_eq!(l.rows[0].frame.x, SX);
-        assert_eq!(l.rows[1].frame.x, SX);
-        assert_eq!(l.rows[1].frame.right(), W - 8.0 - SEL_PAD);
-        assert_eq!(l.rows[5].frame.x, CX);
-        assert_eq!(l.rows[5].frame.right(), W - 8.0);
-        assert_eq!(l.groups[0], Rect::new(12.0, 6.0, W - 20.0, 152.0));
-        assert_eq!(l.groups[1].h, HEADER_H);
-        assert_eq!(l.groups[2], Rect::new(12.0, 218.0, W - 20.0, 88.0));
-        assert_eq!(l.content_h, 306.0 + 12.0);
+        // Every row is inset 12 from its panel's edges, selected or not.
+        for row in &l.rows {
+            assert_eq!(row.frame.x, SX);
+            assert_eq!(row.frame.right(), SR);
+        }
+        assert_eq!(l.groups[0], Rect::new(12.0, 6.0, W - 20.0, 176.0));
+        assert_eq!(l.groups[1], Rect::new(12.0, 198.0, W - 20.0, 36.0));
+        assert_eq!(l.groups[2], Rect::new(12.0, 250.0, W - 20.0, 110.0));
+        assert_eq!(l.content_h, 360.0 + 12.0);
         assert_eq!(l.hint_y, None);
-        // Without an active tab every group hangs off its bar.
+        // The selection changes the wash, not the geometry.
         let mut m = model();
         m.groups[0].active = false;
-        let l = ListLayout::new(&m, W, &FakeMetrics);
-        assert_eq!(l.rows.iter().map(|r| r.frame.y).collect::<Vec<_>>(), vec![6.0, 40.0, 100.0, 170.0, 214.0, 248.0]);
-        assert_eq!(l.rows[1].frame.x, CX);
+        m.groups[2].active = true;
+        assert_eq!(ListLayout::new(&m, W, &FakeMetrics).rows, l.rows);
     }
 
     #[test]
@@ -2038,7 +2063,7 @@ mod tests {
         assert_eq!(open.x, SX + TEXT_X);
         assert_eq!(open.w, 4.0 * 6.0 + 20.0);
         let stop = l.rows[1].actions.iter().find(|(b, _)| *b == TileButton::Stop).unwrap().1;
-        assert_eq!(stop.right(), W - 8.0 - SEL_PAD - CARD_PAD_H);
+        assert_eq!(stop.right(), SR - CARD_PAD_H);
         assert_eq!(stop.w, LINK_ICON_D + LINK_ICON_GAP + 4.0 * 6.0 + 8.0);
         assert_eq!(open.y, stop.y);
     }
@@ -2048,8 +2073,8 @@ mod tests {
         let mut m = model();
         m.show_hint = true;
         let l = ListLayout::new(&m, W, &FakeMetrics);
-        assert_eq!(l.hint_y, Some(306.0 + 16.0));
-        assert_eq!(l.content_h, 306.0 + 16.0 + 20.0 + 12.0);
+        assert_eq!(l.hint_y, Some(360.0 + 16.0));
+        assert_eq!(l.content_h, 360.0 + 16.0 + 20.0 + 12.0);
         // An empty window still lays out.
         m.groups.clear();
         let l = ListLayout::new(&m, W, &FakeMetrics);
@@ -2060,17 +2085,28 @@ mod tests {
     #[test]
     fn hit_tells_the_rows_and_their_buttons_apart() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
-        // Header: chevron zone, body, `+`. The panel's padding is nothing.
+        // Header: chevron zone, colour dot, body, `+`. The panel's padding
+        // is nothing.
         assert_eq!(l.hit(SX + 5.0, 20.0), ListHit::Chevron(0));
         assert_eq!(l.hit(SX + 60.0, 20.0), ListHit::Header(0));
         assert_eq!(l.hit(SX + 60.0, 8.0), ListHit::Empty);
+        // The dot: 8 pt at x 54, a 16 pt target around it, right after the
+        // chevron zone; the number and title start at 64.
+        assert_eq!(ListLayout::dot_centre(&l.rows[0].frame), (SX + 30.0, 24.0));
+        assert_eq!(ListLayout::dot_button(&l.rows[0].frame), Rect::new(SX + 22.0, 16.0, 16.0, 16.0));
+        assert_eq!(l.hit(SX + 30.0, 24.0), ListHit::HeaderDot(0));
+        assert_eq!(l.hit(SX + 23.0, 17.0), ListHit::Chevron(0));
+        assert_eq!(l.hit(SX + 24.0, 17.0), ListHit::HeaderDot(0));
+        assert_eq!(l.hit(SX + 38.0, 24.0), ListHit::Header(0));
+        assert_eq!(l.hit(SX + 30.0, 15.0), ListHit::Header(0));
         let add = ListLayout::add_button(&l.rows[0].frame);
-        assert_eq!(add, Rect::new(W - 8.0 - SEL_PAD - 4.0 - ADD_D, 10.0 + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D));
+        assert_eq!(add, Rect::new(SR - 4.0 - ADD_D, 10.0 + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D));
         assert_eq!(l.hit(add.x + 3.0, add.y + 3.0), ListHit::HeaderAdd(0));
-        // Hovering the `+` still counts as hovering the header row (the `+`
-        // shows while the mouse is anywhere on the row), and the row's
-        // hover tells the `+` from the body.
+        // Hovering the `+` or the dot still counts as hovering the header
+        // row (the `+` shows while the mouse is anywhere on the row), and
+        // the row's hover tells the `+` and the dot from the body.
         assert_eq!(ListHit::HeaderAdd(0).group(), Some(0));
+        assert_eq!(ListHit::HeaderDot(0).group(), Some(0));
         assert_eq!(ListHit::Header(0).group(), Some(0));
         assert_eq!(ListHit::Chevron(0).group(), Some(0));
         assert_eq!(ListHit::Tile(10).group(), None);
@@ -2082,15 +2118,16 @@ mod tests {
         assert_eq!(l.hit(100.0, 120.0), ListHit::Tile(11));
         // Left of the content column: nothing.
         assert_eq!(l.hit(5.0, 60.0), ListHit::Empty);
-        assert_eq!(l.hit(100.0, 180.0), ListHit::Header(1));
-        assert_eq!(l.hit(100.0, 260.0), ListHit::Tile(30));
+        assert_eq!(l.hit(100.0, 180.0), ListHit::Empty);
+        assert_eq!(l.hit(100.0, 210.0), ListHit::Header(1));
+        assert_eq!(l.hit(100.0, 300.0), ListHit::Tile(30));
         assert_eq!(l.hit(100.0, 1000.0), ListHit::Empty);
         // Working tile: close, minimize, stop boxes from the right on line 1.
         let row = &l.rows[2];
         let boxes: Vec<TileButton> = row.glyphs.iter().map(|(b, _)| *b).collect();
         assert_eq!(boxes, vec![TileButton::Close, TileButton::Minimize, TileButton::Stop]);
         let (_, close) = row.glyphs[0];
-        assert_eq!(close.right(), W - 8.0 - SEL_PAD - TILE_PAD_H);
+        assert_eq!(close.right(), SR - TILE_PAD_H);
         assert_eq!(close.w, BUTTON_D);
         assert_eq!(l.hit(close.x + 5.0, close.y + 5.0), ListHit::TileButton(11, TileButton::Close));
         let (_, stop) = row.glyphs[2];
@@ -2119,7 +2156,7 @@ mod tests {
         let (b, resume) = l.rows[1].actions[0];
         assert_eq!(b, TileButton::Resume);
         assert_eq!(resume.w, LINK_ICON_D + LINK_ICON_GAP + RESUME_LABEL.chars().count() as f64 * 6.0 + 8.0);
-        assert_eq!(resume.right(), W - 8.0 - SEL_PAD - TILE_PAD_H);
+        assert_eq!(resume.right(), SR - TILE_PAD_H);
         assert_eq!(l.hit(resume.x + 5.0, resume.y + 5.0), ListHit::TileButton(7, TileButton::Resume));
         assert_eq!(l.rows[1].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::Resume]);
         assert_eq!(l.rows[2].actions[0].0, TileButton::StartClaude);
@@ -2129,15 +2166,15 @@ mod tests {
     #[test]
     fn insertion_index_follows_the_midpoint_rule() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
-        // Headers at 10..38, 174..202, 218..246; the panel starts at 6.
+        // Headers at 10..38, 202..230, 254..282; panels at 6, 198, 250.
         assert_eq!(l.insertion_index(10.0), 0);
         assert_eq!(l.insertion_index(100.0), 1);
-        assert_eq!(l.insertion_index(180.0), 1);
-        assert_eq!(l.insertion_index(190.0), 2);
-        assert_eq!(l.insertion_index(235.0), 3);
+        assert_eq!(l.insertion_index(210.0), 1);
+        assert_eq!(l.insertion_index(220.0), 2);
+        assert_eq!(l.insertion_index(275.0), 3);
         assert_eq!(l.insertion_line_y(0), 6.0 - 8.0);
-        assert_eq!(l.insertion_line_y(1), 174.0 - 8.0);
-        assert_eq!(l.insertion_line_y(3), 306.0 + 8.0);
+        assert_eq!(l.insertion_line_y(1), 198.0 - 8.0);
+        assert_eq!(l.insertion_line_y(3), 360.0 + 8.0);
     }
 
     #[test]
@@ -2160,18 +2197,18 @@ mod tests {
         assert_eq!(l.pane_insertion_slot(&(0..0), 50.0), None);
         assert_eq!(l.pane_insertion_slot(&(99..99), 50.0), None);
         let run = 1..3;
-        // Tile 1 spans 42..96 (centre 69), tile 2 spans 100..154 (centre 127).
+        // Tile 1 spans 50..104 (centre 77), tile 2 spans 116..170 (centre 143).
         assert_eq!(l.pane_insertion_slot(&run, 50.0), Some(0));
         assert_eq!(l.pane_insertion_slot(&run, 100.0), Some(1));
-        assert_eq!(l.pane_insertion_slot(&run, 140.0), Some(2));
+        assert_eq!(l.pane_insertion_slot(&run, 150.0), Some(2));
         // Far above or below the run: no slot, the drop snaps back.
         assert_eq!(l.pane_insertion_slot(&run, 5.0), None);
         assert_eq!(l.pane_insertion_slot(&run, 300.0), None);
-        // The line sits in the middle of the gap between two tiles (4 in
-        // the selected panel, 6 elsewhere), half a tile gap outside the run.
-        assert_eq!(l.pane_insertion_line_y(&run, 0), 42.0 - 3.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 1), 98.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 2), 154.0 + 3.0);
+        // The line sits in the middle of the gap between two tiles, half a
+        // gap outside the run.
+        assert_eq!(l.pane_insertion_line_y(&run, 0), 50.0 - 6.0);
+        assert_eq!(l.pane_insertion_line_y(&run, 1), 110.0);
+        assert_eq!(l.pane_insertion_line_y(&run, 2), 170.0 + 6.0);
         assert_eq!(l.row_for_pane(3), Some(3));
         assert_eq!(l.row_for_pane(99), None);
         assert_eq!(l.row_for_group(1), Some(4));

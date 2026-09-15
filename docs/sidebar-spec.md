@@ -110,42 +110,48 @@ visible), the question wrapped to two lines with an ellipsis on the last
 
 ### 3.4 Group (one per tab; `TabGroupView.tsx`)
 
-Content inset 12 on each side; groups 16 apart. A non-selected group is a
-block with a 3 pt tint bar down its left edge (clipped to a radius of 6) at
-alpha 0.55; content starts 12 pt after the bar. Header 28 tall, radius 6:
-the `chevron-down` / `chevron-right` icon (secondary), 8 pt tint dot, the
-Cmd+N number in tertiary, the title (15 semibold, primary), then at the
-right the `+` button (24 pt, radius 8) and, when folded, the collapsed
-summary: a 6 pt amber dot when a pane awaits, a 6 pt blue dot when one
-works, `4 panes` in tertiary. Header hover: `#20252D`; pressed: white 12 %.
-The `+` is hidden until the mouse is anywhere on the header row (its `+`
-included); it has no ground of its own, and white 14 % (radius 8) appears
-under it only while the mouse is on the `+` itself (20 % pressed). The
-tint is `TAB_COLORS[c]` or `tabNone` grey. The selected tab's group is
-drawn differently: section 3.4.1.
+Content inset 12 on each side; groups 16 apart. Every group is a panel
+(option "A. Wash"), radius 12, filled `bg.raised` and washed with a vertical
+gradient of the tint (`sidebar::wash_stops(strength)`, an `NSGradient` in
+the panel's rounded path): `strength` at the top, x 0.45 at 42 % of the
+height, x 0.14 at the bottom; `strength` is 0.35 on the selected tab
+(`WASH_SELECTED`) and 0.20 on the others (`WASH_OTHER`). The header sits at
+the top of the panel (4 pt above it, `PANEL_PAD_TOP`), the tiles 12 pt
+apart (`PANEL_GAP`), and the panel pads 12 pt at the sides and under the
+last tile (`PANEL_PAD`; a folded panel keeps the 4 pt under its header). No
+tint bar. The tint is `TAB_COLORS[c]` or `tabNone` grey.
 
-#### 3.4.1 Selected tab (option "A. Wash")
+Header 28 tall, radius 6, no ground of its own (the wash shows through):
+the `chevron-down` / `chevron-right` icon, the 8 pt tint dot, the Cmd+N
+number, the title (15 semibold, primary), then at the right the `+` button
+(24 pt, radius 8) and, when folded, the collapsed summary: a 6 pt amber dot
+when a pane awaits, a 6 pt blue dot when one works, `4 panes`. Row hover:
+white 5 %; pressed 10 %. The `+` is hidden until the mouse is anywhere on
+the header row (dot and `+` included); it has no ground of its own, and
+white 14 % (radius 8) appears under it only while the mouse is on the `+`
+itself (20 % pressed). The dot is a button (section 4.3, colour picker): its
+16 pt box (`ListLayout::dot_button`) is its own hit (`ListHit::HeaderDot`),
+between the chevron zone and the number, and a 1 pt white ring at 20 %
+(35 % pressed) appears around it under the mouse.
 
-The active tab's group is a panel, radius 12, filled `bg.raised` and washed
-with a vertical gradient of the tint (`sidebar::wash_stops`, an `NSGradient`
-in the panel's rounded path): alpha 0.35 at the top, 0.35 x 0.45 at 42 % of
-the height, 0.35 x 0.14 at the bottom. Header and tiles sit 4 pt inside the
-panel and 4 pt apart (`SEL_PAD`, `SEL_GAP`), so the panel's rows are 11 pt
-wider on the left than a bar group's. No tint bar.
+#### 3.4.1 Selected tab
 
-- Header: no ground of its own; title white; number, chevron and collapsed
-  count white 72 %; the dot in the tint with a 3 pt halo at 28 %. Hover:
-  white 5 %; pressed 10 %. The `+` is white when shown.
-- Tiles: white 12 % with a 1 pt border white 6 %, radius 10; hover +4 %;
-  pressed +6 %; minimized 7 % less. Secondary text white 68 %; the idle and
-  shell ring white 45 %. Focused pane: white 22 % (+3 % under the mouse), a
+The selected tab's panel differs by its stronger wash and by its text:
+
+- Header: title white; number, chevron and collapsed count white 72 %
+  (secondary / tertiary elsewhere); the dot in the tint with a 3 pt halo at
+  28 %. The `+` is white when shown (primary elsewhere).
+- Tiles (every panel): white 12 % with a 1 pt border white 6 %, radius 10;
+  hover +4 %; pressed +6 %; minimized 7 % less. In the selected panel the
+  secondary text is white 68 % and the idle / shell ring white 45 %.
+  Focused pane (selected panel only): white 22 % (+3 % under the mouse), a
   1 pt border white 22 % and a soft shadow (`NSShadow`, 0 / 6 pt down, 18 pt
   blur, black 22 %); the accent ring is gone, the focused tile is simply the
   brightest one. The awaiting card keeps its amber look inside the panel.
 - Chips (`TileState::chip_style(selected)`): neutral chips are white 55 % on
-  white 7 %; elsewhere `text.tertiary` on white 5 %. Awaiting, working,
-  starting and unread chips keep their colour at 85 % on 10 % of the same
-  colour, in both places.
+  white 7 % in the selected panel; `text.tertiary` on white 5 % elsewhere.
+  Awaiting, working, starting and unread chips keep their colour at 85 % on
+  10 % of the same colour, in both places.
 
 ### 3.5 Tile (`SessionRow.tsx`), radius 10, fill `bg.raised`, padding 8 v / 10 h
 
@@ -160,9 +166,9 @@ secondary, a `★` in amber first when bookmarked; a bare shell shows
 `Start Claude` and a restored session `Resume`, each after a filled 11 pt
 `play` (accent link, primary on hover) right-aligned instead of the end of
 the subtitle. An unread tile with a turn-end summary adds a third row in
-secondary. Heights 54 / 72. Focused pane of the active tab: its group is
-the selected panel, so 3.4.1 applies (no accent ring). Hover: `bg.overlay`;
-pressed: `bg.pressed`. Minimized: fill `bg.base`, 1 pt `border.subtle`.
+secondary. Heights 54 / 72. Fill, border, hover, pressed, minimized and
+the focused pane: 3.4.1 (white layers over the panel's wash, no accent
+ring).
 
 Identity (`sidebar_model::tile_title`, `subtitle`; the phone's `paneLabel`
 and `SessionRow` subtitle, from the same `Pane` reads the daemon gets over
@@ -260,6 +266,7 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
 | Target                     | Click                                                  | Double click       | Right click  |
 |----------------------------|--------------------------------------------------------|--------------------|--------------|
 | Header chevron zone (24 pt)| toggle collapse, no tab switch                         | same               | header menu  |
+| Header colour dot (16 pt)  | colour picker (4.3), no tab switch                     |                    | header menu  |
 | Header body                | `do_switch_tab(idx)`; on the active tab: toggle collapse | `start_rename_tab` | header menu |
 | Header `+`                 | add a pane (4.4)                                       |                    | header menu  |
 | Tile body                  | `focus_pane_in_window(id)` (switches tab, restores, reveals) | rename pane  | tile menu    |
@@ -317,6 +324,18 @@ Header menu (`sidebarTabAction:`, tag = `TabAction`): the six colours +
 `No colour`, separator, `Rename tab…`, `Add a pane` (`do_switch_tab(idx)`
 then `do_split(Horizontal)`), `Collapse others`, separator, `Close tab`
 (`do_switch_tab(idx)` then `do_close_tab()`, with its confirmation).
+
+Colour picker (`show_sidebar_color_menu`): a click on the header's dot pops
+an `NSMenu` under the dot listing `Red`, `Orange`, `Yellow`, `Green`,
+`Blue`, `Violet` (`TAB_COLOR_NAMES`, in `TAB_COLORS` order), each with a
+12 pt filled swatch image (`sidebar_view::swatch_image`, drawn through an
+`NSImage` handler so it is sharp on Retina), then `No colour` with a grey
+ring, a check mark on the tab's current colour. The items share the header
+menu's `sidebarTabAction:` selector and `TabAction::Color(i)` /
+`TabAction::NoColor` tags, so a pick runs `run_tab_action`, which sets
+`Tab.color` (the same field the tab bar's menu and IPC `set-tab-color`
+write); the periodic session save carries it to `session.json` like any
+other tab change.
 
 ### 4.4 Keys
 
@@ -385,13 +404,13 @@ status.success                     #3DD68C
 status.error                       #FF5C5C
 action.interrupt.text              #FF7A7A
 tabNone                            #7C8593
-header.hover                       #20252D
 tab tint          TAB_COLORS[c] (Kova palette, mirrored by the phone)
-selected wash     tint at 0.35 -> 0.1575 (42 %) -> 0.049, over bg.raised
+panel wash        tint at s -> s x 0.45 (42 %) -> s x 0.14, over bg.raised;
+                  s = 0.35 on the selected tab, 0.20 on the others
 
 top 36  summary 24  pill region 36 (pill 28, radius 14)  footer 24
-list inset 12 (+6 top, +12 bottom)  group gap 16  tile gap 6  header 28 (radius 6)
-group bar 3 + inset 12  selected panel radius 12, pad 4, gap 4
+list inset 12 (+6 top, +12 bottom)  group gap 16  header 28 (radius 6)
+panel radius 12, pad 4 top / 12 sides and bottom, row gap 12  dot box 16
 tile radius 10, pad 8/10  card radius 12, pad 10/12, bar 4
 rows: title 20, secondary 16, question 16/line, gap 2  chip 18 (radius 9, pad 7)
 hover button 24 (radius 7, gap 2, icon 16)  header + 24 (radius 8)

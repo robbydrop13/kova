@@ -89,8 +89,14 @@ impl TabAction {
 /// A menu row: a label and its tag, or a separator.
 enum MenuRow {
     Item(String, isize),
+    /// A colour choice: its label, tag, swatch (`None` for the grey ring of
+    /// "No colour") and whether it is the current one (check mark).
+    Swatch(String, isize, Option<[f32; 3]>, bool),
     Separator,
 }
+
+/// The six tab colours, in `TAB_COLORS` order, as the colour menu names them.
+pub(super) const TAB_COLOR_NAMES: [&str; 6] = ["Red", "Orange", "Yellow", "Green", "Blue", "Violet"];
 
 pub(super) struct SidebarState {
     sort: SidebarSort,
@@ -474,6 +480,23 @@ impl KovaView {
         self.pop_up_sidebar_menu(view, location, &rows, objc2::sel!(sidebarTabAction:));
     }
 
+    /// The colour picker under a header's dot: the six tab colours with
+    /// their swatches, then `No colour`, the current one checked. Picks go
+    /// through `sidebarTabAction:` like the header menu's colour items.
+    pub(super) fn show_sidebar_color_menu(&self, view: &objc2_app_kit::NSView, location: CGPoint, tab_idx: usize) {
+        self.ivars().sidebar.borrow_mut().menu_tab = tab_idx;
+        // Bind the current colour before the menu blocks: no `tabs` borrow
+        // may be held while it runs.
+        let current = self.ivars().tabs.borrow().get(tab_idx).and_then(|t| t.color);
+        let mut rows: Vec<MenuRow> = TAB_COLOR_NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, name)| MenuRow::Swatch((*name).into(), TabAction::Color(i).tag(), Some(crate::renderer::TAB_COLORS[i]), current == Some(i)))
+            .collect();
+        rows.push(MenuRow::Swatch("No colour".into(), TabAction::NoColor.tag(), None, current.is_none()));
+        self.pop_up_sidebar_menu(view, location, &rows, objc2::sel!(sidebarTabAction:));
+    }
+
     /// An `NSMenu` at `location` in `view`, built like `show_tab_color_menu`:
     /// every item targets this view with `selector` and carries its tag.
     /// Blocks until the user picks or dismisses; no `tabs` borrow may be held.
@@ -483,23 +506,32 @@ impl KovaView {
         let menu = NSMenu::new(mtm);
         let empty_ke = NSString::from_str("");
         for row in rows {
-            match row {
-                MenuRow::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
-                MenuRow::Item(label, tag) => {
-                    let title = NSString::from_str(label);
-                    let item = unsafe {
-                        NSMenuItem::initWithTitle_action_keyEquivalent(
-                            NSMenuItem::alloc(mtm),
-                            &title,
-                            Some(selector),
-                            &empty_ke,
-                        )
-                    };
-                    item.setTag(*tag);
-                    unsafe { item.setTarget(Some(&*self)) };
-                    menu.addItem(&item);
+            let (label, tag, swatch) = match row {
+                MenuRow::Separator => {
+                    menu.addItem(&NSMenuItem::separatorItem(mtm));
+                    continue;
+                }
+                MenuRow::Item(label, tag) => (label, *tag, None),
+                MenuRow::Swatch(label, tag, color, checked) => (label, *tag, Some((*color, *checked))),
+            };
+            let title = NSString::from_str(label);
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &title,
+                    Some(selector),
+                    &empty_ke,
+                )
+            };
+            item.setTag(tag);
+            unsafe { item.setTarget(Some(&*self)) };
+            if let Some((color, checked)) = swatch {
+                item.setImage(Some(&super::sidebar_view::swatch_image(color)));
+                if checked {
+                    item.setState(unsafe { objc2_app_kit::NSControlStateValueOn });
                 }
             }
+            menu.addItem(&item);
         }
         let _ok: bool = unsafe {
             objc2::msg_send![&menu, popUpMenuPositioningItem: std::ptr::null::<NSMenuItem>(), atLocation: location, inView: view]
@@ -730,6 +762,16 @@ mod tests {
 
     fn bounds(w: f64, h: f64) -> CGRect {
         CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w, height: h } }
+    }
+
+    #[test]
+    fn the_colour_menu_names_every_tab_colour_and_round_trips_its_tags() {
+        assert_eq!(TAB_COLOR_NAMES.len(), crate::renderer::TAB_COLORS.len());
+        for i in 0..TAB_COLOR_NAMES.len() {
+            assert_eq!(TabAction::from_tag(TabAction::Color(i).tag()), Some(TabAction::Color(i)));
+        }
+        assert_eq!(TabAction::from_tag(TabAction::NoColor.tag()), Some(TabAction::NoColor));
+        assert!(TAB_COLOR_NAMES.iter().all(|n| n.is_ascii()));
     }
 
     #[test]

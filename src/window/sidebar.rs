@@ -98,8 +98,6 @@ pub mod tokens {
     pub const INTERRUPT: [f32; 3] = [1.000, 0.478, 0.478];
     pub const TAB_NONE: [f32; 3] = [0.486, 0.522, 0.576];
     pub const SEPARATOR: [f32; 3] = BORDER_SUBTLE;
-    /// A group header under the mouse (`#20252D`).
-    pub const HEADER_HOVER: [f32; 3] = [0.125, 0.145, 0.176];
     /// The white every translucent layer of the selected group is cut from.
     pub const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
     pub const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
@@ -109,8 +107,10 @@ pub mod tokens {
 // Selected tab wash
 // ---------------------------------------------------------------
 
-/// Alpha of the tab colour at the top of the selected group's panel.
-pub const WASH_ALPHA: f64 = 0.35;
+/// Alpha of the tab colour at the top of a group's panel: the selected tab's
+/// strength, and the other tabs'.
+pub const WASH_SELECTED: f64 = 0.35;
+pub const WASH_OTHER: f64 = 0.20;
 /// Alpha of the white the selected group's tiles are filled with.
 pub const SEL_TILE_ALPHA: f64 = 0.12;
 /// The tile's lift under the mouse (a point less on the focused tile, which
@@ -118,11 +118,16 @@ pub const SEL_TILE_ALPHA: f64 = 0.12;
 pub const SEL_TILE_HOVER_LIFT: f64 = 0.04;
 pub const SEL_TILE_FOCUS_LIFT: f64 = 0.10;
 
-/// The vertical gradient washed over the selected group's panel: the tab
-/// colour at `WASH_ALPHA` at the top, fading to 45 % of it at 42 % of the
-/// height and 14 % at the bottom. `(alpha, location)`, top to bottom.
-pub fn wash_stops() -> [(f64, f64); 3] {
-    [(WASH_ALPHA, 0.0), (WASH_ALPHA * 0.45, 0.42), (WASH_ALPHA * 0.14, 1.0)]
+/// The vertical gradient washed over a group's panel: the tab colour at
+/// `strength` at the top, fading to 45 % of it at 42 % of the height and
+/// 14 % at the bottom. `(alpha, location)`, top to bottom.
+pub fn wash_stops(strength: f64) -> [(f64, f64); 3] {
+    [(strength, 0.0), (strength * 0.45, 0.42), (strength * 0.14, 1.0)]
+}
+
+/// The wash strength of a group: `WASH_SELECTED` on the active tab.
+pub fn wash_strength(selected: bool) -> f64 {
+    if selected { WASH_SELECTED } else { WASH_OTHER }
 }
 
 /// Fill alpha of a tile in the selected group.
@@ -641,11 +646,15 @@ mod tests {
 
     #[test]
     fn the_wash_fades_from_the_top_and_tiles_lift_under_focus_and_hover() {
-        let stops = wash_stops();
+        let stops = wash_stops(wash_strength(true));
         assert_eq!(stops[0], (0.35, 0.0));
         assert!((stops[1].0 - 0.1575).abs() < 1e-9 && stops[1].1 == 0.42);
         assert!((stops[2].0 - 0.049).abs() < 1e-9 && stops[2].1 == 1.0);
         assert!(stops.windows(2).all(|w| w[0].0 > w[1].0 && w[0].1 < w[1].1));
+        let other = wash_stops(wash_strength(false));
+        assert_eq!(other[0], (0.20, 0.0));
+        assert!((other[1].0 - 0.09).abs() < 1e-9 && other[1].1 == 0.42);
+        assert!((other[2].0 - 0.028).abs() < 1e-9 && other[2].1 == 1.0);
         assert_eq!(sel_tile_alpha(false, false), 0.12);
         assert_eq!(sel_tile_alpha(false, true), 0.16);
         assert_eq!(sel_tile_alpha(true, false), 0.22);
