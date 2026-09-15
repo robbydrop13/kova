@@ -528,7 +528,7 @@ impl KovaView {
             if let Some((color, checked)) = swatch {
                 item.setImage(Some(&super::sidebar_view::swatch_image(color)));
                 if checked {
-                    item.setState(unsafe { objc2_app_kit::NSControlStateValueOn });
+                    item.setState(objc2_app_kit::NSControlStateValueOn);
                 }
             }
             menu.addItem(&item);
