@@ -294,13 +294,31 @@ keyboard stays with the terminal.
   insertion line spans the content width between the two groups the cursor
   is over (midpoint rule over headers). The drop goes through
   `sidebar_reorder_tab` -> `ipc_move_tab`. Disabled in activity sort.
-- Pane drag: mouse down on a tile body, move 3 pt: the tile lifts the same
-  way and the line, at the tile's width, appears between tiles of the SAME
-  column of the same tab (`ListLayout::pane_run`). Drop = `sidebar_drop_pane`:
-  the adjacent swaps of `swap_chain` replayed through `Tab::swap_panes`, then
-  `mark_all_dirty` + `resize_all_panes`. A drop more than a header height
-  above or below the run snaps back. Cross-column and cross-tab drops are
-  still v4.
+- Pane drag (KovaLink's `dragSlots.ts` / `dragMachine.ts`, ported to
+  `sidebar::next_slot`, `displacements`, `placeholder_y`, `drag_bounds`
+  and `ListLayout::pane_drag_frame`): mouse down on a tile body, move 3 pt:
+  the tile lifts into a ghost (its tile drawn on a `bg.raised` ground with a
+  shadow, 0 / 6 pt down, 12 pt blur, black 35 %, scaled 1.02, alpha 0.94)
+  that follows the cursor inside its column run (`ListLayout::pane_run`,
+  the tiles of the SAME column of the same tab; the travel is clamped to
+  the run). The ghost aims at a rank: a row is crossed when the ghost's
+  leading edge passes its middle, and crossed back only past its displaced
+  middle (a gap of hysteresis, so nothing flickers on the boundary). The
+  rows between the origin and the aimed rank step aside by the held height
+  plus the 12 pt gap, and a skeleton (a 1 pt dashed rounded outline, white
+  25 %, the tile's size and radius, empty inside) marks the aimed spot,
+  which is exactly where the tile will land. The aimed rank lives in the
+  drag state with the pane id, never a row index: a tick may re-lay the
+  list out mid-drag, and the frame is rebuilt from the current layout on
+  every event (a gone pane ends the drag, a stale rank is clamped). Drop =
+  `sidebar_drop_pane(tab_idx, ids, from, to)`: the adjacent swaps of
+  `swap_chain` replayed through `Tab::swap_panes`, then `mark_all_dirty` +
+  `resize_all_panes`; a drop at the origin does nothing. Escape while a
+  tile is lifted cancels: the rows fall back into place and nothing is
+  committed (a local `NSEvent` key monitor installed at lift and removed at
+  drop or cancel, since the list never takes first responder). Cross-column
+  and cross-tab drops are still v4: Kova has no way to move one pane into
+  another tab (`reparent` stays inside a tab, `merge-tab` moves whole tabs).
 - Both call `NSView::autoscroll:` on every drag event, so a cursor past the
   visible part keeps the list scrolling.
 

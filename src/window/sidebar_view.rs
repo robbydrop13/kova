@@ -18,18 +18,19 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSColorSpace, NSCursor, NSEvent, NSFont, NSGradient, NSGraphicsContext,
+    NSAffineTransformNSAppKitAdditions, NSBezierPath, NSColor, NSColorSpace, NSCursor, NSEvent, NSEventMask, NSFont, NSGradient, NSGraphicsContext,
     NSImage, NSLineBreakMode, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView, NSScrollerStyle,
     NSShadow, NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTrackingArea,
     NSTrackingAreaOptions, NSView,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSArray, NSDictionary, NSObjectProtocol, NSString};
+use objc2_foundation::{NSAffineTransform, NSArray, NSDictionary, NSObjectProtocol, NSString};
 
 use super::feather::{self, Icon};
 use super::sidebar::{
-    self, sel_tile_alpha, tab_tint, tokens, wash_stops, wash_strength, ChipStyle, NextPill, SidebarSort,
-    SummaryRun, TileButton, TileState, OPEN_LABEL, RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
+    self, displacements, drag_bounds, next_slot, placeholder_y, sel_tile_alpha, tab_tint, tokens, wash_stops,
+    wash_strength, ChipStyle, NextPill, SidebarSort, Slot, SummaryRun, TileButton, TileState, OPEN_LABEL,
+    RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
 };
 use super::sidebar_model::{GroupVm, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
@@ -101,6 +102,10 @@ const ACTIONS_H: f64 = 20.0;
 const HINT_H: f64 = 20.0;
 /// Pixels of travel before a pressed header or tile lifts into a drag.
 const DRAG_THRESHOLD: f64 = 3.0;
+/// The lifted tile: a touch larger and slightly translucent (KovaLink's
+/// ghost: scale 1.02, opacity 0.94).
+const GHOST_SCALE: f64 = 1.02;
+const GHOST_ALPHA: f64 = 0.94;
 
 // ---------------------------------------------------------------
 // Text styles
@@ -430,37 +435,58 @@ impl ListLayout {
         start..end
     }
 
-    /// The slot (0 ..= run length) a dragged tile would take in `run`, by the
-    /// midpoint rule, `None` when the cursor left the run vertically.
-    pub fn pane_insertion_slot(&self, run: &std::ops::Range<usize>, y: f64) -> Option<usize> {
-        if run.is_empty() || run.end > self.rows.len() {
-            return None;
-        }
-        let first = &self.rows[run.start].frame;
-        let last = &self.rows[run.end - 1].frame;
-        if y < first.y - HEADER_H || y >= last.bottom() + HEADER_H {
-            return None;
-        }
-        for (k, row) in self.rows[run.clone()].iter().enumerate() {
-            if y < row.frame.y + row.frame.h / 2.0 {
-                return Some(k);
-            }
-        }
-        Some(run.len())
+    /// The rows of `run` as drag slots (position and height).
+    pub fn pane_slots(&self, run: &std::ops::Range<usize>) -> Vec<Slot> {
+        self.rows.get(run.clone()).map_or_else(Vec::new, |rows| rows.iter().map(|r| Slot { y: r.frame.y, h: r.frame.h }).collect())
     }
 
-    /// Y of the insertion line for `slot` in `run`: the middle of the gap
-    /// between two tiles, or half a gap outside the run's ends.
-    pub fn pane_insertion_line_y(&self, run: &std::ops::Range<usize>, slot: usize) -> f64 {
-        if slot == 0 {
-            self.rows[run.start].frame.y - PANEL_GAP / 2.0
-        } else if slot < run.len() {
-            let above = self.rows[run.start + slot - 1].frame.bottom();
-            let below = self.rows[run.start + slot].frame.y;
-            (above + below) / 2.0
-        } else {
-            self.rows[run.end - 1].frame.bottom() + PANEL_GAP / 2.0
-        }
+    /// The state of a pane drag against this layout: the held row, its run,
+    /// the clamped travel, how far each row of the run steps aside and where
+    /// the skeleton sits. `None` once the pane is gone.
+    pub fn pane_drag_frame(&self, pane_id: PaneId, dy: f64, to: usize) -> Option<PaneDragFrame> {
+        let row = self.row_for_pane(pane_id)?;
+        let run = self.pane_run(row);
+        let slots = self.pane_slots(&run);
+        let from = row - run.start;
+        let range = (0, slots.len().checked_sub(1)?);
+        let (min_dy, max_dy) = drag_bounds(&slots, from, range);
+        let dy = dy.clamp(min_dy, max_dy);
+        let to = to.clamp(range.0, range.1);
+        Some(PaneDragFrame {
+            run: run.clone(),
+            from,
+            to,
+            dy,
+            moves: displacements(&slots, from, to, PANEL_GAP),
+            placeholder_y: placeholder_y(&slots, from, to, PANEL_GAP),
+            slots,
+        })
+    }
+}
+
+/// One frame of a pane drag (`ListLayout::pane_drag_frame`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneDragFrame {
+    /// The rows of the held pane's column run.
+    pub run: std::ops::Range<usize>,
+    /// The held pane's rank in the run, and the rank it aims at.
+    pub from: usize,
+    pub to: usize,
+    /// The held tile's travel from its row, clamped to the run.
+    pub dy: f64,
+    pub slots: Vec<Slot>,
+    /// How far each row of the run steps aside (the held one stays 0).
+    pub moves: Vec<f64>,
+    /// The top of the skeleton, in list coordinates.
+    pub placeholder_y: f64,
+}
+
+impl PaneDragFrame {
+    /// The rank the held tile aims at after a move to `dy`, with the run's
+    /// hysteresis.
+    pub fn next_to(&self, dy: f64) -> usize {
+        let range = (0, self.slots.len().saturating_sub(1));
+        next_slot(&self.slots, self.from, self.to, dy, PANEL_GAP, range)
     }
 }
 
@@ -611,13 +637,15 @@ struct TabDrag {
 }
 
 /// Same for a tile: the pane id, resolved to a row when drawn or dropped.
+/// `to` is the rank the tile aims at inside its column run (KovaLink's
+/// drag machine: the other rows step aside and a skeleton marks it).
 #[derive(Clone, Copy)]
 struct PaneDrag {
     pane_id: PaneId,
     start_y: f64,
     current_y: f64,
-    grab_offset: f64,
     dragging: bool,
+    to: usize,
 }
 
 struct Shared {
@@ -758,18 +786,28 @@ pub(super) fn swatch_image(c: Option<[f32; 3]>) -> Retained<NSImage> {
     NSImage::imageWithSize_flipped_drawingHandler(size, false, &handler)
 }
 
-/// A rounded fill with the focused tile's soft shadow under it: 6 pt down,
-/// 18 pt blur, black at 22 %.
-fn fill_round_shadowed(r: &Rect, radius: f64, c: [f32; 3], alpha: f64) {
+/// A rounded fill with a soft shadow under it: 6 pt down, `blur` wide,
+/// black at `shadow_alpha`.
+fn fill_round_shadowed(r: &Rect, radius: f64, c: [f32; 3], alpha: f64, blur: f64, shadow_alpha: f64) {
     NSGraphicsContext::saveGraphicsState_class();
     let shadow = NSShadow::new();
     // Shadow offsets are in the window's base space, y up: negative is down.
     shadow.setShadowOffset(CGSize { width: 0.0, height: -6.0 });
-    shadow.setShadowBlurRadius(18.0);
-    shadow.setShadowColor(Some(&color(tokens::BLACK, 0.22 * alpha)));
+    shadow.setShadowBlurRadius(blur);
+    shadow.setShadowColor(Some(&color(tokens::BLACK, shadow_alpha * alpha)));
     shadow.set();
     fill_round(r, radius, c, alpha);
     NSGraphicsContext::restoreGraphicsState_class();
+}
+
+/// A dashed rounded outline: the drag skeleton.
+fn stroke_dashed_round(r: &Rect, radius: f64, width: f64, c: [f32; 3], alpha: f64) {
+    color(c, alpha).setStroke();
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r.inset(width / 2.0).cg(), radius, radius);
+    path.setLineWidth(width);
+    let pattern: [f64; 2] = [5.0, 4.0];
+    unsafe { path.setLineDash_count_phase(pattern.as_ptr(), pattern.len() as isize, 0.0) };
+    path.stroke();
 }
 
 /// Text attributes: font, colour, truncation.
@@ -1321,6 +1359,9 @@ pub struct SidebarListViewIvars {
     /// The mouse went down inside the list: the matching mouse up is ours
     /// whatever it lands on.
     mouse_down: std::cell::Cell<bool>,
+    /// While a tile is lifted: the local key monitor that turns Escape into
+    /// a cancel (the list never takes first responder).
+    escape_monitor: RefCell<Option<Retained<AnyObject>>>,
 }
 
 define_class!(
@@ -1426,8 +1467,8 @@ define_class!(
                         let mut sh = self.ivars().shared.borrow_mut();
                         sh.pressed = hit;
                         if let Some(row) = sh.layout.row_for_pane(pane_id) {
-                            let row_y = sh.layout.rows[row].frame.y;
-                            sh.pane_drag = Some(PaneDrag { pane_id, start_y: y, current_y: y, grab_offset: y - row_y, dragging: false });
+                            let to = row - sh.layout.pane_run(row).start;
+                            sh.pane_drag = Some(PaneDrag { pane_id, start_y: y, current_y: y, dragging: false, to });
                         }
                     }
                 }
@@ -1446,6 +1487,7 @@ define_class!(
             }
             let (x, y) = local_point(self, event);
             let mut lifted = false;
+            let mut just_lifted = false;
             {
                 let mut sh = self.ivars().shared.borrow_mut();
                 if let Some(mut d) = sh.tab_drag {
@@ -1462,10 +1504,16 @@ define_class!(
                     d.current_y = y;
                     if !d.dragging && (y - d.start_y).abs() >= DRAG_THRESHOLD {
                         d.dragging = true;
+                        just_lifted = true;
                     }
                     if d.dragging {
                         sh.pressed = ListHit::Empty;
                         lifted = true;
+                        // Aim: the rank the tile is over, with the run's
+                        // hysteresis, against the current layout.
+                        if let Some(frame) = sh.layout.pane_drag_frame(d.pane_id, y - d.start_y, d.to) {
+                            d.to = frame.next_to(frame.dy);
+                        }
                     }
                     sh.pane_drag = Some(d);
                 } else if sh.pressed != ListHit::Empty {
@@ -1474,6 +1522,9 @@ define_class!(
                         sh.pressed = ListHit::Empty;
                     }
                 }
+            }
+            if just_lifted {
+                self.install_escape_monitor();
             }
             if lifted {
                 // Near an edge of the visible part, keep scrolling.
@@ -1492,10 +1543,11 @@ define_class!(
                 let mut sh = self.ivars().shared.borrow_mut();
                 (sh.tab_drag.take(), sh.pane_drag.take(), std::mem::replace(&mut sh.pressed, ListHit::Empty))
             };
+            self.remove_escape_monitor();
             if let Some(d) = tab_drag.filter(|d| d.dragging) {
                 self.drop_tab(d.tab_id, y);
             } else if let Some(d) = pane_drag.filter(|d| d.dragging) {
-                self.drop_pane(d.pane_id, y);
+                self.drop_pane(d.pane_id, d.to);
             } else if pressed != ListHit::Empty {
                 let hit = self.ivars().shared.borrow().layout.hit(x, y);
                 if hit == pressed {
@@ -1524,7 +1576,11 @@ define_class!(
 
 impl SidebarListView {
     fn new(mtm: MainThreadMarker, shared: Rc<RefCell<Shared>>, frame: CGRect) -> Retained<Self> {
-        let this = mtm.alloc::<Self>().set_ivars(SidebarListViewIvars { shared, mouse_down: std::cell::Cell::new(false) });
+        let this = mtm.alloc::<Self>().set_ivars(SidebarListViewIvars {
+            shared,
+            mouse_down: std::cell::Cell::new(false),
+            escape_monitor: RefCell::new(None),
+        });
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
@@ -1612,28 +1668,67 @@ impl SidebarListView {
         }
     }
 
-    /// Drop a dragged tile at the slot under `y` in its column run. The pane
-    /// may have gone since the mouse went down: then nothing happens.
-    fn drop_pane(&self, pane_id: PaneId, y: f64) {
+    /// Drop a dragged tile at rank `to` of its column run. The pane may have
+    /// gone since the mouse went down: then nothing happens.
+    fn drop_pane(&self, pane_id: PaneId, to: usize) {
         let (tab_idx, ids, from, to) = {
             let sh = self.ivars().shared.borrow();
+            let Some(frame) = sh.layout.pane_drag_frame(pane_id, 0.0, to) else { return };
             let Some(row) = sh.layout.row_for_pane(pane_id) else { return };
-            let run = sh.layout.pane_run(row);
-            let Some(slot) = sh.layout.pane_insertion_slot(&run, y) else { return };
             let RowKind::Tile { group, .. } = sh.layout.rows[row].kind else { return };
             let Some(tab_idx) = sh.model.groups.get(group).map(|g| g.tab_idx) else { return };
-            let ids: Vec<PaneId> = sh.layout.rows[run.clone()]
+            let ids: Vec<PaneId> = sh.layout.rows[frame.run.clone()]
                 .iter()
                 .filter_map(|r| match r.kind {
                     RowKind::Tile { pane_id, .. } => Some(pane_id),
                     _ => None,
                 })
                 .collect();
-            let from = row - run.start;
-            (tab_idx, ids, from, sidebar::drop_index(from, slot))
+            (tab_idx, ids, frame.from, frame.to)
         };
+        if from == to {
+            return;
+        }
         if let Some(kova) = kova_of(self) {
             kova.sidebar_drop_pane(tab_idx, &ids, from, to);
+        }
+    }
+
+    /// Escape while a tile is lifted: the rows fall back into their order
+    /// and nothing is committed.
+    fn cancel_pane_drag(&self) {
+        let cancelled = {
+            let mut sh = self.ivars().shared.borrow_mut();
+            sh.pane_drag.take().is_some_and(|d| d.dragging)
+        };
+        self.remove_escape_monitor();
+        if cancelled {
+            self.setNeedsDisplay(true);
+        }
+    }
+
+    /// Watch for Escape while a tile is lifted. The list never becomes
+    /// first responder, so the key would otherwise reach the terminal.
+    fn install_escape_monitor(&self) {
+        self.remove_escape_monitor();
+        let view = self.retain();
+        let handler = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+            // Escape is key code 53.
+            let key = unsafe { event.as_ref() }.keyCode();
+            if key == 53 {
+                view.cancel_pane_drag();
+                std::ptr::null_mut()
+            } else {
+                event.as_ptr()
+            }
+        });
+        let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler) };
+        *self.ivars().escape_monitor.borrow_mut() = monitor;
+    }
+
+    fn remove_escape_monitor(&self) {
+        if let Some(monitor) = self.ivars().escape_monitor.borrow_mut().take() {
+            unsafe { NSEvent::removeMonitor(&monitor) };
         }
     }
 
@@ -1658,17 +1753,25 @@ impl SidebarListView {
         let lifted_tab = sh.tab_drag.filter(|d| d.dragging);
         let lifted_group = lifted_tab.and_then(|d| sh.model.groups.iter().position(|g| g.tab_id == d.tab_id));
         let lifted_pane = sh.pane_drag.filter(|d| d.dragging);
-        let lifted_row = lifted_pane.and_then(|d| sh.layout.row_for_pane(d.pane_id));
+        let pane_frame = lifted_pane.and_then(|d| sh.layout.pane_drag_frame(d.pane_id, d.current_y - d.start_y, d.to));
+        let lifted_row = pane_frame.as_ref().map(|f| f.run.start + f.from);
         for (ri, row) in sh.layout.rows.iter().enumerate() {
-            if !visible(&row.frame) {
-                continue;
-            }
             let lifted = match row.kind {
                 RowKind::Header { group } => lifted_group == Some(group),
                 RowKind::Tile { .. } => lifted_row == Some(ri),
             };
+            // The held tile is drawn later, floating; its skeleton takes
+            // its place. The rows of its run step aside.
+            if lifted && pane_frame.is_some() {
+                continue;
+            }
+            let shift = pane_frame.as_ref().filter(|f| f.run.contains(&ri)).map_or(0.0, |f| f.moves[ri - f.run.start]);
+            let y = row.frame.y + shift;
+            if !visible(&Rect::new(row.frame.x, y, row.frame.w, row.frame.h)) {
+                continue;
+            }
             let alpha = if lifted { 0.35 } else { 1.0 };
-            self.draw_row(&sh, row, row.frame.y, alpha);
+            self.draw_row(&sh, row, y, alpha);
         }
 
         if let Some(hy) = sh.layout.hint_y {
@@ -1686,15 +1789,29 @@ impl SidebarListView {
                 self.draw_row(&sh, row, d.current_y - d.grab_offset, 0.9);
             }
         }
-        if let (Some(d), Some(ri)) = (lifted_pane, lifted_row) {
-            let run = sh.layout.pane_run(ri);
-            if let Some(slot) = sh.layout.pane_insertion_slot(&run, d.current_y) {
-                let ly = sh.layout.pane_insertion_line_y(&run, slot);
-                let f = &sh.layout.rows[ri].frame;
-                fill_round(&Rect::new(f.x, ly - 1.0, f.w, 2.0), 1.0, tokens::ACCENT, 1.0);
-            }
+        if let (Some(f), Some(ri)) = (pane_frame, lifted_row) {
             let row = &sh.layout.rows[ri];
-            self.draw_row(&sh, row, d.current_y - d.grab_offset, 0.9);
+            let awaiting = matches!(row.kind, RowKind::Tile { group, index, .. }
+                if sh.model.groups.get(group).and_then(|g| g.tiles.get(index)).is_some_and(|t| t.awaiting()));
+            let radius = if awaiting { CARD_RADIUS } else { TILE_RADIUS };
+            // The skeleton: a dashed, empty outline the size of the tile
+            // where it will land.
+            let skeleton = Rect::new(row.frame.x, f.placeholder_y, row.frame.w, row.frame.h);
+            stroke_dashed_round(&skeleton, radius, 1.0, tokens::WHITE, 0.25);
+            // The ghost: the tile lifted on a raised ground with a shadow,
+            // a touch larger, following the cursor within its run.
+            let y = row.frame.y + f.dy;
+            let ghost = Rect::new(row.frame.x, y, row.frame.w, row.frame.h);
+            NSGraphicsContext::saveGraphicsState_class();
+            let lift = NSAffineTransform::transform();
+            let (cx, cy) = (ghost.x + ghost.w / 2.0, ghost.y + ghost.h / 2.0);
+            lift.translateXBy_yBy(cx, cy);
+            lift.scaleBy(GHOST_SCALE);
+            lift.translateXBy_yBy(-cx, -cy);
+            lift.concat();
+            fill_round_shadowed(&ghost, radius, tokens::TILE, 1.0, 12.0, 0.35);
+            self.draw_row(&sh, row, y, GHOST_ALPHA);
+            NSGraphicsContext::restoreGraphicsState_class();
         }
     }
 
@@ -1814,7 +1931,7 @@ impl SidebarListView {
                 fill_alpha -= 0.07;
             }
             if tile.focused {
-                fill_round_shadowed(frame, radius, tokens::WHITE, fill_alpha * alpha);
+                fill_round_shadowed(frame, radius, tokens::WHITE, fill_alpha * alpha, 18.0, 0.22);
                 stroke_round(frame, radius, 1.0, tokens::WHITE, 0.22 * alpha);
             } else {
                 fill_round(frame, radius, tokens::WHITE, fill_alpha * alpha);
@@ -2191,23 +2308,41 @@ mod tests {
         assert_eq!(l.pane_run(5), 5..6);
         assert_eq!(l.pane_run(0), 0..0);
         // A row that is gone or no longer a tile (the list was re-laid out
-        // mid-drag) has an empty run, and an empty run has no slot.
+        // mid-drag) has an empty run.
         assert_eq!(l.pane_run(99), 99..99);
-        assert_eq!(l.pane_insertion_slot(&(0..0), 50.0), None);
-        assert_eq!(l.pane_insertion_slot(&(99..99), 50.0), None);
-        let run = 1..3;
-        // Tile 1 spans 58..112 (centre 85), tile 2 spans 124..178 (centre 151).
-        assert_eq!(l.pane_insertion_slot(&run, 50.0), Some(0));
-        assert_eq!(l.pane_insertion_slot(&run, 100.0), Some(1));
-        assert_eq!(l.pane_insertion_slot(&run, 160.0), Some(2));
-        // Far above or below the run: no slot, the drop snaps back.
-        assert_eq!(l.pane_insertion_slot(&run, 5.0), None);
-        assert_eq!(l.pane_insertion_slot(&run, 300.0), None);
-        // The line sits in the middle of the gap between two tiles, half a
-        // gap outside the run.
-        assert_eq!(l.pane_insertion_line_y(&run, 0), 58.0 - 6.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 1), 118.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 2), 178.0 + 6.0);
+        // Tile 1 spans 58..112, tile 2 124..178: the run's slots.
+        assert_eq!(l.pane_slots(&(1..3)), vec![Slot { y: 58.0, h: 54.0 }, Slot { y: 124.0, h: 54.0 }]);
+        assert_eq!(l.pane_slots(&(99..100)), Vec::<Slot>::new());
+        // Lifting pane 1 and pulling it 39 down: its bottom (112 + 39) sits
+        // on tile 2's middle (151), nothing crossed, the skeleton stays at
+        // its origin; at 40 the bottom passes it: tile 2 steps up by
+        // 54 + 12 and the skeleton takes its old bottom.
+        let f = l.pane_drag_frame(1, 39.0, 0).unwrap();
+        assert_eq!((f.run.clone(), f.from, f.to, f.dy), (1..3, 0, 0, 39.0));
+        assert_eq!(f.next_to(39.0), 0);
+        assert_eq!(f.next_to(40.0), 1);
+        let f = l.pane_drag_frame(1, 40.0, 1).unwrap();
+        assert_eq!(f.moves, vec![0.0, -66.0]);
+        assert_eq!(f.placeholder_y, 124.0);
+        // Hysteresis: tile 2 now sits 66 higher (middle at 85); it returns
+        // only once the held top (58 + dy) passes back above that.
+        assert_eq!(f.next_to(28.0), 1);
+        assert_eq!(f.next_to(26.0), 0);
+        // The travel is clamped to the run: pane 1 cannot go above its own
+        // top nor below tile 2's bottom; a stale rank is clamped too.
+        let f = l.pane_drag_frame(1, -500.0, 5).unwrap();
+        assert_eq!((f.dy, f.to), (0.0, 1));
+        assert_eq!(l.pane_drag_frame(1, 500.0, 0).unwrap().dy, 66.0);
+        // Pane 2 pulled up 41: it aims at rank 0, tile 1 steps down.
+        let f = l.pane_drag_frame(2, -41.0, 1).unwrap();
+        assert_eq!(f.next_to(-41.0), 0);
+        let f = l.pane_drag_frame(2, -41.0, 0).unwrap();
+        assert_eq!(f.moves, vec![66.0, 0.0]);
+        assert_eq!(f.placeholder_y, 58.0);
+        // A lone pane in its column has nowhere to go; a gone pane no frame.
+        let f = l.pane_drag_frame(3, 30.0, 0).unwrap();
+        assert_eq!((f.dy, f.to, f.moves.clone()), (0.0, 0, vec![0.0]));
+        assert_eq!(l.pane_drag_frame(99, 0.0, 0), None);
         assert_eq!(l.row_for_pane(3), Some(3));
         assert_eq!(l.row_for_pane(99), None);
         assert_eq!(l.row_for_group(1), Some(4));

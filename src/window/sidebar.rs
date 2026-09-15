@@ -432,10 +432,115 @@ pub fn swap_chain(len: usize, from: usize, to: usize) -> Vec<(usize, usize)> {
     }
 }
 
-/// The index a dragged item ends at when dropped in `slot` (0 ..= len) of a
-/// list it already belongs to at `from`.
-pub fn drop_index(from: usize, slot: usize) -> usize {
-    if slot > from { slot - 1 } else { slot }
+
+// ---------------------------------------------------------------
+// Drag geometry (KovaLink `dragSlots.ts`)
+// ---------------------------------------------------------------
+//
+// Where the held tile lands and how far the others step aside. Rows are
+// not all the same height; only the gap between them is.
+
+/// A row's position and height in the list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slot {
+    pub y: f64,
+    pub h: f64,
+}
+
+/// The rank the held row `from` aims at after moving by `dy`, starting from
+/// the `current` rank. A row is crossed when the leading edge of the held
+/// tile passes its middle; it is crossed back at its displaced middle, so
+/// with a `gap` of hysteresis. The rank stays inside `range` (inclusive).
+/// At `dy = 0` nothing moves.
+pub fn next_slot(slots: &[Slot], from: usize, current: usize, dy: f64, gap: f64, range: (usize, usize)) -> usize {
+    let Some(held) = slots.get(from) else { return current };
+    let (lo, hi) = range;
+    let big = held.h + gap;
+    let top = held.y + dy;
+    let bottom = top + held.h;
+    let mut to = current.clamp(lo, hi);
+    loop {
+        let mut next = to;
+        if to >= from {
+            if to + 1 <= hi && slots.get(to + 1).is_some_and(|below| bottom > below.y + below.h / 2.0) {
+                next = to + 1;
+            } else if to > from {
+                let crossed = slots[to];
+                if top < crossed.y - big + crossed.h / 2.0 {
+                    next = to - 1;
+                }
+            }
+        }
+        if next == to && to <= from {
+            if to >= lo + 1 && slots.get(to - 1).is_some_and(|above| top < above.y + above.h / 2.0) {
+                next = to - 1;
+            } else if to < from {
+                let crossed = slots[to];
+                if bottom > crossed.y + big + crossed.h / 2.0 {
+                    next = to + 1;
+                }
+            }
+        }
+        if next == to {
+            return to;
+        }
+        to = next;
+    }
+}
+
+/// How far each row steps aside when row `from` aims at rank `to`: the
+/// room the held tile frees.
+pub fn displacements(slots: &[Slot], from: usize, to: usize, gap: f64) -> Vec<f64> {
+    let big = slots.get(from).map_or(0.0, |s| s.h) + gap;
+    (0..slots.len())
+        .map(|i| {
+            if from < i && i <= to {
+                -big
+            } else if to <= i && i < from {
+                big
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// Where the held tile lands on release, relative to its origin: what the
+/// skeleton's position is checked against.
+#[cfg(test)]
+pub fn settle_offset(slots: &[Slot], from: usize, to: usize) -> f64 {
+    let (Some(held), Some(target)) = (slots.get(from), slots.get(to)) else { return 0.0 };
+    if to == from {
+        0.0
+    } else if to > from {
+        target.y + target.h - held.h - held.y
+    } else {
+        target.y - held.y
+    }
+}
+
+/// The top of the skeleton marking the aimed rank: the room left by the
+/// rows that stepped aside, which is exactly where the tile will land.
+pub fn placeholder_y(slots: &[Slot], from: usize, to: usize, gap: f64) -> f64 {
+    let (Some(held), Some(target)) = (slots.get(from), slots.get(to)) else {
+        return slots.get(from).map_or(0.0, |s| s.y);
+    };
+    if to == from {
+        held.y
+    } else if to > from {
+        target.y + target.h - (held.h + gap) + gap
+    } else {
+        target.y
+    }
+}
+
+/// The travel the held tile may take: from the top of the first row of the
+/// range to the bottom of the last, as `(min_dy, max_dy)`.
+pub fn drag_bounds(slots: &[Slot], from: usize, range: (usize, usize)) -> (f64, f64) {
+    let (Some(held), Some(first), Some(last)) = (slots.get(from), slots.get(range.0), slots.get(range.1)) else {
+        return (0.0, 0.0);
+    };
+    (first.y - held.y, last.y + last.h - held.h - held.y)
 }
 
 // ---------------------------------------------------------------
@@ -553,11 +658,87 @@ mod tests {
         assert_eq!(swap_chain(4, 3, 1), vec![(3, 2), (2, 1)]);
         assert_eq!(swap_chain(4, 2, 2), Vec::<(usize, usize)>::new());
         assert_eq!(swap_chain(2, 5, 0), Vec::<(usize, usize)>::new());
-        // Slot arithmetic: dropping below itself shifts by one.
-        assert_eq!(drop_index(0, 2), 1);
-        assert_eq!(drop_index(0, 1), 0);
-        assert_eq!(drop_index(2, 0), 0);
-        assert_eq!(drop_index(1, 3), 2);
+    }
+
+    /// Rows stacked from y 0 with an 8 pt gap.
+    fn stack(heights: &[f64]) -> Vec<Slot> {
+        let mut y = 0.0;
+        heights
+            .iter()
+            .map(|&h| {
+                let slot = Slot { y, h };
+                y += h + 8.0;
+                slot
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_held_tile_crosses_rows_at_their_middle_with_hysteresis() {
+        let equal = stack(&[64.0, 64.0, 64.0, 64.0]);
+        let all = (0, 3);
+        for i in 0..4 {
+            assert_eq!(next_slot(&equal, i, i, 0.0, 8.0, all), i);
+        }
+        // Down: the next row's middle is at 104, the held bottom at 64 + dy.
+        assert_eq!(next_slot(&equal, 0, 0, 40.0, 8.0, all), 0);
+        assert_eq!(next_slot(&equal, 0, 0, 41.0, 8.0, all), 1);
+        assert_eq!(next_slot(&equal, 0, 0, 120.0, 8.0, all), 2);
+        // Up: the previous row's middle is at 104, the held top at 144 + dy.
+        assert_eq!(next_slot(&equal, 2, 2, -40.0, 8.0, all), 2);
+        assert_eq!(next_slot(&equal, 2, 2, -41.0, 8.0, all), 1);
+        assert_eq!(next_slot(&equal, 3, 3, -300.0, 8.0, all), 0);
+        // Hysteresis: a crossed row is crossed back at its displaced middle.
+        assert_eq!(next_slot(&equal, 0, 1, 41.0, 8.0, all), 1);
+        assert_eq!(next_slot(&equal, 0, 1, 33.0, 8.0, all), 1);
+        assert_eq!(next_slot(&equal, 0, 1, 31.0, 8.0, all), 0);
+        assert_eq!(next_slot(&equal, 2, 1, -41.0, 8.0, all), 1);
+        assert_eq!(next_slot(&equal, 2, 1, -33.0, 8.0, all), 1);
+        assert_eq!(next_slot(&equal, 2, 1, -31.0, 8.0, all), 2);
+        // Unequal heights: the crossed row's middle counts, not its height.
+        let mixed = stack(&[64.0, 220.0, 64.0]);
+        assert_eq!(next_slot(&mixed, 0, 0, 118.0, 8.0, (0, 2)), 0);
+        assert_eq!(next_slot(&mixed, 0, 0, 119.0, 8.0, (0, 2)), 1);
+        assert_eq!(next_slot(&mixed, 1, 1, -40.0, 8.0, (0, 2)), 1);
+        assert_eq!(next_slot(&mixed, 1, 1, -41.0, 8.0, (0, 2)), 0);
+        // Bounded by the list and by the range.
+        assert_eq!(next_slot(&equal, 0, 0, -500.0, 8.0, all), 0);
+        assert_eq!(next_slot(&equal, 3, 3, 500.0, 8.0, all), 3);
+        assert_eq!(next_slot(&equal, 0, 0, 500.0, 8.0, all), 3);
+        assert_eq!(next_slot(&equal, 2, 2, -500.0, 8.0, (2, 3)), 2);
+        assert_eq!(next_slot(&equal, 2, 2, 500.0, 8.0, (2, 3)), 3);
+        assert_eq!(next_slot(&equal, 1, 1, 500.0, 8.0, (0, 1)), 1);
+        assert_eq!(next_slot(&equal, 9, 1, 50.0, 8.0, all), 1);
+    }
+
+    #[test]
+    fn rows_step_aside_by_the_held_height_and_the_skeleton_takes_the_landing_spot() {
+        let equal = stack(&[64.0, 64.0, 64.0, 64.0]);
+        assert_eq!(displacements(&equal, 0, 2, 8.0), vec![0.0, -72.0, -72.0, 0.0]);
+        assert_eq!(displacements(&equal, 3, 1, 8.0), vec![0.0, 72.0, 72.0, 0.0]);
+        assert_eq!(displacements(&equal, 1, 1, 8.0), vec![0.0; 4]);
+        let mixed = stack(&[64.0, 220.0, 64.0]);
+        assert_eq!(displacements(&mixed, 1, 2, 8.0), vec![0.0, 0.0, -228.0]);
+        assert_eq!(settle_offset(&equal, 0, 0), 0.0);
+        assert_eq!(settle_offset(&equal, 0, 2), 144.0);
+        assert_eq!(settle_offset(&equal, 2, 0), -144.0);
+        assert_eq!(settle_offset(&mixed, 0, 1), 292.0 - 64.0);
+        assert_eq!(settle_offset(&mixed, 1, 0), -72.0);
+        assert_eq!(drag_bounds(&equal, 1, (0, 3)), (-72.0, 144.0));
+        assert_eq!(drag_bounds(&equal, 0, (0, 3)), (0.0, 216.0));
+        assert_eq!(drag_bounds(&equal, 2, (2, 3)), (0.0, 72.0));
+        assert_eq!(drag_bounds(&mixed, 0, (0, 2)), (0.0, 300.0));
+        assert_eq!(drag_bounds(&equal, 7, (0, 3)), (0.0, 0.0));
+        assert_eq!(placeholder_y(&equal, 0, 0, 8.0), 0.0);
+        assert_eq!(placeholder_y(&equal, 2, 2, 8.0), 144.0);
+        // The skeleton sits exactly where the tile will land.
+        for slots in [equal, stack(&[72.0, 88.0, 210.0]), stack(&[210.0, 72.0, 88.0, 72.0])] {
+            for from in 0..slots.len() {
+                for to in 0..slots.len() {
+                    assert_eq!(placeholder_y(&slots, from, to, 8.0), slots[from].y + settle_offset(&slots, from, to));
+                }
+            }
+        }
     }
 
     #[test]
