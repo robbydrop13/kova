@@ -75,13 +75,13 @@ impl KovaView {
 
         self.ivars().color_menu_tab.set(tab_idx);
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let pastilles = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣"];
+        let current = self.ivars().tabs.borrow().get(tab_idx).and_then(|t| t.color);
         let menu = NSMenu::new(mtm);
         let action = objc2::sel!(tabColorSelected:);
         let empty_ke = NSString::from_str("");
 
-        for (i, emoji) in pastilles.iter().enumerate() {
-            let title = NSString::from_str(emoji);
+        for (i, name) in crate::renderer::TAB_COLOR_NAMES.iter().enumerate() {
+            let title = NSString::from_str(name);
             let item = unsafe {
                 NSMenuItem::initWithTitle_action_keyEquivalent(
                     NSMenuItem::alloc(mtm),
@@ -91,13 +91,17 @@ impl KovaView {
                 )
             };
             item.setTag(i as isize);
+            item.setImage(Some(&super::sidebar_view::swatch_image(Some(crate::renderer::TAB_COLORS[i]))));
+            if current == Some(i) {
+                item.setState(objc2_app_kit::NSControlStateValueOn);
+            }
             unsafe { item.setTarget(Some(&*self)) };
             menu.addItem(&item);
         }
 
-        // Separator + "Aucune" item
+        // Separator + "No colour" item
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        let none_title = NSString::from_str("Aucune");
+        let none_title = NSString::from_str("No colour");
         let none_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -107,6 +111,10 @@ impl KovaView {
             )
         };
         none_item.setTag(-1);
+        none_item.setImage(Some(&super::sidebar_view::swatch_image(None)));
+        if current.is_none() {
+            none_item.setState(objc2_app_kit::NSControlStateValueOn);
+        }
         unsafe { none_item.setTarget(Some(&*self)) };
         menu.addItem(&none_item);
 

@@ -414,10 +414,10 @@ Response: `{ "ok": true }`.
 { "cmd": "set-tab-color", "pane_id": 42, "color": 4 }
 ```
 
-`color` is an index into the same six-color palette the tab bar's right-click menu offers:
-`0` red, `1` orange, `2` yellow, `3` green, `4` blue, `5` violet. Pass `"color": null` to
-clear it (tab falls back to the default background). Anything outside `0..5` is refused
-rather than wrapped.
+`color` is an index into the same twelve-color palette the tab bar's right-click menu offers:
+`0` red, `1` orange, `2` yellow, `3` green, `4` blue, `5` violet, `6` pink, `7` coral,
+`8` lime, `9` teal, `10` cyan, `11` indigo. Pass `"color": null` to clear it (tab falls
+back to the default background). Anything outside `0..11` is refused rather than wrapped.
 
 Response: `{ "ok": true }`.
 

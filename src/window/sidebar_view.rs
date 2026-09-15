@@ -58,11 +58,11 @@ const LIST_TOP: f64 = 6.0;
 const LIST_BOTTOM: f64 = 12.0;
 const GROUP_GAP: f64 = 16.0;
 const HEADER_H: f64 = 28.0;
-const HEADER_RADIUS: f64 = 6.0;
-/// A group's panel: its radius, the padding above the header, the padding
-/// at the sides and the bottom, and the gap between the rows.
+/// The header's hover ground is a full pill.
+const HEADER_RADIUS: f64 = HEADER_H / 2.0;
+/// A group's panel: its radius, the padding around its rows (the header at
+/// the top included) and the gap between the rows.
 const PANEL_RADIUS: f64 = 12.0;
-const PANEL_PAD_TOP: f64 = 4.0;
 const PANEL_PAD: f64 = 12.0;
 const PANEL_GAP: f64 = 12.0;
 /// The chevron zone at the left of a header, then the colour dot's box.
@@ -295,11 +295,9 @@ impl ListLayout {
                 y += GROUP_GAP;
             }
             let top = y;
-            // Every group is a panel: the header at its top (`PANEL_PAD_TOP`
-            // above it), the tiles `PANEL_GAP` apart, `PANEL_PAD` at the
-            // sides and under the last tile. A folded group keeps the small
-            // padding under its header so the panel stays balanced.
-            y += PANEL_PAD_TOP;
+            // Every group is a panel: the header at its top, the tiles
+            // `PANEL_GAP` apart, `PANEL_PAD` all around.
+            y += PANEL_PAD;
             rows.push(Row {
                 kind: RowKind::Header { group: gi },
                 frame: Rect::new(content_x, y, content_w, HEADER_H),
@@ -314,7 +312,7 @@ impl ListLayout {
                 y += row.frame.h;
                 rows.push(row);
             }
-            y += if g.tiles.is_empty() { PANEL_PAD_TOP } else { PANEL_PAD };
+            y += PANEL_PAD;
             groups.push(Rect::new(x0, top, x1 - x0, y - top));
         }
         let hint_y = model.show_hint.then(|| {
@@ -2013,22 +2011,22 @@ mod tests {
     fn rows_stack_in_padded_panels() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
         let ys: Vec<f64> = l.rows.iter().map(|r| r.frame.y).collect();
-        // Panel from 6: pad 4, header 10..38, gap 12, tile 50..104, gap 12,
-        // tile 116..170, pad 12 (panel ends 182); group gap 16, panel 198:
-        // header 202..230 (folded, pad 4 under it, ends 234); gap 16, panel
-        // 250: header 254..282, gap 12, tile 294..348, pad 12 (ends 360);
-        // bottom 12.
-        assert_eq!(ys, vec![10.0, 50.0, 116.0, 202.0, 254.0, 294.0]);
+        // Panel from 6: pad 12, header 18..46, gap 12, tile 58..112, gap
+        // 12, tile 124..178, pad 12 (panel ends 190); group gap 16, panel
+        // 206: header 218..246 (folded, pad 12 under it, ends 258); gap 16,
+        // panel 274: header 286..314, gap 12, tile 326..380, pad 12 (ends
+        // 392); bottom 12.
+        assert_eq!(ys, vec![18.0, 58.0, 124.0, 218.0, 286.0, 326.0]);
         assert_eq!(l.rows[1].frame.h, 54.0);
         // Every row is inset 12 from its panel's edges, selected or not.
         for row in &l.rows {
             assert_eq!(row.frame.x, SX);
             assert_eq!(row.frame.right(), SR);
         }
-        assert_eq!(l.groups[0], Rect::new(12.0, 6.0, W - 20.0, 176.0));
-        assert_eq!(l.groups[1], Rect::new(12.0, 198.0, W - 20.0, 36.0));
-        assert_eq!(l.groups[2], Rect::new(12.0, 250.0, W - 20.0, 110.0));
-        assert_eq!(l.content_h, 360.0 + 12.0);
+        assert_eq!(l.groups[0], Rect::new(12.0, 6.0, W - 20.0, 184.0));
+        assert_eq!(l.groups[1], Rect::new(12.0, 206.0, W - 20.0, 52.0));
+        assert_eq!(l.groups[2], Rect::new(12.0, 274.0, W - 20.0, 118.0));
+        assert_eq!(l.content_h, 392.0 + 12.0);
         assert_eq!(l.hint_y, None);
         // The selection changes the wash, not the geometry.
         let mut m = model();
@@ -2073,8 +2071,8 @@ mod tests {
         let mut m = model();
         m.show_hint = true;
         let l = ListLayout::new(&m, W, &FakeMetrics);
-        assert_eq!(l.hint_y, Some(360.0 + 16.0));
-        assert_eq!(l.content_h, 360.0 + 16.0 + 20.0 + 12.0);
+        assert_eq!(l.hint_y, Some(392.0 + 16.0));
+        assert_eq!(l.content_h, 392.0 + 16.0 + 20.0 + 12.0);
         // An empty window still lays out.
         m.groups.clear();
         let l = ListLayout::new(&m, W, &FakeMetrics);
@@ -2092,15 +2090,15 @@ mod tests {
         assert_eq!(l.hit(SX + 60.0, 8.0), ListHit::Empty);
         // The dot: 8 pt at x 54, a 16 pt target around it, right after the
         // chevron zone; the number and title start at 64.
-        assert_eq!(ListLayout::dot_centre(&l.rows[0].frame), (SX + 30.0, 24.0));
-        assert_eq!(ListLayout::dot_button(&l.rows[0].frame), Rect::new(SX + 22.0, 16.0, 16.0, 16.0));
-        assert_eq!(l.hit(SX + 30.0, 24.0), ListHit::HeaderDot(0));
-        assert_eq!(l.hit(SX + 23.0, 17.0), ListHit::Chevron(0));
-        assert_eq!(l.hit(SX + 24.0, 17.0), ListHit::HeaderDot(0));
-        assert_eq!(l.hit(SX + 38.0, 24.0), ListHit::Header(0));
-        assert_eq!(l.hit(SX + 30.0, 15.0), ListHit::Header(0));
+        assert_eq!(ListLayout::dot_centre(&l.rows[0].frame), (SX + 30.0, 32.0));
+        assert_eq!(ListLayout::dot_button(&l.rows[0].frame), Rect::new(SX + 22.0, 24.0, 16.0, 16.0));
+        assert_eq!(l.hit(SX + 30.0, 32.0), ListHit::HeaderDot(0));
+        assert_eq!(l.hit(SX + 23.0, 25.0), ListHit::Chevron(0));
+        assert_eq!(l.hit(SX + 24.0, 25.0), ListHit::HeaderDot(0));
+        assert_eq!(l.hit(SX + 38.0, 32.0), ListHit::Header(0));
+        assert_eq!(l.hit(SX + 30.0, 23.0), ListHit::Header(0));
         let add = ListLayout::add_button(&l.rows[0].frame);
-        assert_eq!(add, Rect::new(SR - 4.0 - ADD_D, 10.0 + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D));
+        assert_eq!(add, Rect::new(SR - 4.0 - ADD_D, 18.0 + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D));
         assert_eq!(l.hit(add.x + 3.0, add.y + 3.0), ListHit::HeaderAdd(0));
         // Hovering the `+` or the dot still counts as hovering the header
         // row (the `+` shows while the mouse is anywhere on the row), and
@@ -2113,14 +2111,15 @@ mod tests {
         assert_ne!(l.hit(add.x + 3.0, add.y + 3.0), l.hit(add.x - 3.0, add.y + 3.0));
         assert_eq!(l.hit(add.x - 3.0, add.y + 3.0), ListHit::Header(0));
         // The gap above a tile is nothing, the body is the pane.
-        assert_eq!(l.hit(100.0, 40.0), ListHit::Empty);
+        assert_eq!(l.hit(100.0, 50.0), ListHit::Empty);
         assert_eq!(l.hit(100.0, 60.0), ListHit::Tile(10));
-        assert_eq!(l.hit(100.0, 120.0), ListHit::Tile(11));
+        assert_eq!(l.hit(100.0, 130.0), ListHit::Tile(11));
         // Left of the content column: nothing.
         assert_eq!(l.hit(5.0, 60.0), ListHit::Empty);
         assert_eq!(l.hit(100.0, 180.0), ListHit::Empty);
-        assert_eq!(l.hit(100.0, 210.0), ListHit::Header(1));
-        assert_eq!(l.hit(100.0, 300.0), ListHit::Tile(30));
+        assert_eq!(l.hit(100.0, 210.0), ListHit::Empty);
+        assert_eq!(l.hit(100.0, 230.0), ListHit::Header(1));
+        assert_eq!(l.hit(100.0, 340.0), ListHit::Tile(30));
         assert_eq!(l.hit(100.0, 1000.0), ListHit::Empty);
         // Working tile: close, minimize, stop boxes from the right on line 1.
         let row = &l.rows[2];
@@ -2166,15 +2165,15 @@ mod tests {
     #[test]
     fn insertion_index_follows_the_midpoint_rule() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
-        // Headers at 10..38, 202..230, 254..282; panels at 6, 198, 250.
+        // Headers at 18..46, 218..246, 286..314; panels at 6, 206, 274.
         assert_eq!(l.insertion_index(10.0), 0);
         assert_eq!(l.insertion_index(100.0), 1);
         assert_eq!(l.insertion_index(210.0), 1);
-        assert_eq!(l.insertion_index(220.0), 2);
-        assert_eq!(l.insertion_index(275.0), 3);
+        assert_eq!(l.insertion_index(240.0), 2);
+        assert_eq!(l.insertion_index(305.0), 3);
         assert_eq!(l.insertion_line_y(0), 6.0 - 8.0);
-        assert_eq!(l.insertion_line_y(1), 198.0 - 8.0);
-        assert_eq!(l.insertion_line_y(3), 360.0 + 8.0);
+        assert_eq!(l.insertion_line_y(1), 206.0 - 8.0);
+        assert_eq!(l.insertion_line_y(3), 392.0 + 8.0);
     }
 
     #[test]
@@ -2197,18 +2196,18 @@ mod tests {
         assert_eq!(l.pane_insertion_slot(&(0..0), 50.0), None);
         assert_eq!(l.pane_insertion_slot(&(99..99), 50.0), None);
         let run = 1..3;
-        // Tile 1 spans 50..104 (centre 77), tile 2 spans 116..170 (centre 143).
+        // Tile 1 spans 58..112 (centre 85), tile 2 spans 124..178 (centre 151).
         assert_eq!(l.pane_insertion_slot(&run, 50.0), Some(0));
         assert_eq!(l.pane_insertion_slot(&run, 100.0), Some(1));
-        assert_eq!(l.pane_insertion_slot(&run, 150.0), Some(2));
+        assert_eq!(l.pane_insertion_slot(&run, 160.0), Some(2));
         // Far above or below the run: no slot, the drop snaps back.
         assert_eq!(l.pane_insertion_slot(&run, 5.0), None);
         assert_eq!(l.pane_insertion_slot(&run, 300.0), None);
         // The line sits in the middle of the gap between two tiles, half a
         // gap outside the run.
-        assert_eq!(l.pane_insertion_line_y(&run, 0), 50.0 - 6.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 1), 110.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 2), 170.0 + 6.0);
+        assert_eq!(l.pane_insertion_line_y(&run, 0), 58.0 - 6.0);
+        assert_eq!(l.pane_insertion_line_y(&run, 1), 118.0);
+        assert_eq!(l.pane_insertion_line_y(&run, 2), 178.0 + 6.0);
         assert_eq!(l.row_for_pane(3), Some(3));
         assert_eq!(l.row_for_pane(99), None);
         assert_eq!(l.row_for_group(1), Some(4));

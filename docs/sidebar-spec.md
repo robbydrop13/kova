@@ -114,14 +114,16 @@ Content inset 12 on each side; groups 16 apart. Every group is a panel
 (option "A. Wash"), radius 12, filled `bg.raised` and washed with a vertical
 gradient of the tint (`sidebar::wash_stops(strength)`, an `NSGradient` in
 the panel's rounded path): `strength` at the top, x 0.45 at 42 % of the
-height, x 0.14 at the bottom; `strength` is 0.35 on the selected tab
+height, x 0.14 at the bottom; `strength` is 0.40 on the selected tab
 (`WASH_SELECTED`) and 0.20 on the others (`WASH_OTHER`). The header sits at
-the top of the panel (4 pt above it, `PANEL_PAD_TOP`), the tiles 12 pt
-apart (`PANEL_GAP`), and the panel pads 12 pt at the sides and under the
-last tile (`PANEL_PAD`; a folded panel keeps the 4 pt under its header). No
-tint bar. The tint is `TAB_COLORS[c]` or `tabNone` grey.
+the top of the panel, the tiles 12 pt apart (`PANEL_GAP`), and the panel
+pads 12 pt all around (`PANEL_PAD`: above the header, at the sides, under
+the last row). No tint bar. The tint is `TAB_COLORS[c]` (twelve colours:
+red, orange, yellow, green, blue, violet, pink, coral, lime, teal, cyan,
+indigo) or `tabNone` grey.
 
-Header 28 tall, radius 6, no ground of its own (the wash shows through):
+Header 28 tall, its hover ground a full pill (radius 14), no ground of its
+own otherwise (the wash shows through):
 the `chevron-down` / `chevron-right` icon, the 8 pt tint dot, the Cmd+N
 number, the title (15 semibold, primary), then at the right the `+` button
 (24 pt, radius 8) and, when folded, the collapsed summary: a 6 pt amber dot
@@ -320,14 +322,14 @@ tile's own buttons go through the same function.
 | Minimize / Restore| not minimized / minimized                              | focus then `do_minimize_pane()`; restore = `focus_pane_in_window`         |
 | Close             | always                                                 | `ipc_close_pane(id)`; when `is_working()` an `NSAlert` first (`Close {title}?`, `Close and interrupt` / `Keep working`). Refused on the last pane with a status line |
 
-Header menu (`sidebarTabAction:`, tag = `TabAction`): the six colours +
+Header menu (`sidebarTabAction:`, tag = `TabAction`): the twelve colours +
 `No colour`, separator, `Rename tab…`, `Add a pane` (`do_switch_tab(idx)`
 then `do_split(Horizontal)`), `Collapse others`, separator, `Close tab`
 (`do_switch_tab(idx)` then `do_close_tab()`, with its confirmation).
 
 Colour picker (`show_sidebar_color_menu`): a click on the header's dot pops
-an `NSMenu` under the dot listing `Red`, `Orange`, `Yellow`, `Green`,
-`Blue`, `Violet` (`TAB_COLOR_NAMES`, in `TAB_COLORS` order), each with a
+an `NSMenu` under the dot listing the twelve colours (`TAB_COLOR_NAMES`, in
+`TAB_COLORS` order: `Red` to `Indigo`, one column), each with a
 12 pt filled swatch image (`sidebar_view::swatch_image`, drawn through an
 `NSImage` handler so it is sharp on Retina), then `No colour` with a grey
 ring, a check mark on the tab's current colour. The items share the header
@@ -406,11 +408,11 @@ action.interrupt.text              #FF7A7A
 tabNone                            #7C8593
 tab tint          TAB_COLORS[c] (Kova palette, mirrored by the phone)
 panel wash        tint at s -> s x 0.45 (42 %) -> s x 0.14, over bg.raised;
-                  s = 0.35 on the selected tab, 0.20 on the others
+                  s = 0.40 on the selected tab, 0.20 on the others
 
 top 36  summary 24  pill region 36 (pill 28, radius 14)  footer 24
-list inset 12 (+6 top, +12 bottom)  group gap 16  header 28 (radius 6)
-panel radius 12, pad 4 top / 12 sides and bottom, row gap 12  dot box 16
+list inset 12 (+6 top, +12 bottom)  group gap 16  header 28 (hover pill radius 14)
+panel radius 12, pad 12, row gap 12  dot box 16
 tile radius 10, pad 8/10  card radius 12, pad 10/12, bar 4
 rows: title 20, secondary 16, question 16/line, gap 2  chip 18 (radius 9, pad 7)
 hover button 24 (radius 7, gap 2, icon 16)  header + 24 (radius 8)

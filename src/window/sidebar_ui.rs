@@ -9,6 +9,7 @@ use super::*;
 use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
 use super::sidebar_model::{header_title, PaneFacts, SidebarModel, TabFacts};
 use crate::config::LayoutMode;
+use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
 
 /// How long `✓ All caught up` stays up once the last unread was read.
 const CAUGHT_UP_SECS: f32 = 1.6;
@@ -61,15 +62,19 @@ pub(super) enum TabAction {
     Close,
 }
 
+/// Menu tags: a colour is its palette index, the other actions sit past
+/// the palette.
+const TAG_NO_COLOR: isize = 20;
+
 impl TabAction {
     fn from_tag(tag: isize) -> Option<Self> {
         match tag {
-            0..=5 => Some(TabAction::Color(tag as usize)),
-            6 => Some(TabAction::NoColor),
-            10 => Some(TabAction::Rename),
-            11 => Some(TabAction::AddPane),
-            12 => Some(TabAction::CollapseOthers),
-            13 => Some(TabAction::Close),
+            t if (0..TAB_COLORS.len() as isize).contains(&t) => Some(TabAction::Color(t as usize)),
+            TAG_NO_COLOR => Some(TabAction::NoColor),
+            21 => Some(TabAction::Rename),
+            22 => Some(TabAction::AddPane),
+            23 => Some(TabAction::CollapseOthers),
+            24 => Some(TabAction::Close),
             _ => None,
         }
     }
@@ -77,13 +82,25 @@ impl TabAction {
     fn tag(self) -> isize {
         match self {
             TabAction::Color(i) => i as isize,
-            TabAction::NoColor => 6,
-            TabAction::Rename => 10,
-            TabAction::AddPane => 11,
-            TabAction::CollapseOthers => 12,
-            TabAction::Close => 13,
+            TabAction::NoColor => TAG_NO_COLOR,
+            TabAction::Rename => 21,
+            TabAction::AddPane => 22,
+            TabAction::CollapseOthers => 23,
+            TabAction::Close => 24,
         }
     }
+}
+
+/// The colour rows of a menu: every palette colour with its swatch, then
+/// `No colour`, the current one checked.
+fn color_rows(current: Option<usize>) -> Vec<MenuRow> {
+    let mut rows: Vec<MenuRow> = TAB_COLOR_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| MenuRow::Swatch((*name).into(), TabAction::Color(i).tag(), Some(TAB_COLORS[i]), current == Some(i)))
+        .collect();
+    rows.push(MenuRow::Swatch("No colour".into(), TabAction::NoColor.tag(), None, current.is_none()));
+    rows
 }
 
 /// A menu row: a label and its tag, or a separator.
@@ -95,8 +112,6 @@ enum MenuRow {
     Separator,
 }
 
-/// The six tab colours, in `TAB_COLORS` order, as the colour menu names them.
-pub(super) const TAB_COLOR_NAMES: [&str; 6] = ["Red", "Orange", "Yellow", "Green", "Blue", "Violet"];
 
 pub(super) struct SidebarState {
     sort: SidebarSort,
@@ -464,13 +479,7 @@ impl KovaView {
     /// The header's context menu: the colours, then the tab actions.
     pub(super) fn show_sidebar_tab_menu(&self, view: &objc2_app_kit::NSView, location: CGPoint, tab_idx: usize) {
         self.ivars().sidebar.borrow_mut().menu_tab = tab_idx;
-        let pastilles = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣"];
-        let mut rows: Vec<MenuRow> = pastilles
-            .iter()
-            .enumerate()
-            .map(|(i, p)| MenuRow::Item((*p).into(), TabAction::Color(i).tag()))
-            .collect();
-        rows.push(MenuRow::Item("No colour".into(), TabAction::NoColor.tag()));
+        let mut rows = color_rows(self.ivars().tabs.borrow().get(tab_idx).and_then(|t| t.color));
         rows.push(MenuRow::Separator);
         rows.push(MenuRow::Item("Rename tab\u{2026}".into(), TabAction::Rename.tag()));
         rows.push(MenuRow::Item("Add a pane".into(), TabAction::AddPane.tag()));
@@ -488,12 +497,7 @@ impl KovaView {
         // Bind the current colour before the menu blocks: no `tabs` borrow
         // may be held while it runs.
         let current = self.ivars().tabs.borrow().get(tab_idx).and_then(|t| t.color);
-        let mut rows: Vec<MenuRow> = TAB_COLOR_NAMES
-            .iter()
-            .enumerate()
-            .map(|(i, name)| MenuRow::Swatch((*name).into(), TabAction::Color(i).tag(), Some(crate::renderer::TAB_COLORS[i]), current == Some(i)))
-            .collect();
-        rows.push(MenuRow::Swatch("No colour".into(), TabAction::NoColor.tag(), None, current.is_none()));
+        let rows = color_rows(current);
         self.pop_up_sidebar_menu(view, location, &rows, objc2::sel!(sidebarTabAction:));
     }
 
@@ -766,12 +770,24 @@ mod tests {
 
     #[test]
     fn the_colour_menu_names_every_tab_colour_and_round_trips_its_tags() {
-        assert_eq!(TAB_COLOR_NAMES.len(), crate::renderer::TAB_COLORS.len());
+        assert_eq!(TAB_COLOR_NAMES.len(), TAB_COLORS.len());
+        assert_eq!(TAB_COLORS.len(), 12);
         for i in 0..TAB_COLOR_NAMES.len() {
             assert_eq!(TabAction::from_tag(TabAction::Color(i).tag()), Some(TabAction::Color(i)));
         }
-        assert_eq!(TabAction::from_tag(TabAction::NoColor.tag()), Some(TabAction::NoColor));
+        assert_eq!(TabAction::from_tag(TAB_COLORS.len() as isize), None);
+        for a in [TabAction::NoColor, TabAction::Rename, TabAction::AddPane, TabAction::CollapseOthers, TabAction::Close] {
+            assert_eq!(TabAction::from_tag(a.tag()), Some(a));
+            assert!(a.tag() >= TAB_COLORS.len() as isize);
+        }
         assert!(TAB_COLOR_NAMES.iter().all(|n| n.is_ascii()));
+        // The first six keep their indices: saved sessions store them.
+        assert_eq!(&TAB_COLOR_NAMES[..6], &["Red", "Orange", "Yellow", "Green", "Blue", "Violet"]);
+        let rows = color_rows(Some(7));
+        assert_eq!(rows.len(), 13);
+        assert!(matches!(&rows[7], MenuRow::Swatch(n, 7, Some(_), true) if n == "Coral"));
+        assert!(matches!(&rows[12], MenuRow::Swatch(n, TAG_NO_COLOR, None, false) if n == "No colour"));
+        assert!(matches!(&color_rows(None)[12], MenuRow::Swatch(_, _, None, true)));
     }
 
     #[test]

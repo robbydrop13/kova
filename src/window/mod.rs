@@ -1267,7 +1267,7 @@ define_class!(
 
         #[unsafe(method(tabColorSelected:))]
         fn tab_color_selected(&self, sender: &objc2_app_kit::NSMenuItem) {
-            const PALETTE_SIZE: isize = 6;
+            const PALETTE_SIZE: isize = crate::renderer::TAB_COLORS.len() as isize;
             let tag = sender.tag();
             let tab_idx = self.ivars().color_menu_tab.get();
             let mut tabs = self.ivars().tabs.borrow_mut();

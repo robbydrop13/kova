@@ -109,7 +109,7 @@ pub mod tokens {
 
 /// Alpha of the tab colour at the top of a group's panel: the selected tab's
 /// strength, and the other tabs'.
-pub const WASH_SELECTED: f64 = 0.35;
+pub const WASH_SELECTED: f64 = 0.40;
 pub const WASH_OTHER: f64 = 0.20;
 /// Alpha of the white the selected group's tiles are filled with.
 pub const SEL_TILE_ALPHA: f64 = 0.12;
@@ -647,9 +647,9 @@ mod tests {
     #[test]
     fn the_wash_fades_from_the_top_and_tiles_lift_under_focus_and_hover() {
         let stops = wash_stops(wash_strength(true));
-        assert_eq!(stops[0], (0.35, 0.0));
-        assert!((stops[1].0 - 0.1575).abs() < 1e-9 && stops[1].1 == 0.42);
-        assert!((stops[2].0 - 0.049).abs() < 1e-9 && stops[2].1 == 1.0);
+        assert_eq!(stops[0], (0.40, 0.0));
+        assert!((stops[1].0 - 0.18).abs() < 1e-9 && stops[1].1 == 0.42);
+        assert!((stops[2].0 - 0.056).abs() < 1e-9 && stops[2].1 == 1.0);
         assert!(stops.windows(2).all(|w| w[0].0 > w[1].0 && w[0].1 < w[1].1));
         let other = wash_stops(wash_strength(false));
         assert_eq!(other[0], (0.20, 0.0));
