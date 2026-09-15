@@ -726,6 +726,23 @@ fn draw_text(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha
         Align::Right => r.right() - w,
         Align::Center => r.x + (r.w - w) / 2.0,
     };
+    // Symbol glyphs (+, x, stop, play) sit off centre when their line box is
+    // centred, so centre their ink on the box instead.
+    if matches!(style, Style::Plus | Style::Glyph) {
+        // Device metrics give the ink box relative to the text origin.
+        let ink = unsafe {
+            ns.boundingRectWithSize_options_attributes_context(
+                CGSize { width: 10_000.0, height: 10_000.0 },
+                NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::UsesDeviceMetrics,
+                Some(&a),
+                None,
+            )
+        };
+        let ox = r.x + r.w / 2.0 - (ink.origin.x + ink.size.width / 2.0);
+        let oy = r.y + r.h / 2.0 - (ink.origin.y + ink.size.height / 2.0);
+        unsafe { ns.drawAtPoint_withAttributes(CGPoint { x: ox, y: oy }, Some(&a)) };
+        return w;
+    }
     let y = r.y + ((r.h - size.height) / 2.0).round();
     unsafe { ns.drawInRect_withAttributes(Rect::new(x, y, w, size.height).cg(), Some(&a)) };
     w
