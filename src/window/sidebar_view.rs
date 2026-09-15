@@ -255,6 +255,9 @@ pub enum ListHit {
     HeaderAdd(usize),
     Tile(PaneId),
     TileButton(PaneId, TileButton),
+    /// The rest of a group's panel (its padding, the gaps, the empty
+    /// bottom): select the tab.
+    Panel(usize),
     Empty,
 }
 
@@ -376,7 +379,25 @@ impl ListLayout {
                 }
             };
         }
-        ListHit::Empty
+        // Not on a row: the panel itself, if the point is inside one.
+        match self.groups.iter().position(|block| block.contains(x, y)) {
+            Some(g) => ListHit::Panel(g),
+            None => ListHit::Empty,
+        }
+    }
+
+    /// The group whose panel `hit` is on, whatever part of it (a tile's
+    /// group through its row).
+    pub fn group_of(&self, hit: ListHit) -> Option<usize> {
+        match hit {
+            ListHit::Empty => None,
+            ListHit::Panel(g) => Some(g),
+            ListHit::Tile(id) | ListHit::TileButton(id, _) => self.row_for_pane(id).and_then(|r| match self.rows[r].kind {
+                RowKind::Tile { group, .. } => Some(group),
+                _ => None,
+            }),
+            other => other.group(),
+        }
     }
 
     pub fn row_for_pane(&self, pane_id: PaneId) -> Option<usize> {
@@ -654,6 +675,9 @@ struct Shared {
     chrome: ChromeLayout,
     fonts: Vec<(Style, Retained<NSFont>)>,
     hovered: ListHit,
+    /// The tab whose panel the mouse is on (any part of it): its wash
+    /// brightens. The id, not the group index: a tick may reorder groups.
+    hovered_tab: Option<TabId>,
     /// What the mouse went down on; the action fires on mouse up inside the
     /// same target, like a button.
     pressed: ListHit,
@@ -1131,6 +1155,7 @@ impl SidebarView {
             chrome: ChromeLayout::default(),
             fonts: build_fonts(),
             hovered: ListHit::Empty,
+            hovered_tab: None,
             pressed: ListHit::Empty,
             chrome_hovered: ChromeHit::Empty,
             chrome_pressed: ChromeHit::Empty,
@@ -1244,11 +1269,16 @@ impl SidebarView {
             // The rows moved: whatever was under the mouse may not be any more.
             if sh.hovered != ListHit::Empty && sh.tab_drag.is_none() && sh.pane_drag.is_none() {
                 sh.hovered = ListHit::Empty;
+                sh.hovered_tab = None;
             }
         }
         let visible_h = self.ivars().shared.borrow().chrome.list.h;
         list.setFrameSize(CGSize { width, height: content_h.max(visible_h) });
         list.install_tooltips();
+        // The panels moved: their hand-cursor rects follow.
+        if let Some(win) = list.window() {
+            win.invalidateCursorRectsForView(&list);
+        }
         list.setNeedsDisplay(true);
     }
 
@@ -1399,6 +1429,17 @@ define_class!(
             install_tracking_area(self);
         }
 
+        /// The hand over every panel: the whole tab is a click target.
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            // Bind the rects first: adding a cursor rect is an AppKit call.
+            let panels: Vec<CGRect> = self.ivars().shared.borrow().layout.groups.iter().map(|r| r.cg()).collect();
+            for r in panels {
+                #[allow(deprecated)]
+                self.addCursorRect_cursor(r, &NSCursor::pointingHandCursor());
+            }
+        }
+
         /// `NSToolTipOwner`: the tooltip of the glyph button under the mouse.
         #[unsafe(method_id(view:stringForToolTip:point:userData:))]
         #[unsafe(method_family = none)]
@@ -1472,7 +1513,7 @@ define_class!(
                         }
                     }
                 }
-                ListHit::Chevron(_) | ListHit::HeaderDot(_) | ListHit::HeaderAdd(_) | ListHit::TileButton(..) => {
+                ListHit::Chevron(_) | ListHit::HeaderDot(_) | ListHit::HeaderAdd(_) | ListHit::TileButton(..) | ListHit::Panel(_) => {
                     self.ivars().shared.borrow_mut().pressed = hit;
                 }
                 ListHit::Empty => {}
@@ -1560,15 +1601,19 @@ define_class!(
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
             let (x, y) = local_point(self, event);
-            let hit = self.ivars().shared.borrow().layout.hit(x, y);
+            // Bind everything before the menus: they block, and the tick may
+            // borrow the shared cell meanwhile.
+            let (hit, tab_idx) = {
+                let sh = self.ivars().shared.borrow();
+                let hit = sh.layout.hit(x, y);
+                let tab_idx = sh.layout.group_of(hit).and_then(|g| sh.model.groups.get(g)).map(|g| g.tab_idx);
+                (hit, tab_idx)
+            };
             let Some(kova) = kova_of(self) else { return };
             if let Some(pane_id) = hit.pane() {
                 kova.show_sidebar_pane_menu(self, CGPoint { x, y }, pane_id);
-            } else if let Some(g) = hit.group() {
-                let tab_idx = self.ivars().shared.borrow().model.groups.get(g).map(|g| g.tab_idx);
-                if let Some(tab_idx) = tab_idx {
-                    kova.show_sidebar_tab_menu(self, CGPoint { x, y }, tab_idx);
-                }
+            } else if let Some(tab_idx) = tab_idx {
+                kova.show_sidebar_tab_menu(self, CGPoint { x, y }, tab_idx);
             }
         }
     }
@@ -1586,8 +1631,10 @@ impl SidebarListView {
 
     fn set_hovered(&self, hit: ListHit) {
         let mut sh = self.ivars().shared.borrow_mut();
-        if sh.hovered != hit {
+        let tab = sh.layout.group_of(hit).and_then(|g| sh.model.groups.get(g)).map(|g| g.tab_id);
+        if sh.hovered != hit || sh.hovered_tab != tab {
             sh.hovered = hit;
+            sh.hovered_tab = tab;
             drop(sh);
             self.setNeedsDisplay(true);
         }
@@ -1630,6 +1677,11 @@ impl SidebarListView {
             ListHit::Header(g) => {
                 if let Some(t) = tab_of(g) {
                     kova.sidebar_header_clicked(t);
+                }
+            }
+            ListHit::Panel(g) => {
+                if let Some(t) = tab_of(g) {
+                    kova.do_switch_tab(t);
                 }
             }
             ListHit::HeaderAdd(g) => {
@@ -1745,7 +1797,8 @@ impl SidebarListView {
                 continue;
             }
             let Some(g) = sh.model.groups.get(gi) else { continue };
-            draw_wash(block, PANEL_RADIUS, tab_tint(g.color), wash_strength(g.active), 1.0);
+            let hovered = sh.hovered_tab == Some(g.tab_id);
+            draw_wash(block, PANEL_RADIUS, tab_tint(g.color), wash_strength(g.active, hovered), 1.0);
         }
 
         // The lifted header or tile, resolved against the current layout: a
@@ -2204,7 +2257,8 @@ mod tests {
         // is nothing.
         assert_eq!(l.hit(SX + 5.0, 20.0), ListHit::Chevron(0));
         assert_eq!(l.hit(SX + 60.0, 20.0), ListHit::Header(0));
-        assert_eq!(l.hit(SX + 60.0, 8.0), ListHit::Empty);
+        // The panel's padding is the panel itself: a click selects the tab.
+        assert_eq!(l.hit(SX + 60.0, 8.0), ListHit::Panel(0));
         // The dot: 8 pt at x 54, a 16 pt target around it, right after the
         // chevron zone; the number and title start at 64.
         assert_eq!(ListLayout::dot_centre(&l.rows[0].frame), (SX + 30.0, 32.0));
@@ -2227,17 +2281,29 @@ mod tests {
         assert_eq!(ListHit::Tile(10).group(), None);
         assert_ne!(l.hit(add.x + 3.0, add.y + 3.0), l.hit(add.x - 3.0, add.y + 3.0));
         assert_eq!(l.hit(add.x - 3.0, add.y + 3.0), ListHit::Header(0));
-        // The gap above a tile is nothing, the body is the pane.
-        assert_eq!(l.hit(100.0, 50.0), ListHit::Empty);
+        // The gap above a tile, the side padding and the empty bottom are
+        // the panel; the body is the pane.
+        assert_eq!(l.hit(100.0, 50.0), ListHit::Panel(0));
         assert_eq!(l.hit(100.0, 60.0), ListHit::Tile(10));
         assert_eq!(l.hit(100.0, 130.0), ListHit::Tile(11));
-        // Left of the content column: nothing.
-        assert_eq!(l.hit(5.0, 60.0), ListHit::Empty);
-        assert_eq!(l.hit(100.0, 180.0), ListHit::Empty);
-        assert_eq!(l.hit(100.0, 210.0), ListHit::Empty);
+        assert_eq!(l.hit(15.0, 60.0), ListHit::Panel(0));
+        assert_eq!(l.hit(100.0, 180.0), ListHit::Panel(0));
+        assert_eq!(l.hit(100.0, 210.0), ListHit::Panel(1));
         assert_eq!(l.hit(100.0, 230.0), ListHit::Header(1));
         assert_eq!(l.hit(100.0, 340.0), ListHit::Tile(30));
+        // Left of the panels, between two panels, past the last: nothing.
+        assert_eq!(l.hit(5.0, 60.0), ListHit::Empty);
+        assert_eq!(l.hit(100.0, 195.0), ListHit::Empty);
         assert_eq!(l.hit(100.0, 1000.0), ListHit::Empty);
+        // Every hit on a panel names its group, a tile's through its row;
+        // only the header parts count as the header row.
+        assert_eq!(l.group_of(ListHit::Panel(1)), Some(1));
+        assert_eq!(l.group_of(ListHit::Tile(30)), Some(2));
+        assert_eq!(l.group_of(ListHit::TileButton(11, TileButton::Close)), Some(0));
+        assert_eq!(l.group_of(ListHit::HeaderDot(1)), Some(1));
+        assert_eq!(l.group_of(ListHit::Tile(99)), None);
+        assert_eq!(l.group_of(ListHit::Empty), None);
+        assert_eq!(ListHit::Panel(1).group(), None);
         // Working tile: close, minimize, stop boxes from the right on line 1.
         let row = &l.rows[2];
         let boxes: Vec<TileButton> = row.glyphs.iter().map(|(b, _)| *b).collect();

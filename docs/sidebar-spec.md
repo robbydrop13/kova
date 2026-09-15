@@ -115,7 +115,14 @@ Content inset 12 on each side; groups 16 apart. Every group is a panel
 gradient of the tint (`sidebar::wash_stops(strength)`, an `NSGradient` in
 the panel's rounded path): `strength` at the top, x 0.45 at 42 % of the
 height, x 0.14 at the bottom; `strength` is 0.40 on the selected tab
-(`WASH_SELECTED`) and 0.20 on the others (`WASH_OTHER`). The header sits at
+(`WASH_SELECTED`) and on the tab under the mouse (`wash_strength(selected,
+hovered)`: any hit inside the panel, controls and tiles included, bound as
+`hovered_tab`, a tab id, on every mouse move), 0.20 on the others
+(`WASH_OTHER`). The whole panel is one click target: a click on its
+padding, on a gap or on the empty bottom (`ListHit::Panel`, the fallback
+once no row or control took the point) selects the tab, and the hand
+cursor covers every panel (cursor rects on the list view, refreshed on
+relayout). The header sits at
 the top of the panel, the tiles 12 pt apart (`PANEL_GAP`), and the panel
 pads 12 pt all around (`PANEL_PAD`: above the header, at the sides, under
 the last row). No tint bar. The tint is `TAB_COLORS[c]` (twelve colours:
@@ -267,6 +274,7 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
 
 | Target                     | Click                                                  | Double click       | Right click  |
 |----------------------------|--------------------------------------------------------|--------------------|--------------|
+| Panel padding, gaps, bottom| `do_switch_tab(idx)`                                   |                    | header menu  |
 | Header chevron zone (24 pt)| toggle collapse, no tab switch                         | same               | header menu  |
 | Header colour dot (16 pt)  | colour picker (4.3), no tab switch                     |                    | header menu  |
 | Header body                | `do_switch_tab(idx)`; on the active tab: toggle collapse | `start_rename_tab` | header menu |
