@@ -16,19 +16,20 @@ use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSCursor, NSEvent, NSFont, NSGraphicsContext, NSLineBreakMode, NSLineCapStyle,
-    NSLineJoinStyle, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView, NSScrollerStyle,
-    NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTrackingArea,
+    NSBezierPath, NSColor, NSColorSpace, NSCursor, NSEvent, NSFont, NSGradient, NSGraphicsContext,
+    NSLineBreakMode, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView, NSScrollerStyle,
+    NSShadow, NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTrackingArea,
     NSTrackingAreaOptions, NSView,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSDictionary, NSObjectProtocol, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSObjectProtocol, NSString};
 
+use super::feather::{self, Icon};
 use super::sidebar::{
-    self, tab_tint, tokens, NextPill, SidebarSort, SummaryRun, TileButton, TileState, OPEN_LABEL,
-    RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
+    self, sel_tile_alpha, tab_tint, tokens, wash_stops, ChipStyle, NextPill, SidebarSort, SummaryRun,
+    TileButton, TileState, OPEN_LABEL, RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
 };
 use super::sidebar_model::{GroupVm, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
@@ -62,9 +63,21 @@ const HEADER_RADIUS: f64 = 6.0;
 /// The tint bar at the left of a group, and the content inset after it.
 const GROUP_BAR_W: f64 = 3.0;
 const GROUP_CONTENT_X: f64 = 12.0;
+/// The selected tab's panel: its radius, the padding around its header and
+/// tiles, and the gap between them.
+const SEL_RADIUS: f64 = 12.0;
+const SEL_PAD: f64 = 4.0;
+const SEL_GAP: f64 = 4.0;
 /// The chevron zone at the left of a header.
 const CHEVRON_ZONE_W: f64 = 24.0;
-const ADD_D: f64 = 22.0;
+/// The header's `+` button and its hover ground.
+const ADD_D: f64 = 24.0;
+const ADD_RADIUS: f64 = 8.0;
+/// Feather icons: the box of a button icon, of a link icon, of the pill's.
+const ICON_D: f64 = 16.0;
+const LINK_ICON_D: f64 = 11.0;
+const LINK_ICON_GAP: f64 = 4.0;
+const PILL_ICON_D: f64 = 12.0;
 const TILE_PAD_V: f64 = 8.0;
 const TILE_PAD_H: f64 = 10.0;
 const TILE_RADIUS: f64 = 10.0;
@@ -83,8 +96,9 @@ const GLYPH_D: f64 = 8.0;
 const TEXT_X: f64 = 26.0;
 const CHIP_H: f64 = 18.0;
 const CHIP_PAD: f64 = 7.0;
-const BUTTON_D: f64 = 20.0;
-const BUTTON_GAP: f64 = 4.0;
+const BUTTON_D: f64 = 24.0;
+const BUTTON_GAP: f64 = 2.0;
+const BUTTON_RADIUS: f64 = 7.0;
 const ACTIONS_H: f64 = 20.0;
 const HINT_H: f64 = 20.0;
 /// Pixels of travel before a pressed header or tile lifts into a drag.
@@ -110,8 +124,6 @@ pub enum Style {
     Footer,
     Hint,
     Number,
-    Plus,
-    Glyph,
 }
 
 /// Font weight, mapped to `NSFontWeight*`.
@@ -124,7 +136,7 @@ pub enum Weight {
 }
 
 impl Style {
-    pub const ALL: [Style; 15] = [
+    pub const ALL: [Style; 13] = [
         Style::Title,
         Style::Secondary,
         Style::Chip,
@@ -138,8 +150,6 @@ impl Style {
         Style::Footer,
         Style::Hint,
         Style::Number,
-        Style::Plus,
-        Style::Glyph,
     ];
 
     pub fn size(self) -> f64 {
@@ -147,16 +157,15 @@ impl Style {
             Style::Title => 15.0,
             Style::Secondary | Style::Question => 13.0,
             Style::Detail | Style::Link | Style::Pill => 12.0,
-            Style::Chip | Style::Summary | Style::Hint | Style::Number | Style::Glyph => 11.0,
+            Style::Chip | Style::Summary | Style::Hint | Style::Number => 11.0,
             Style::Sort | Style::PillBadge | Style::Footer => 10.0,
-            Style::Plus => 14.0,
         }
     }
 
     pub fn weight(self) -> Weight {
         match self {
             Style::Title | Style::Pill | Style::Link => Weight::Semibold,
-            Style::Chip | Style::Sort | Style::Plus | Style::Glyph => Weight::Medium,
+            Style::Chip | Style::Sort => Weight::Medium,
             Style::PillBadge => Weight::Bold,
             _ => Weight::Regular,
         }
@@ -285,19 +294,30 @@ impl ListLayout {
                 y += GROUP_GAP;
             }
             let top = y;
+            // The selected tab is a panel: header and tiles sit `SEL_PAD`
+            // inside it, `SEL_GAP` apart. The others hang off their tint bar.
+            let (cx, cw, gap) = if g.active {
+                y += SEL_PAD;
+                (x0 + SEL_PAD, x1 - x0 - 2.0 * SEL_PAD, SEL_GAP)
+            } else {
+                (content_x, content_w, TILE_GAP)
+            };
             rows.push(Row {
                 kind: RowKind::Header { group: gi },
-                frame: Rect::new(content_x, y, content_w, HEADER_H),
+                frame: Rect::new(cx, y, cw, HEADER_H),
                 glyphs: Vec::new(),
                 actions: Vec::new(),
                 question_lines: 0,
             });
             y += HEADER_H;
             for (ti, tile) in g.tiles.iter().enumerate() {
-                y += TILE_GAP;
-                let row = tile_row(gi, ti, tile, content_x, y, content_w, m);
+                y += gap;
+                let row = tile_row(gi, ti, tile, cx, y, cw, m);
                 y += row.frame.h;
                 rows.push(row);
+            }
+            if g.active {
+                y += SEL_PAD;
             }
             groups.push(Rect::new(x0, top, x1 - x0, y - top));
         }
@@ -421,10 +441,15 @@ impl ListLayout {
         Some(run.len())
     }
 
-    /// Y of the insertion line for `slot` in `run`.
+    /// Y of the insertion line for `slot` in `run`: the middle of the gap
+    /// between two tiles, or half a gap outside the run's ends.
     pub fn pane_insertion_line_y(&self, run: &std::ops::Range<usize>, slot: usize) -> f64 {
-        if slot < run.len() {
-            self.rows[run.start + slot].frame.y - TILE_GAP / 2.0
+        if slot == 0 {
+            self.rows[run.start].frame.y - TILE_GAP / 2.0
+        } else if slot < run.len() {
+            let above = self.rows[run.start + slot - 1].frame.bottom();
+            let below = self.rows[run.start + slot].frame.y;
+            (above + below) / 2.0
         } else {
             self.rows[run.end - 1].frame.bottom() + TILE_GAP / 2.0
         }
@@ -459,7 +484,7 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
         h += 4.0;
         let open_w = m.width(OPEN_LABEL, Style::Link) + 20.0;
         actions.push((TileButton::Open, Rect::new(text_x, y + h, open_w, ACTIONS_H)));
-        let stop_w = m.width(STOP_LABEL, Style::Link) + 8.0;
+        let stop_w = link_w(m, STOP_LABEL);
         actions.push((TileButton::Stop, Rect::new(right - stop_w, y + h, stop_w, ACTIONS_H)));
         h += ACTIONS_H;
     } else {
@@ -472,7 +497,7 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
             None
         };
         if let Some((button, label)) = call {
-            let call_w = m.width(label, Style::Link) + 8.0;
+            let call_w = link_w(m, label);
             let line2_y = line1_y + LINE_TITLE_H + LINE_GAP;
             actions.push((button, Rect::new(right - call_w, line2_y - 1.0, call_w, LINE_SEC_H + 2.0)));
         }
@@ -488,6 +513,12 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
         actions,
         question_lines,
     }
+}
+
+/// The box of a link (`Resume`, `Stop`): its icon, the gap, the word, and
+/// 4 pt either side.
+fn link_w(m: &dyn TextMetrics, label: &str) -> f64 {
+    LINK_ICON_D + LINK_ICON_GAP + m.width(label, Style::Link) + 8.0
 }
 
 /// What a point of the chrome lands on.
@@ -668,23 +699,54 @@ fn stroke_ring(cx: f64, cy: f64, d: f64, width: f64, c: [f32; 3], alpha: f64) {
     path.stroke();
 }
 
-/// A chevron pointing down (open) or right (folded), 8 pt wide.
-fn stroke_chevron(x: f64, cy: f64, open: bool, c: [f32; 3], alpha: f64) {
+/// A Feather icon stroked in a `size` box centred in `r`.
+fn stroke_icon(icon: Icon, r: &Rect, size: f64, c: [f32; 3], alpha: f64) {
     color(c, alpha).setStroke();
-    let path = NSBezierPath::bezierPath();
-    path.setLineWidth(1.5);
-    path.setLineCapStyle(NSLineCapStyle::Round);
-    path.setLineJoinStyle(NSLineJoinStyle::Round);
-    if open {
-        path.moveToPoint(CGPoint { x, y: cy - 2.0 });
-        path.lineToPoint(CGPoint { x: x + 4.0, y: cy + 2.0 });
-        path.lineToPoint(CGPoint { x: x + 8.0, y: cy - 2.0 });
-    } else {
-        path.moveToPoint(CGPoint { x: x + 2.0, y: cy - 4.0 });
-        path.lineToPoint(CGPoint { x: x + 6.0, y: cy });
-        path.lineToPoint(CGPoint { x: x + 2.0, y: cy + 4.0 });
+    feather::path(icon, feather::centred_box((r.x, r.y, r.w, r.h), size)).stroke();
+}
+
+/// A Feather icon filled (the solid play and square) in a `size` box
+/// centred in `r`.
+fn fill_icon(icon: Icon, r: &Rect, size: f64, c: [f32; 3], alpha: f64) {
+    color(c, alpha).setFill();
+    feather::path(icon, feather::centred_box((r.x, r.y, r.w, r.h), size)).fill();
+}
+
+/// The selected tab's wash: the tint fading down the panel (`wash_stops`)
+/// over the raised ground, inside the panel's rounded rect.
+fn draw_wash(r: &Rect, radius: f64, tint: [f32; 3], alpha: f64) {
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r.cg(), radius, radius);
+    color(tokens::TILE, alpha).setFill();
+    path.fill();
+    let stops = wash_stops();
+    let colors: Vec<Retained<NSColor>> = stops.iter().map(|&(a, _)| color(tint, a * alpha)).collect();
+    let locations: Vec<f64> = stops.iter().map(|&(_, l)| l).collect();
+    let gradient = unsafe {
+        NSGradient::initWithColors_atLocations_colorSpace(
+            NSGradient::alloc(),
+            &NSArray::from_retained_slice(&colors),
+            locations.as_ptr(),
+            &NSColorSpace::sRGBColorSpace(),
+        )
+    };
+    if let Some(gradient) = gradient {
+        // The view is flipped: 90 degrees runs from the top edge down.
+        gradient.drawInBezierPath_angle(&path, 90.0);
     }
-    path.stroke();
+}
+
+/// A rounded fill with the focused tile's soft shadow under it: 6 pt down,
+/// 18 pt blur, black at 22 %.
+fn fill_round_shadowed(r: &Rect, radius: f64, c: [f32; 3], alpha: f64) {
+    NSGraphicsContext::saveGraphicsState_class();
+    let shadow = NSShadow::new();
+    // Shadow offsets are in the window's base space, y up: negative is down.
+    shadow.setShadowOffset(CGSize { width: 0.0, height: -6.0 });
+    shadow.setShadowBlurRadius(18.0);
+    shadow.setShadowColor(Some(&color(tokens::BLACK, 0.22 * alpha)));
+    shadow.set();
+    fill_round(r, radius, c, alpha);
+    NSGraphicsContext::restoreGraphicsState_class();
 }
 
 /// Text attributes: font, colour, truncation.
@@ -726,23 +788,6 @@ fn draw_text(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha
         Align::Right => r.right() - w,
         Align::Center => r.x + (r.w - w) / 2.0,
     };
-    // Symbol glyphs (+, x, stop, play) sit off centre when their line box is
-    // centred, so centre their ink on the box instead.
-    if matches!(style, Style::Plus | Style::Glyph) {
-        // Device metrics give the ink box relative to the text origin.
-        let ink = unsafe {
-            ns.boundingRectWithSize_options_attributes_context(
-                CGSize { width: 10_000.0, height: 10_000.0 },
-                NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::UsesDeviceMetrics,
-                Some(&a),
-                None,
-            )
-        };
-        let ox = r.x + r.w / 2.0 - (ink.origin.x + ink.size.width / 2.0);
-        let oy = r.y + r.h / 2.0 - (ink.origin.y + ink.size.height / 2.0);
-        unsafe { ns.drawAtPoint_withAttributes(CGPoint { x: ox, y: oy }, Some(&a)) };
-        return w;
-    }
     let y = r.y + ((r.h - size.height) / 2.0).round();
     unsafe { ns.drawInRect_withAttributes(Rect::new(x, y, w, size.height).cg(), Some(&a)) };
     w
@@ -763,17 +808,26 @@ fn draw_wrapped(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], al
 }
 
 /// A chip: rounded fill and its caption. Returns its rect.
-fn draw_chip(sh: &Shared, text: &str, right: f64, cy: f64, bg: [f32; 3], fg: [f32; 3], dot: Option<[f32; 3]>, alpha: f64) -> Rect {
+fn draw_chip(sh: &Shared, text: &str, right: f64, cy: f64, style: ChipStyle, dot: Option<[f32; 3]>, alpha: f64) -> Rect {
     let text_w = AppKitMetrics(sh).width(text, Style::Chip);
     let dot_w = if dot.is_some() { GLYPH_D - 2.0 + 5.0 } else { 0.0 };
     let w = text_w + 2.0 * CHIP_PAD + dot_w;
     let r = Rect::new(right - w, cy - CHIP_H / 2.0, w, CHIP_H);
-    fill_round(&r, CHIP_H / 2.0, bg, alpha);
+    fill_round(&r, CHIP_H / 2.0, style.bg, style.bg_alpha * alpha);
     if let Some(d) = dot {
         fill_dot(r.x + CHIP_PAD + 3.0, cy, 6.0, d, alpha);
     }
-    draw_text(sh, text, &Rect::new(r.x + CHIP_PAD + dot_w, r.y, text_w, CHIP_H), Style::Chip, fg, alpha, Align::Left, false);
+    draw_text(sh, text, &Rect::new(r.x + CHIP_PAD + dot_w, r.y, text_w, CHIP_H), Style::Chip, style.fg, style.fg_alpha * alpha, Align::Left, false);
     r
+}
+
+/// A link: a filled Feather icon, a gap, the word, the pair centred in `r`.
+fn draw_link(sh: &Shared, icon: Icon, label: &str, r: &Rect, c: [f32; 3], alpha: f64) {
+    let text_w = AppKitMetrics(sh).width(label, Style::Link).min(r.w - LINK_ICON_D - LINK_ICON_GAP).max(0.0);
+    let w = LINK_ICON_D + LINK_ICON_GAP + text_w;
+    let x = r.x + (r.w - w) / 2.0;
+    fill_icon(icon, &Rect::new(x, r.y, LINK_ICON_D, r.h), LINK_ICON_D, c, alpha);
+    draw_text(sh, label, &Rect::new(x + LINK_ICON_D + LINK_ICON_GAP, r.y, text_w, r.h), Style::Link, c, alpha, Align::Left, false);
 }
 
 /// The `KovaView` of the window a sidebar view sits in.
@@ -1210,7 +1264,12 @@ impl SidebarView {
                 draw_text(&sh, &label, &r, Style::PillBadge, fg, 1.0, Align::Center, false);
                 right -= w + 8.0;
             }
-            draw_text(&sh, sh.model.pill.label(), &Rect::new(c.pill.x + 12.0, c.pill.y, right - c.pill.x - 12.0, c.pill.h), Style::Pill, text, text_alpha, Align::Left, false);
+            let mut left = c.pill.x + 12.0;
+            if let Some(icon) = sh.model.pill.icon() {
+                fill_icon(icon, &Rect::new(left, c.pill.y, PILL_ICON_D, c.pill.h), PILL_ICON_D, text, text_alpha);
+                left += PILL_ICON_D + 5.0;
+            }
+            draw_text(&sh, sh.model.pill.label(), &Rect::new(left, c.pill.y, (right - left).max(0.0), c.pill.h), Style::Pill, text, text_alpha, Align::Left, false);
         }
 
         // Footer: version and the way back to the tab bar.
@@ -1550,16 +1609,21 @@ impl SidebarListView {
         let dirty_bottom = dirty.origin.y + dirty.size.height;
         let visible = |r: &Rect| r.bottom() >= dirty_top && r.y <= dirty_bottom;
 
-        // Group blocks: the tint bar down the left, clipped to the block's
+        // Group blocks: the selected tab is a panel washed with its tint,
+        // the others carry a tint bar down the left, clipped to the block's
         // rounded corners.
         for (gi, block) in sh.layout.groups.iter().enumerate() {
             if !visible(block) {
                 continue;
             }
             let Some(g) = sh.model.groups.get(gi) else { continue };
+            if g.active {
+                draw_wash(block, SEL_RADIUS, tab_tint(g.color), 1.0);
+                continue;
+            }
             NSGraphicsContext::saveGraphicsState_class();
             NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(block.cg(), HEADER_RADIUS, HEADER_RADIUS).addClip();
-            fill_rect(&Rect::new(block.x, block.y, GROUP_BAR_W, block.h), tab_tint(g.color), if g.active { 1.0 } else { 0.55 });
+            fill_rect(&Rect::new(block.x, block.y, GROUP_BAR_W, block.h), tab_tint(g.color), 0.55);
             NSGraphicsContext::restoreGraphicsState_class();
         }
 
@@ -1629,40 +1693,59 @@ impl SidebarListView {
 
     fn draw_header(&self, sh: &Shared, g: &GroupVm, group: usize, frame: &Rect, alpha: f64) {
         let tint = tab_tint(g.color);
-        let hovered = matches!(sh.hovered, ListHit::Header(h) | ListHit::Chevron(h) if h == group);
-        let pressed = matches!(sh.pressed, ListHit::Header(h) | ListHit::Chevron(h) if h == group);
-        // Ground: the active tab wears its tint, the others only light up
-        // under the mouse.
-        if g.active {
-            if g.color.is_some() {
-                fill_round(frame, HEADER_RADIUS, tint, 0.15 * alpha);
-            } else {
-                fill_round(frame, HEADER_RADIUS, tokens::TILE_HOVER, alpha);
-            }
-        }
-        if pressed {
-            fill_round(frame, HEADER_RADIUS, tokens::TEXT_ON_FILL, 0.12 * alpha);
-        } else if hovered {
-            fill_round(frame, HEADER_RADIUS, tokens::TEXT_ON_FILL, 0.06 * alpha);
-        }
-        let cy = frame.y + frame.h / 2.0;
-        stroke_chevron(frame.x + 8.0, cy, !g.collapsed, tokens::TEXT_SECONDARY, alpha);
-        fill_dot(frame.x + CHEVRON_ZONE_W + 6.0, cy, GLYPH_D, tint, alpha);
-        let mut x = frame.x + CHEVRON_ZONE_W + 16.0;
-        let number = (g.tab_idx + 1).to_string();
-        let nw = draw_text(sh, &number, &Rect::new(x, frame.y, 30.0, frame.h), Style::Number, tokens::TEXT_TERTIARY, alpha, Align::Left, false);
-        x += nw + 5.0;
-
-        // Right side: the `+`, then the collapsed summary.
-        let add = ListLayout::add_button(frame);
+        let selected = g.active;
+        // The whole row, `+` included, counts as hovered: the `+` only shows
+        // while the mouse is somewhere on the header.
+        let row_hovered = sh.hovered.group() == Some(group);
+        let body_pressed = matches!(sh.pressed, ListHit::Header(h) | ListHit::Chevron(h) if h == group);
         let add_hovered = sh.hovered == ListHit::HeaderAdd(group);
         let add_pressed = sh.pressed == ListHit::HeaderAdd(group);
-        fill_round(&add, ADD_D / 2.0, if add_hovered || add_pressed { tokens::TILE_PRESSED } else { tokens::TILE }, alpha);
-        draw_text(sh, "+", &add, Style::Plus, if add_hovered { tokens::TEXT_PRIMARY } else { tokens::TEXT_SECONDARY }, alpha, Align::Center, false);
+        // Ground: the selected header has none of its own (the panel's wash
+        // shows through) and lights up white 5 % under the mouse; the others
+        // take `HEADER_HOVER`.
+        if selected {
+            if body_pressed {
+                fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.10 * alpha);
+            } else if row_hovered {
+                fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.05 * alpha);
+            }
+        } else if body_pressed {
+            fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.12 * alpha);
+        } else if row_hovered {
+            fill_round(frame, HEADER_RADIUS, tokens::HEADER_HOVER, alpha);
+        }
+        let (muted, muted_alpha) = if selected { (tokens::WHITE, 0.72) } else { (tokens::TEXT_SECONDARY, 1.0) };
+        let (number_fg, number_alpha) = if selected { (tokens::WHITE, 0.72) } else { (tokens::TEXT_TERTIARY, 1.0) };
+        let cy = frame.y + frame.h / 2.0;
+        let chevron = if g.collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
+        stroke_icon(chevron, &Rect::new(frame.x + 4.0, cy - ICON_D / 2.0, ICON_D, ICON_D), ICON_D, muted, muted_alpha * alpha);
+        let dot_cx = frame.x + CHEVRON_ZONE_W + 6.0;
+        if selected {
+            // A 3 pt halo of the tint around the dot.
+            fill_dot(dot_cx, cy, GLYPH_D + 6.0, tint, 0.28 * alpha);
+        }
+        fill_dot(dot_cx, cy, GLYPH_D, tint, alpha);
+        let mut x = frame.x + CHEVRON_ZONE_W + 16.0;
+        let number = (g.tab_idx + 1).to_string();
+        let nw = draw_text(sh, &number, &Rect::new(x, frame.y, 30.0, frame.h), Style::Number, number_fg, number_alpha * alpha, Align::Left, false);
+        x += nw + 5.0;
+
+        // Right side: the `+` (only while the row is hovered), then the
+        // collapsed summary.
+        let add = ListLayout::add_button(frame);
+        if row_hovered || add_pressed {
+            if add_pressed {
+                fill_round(&add, ADD_RADIUS, tokens::WHITE, 0.20 * alpha);
+            } else if add_hovered {
+                fill_round(&add, ADD_RADIUS, tokens::WHITE, 0.14 * alpha);
+            }
+            let plus_fg = if selected { tokens::WHITE } else { tokens::TEXT_PRIMARY };
+            stroke_icon(Icon::Plus, &add, ICON_D, plus_fg, alpha);
+        }
         let mut right = add.x - 8.0;
         if g.collapsed {
             let label = g.summary.count_label();
-            let w = draw_text(sh, &label, &Rect::new(x, frame.y, right - x, frame.h), Style::Chip, tokens::TEXT_TERTIARY, alpha, Align::Right, false);
+            let w = draw_text(sh, &label, &Rect::new(x, frame.y, right - x, frame.h), Style::Chip, number_fg, number_alpha * alpha, Align::Right, false);
             right -= w + 6.0;
             if g.summary.working > 0 {
                 fill_dot(right - 3.0, cy, 6.0, tokens::WORKING, alpha);
@@ -1673,7 +1756,7 @@ impl SidebarListView {
                 right -= 10.0;
             }
         }
-        let title_fg = if g.active && g.color.is_some() { tint } else { tokens::TEXT_PRIMARY };
+        let title_fg = if selected { tokens::WHITE } else { tokens::TEXT_PRIMARY };
         draw_text(sh, &g.title, &Rect::new(x, frame.y, (right - x).max(0.0), frame.h), Style::Title, title_fg, alpha, Align::Left, g.renaming);
     }
 
@@ -1683,32 +1766,51 @@ impl SidebarListView {
         let hovered = sh.hovered.pane() == Some(tile.pane_id);
         let pressed = sh.pressed == ListHit::Tile(tile.pane_id);
         let shifted = |r: &Rect| Rect::new(r.x, r.y + dy, r.w, r.h);
+        let RowKind::Tile { group, .. } = row.kind else { return };
+        let selected = sh.model.groups.get(group).is_some_and(|g| g.active);
 
-        // Ground, border, focus ring.
-        let fill = if awaiting {
-            tokens::AWAITING_BG
-        } else if pressed {
-            tokens::TILE_PRESSED
-        } else if hovered || tile.focused {
-            tokens::TILE_HOVER
-        } else if tile.minimized {
-            tokens::GROUND
-        } else {
-            tokens::TILE
-        };
-        fill_round(frame, radius, fill, alpha);
+        // Ground and border. Inside the selected panel the tile is a white
+        // layer over the wash (lifted under the mouse, more when focused, with
+        // a soft shadow); elsewhere the raised tile of the phone. No accent
+        // ring any more: the focused tile is the brightest one.
         if awaiting {
+            fill_round(frame, radius, tokens::AWAITING_BG, alpha);
             NSGraphicsContext::saveGraphicsState_class();
             NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(frame.cg(), radius, radius).addClip();
             fill_rect(&Rect::new(frame.x, frame.y, CARD_BAR_W, frame.h), tokens::AWAITING, alpha);
             NSGraphicsContext::restoreGraphicsState_class();
             stroke_round(frame, radius, 1.0, tokens::AWAITING, if hovered { 0.8 } else { 0.35 } * alpha);
-        } else if tile.minimized {
-            stroke_round(frame, radius, 1.0, tokens::BORDER_SUBTLE, alpha);
+        } else if selected {
+            let mut fill_alpha = sel_tile_alpha(tile.focused, hovered);
+            if pressed {
+                fill_alpha += 0.06;
+            }
+            if tile.minimized && !tile.focused {
+                fill_alpha -= 0.07;
+            }
+            if tile.focused {
+                fill_round_shadowed(frame, radius, tokens::WHITE, fill_alpha * alpha);
+                stroke_round(frame, radius, 1.0, tokens::WHITE, 0.22 * alpha);
+            } else {
+                fill_round(frame, radius, tokens::WHITE, fill_alpha * alpha);
+                stroke_round(frame, radius, 1.0, tokens::WHITE, 0.06 * alpha);
+            }
+        } else {
+            let fill = if pressed {
+                tokens::TILE_PRESSED
+            } else if hovered || tile.focused {
+                tokens::TILE_HOVER
+            } else if tile.minimized {
+                tokens::GROUND
+            } else {
+                tokens::TILE
+            };
+            fill_round(frame, radius, fill, alpha);
+            if tile.minimized {
+                stroke_round(frame, radius, 1.0, tokens::BORDER_SUBTLE, alpha);
+            }
         }
-        if tile.focused {
-            stroke_round(frame, radius, 1.5, tokens::ACCENT, alpha);
-        }
+        let (sec_fg, sec_alpha) = if selected { (tokens::WHITE, 0.68) } else { (tokens::TEXT_SECONDARY, 1.0) };
 
         // Row 1: state glyph, title, chip or hover actions or age.
         let text_x = frame.x + TEXT_X;
@@ -1716,7 +1818,8 @@ impl SidebarListView {
         let line1 = Rect::new(text_x, frame.y + pad_v, right - text_x, LINE_TITLE_H);
         let cy = line1.y + LINE_TITLE_H / 2.0;
         if tile.state.neutral() {
-            stroke_ring(frame.x + GLYPH_X + GLYPH_D / 2.0, cy, GLYPH_D, 1.5, tokens::BORDER_STRONG, alpha);
+            let (ring, ring_alpha) = if selected { (tokens::WHITE, 0.45) } else { (tokens::BORDER_STRONG, 1.0) };
+            stroke_ring(frame.x + GLYPH_X + GLYPH_D / 2.0, cy, GLYPH_D, 1.5, ring, ring_alpha * alpha);
         } else {
             fill_dot(frame.x + GLYPH_X + GLYPH_D / 2.0, cy, GLYPH_D, tile.state.color(), alpha);
         }
@@ -1726,26 +1829,28 @@ impl SidebarListView {
                 let r = shifted(r);
                 let b_hovered = sh.hovered == ListHit::TileButton(tile.pane_id, *b);
                 let b_pressed = sh.pressed == ListHit::TileButton(tile.pane_id, *b);
-                fill_round(&r, BUTTON_D / 2.0, if b_pressed { tokens::BORDER_STRONG } else { tokens::TILE_PRESSED }, alpha);
-                if b_hovered && !b_pressed {
-                    stroke_round(&r, BUTTON_D / 2.0, 1.0, tokens::BORDER_STRONG, alpha);
+                // Bare icons; a white ground only under the one the mouse is on.
+                if b_pressed {
+                    fill_round(&r, BUTTON_RADIUS, tokens::WHITE, 0.20 * alpha);
+                } else if b_hovered {
+                    fill_round(&r, BUTTON_RADIUS, tokens::WHITE, 0.12 * alpha);
                 }
-                let fg = match b {
-                    TileButton::Close if b_hovered => tokens::ERROR,
-                    TileButton::Stop => tokens::INTERRUPT,
-                    TileButton::StartClaude | TileButton::Resume => tokens::ACCENT,
-                    _ if b_hovered => tokens::TEXT_PRIMARY,
-                    _ => tokens::TEXT_SECONDARY,
+                let (fg, fg_alpha) = match b {
+                    TileButton::Close if b_hovered => (tokens::ERROR, 1.0),
+                    TileButton::Stop => (tokens::INTERRUPT, 1.0),
+                    TileButton::StartClaude | TileButton::Resume => (tokens::ACCENT, 1.0),
+                    _ if b_hovered => (tokens::TEXT_PRIMARY, 1.0),
+                    _ => (sec_fg, sec_alpha),
                 };
-                draw_text(sh, b.glyph(), &r, Style::Glyph, fg, alpha, Align::Center, false);
-                title_right = title_right.min(r.x - 6.0);
+                stroke_icon(b.icon(), &r, ICON_D, fg, fg_alpha * alpha);
+                title_right = title_right.min(r.x - 4.0);
             }
         } else if let Some((age, aging)) = &tile.age {
             let w = draw_text(sh, age, &line1, Style::Secondary, if *aging { tokens::ERROR } else { tokens::TEXT_TERTIARY }, alpha, Align::Right, false);
             title_right -= w + 8.0;
         } else if !awaiting {
             let dot = matches!(tile.state, TileState::Unread { .. }).then_some(tokens::ACCENT);
-            let chip = draw_chip(sh, &tile.chip(), right, cy, tile.state.chip_bg(), tile.state.chip_fg(), dot, alpha);
+            let chip = draw_chip(sh, &tile.chip(), right, cy, tile.state.chip_style(selected), dot, alpha);
             title_right = chip.x - 8.0;
         }
         let title = if tile.minimized { format!("\u{229f} {}", tile.title) } else { tile.title.clone() };
@@ -1771,7 +1876,7 @@ impl SidebarListView {
                     }
                     _ => {
                         let fg = if b_hovered { tokens::TEXT_PRIMARY } else { tokens::INTERRUPT };
-                        draw_text(sh, STOP_LABEL, &r, Style::Link, fg, alpha, Align::Center, false);
+                        draw_link(sh, Icon::Square, STOP_LABEL, &r, fg, alpha);
                     }
                 }
             }
@@ -1786,7 +1891,7 @@ impl SidebarListView {
                 };
                 let r = shifted(r);
                 let b_hovered = sh.hovered == ListHit::TileButton(tile.pane_id, *b);
-                draw_text(sh, label, &r, Style::Link, if b_hovered { tokens::TEXT_PRIMARY } else { tokens::ACCENT }, alpha, Align::Center, false);
+                draw_link(sh, b.icon(), label, &r, if b_hovered { tokens::TEXT_PRIMARY } else { tokens::ACCENT }, alpha);
                 sec_right = r.x - 6.0;
             }
             let mut sx = text_x;
@@ -1794,10 +1899,10 @@ impl SidebarListView {
                 let w = draw_text(sh, "\u{2605}", &Rect::new(sx, line2.y, 14.0, LINE_SEC_H), Style::Secondary, tokens::AWAITING, alpha, Align::Left, false);
                 sx += w + 4.0;
             }
-            draw_text(sh, &tile.secondary, &Rect::new(sx, line2.y, (sec_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, tokens::TEXT_SECONDARY, alpha, Align::Left, false);
+            draw_text(sh, &tile.secondary, &Rect::new(sx, line2.y, (sec_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, sec_fg, sec_alpha * alpha, Align::Left, false);
             if let Some(summary) = &tile.summary {
                 let line3_y = line2.bottom() + LINE_GAP;
-                draw_text(sh, summary, &Rect::new(text_x, line3_y, right - text_x, LINE_SEC_H), Style::Secondary, tokens::TEXT_SECONDARY, alpha, Align::Left, false);
+                draw_text(sh, summary, &Rect::new(text_x, line3_y, right - text_x, LINE_SEC_H), Style::Secondary, sec_fg, sec_alpha * alpha, Align::Left, false);
             }
         }
     }
@@ -1872,24 +1977,39 @@ mod tests {
     }
 
     const W: f64 = 280.0;
-    /// Content x: 12 + 3 + 12.
+    /// Content x of a group hanging off its tint bar: 12 + 3 + 12.
     const CX: f64 = 27.0;
+    /// Content x inside the selected panel: 12 + 4.
+    const SX: f64 = 16.0;
 
     #[test]
-    fn rows_stack_with_gaps_and_the_tint_bar_spans_each_group() {
+    fn rows_stack_with_gaps_and_the_selected_tab_is_a_padded_panel() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
         let ys: Vec<f64> = l.rows.iter().map(|r| r.frame.y).collect();
-        // header 6..34, gap 6, tile 40..94, gap 6, tile 100..154, group gap
-        // 16, header 170..198 (collapsed), gap 16, header 214..242, gap 6,
-        // tile 248..302, bottom 12.
-        assert_eq!(ys, vec![6.0, 40.0, 100.0, 170.0, 214.0, 248.0]);
+        // Selected panel from 6: pad 4, header 10..38, gap 4, tile 42..96,
+        // gap 4, tile 100..154, pad 4 (panel ends 158); group gap 16, header
+        // 174..202 (collapsed), gap 16, header 218..246, gap 6, tile
+        // 252..306, bottom 12.
+        assert_eq!(ys, vec![10.0, 42.0, 100.0, 174.0, 218.0, 252.0]);
         assert_eq!(l.rows[1].frame.h, 54.0);
-        assert_eq!(l.rows[1].frame.x, CX);
-        assert_eq!(l.rows[1].frame.right(), W - 8.0);
-        assert_eq!(l.groups[0], Rect::new(12.0, 6.0, W - 20.0, 148.0));
+        // Inside the panel the rows are inset 4 from its edges; the others
+        // start after the tint bar and end at the list's edge.
+        assert_eq!(l.rows[0].frame.x, SX);
+        assert_eq!(l.rows[1].frame.x, SX);
+        assert_eq!(l.rows[1].frame.right(), W - 8.0 - SEL_PAD);
+        assert_eq!(l.rows[5].frame.x, CX);
+        assert_eq!(l.rows[5].frame.right(), W - 8.0);
+        assert_eq!(l.groups[0], Rect::new(12.0, 6.0, W - 20.0, 152.0));
         assert_eq!(l.groups[1].h, HEADER_H);
-        assert_eq!(l.content_h, 302.0 + 12.0);
+        assert_eq!(l.groups[2], Rect::new(12.0, 218.0, W - 20.0, 88.0));
+        assert_eq!(l.content_h, 306.0 + 12.0);
         assert_eq!(l.hint_y, None);
+        // Without an active tab every group hangs off its bar.
+        let mut m = model();
+        m.groups[0].active = false;
+        let l = ListLayout::new(&m, W, &FakeMetrics);
+        assert_eq!(l.rows.iter().map(|r| r.frame.y).collect::<Vec<_>>(), vec![6.0, 40.0, 100.0, 170.0, 214.0, 248.0]);
+        assert_eq!(l.rows[1].frame.x, CX);
     }
 
     #[test]
@@ -1912,12 +2032,14 @@ mod tests {
         assert_eq!(hs, vec![HEADER_H, 116.0, 82.0, 72.0, 54.0]);
         assert_eq!(l.rows[1].question_lines, 2);
         assert_eq!(l.rows[2].question_lines, 1);
-        // The card's actions: Open at the text column, Stop at the right.
+        // The card's actions: Open at the text column, Stop (icon, gap,
+        // word, 4 pt either side) at the right.
         let open = l.rows[1].actions.iter().find(|(b, _)| *b == TileButton::Open).unwrap().1;
-        assert_eq!(open.x, CX + TEXT_X);
+        assert_eq!(open.x, SX + TEXT_X);
         assert_eq!(open.w, 4.0 * 6.0 + 20.0);
         let stop = l.rows[1].actions.iter().find(|(b, _)| *b == TileButton::Stop).unwrap().1;
-        assert_eq!(stop.right(), W - 8.0 - CARD_PAD_H);
+        assert_eq!(stop.right(), W - 8.0 - SEL_PAD - CARD_PAD_H);
+        assert_eq!(stop.w, LINK_ICON_D + LINK_ICON_GAP + 4.0 * 6.0 + 8.0);
         assert_eq!(open.y, stop.y);
     }
 
@@ -1926,8 +2048,8 @@ mod tests {
         let mut m = model();
         m.show_hint = true;
         let l = ListLayout::new(&m, W, &FakeMetrics);
-        assert_eq!(l.hint_y, Some(302.0 + 16.0));
-        assert_eq!(l.content_h, 302.0 + 16.0 + 20.0 + 12.0);
+        assert_eq!(l.hint_y, Some(306.0 + 16.0));
+        assert_eq!(l.content_h, 306.0 + 16.0 + 20.0 + 12.0);
         // An empty window still lays out.
         m.groups.clear();
         let l = ListLayout::new(&m, W, &FakeMetrics);
@@ -1938,13 +2060,24 @@ mod tests {
     #[test]
     fn hit_tells_the_rows_and_their_buttons_apart() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
-        // Header: chevron zone, body, `+`.
-        assert_eq!(l.hit(CX + 5.0, 20.0), ListHit::Chevron(0));
-        assert_eq!(l.hit(CX + 60.0, 20.0), ListHit::Header(0));
+        // Header: chevron zone, body, `+`. The panel's padding is nothing.
+        assert_eq!(l.hit(SX + 5.0, 20.0), ListHit::Chevron(0));
+        assert_eq!(l.hit(SX + 60.0, 20.0), ListHit::Header(0));
+        assert_eq!(l.hit(SX + 60.0, 8.0), ListHit::Empty);
         let add = ListLayout::add_button(&l.rows[0].frame);
+        assert_eq!(add, Rect::new(W - 8.0 - SEL_PAD - 4.0 - ADD_D, 10.0 + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D));
         assert_eq!(l.hit(add.x + 3.0, add.y + 3.0), ListHit::HeaderAdd(0));
+        // Hovering the `+` still counts as hovering the header row (the `+`
+        // shows while the mouse is anywhere on the row), and the row's
+        // hover tells the `+` from the body.
+        assert_eq!(ListHit::HeaderAdd(0).group(), Some(0));
+        assert_eq!(ListHit::Header(0).group(), Some(0));
+        assert_eq!(ListHit::Chevron(0).group(), Some(0));
+        assert_eq!(ListHit::Tile(10).group(), None);
+        assert_ne!(l.hit(add.x + 3.0, add.y + 3.0), l.hit(add.x - 3.0, add.y + 3.0));
+        assert_eq!(l.hit(add.x - 3.0, add.y + 3.0), ListHit::Header(0));
         // The gap above a tile is nothing, the body is the pane.
-        assert_eq!(l.hit(100.0, 36.0), ListHit::Empty);
+        assert_eq!(l.hit(100.0, 40.0), ListHit::Empty);
         assert_eq!(l.hit(100.0, 60.0), ListHit::Tile(10));
         assert_eq!(l.hit(100.0, 120.0), ListHit::Tile(11));
         // Left of the content column: nothing.
@@ -1957,7 +2090,8 @@ mod tests {
         let boxes: Vec<TileButton> = row.glyphs.iter().map(|(b, _)| *b).collect();
         assert_eq!(boxes, vec![TileButton::Close, TileButton::Minimize, TileButton::Stop]);
         let (_, close) = row.glyphs[0];
-        assert_eq!(close.right(), W - 8.0 - TILE_PAD_H);
+        assert_eq!(close.right(), W - 8.0 - SEL_PAD - TILE_PAD_H);
+        assert_eq!(close.w, BUTTON_D);
         assert_eq!(l.hit(close.x + 5.0, close.y + 5.0), ListHit::TileButton(11, TileButton::Close));
         let (_, stop) = row.glyphs[2];
         // Minimize sits one gap left of close, stop one gap left of minimize.
@@ -1984,8 +2118,8 @@ mod tests {
         let l = ListLayout::new(&m, W, &FakeMetrics);
         let (b, resume) = l.rows[1].actions[0];
         assert_eq!(b, TileButton::Resume);
-        assert_eq!(resume.w, RESUME_LABEL.chars().count() as f64 * 6.0 + 8.0);
-        assert_eq!(resume.right(), W - 8.0 - TILE_PAD_H);
+        assert_eq!(resume.w, LINK_ICON_D + LINK_ICON_GAP + RESUME_LABEL.chars().count() as f64 * 6.0 + 8.0);
+        assert_eq!(resume.right(), W - 8.0 - SEL_PAD - TILE_PAD_H);
         assert_eq!(l.hit(resume.x + 5.0, resume.y + 5.0), ListHit::TileButton(7, TileButton::Resume));
         assert_eq!(l.rows[1].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::Resume]);
         assert_eq!(l.rows[2].actions[0].0, TileButton::StartClaude);
@@ -1995,15 +2129,15 @@ mod tests {
     #[test]
     fn insertion_index_follows_the_midpoint_rule() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
-        // Headers at 6..34, 170..198, 214..242.
+        // Headers at 10..38, 174..202, 218..246; the panel starts at 6.
         assert_eq!(l.insertion_index(10.0), 0);
         assert_eq!(l.insertion_index(100.0), 1);
         assert_eq!(l.insertion_index(180.0), 1);
         assert_eq!(l.insertion_index(190.0), 2);
         assert_eq!(l.insertion_index(235.0), 3);
         assert_eq!(l.insertion_line_y(0), 6.0 - 8.0);
-        assert_eq!(l.insertion_line_y(1), 170.0 - 8.0);
-        assert_eq!(l.insertion_line_y(3), 302.0 + 8.0);
+        assert_eq!(l.insertion_line_y(1), 174.0 - 8.0);
+        assert_eq!(l.insertion_line_y(3), 306.0 + 8.0);
     }
 
     #[test]
@@ -2026,15 +2160,17 @@ mod tests {
         assert_eq!(l.pane_insertion_slot(&(0..0), 50.0), None);
         assert_eq!(l.pane_insertion_slot(&(99..99), 50.0), None);
         let run = 1..3;
-        // Tile 1 spans 40..94 (centre 67), tile 2 spans 100..154 (centre 127).
+        // Tile 1 spans 42..96 (centre 69), tile 2 spans 100..154 (centre 127).
         assert_eq!(l.pane_insertion_slot(&run, 50.0), Some(0));
         assert_eq!(l.pane_insertion_slot(&run, 100.0), Some(1));
         assert_eq!(l.pane_insertion_slot(&run, 140.0), Some(2));
         // Far above or below the run: no slot, the drop snaps back.
         assert_eq!(l.pane_insertion_slot(&run, 5.0), None);
         assert_eq!(l.pane_insertion_slot(&run, 300.0), None);
-        assert_eq!(l.pane_insertion_line_y(&run, 0), 40.0 - 3.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 1), 100.0 - 3.0);
+        // The line sits in the middle of the gap between two tiles (4 in
+        // the selected panel, 6 elsewhere), half a tile gap outside the run.
+        assert_eq!(l.pane_insertion_line_y(&run, 0), 42.0 - 3.0);
+        assert_eq!(l.pane_insertion_line_y(&run, 1), 98.0);
         assert_eq!(l.pane_insertion_line_y(&run, 2), 154.0 + 3.0);
         assert_eq!(l.row_for_pane(3), Some(3));
         assert_eq!(l.row_for_pane(99), None);
@@ -2076,7 +2212,7 @@ mod tests {
         assert_eq!(Style::Chip.size(), 11.0);
         assert_eq!(Style::Chip.weight(), Weight::Medium);
         assert_eq!(Style::PillBadge.weight(), Weight::Bold);
-        assert_eq!(Style::ALL.len(), 15);
+        assert_eq!(Style::ALL.len(), 13);
         let _ = PaneFlags::default();
     }
 }

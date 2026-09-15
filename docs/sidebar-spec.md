@@ -110,33 +110,59 @@ visible), the question wrapped to two lines with an ellipsis on the last
 
 ### 3.4 Group (one per tab; `TabGroupView.tsx`)
 
-Content inset 12 on each side; groups 16 apart; a group is a block with a
-3 pt tint bar down its left edge (clipped to a radius of 6), alpha 1 on the
-active tab, 0.55 on the others; content starts 12 pt after the bar. Header
-28 tall, radius 6: chevron (open `▾` / folded `▸`, secondary), 8 pt tint dot,
-the Cmd+N number in tertiary, the title (13 semibold; in the tint on the
-active tab, whose header is filled with the tint at 15 %, or `bg.overlay`
-without a colour), then at the right the `+` round button (22 pt, `bg.raised`,
-`bg.pressed` on hover) and, when folded, the collapsed summary: a 6 pt amber
-dot when a pane awaits, a 6 pt blue dot when one works, `4 panes` in
-tertiary. Hover: white at 6 %; pressed 12 %. The tint is `TAB_COLORS[c]` or
-`tabNone` grey.
+Content inset 12 on each side; groups 16 apart. A non-selected group is a
+block with a 3 pt tint bar down its left edge (clipped to a radius of 6) at
+alpha 0.55; content starts 12 pt after the bar. Header 28 tall, radius 6:
+the `chevron-down` / `chevron-right` icon (secondary), 8 pt tint dot, the
+Cmd+N number in tertiary, the title (15 semibold, primary), then at the
+right the `+` button (24 pt, radius 8) and, when folded, the collapsed
+summary: a 6 pt amber dot when a pane awaits, a 6 pt blue dot when one
+works, `4 panes` in tertiary. Header hover: `#20252D`; pressed: white 12 %.
+The `+` is hidden until the mouse is anywhere on the header row (its `+`
+included); it has no ground of its own, and white 14 % (radius 8) appears
+under it only while the mouse is on the `+` itself (20 % pressed). The
+tint is `TAB_COLORS[c]` or `tabNone` grey. The selected tab's group is
+drawn differently: section 3.4.1.
+
+#### 3.4.1 Selected tab (option "A. Wash")
+
+The active tab's group is a panel, radius 12, filled `bg.raised` and washed
+with a vertical gradient of the tint (`sidebar::wash_stops`, an `NSGradient`
+in the panel's rounded path): alpha 0.35 at the top, 0.35 x 0.45 at 42 % of
+the height, 0.35 x 0.14 at the bottom. Header and tiles sit 4 pt inside the
+panel and 4 pt apart (`SEL_PAD`, `SEL_GAP`), so the panel's rows are 11 pt
+wider on the left than a bar group's. No tint bar.
+
+- Header: no ground of its own; title white; number, chevron and collapsed
+  count white 72 %; the dot in the tint with a 3 pt halo at 28 %. Hover:
+  white 5 %; pressed 10 %. The `+` is white when shown.
+- Tiles: white 12 % with a 1 pt border white 6 %, radius 10; hover +4 %;
+  pressed +6 %; minimized 7 % less. Secondary text white 68 %; the idle and
+  shell ring white 45 %. Focused pane: white 22 % (+3 % under the mouse), a
+  1 pt border white 22 % and a soft shadow (`NSShadow`, 0 / 6 pt down, 18 pt
+  blur, black 22 %); the accent ring is gone, the focused tile is simply the
+  brightest one. The awaiting card keeps its amber look inside the panel.
+- Chips (`TileState::chip_style(selected)`): neutral chips are white 55 % on
+  white 7 %; elsewhere `text.tertiary` on white 5 %. Awaiting, working,
+  starting and unread chips keep their colour at 85 % on 10 % of the same
+  colour, in both places.
 
 ### 3.5 Tile (`SessionRow.tsx`), radius 10, fill `bg.raised`, padding 8 v / 10 h
 
 Row 1 (20 tall): the state glyph at x 10 (an 8 pt dot in the state colour;
 a 1.5 pt `border.strong` ring for idle and shell), the title from x 26 (`⊟ `
 prefix when minimized), the chip right-aligned: 18 tall, radius 9, padding 7,
-`workingBg` fill + working text (`working`, `starting`), `accent.subtleBg`
-fill + accent text + 6 pt accent dot (`done`, `bell`), `bg.overlay` fill +
-tertiary text (`idle`, `shell`, or the agent of a restored session: see
-below). Row 2 (16 tall, 2 below): the subtitle in secondary, a `★` in amber
-first when bookmarked; a bare shell shows `▶ Start Claude` and a restored
-session `▶ Resume` (accent link, primary on hover) right-aligned instead of
-the end of the subtitle. An unread tile with a turn-end summary adds a third
-row in secondary. Heights 54 / 72. Focused pane of the active tab: fill
-`bg.overlay` and a 1.5 pt accent ring. Hover: `bg.overlay`; pressed:
-`bg.pressed`. Minimized: fill `bg.base`, 1 pt `border.subtle`.
+its colours from `TileState::chip_style` (3.4.1): working 85 % on working
+10 % (`working`, `starting`), accent 85 % on accent 10 % + 6 pt accent dot
+(`done`, `bell`), tertiary on white 5 % (`idle`, `shell`, or the agent of a
+restored session: see below). Row 2 (16 tall, 2 below): the subtitle in
+secondary, a `★` in amber first when bookmarked; a bare shell shows
+`Start Claude` and a restored session `Resume`, each after a filled 11 pt
+`play` (accent link, primary on hover) right-aligned instead of the end of
+the subtitle. An unread tile with a turn-end summary adds a third row in
+secondary. Heights 54 / 72. Focused pane of the active tab: its group is
+the selected panel, so 3.4.1 applies (no accent ring). Hover: `bg.overlay`;
+pressed: `bg.pressed`. Minimized: fill `bg.base`, 1 pt `border.subtle`.
 
 Identity (`sidebar_model::tile_title`, `subtitle`; the phone's `paneLabel`
 and `SessionRow` subtitle, from the same `Pane` reads the daemon gets over
@@ -156,18 +182,32 @@ IPC):
   command is `claude … --resume <id>` or `codex resume <id>`, which is what a
   restored pane holds until Enter is pressed). Such a restored session keeps
   the shell tile (ring) but its chip reads `claude` / `codex` and its call is
-  `▶ Resume`; `shell` and `▶ Start Claude` are for a plain shell only.
+  `Resume`; `shell` and `Start Claude` are for a plain shell only.
 - The group header without a custom tab name is titled the same way from the
   focused pane.
 
-Hover actions replace the chip on row 1, right to left: `×` close (error
-red on hover), `⊟` / `⊞` minimize / restore, `■` stop (interrupt colour;
-working or awaiting), `▶` start Claude (accent; bare shell) or resume
-(accent; restored session). Each is a 20 pt round button (`bg.pressed`, a
-`border.strong` ring on hover), 4 apart, with a tooltip (`Close`, `Minimize`,
-`Restore`, `Stop`, `Start Claude here`, `Resume the session`) through
+Hover actions replace the chip on row 1, right to left: `x` close (error
+red on hover), `minimize-2` / `maximize-2` minimize / restore, `square` stop
+(interrupt colour; working or awaiting), `play` start Claude (accent; bare
+shell) or resume (accent; restored session). Each is a 24 pt button
+(radius 7, bare; white 12 % under the one hovered, 20 % pressed) holding a
+16 pt Feather icon, 2 apart, with a tooltip (`Close`, `Minimize`, `Restore`,
+`Stop`, `Start Claude here`, `Resume the session`) through
 `addToolTipRect:owner:userData:`. Pressed paints on mouse down, the action
 fires on mouse up inside the same button (a leave cancels).
+
+#### Icon set (`src/window/feather.rs`)
+
+Feather icons, drawn as stroked `NSBezierPath`s on Feather's 24 pt grid
+(2 pt stroke, round caps and joins) mapped into a 16 pt box centred in the
+button, so the stroke is 1.33 pt and the icon scales with the row. The
+views are flipped (y down, like SVG), so the published coordinates are used
+as they are. `chevron-down` / `chevron-right` (collapse caret), `plus`
+(header), `x` (close), `play` (focus, start, resume), `maximize-2` /
+`minimize-2` (restore / minimize), `square` (stop). The `Resume` and `Stop`
+links and the Next pill use the filled `play` and `square` (11 pt in the
+links, 12 pt in the pill). `Icon::segments` and the point mapping are pure
+and unit-tested.
 
 ### 3.6 Awaiting card (`AwaitingCard.tsx`), radius 12, fill `awaitingBg`
 
@@ -177,7 +217,7 @@ the age (`4m`) right in tertiary, `status.error` past 10 min. Then the
 question (13, primary, 1 or 2 lines, measured), the detail (12, secondary:
 the command, the file, or the header), and a 20 pt actions row: `Open`
 (accent pill, white 12 semibold, `primaryPressed` on hover) at the text
-column, `■ Stop` (interrupt colour, primary on hover) at the right. Heights
+column, `Stop` after a filled `square` (interrupt colour, primary on hover) at the right. Heights
 82 (1 line, no detail) to 116.
 
 ### 3.7 Summary, sort, Next pill
@@ -192,8 +232,8 @@ column, `■ Stop` (interrupt colour, primary on hover) at the right. Heights
 
 | State     | Condition                             | Fill                             | Text                         | Badge                          |
 |-----------|---------------------------------------|----------------------------------|------------------------------|--------------------------------|
-| next      | Cmd+J's unread tier is not empty      | `accent.primary`                 | white `▶ Next unread`        | white 18 pt circle, accent digits |
-| idle      | unread empty, idle tier not           | `bg.overlay` + 1 pt `border.strong` | secondary `▶ Next idle`   | `bg.pressed` circle, secondary digits |
+| next      | Cmd+J's unread tier is not empty      | `accent.primary`                 | white filled `play` + `Next unread` | white 18 pt circle, accent digits |
+| idle      | unread empty, idle tier not           | `bg.overlay` + 1 pt `border.strong` | secondary filled `play` + `Next idle` | `bg.pressed` circle, secondary digits |
 | caught up | both empty, unread just dropped to 0  | `bg.overlay`                     | `status.success` `✓ All caught up` | none; 1.6 s, then `nothing` |
 | nothing   | both empty                            | `bg.overlay`                     | tertiary `✓ Nothing to read` | none, not clickable            |
 
@@ -225,9 +265,9 @@ column, `■ Stop` (interrupt colour, primary on hover) at the right. Heights
 | Tile body                  | `focus_pane_in_window(id)` (switches tab, restores, reveals) | rename pane  | tile menu    |
 | Tile hover buttons         | the action, without focusing the pane                  |                    | tile menu    |
 | Awaiting `Open`            | same as tile body                                      |                    | tile menu    |
-| Awaiting `■ Stop`          | interrupt (4.4)                                        |                    | tile menu    |
-| Shell `▶ Start Claude`     | start Claude (4.4)                                     |                    | tile menu    |
-| Restored `▶ Resume`        | resume (4.4)                                           |                    | tile menu    |
+| Awaiting `Stop`            | interrupt (4.4)                                        |                    | tile menu    |
+| Shell `Start Claude`       | start Claude (4.4)                                     |                    | tile menu    |
+| Restored `Resume`          | resume (4.4)                                           |                    | tile menu    |
 | Next pill                  | `do_focus_next_attention()` (not when `nothing`)       |                    |              |
 | Sort toggle                | kova <-> activity                                      |                    |              |
 | `« Tab bar` footer         | switch `layout.mode` to tabs                           |                    |              |
@@ -304,7 +344,7 @@ sort key and the collapsed dot priority.
 | 3 | `is_working()`                                                                                     | working  | blue dot, `working`                   |
 | 4 | `is_starting_agent()`                                                                              | starting | blue dot, `starting`                  |
 | 5 | `is_idle_agent()`                                                                                  | idle     | ring, neutral `idle`                  |
-| 6 | else                                                                                               | shell    | ring, neutral `shell` and `▶ Start Claude` when bare; neutral `claude` / `codex` and `▶ Resume` on a restored session |
+| 6 | else                                                                                               | shell    | ring, neutral `shell` and `Start Claude` when bare; neutral `claude` / `codex` and `Resume` on a restored session |
 
 The hook's waiting flag alone (`is_awaiting_unseen()` without a parsed
 prompt) paints `done`, never amber: the `Stop` hook raises it at every turn
@@ -334,7 +374,6 @@ border.subtle                      #23272F   (= separator, hairlines)
 border.strong                      #333944   (ring glyph, pill border)
 accent           accent.primary    #4C8DFF   (= unread, focus ring, links)
 accent.pressed                     #3A79E6
-accent.subtleBg                    #12213A   (unread chip)
 text.primary                       #E8EAED
 text.secondary                     #9BA3AF
 text.tertiary                      #7C8593
@@ -342,18 +381,21 @@ text.onFill                        #FFFFFF
 status.awaiting                    #FFB020
 status.awaitingBg                  #2A1F08
 status.working                     #38BDF8
-status.workingBg                   #0A1F2B   (working chip)
 status.success                     #3DD68C
 status.error                       #FF5C5C
 action.interrupt.text              #FF7A7A
 tabNone                            #7C8593
+header.hover                       #20252D
 tab tint          TAB_COLORS[c] (Kova palette, mirrored by the phone)
+selected wash     tint at 0.35 -> 0.1575 (42 %) -> 0.049, over bg.raised
 
 top 36  summary 24  pill region 36 (pill 28, radius 14)  footer 24
 list inset 12 (+6 top, +12 bottom)  group gap 16  tile gap 6  header 28 (radius 6)
-group bar 3 + inset 12  tile radius 10, pad 8/10  card radius 12, pad 10/12, bar 4
+group bar 3 + inset 12  selected panel radius 12, pad 4, gap 4
+tile radius 10, pad 8/10  card radius 12, pad 10/12, bar 4
 rows: title 20, secondary 16, question 16/line, gap 2  chip 18 (radius 9, pad 7)
-hover button 20 (gap 4)  actions row 20  hint 20  width 280, clamp 200..520
+hover button 24 (radius 7, gap 2, icon 16)  header + 24 (radius 8)
+link icon 11 (gap 4)  pill icon 12  actions row 20  hint 20  width 280, clamp 200..520
 ```
 
 Motion: hover and pressed states are redrawn on the next frame (KovaLink's

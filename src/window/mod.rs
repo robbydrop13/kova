@@ -1,4 +1,5 @@
 mod attention;
+mod feather;
 use attention::{do_history_step, pane_history_state};
 mod geometry;
 mod ipc_handlers;

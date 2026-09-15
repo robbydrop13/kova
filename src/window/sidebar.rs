@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::feather::Icon;
 use crate::config::{clamp_sidebar_width, LayoutConfig, LayoutMode, LayoutPrefs};
 
 // ---------------------------------------------------------------
@@ -85,7 +86,6 @@ pub mod tokens {
     pub const BORDER_STRONG: [f32; 3] = [0.200, 0.224, 0.267];
     pub const ACCENT: [f32; 3] = [0.298, 0.553, 1.000];
     pub const ACCENT_PRESSED: [f32; 3] = [0.227, 0.475, 0.902];
-    pub const ACCENT_SUBTLE_BG: [f32; 3] = [0.071, 0.129, 0.227];
     pub const TEXT_PRIMARY: [f32; 3] = [0.910, 0.918, 0.929];
     pub const TEXT_SECONDARY: [f32; 3] = [0.608, 0.639, 0.686];
     pub const TEXT_TERTIARY: [f32; 3] = [0.486, 0.522, 0.576];
@@ -93,12 +93,46 @@ pub mod tokens {
     pub const AWAITING: [f32; 3] = [1.000, 0.690, 0.125];
     pub const AWAITING_BG: [f32; 3] = [0.165, 0.122, 0.031];
     pub const WORKING: [f32; 3] = [0.220, 0.741, 0.973];
-    pub const WORKING_BG: [f32; 3] = [0.039, 0.122, 0.169];
     pub const SUCCESS: [f32; 3] = [0.239, 0.839, 0.549];
     pub const ERROR: [f32; 3] = [1.000, 0.361, 0.361];
     pub const INTERRUPT: [f32; 3] = [1.000, 0.478, 0.478];
     pub const TAB_NONE: [f32; 3] = [0.486, 0.522, 0.576];
     pub const SEPARATOR: [f32; 3] = BORDER_SUBTLE;
+    /// A group header under the mouse (`#20252D`).
+    pub const HEADER_HOVER: [f32; 3] = [0.125, 0.145, 0.176];
+    /// The white every translucent layer of the selected group is cut from.
+    pub const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
+    pub const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
+}
+
+// ---------------------------------------------------------------
+// Selected tab wash
+// ---------------------------------------------------------------
+
+/// Alpha of the tab colour at the top of the selected group's panel.
+pub const WASH_ALPHA: f64 = 0.35;
+/// Alpha of the white the selected group's tiles are filled with.
+pub const SEL_TILE_ALPHA: f64 = 0.12;
+/// The tile's lift under the mouse (a point less on the focused tile, which
+/// is already the brightest), and the focused tile's lift.
+pub const SEL_TILE_HOVER_LIFT: f64 = 0.04;
+pub const SEL_TILE_FOCUS_LIFT: f64 = 0.10;
+
+/// The vertical gradient washed over the selected group's panel: the tab
+/// colour at `WASH_ALPHA` at the top, fading to 45 % of it at 42 % of the
+/// height and 14 % at the bottom. `(alpha, location)`, top to bottom.
+pub fn wash_stops() -> [(f64, f64); 3] {
+    [(WASH_ALPHA, 0.0), (WASH_ALPHA * 0.45, 0.42), (WASH_ALPHA * 0.14, 1.0)]
+}
+
+/// Fill alpha of a tile in the selected group.
+pub fn sel_tile_alpha(focused: bool, hovered: bool) -> f64 {
+    let hover = match (focused, hovered) {
+        (_, false) => 0.0,
+        (true, true) => SEL_TILE_HOVER_LIFT - 0.01,
+        (false, true) => SEL_TILE_HOVER_LIFT,
+    };
+    SEL_TILE_ALPHA + if focused { SEL_TILE_FOCUS_LIFT } else { 0.0 } + hover
 }
 
 /// The tint of a tab: its Kova colour, or the neutral grey without one.
@@ -247,26 +281,33 @@ impl TileState {
         }
     }
 
-    /// Chip fill: the tinted grounds of KovaLink's badges, `bg.overlay` for
-    /// the neutral ones.
-    pub fn chip_bg(self) -> [f32; 3] {
-        match self {
-            TileState::Awaiting => tokens::AWAITING_BG,
-            TileState::Unread { .. } => tokens::ACCENT_SUBTLE_BG,
-            TileState::Working | TileState::Starting => tokens::WORKING_BG,
-            TileState::Idle | TileState::Shell => tokens::TILE_HOVER,
+    /// The chip's colours: a coloured state keeps its colour at 85 % on
+    /// 10 % of the same colour; a neutral chip is tertiary on white 5 %, or
+    /// white 55 % on white 7 % inside the selected group.
+    pub fn chip_style(self, selected: bool) -> ChipStyle {
+        if !self.neutral() {
+            let c = self.color();
+            ChipStyle { bg: c, bg_alpha: 0.10, fg: c, fg_alpha: 0.85 }
+        } else if selected {
+            ChipStyle { bg: tokens::WHITE, bg_alpha: 0.07, fg: tokens::WHITE, fg_alpha: 0.55 }
+        } else {
+            ChipStyle { bg: tokens::WHITE, bg_alpha: 0.05, fg: tokens::TEXT_TERTIARY, fg_alpha: 1.0 }
         }
-    }
-
-    /// Chip text colour.
-    pub fn chip_fg(self) -> [f32; 3] {
-        if self.neutral() { tokens::TEXT_TERTIARY } else { self.color() }
     }
 
     /// Neutral chips (idle, shell) are grey, and their glyph is a hollow ring.
     pub fn neutral(self) -> bool {
         matches!(self, TileState::Idle | TileState::Shell)
     }
+}
+
+/// A chip's fill and caption, each with its alpha.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChipStyle {
+    pub bg: [f32; 3],
+    pub bg_alpha: f64,
+    pub fg: [f32; 3],
+    pub fg_alpha: f64,
 }
 
 /// What a collapsed header says about its panes: dots for the awaiting and
@@ -320,14 +361,14 @@ pub enum TileButton {
 }
 
 impl TileButton {
-    pub fn glyph(self) -> &'static str {
+    /// The Feather icon of the hover button and of the link.
+    pub fn icon(self) -> Icon {
         match self {
-            TileButton::Close => "\u{d7}",
-            TileButton::Minimize => "\u{229f}",
-            TileButton::Restore => "\u{229e}",
-            TileButton::Stop => "\u{25a0}",
-            TileButton::StartClaude | TileButton::Resume => "\u{25b6}",
-            TileButton::Open => "\u{23ce}",
+            TileButton::Close => Icon::X,
+            TileButton::Minimize => Icon::Minimize,
+            TileButton::Restore => Icon::Maximize,
+            TileButton::Stop => Icon::Square,
+            TileButton::StartClaude | TileButton::Resume | TileButton::Open => Icon::Play,
         }
     }
 
@@ -360,11 +401,13 @@ impl TileButton {
     }
 }
 
-/// Copy of the awaiting tile's action line and the shell tile's call.
+/// Copy of the awaiting tile's action line and the shell tile's call. The
+/// links carry a filled Feather icon before the word (square for Stop, play
+/// for the others).
 pub const OPEN_LABEL: &str = "Open";
-pub const STOP_LABEL: &str = "\u{25a0} Stop";
-pub const START_CLAUDE_LABEL: &str = "\u{25b6} Start Claude";
-pub const RESUME_LABEL: &str = "\u{25b6} Resume";
+pub const STOP_LABEL: &str = "Stop";
+pub const START_CLAUDE_LABEL: &str = "Start Claude";
+pub const RESUME_LABEL: &str = "Resume";
 
 // ---------------------------------------------------------------
 // Pane drag arithmetic
@@ -457,11 +500,16 @@ impl NextPill {
 
     pub fn label(self) -> &'static str {
         match self {
-            NextPill::Next(_) => "\u{25b6} Next unread",
-            NextPill::Idle(_) => "\u{25b6} Next idle",
+            NextPill::Next(_) => "Next unread",
+            NextPill::Idle(_) => "Next idle",
             NextPill::CaughtUp => "\u{2713} All caught up",
             NextPill::Nothing => "\u{2713} Nothing to read",
         }
+    }
+
+    /// The filled play before the label of the clickable states.
+    pub fn icon(self) -> Option<Icon> {
+        self.clickable().then_some(Icon::Play)
     }
 
     pub fn badge(self) -> Option<usize> {
@@ -531,7 +579,9 @@ mod tests {
         assert_eq!(NextPill::CaughtUp.badge(), None);
         assert!(NextPill::Idle(1).clickable());
         assert!(!NextPill::Nothing.clickable());
-        assert_eq!(NextPill::Next(1).label(), "\u{25b6} Next unread");
+        assert_eq!(NextPill::Next(1).label(), "Next unread");
+        assert_eq!(NextPill::Next(1).icon(), Some(Icon::Play));
+        assert_eq!(NextPill::Nothing.icon(), None);
     }
 
     #[test]
@@ -572,9 +622,46 @@ mod tests {
         assert!(Idle.neutral() && Shell.neutral() && !Working.neutral());
         assert_eq!(Unread { bell: true }.chip(), "bell");
         assert_eq!(Working.color(), tokens::WORKING);
-        assert_eq!(Working.chip_bg(), tokens::WORKING_BG);
         assert_eq!(Shell.color(), tokens::BORDER_STRONG);
-        assert_eq!(Shell.chip_fg(), tokens::TEXT_TERTIARY);
+    }
+
+    #[test]
+    fn chips_keep_their_colour_and_neutral_ones_follow_the_group() {
+        use TileState::*;
+        let working = Working.chip_style(false);
+        assert_eq!(working, ChipStyle { bg: tokens::WORKING, bg_alpha: 0.10, fg: tokens::WORKING, fg_alpha: 0.85 });
+        assert_eq!(Working.chip_style(true), working);
+        assert_eq!(Awaiting.chip_style(true).fg, tokens::AWAITING);
+        assert_eq!(Unread { bell: false }.chip_style(false).fg, tokens::ACCENT);
+        let plain = Shell.chip_style(false);
+        assert_eq!(plain, ChipStyle { bg: tokens::WHITE, bg_alpha: 0.05, fg: tokens::TEXT_TERTIARY, fg_alpha: 1.0 });
+        assert_eq!(Idle.chip_style(false), plain);
+        assert_eq!(Idle.chip_style(true), ChipStyle { bg: tokens::WHITE, bg_alpha: 0.07, fg: tokens::WHITE, fg_alpha: 0.55 });
+    }
+
+    #[test]
+    fn the_wash_fades_from_the_top_and_tiles_lift_under_focus_and_hover() {
+        let stops = wash_stops();
+        assert_eq!(stops[0], (0.35, 0.0));
+        assert!((stops[1].0 - 0.1575).abs() < 1e-9 && stops[1].1 == 0.42);
+        assert!((stops[2].0 - 0.049).abs() < 1e-9 && stops[2].1 == 1.0);
+        assert!(stops.windows(2).all(|w| w[0].0 > w[1].0 && w[0].1 < w[1].1));
+        assert_eq!(sel_tile_alpha(false, false), 0.12);
+        assert_eq!(sel_tile_alpha(false, true), 0.16);
+        assert_eq!(sel_tile_alpha(true, false), 0.22);
+        assert!((sel_tile_alpha(true, true) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn buttons_and_links_carry_feather_icons() {
+        assert_eq!(TileButton::Close.icon(), Icon::X);
+        assert_eq!(TileButton::Minimize.icon(), Icon::Minimize);
+        assert_eq!(TileButton::Restore.icon(), Icon::Maximize);
+        assert_eq!(TileButton::Stop.icon(), Icon::Square);
+        assert_eq!(TileButton::StartClaude.icon(), Icon::Play);
+        assert_eq!(TileButton::Resume.icon(), Icon::Play);
+        assert_eq!(STOP_LABEL, "Stop");
+        assert_eq!(RESUME_LABEL, "Resume");
     }
 
     #[test]
