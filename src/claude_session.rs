@@ -23,9 +23,19 @@ use parking_lot::Mutex;
 /// the normal case; the extra levels cover a wrapper script in between).
 const MAX_ANCESTRY_DEPTH: usize = 3;
 
-/// A session file records `startedAt` a moment after its process was exec'd,
-/// so the two clocks are compared with slack. Measured drift is under a second.
+/// A session file records `startedAt` when the conversation starts, which can
+/// be minutes after its process was exec'd (`claude --resume` shows a picker
+/// first, a trust prompt can sit there too). A recycled PID is the only thing
+/// the check has to catch, and that process was exec'd *after* the file was
+/// written, so only a process younger than the file (with slack for clock
+/// drift) is rejected.
 const START_TIME_TOLERANCE_SECS: u64 = 30;
+
+/// True when `proc_start` can be the process that wrote a file at `started_at`
+/// (both in epoch seconds): exec'd before it, or within the drift slack after.
+fn process_owns_session(proc_start: u64, started_at: u64) -> bool {
+    proc_start <= started_at.saturating_add(START_TIME_TOLERANCE_SECS)
+}
 
 /// The scan is re-run at most this often. Snapshots happen on every autosave
 /// (once per tab), so without this the same directory would be re-read dozens
@@ -126,7 +136,7 @@ fn scan_uncached() -> HashMap<u32, Session> {
         // (~/.local/share/claude/versions/2.1.220), so its name is a version
         // string, not "claude".
         let Some((_, start_secs)) = proc_info(pid) else { continue };
-        if start_secs.abs_diff(started_at) > START_TIME_TOLERANCE_SECS {
+        if !process_owns_session(start_secs, started_at) {
             log::debug!("Ignoring stale Claude session file {}", path.display());
             continue;
         }
@@ -236,6 +246,19 @@ fn strip_session_flags(cmd: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_file_written_long_after_exec_still_belongs_to_its_process() {
+        // `claude --resume` sat in its picker for five minutes before the
+        // conversation (and its session file) started.
+        assert!(process_owns_session(1_000, 1_340));
+        // Ordinary case: the file follows the exec within a second.
+        assert!(process_owns_session(1_000, 1_001));
+        // Clock drift: a file a few seconds older than the process is fine.
+        assert!(process_owns_session(1_010, 1_000));
+        // A recycled PID: the process was exec'd well after the file was written.
+        assert!(!process_owns_session(1_100, 1_000));
+    }
 
     /// Manual check against the live machine — the detection depends on Claude
     /// Code's on-disk layout, which no unit test can stand in for. Run it with
