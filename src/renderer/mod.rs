@@ -2443,8 +2443,9 @@ impl Renderer {
                     ("Minimize Pane", kc.minimize_pane.as_str(), ""),
                     ("Restore Minimized", kc.restore_minimized.as_str(), ""),
                     ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
+                    ("Mark Unread / Read", kc.toggle_unread.as_str(), "toggle the unread mark"),
                     ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
-                    ("Next Waiting", kc.next_attention.as_str(), "waiting pane, else unread"),
+                    ("Next Unread", kc.next_attention.as_str(), "the next pane with something new"),
                     ("Back / Forward", kc.history_back.as_str(), "panes you visited"),
                 ]),
                 ("EDIT & SEARCH", vec![

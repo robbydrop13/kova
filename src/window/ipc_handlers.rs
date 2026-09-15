@@ -77,6 +77,9 @@ pub fn pane_json(
         // client walking waiting panes needs that halt, or it hands back panes already read on
         // this Mac. False on a pane that is not waiting at all, where the bit means nothing.
         "awaiting_seen": pane.is_awaiting() && !pane.is_awaiting_unseen(),
+        // Something new since the pane was last looked at (a prompt, a finished
+        // turn, a bell, or the user's own mark): what the Next pill counts.
+        "unread": super::sidebar_ui::pane_flags(pane, focused).is_unread(),
         "minimized": pane.minimized,
         // Which agent holds the pane's conversation ("claude", "codex"), absent
         // at a bare shell. `claude_session_id` stays Claude-only so a client

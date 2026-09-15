@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::feather::Icon;
 use crate::config::{clamp_sidebar_width, LayoutConfig, LayoutMode, LayoutPrefs};
+use crate::pane::PaneId;
 
 // ---------------------------------------------------------------
 // Process-wide layout setting
@@ -93,7 +94,6 @@ pub mod tokens {
     pub const AWAITING: [f32; 3] = [1.000, 0.690, 0.125];
     pub const AWAITING_BG: [f32; 3] = [0.165, 0.122, 0.031];
     pub const WORKING: [f32; 3] = [0.220, 0.741, 0.973];
-    pub const SUCCESS: [f32; 3] = [0.239, 0.839, 0.549];
     pub const ERROR: [f32; 3] = [1.000, 0.361, 0.361];
     pub const INTERRUPT: [f32; 3] = [1.000, 0.478, 0.478];
     pub const TAB_NONE: [f32; 3] = [0.486, 0.522, 0.576];
@@ -201,8 +201,9 @@ pub fn display_order(sort: SidebarSort, tab_states: &[TileState]) -> Vec<usize> 
 pub enum TileState {
     /// A permission prompt is on screen (detected, never the hook flag alone).
     Awaiting,
-    /// Output nobody looked at: a finished turn, a completion, or a bell.
-    Unread { bell: bool },
+    /// Something new nobody looked at: a finished turn, a completion, a bell,
+    /// or the user's own mark.
+    Unread(UnreadKind),
     Working,
     /// Claude launched, its session not resolved yet.
     Starting,
@@ -212,29 +213,58 @@ pub enum TileState {
     Shell,
 }
 
+/// Why a tile is unread: what its chip says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnreadKind {
+    /// A finished turn, a completion, the hook's waiting flag: `done`.
+    Done,
+    /// A bell alone: `bell`.
+    Bell,
+    /// The user's own mark (Cmd+U): `unread`.
+    Manual,
+}
+
 /// The `Pane` reads a tile state is derived from. `seen` is true for the
-/// focused pane of the active tab: what is being looked at is never unread.
+/// focused pane of the active tab: what is being looked at is never unread,
+/// except by the user's own mark.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PaneFlags {
     pub permission_prompt: bool,
+    /// The permission prompt appeared since the pane was last looked at.
+    pub prompt_unseen: bool,
     pub bell: bool,
     pub completion: bool,
     /// The hook's waiting flag, unseen. Paints `done`, not `waiting`: the
     /// `Stop` hook raises it at every turn end.
     pub hook_unseen: bool,
     pub turn_end_unseen: bool,
+    /// Marked unread by hand; survives focus until the pane is focused anew.
+    pub manual: bool,
     pub working: bool,
     pub starting: bool,
     pub idle_agent: bool,
     pub seen: bool,
 }
 
+impl PaneFlags {
+    /// The one unread rule (Cmd+J, the pill's count, the tile): something
+    /// new since the pane was last looked at, or the user's own mark. Idle
+    /// sessions are never unread by themselves.
+    pub fn is_unread(self) -> bool {
+        self.manual
+            || (!self.seen
+                && (self.prompt_unseen || self.completion || self.bell || self.hook_unseen || self.turn_end_unseen))
+    }
+}
+
 impl TileState {
     pub fn from_flags(f: PaneFlags) -> Self {
         if f.permission_prompt && !f.working {
             TileState::Awaiting
+        } else if f.manual {
+            TileState::Unread(UnreadKind::Manual)
         } else if !f.seen && (f.completion || f.bell || f.hook_unseen || f.turn_end_unseen) {
-            TileState::Unread { bell: f.bell && !f.completion }
+            TileState::Unread(if f.bell && !f.completion { UnreadKind::Bell } else { UnreadKind::Done })
         } else if f.working {
             TileState::Working
         } else if f.starting {
@@ -250,7 +280,7 @@ impl TileState {
     pub fn rank(self) -> u8 {
         match self {
             TileState::Awaiting => 0,
-            TileState::Unread { .. } => 1,
+            TileState::Unread(_) => 1,
             TileState::Working => 2,
             TileState::Starting => 3,
             TileState::Idle => 4,
@@ -267,8 +297,9 @@ impl TileState {
     pub fn chip(self) -> &'static str {
         match self {
             TileState::Awaiting => "waiting",
-            TileState::Unread { bell: true } => "bell",
-            TileState::Unread { bell: false } => "done",
+            TileState::Unread(UnreadKind::Bell) => "bell",
+            TileState::Unread(UnreadKind::Done) => "done",
+            TileState::Unread(UnreadKind::Manual) => "unread",
             TileState::Working => "working",
             TileState::Starting => "starting",
             TileState::Idle => "idle",
@@ -281,7 +312,7 @@ impl TileState {
     pub fn color(self) -> [f32; 3] {
         match self {
             TileState::Awaiting => tokens::AWAITING,
-            TileState::Unread { .. } => tokens::ACCENT,
+            TileState::Unread(_) => tokens::ACCENT,
             TileState::Working | TileState::Starting => tokens::WORKING,
             TileState::Idle | TileState::Shell => tokens::BORDER_STRONG,
         }
@@ -364,6 +395,10 @@ pub enum TileButton {
     Resume,
     /// The awaiting tile's `Open` button.
     Open,
+    /// `mail`: mark the pane unread by hand.
+    MarkUnread,
+    /// `check`: mark everything here read.
+    MarkRead,
 }
 
 impl TileButton {
@@ -375,6 +410,8 @@ impl TileButton {
             TileButton::Restore => Icon::Maximize,
             TileButton::Stop => Icon::Square,
             TileButton::StartClaude | TileButton::Resume | TileButton::Open => Icon::Play,
+            TileButton::MarkUnread => Icon::Mail,
+            TileButton::MarkRead => Icon::Check,
         }
     }
 
@@ -387,14 +424,20 @@ impl TileButton {
             TileButton::StartClaude => "Start Claude here",
             TileButton::Resume => "Resume the session",
             TileButton::Open => "Open",
+            TileButton::MarkUnread => "Mark unread",
+            TileButton::MarkRead => "Mark read",
         }
     }
 
     /// The hover glyphs of a tile, right to left: close, minimize / restore,
-    /// stop when something can be interrupted, start Claude on a bare shell,
-    /// resume on a shell holding a resume line.
-    pub fn hover_glyphs(state: TileState, minimized: bool, bare_shell: bool, resumable: bool) -> Vec<TileButton> {
-        let mut out = vec![TileButton::Close, if minimized { TileButton::Restore } else { TileButton::Minimize }];
+    /// mark read / unread, stop when something can be interrupted, start
+    /// Claude on a bare shell, resume on a shell holding a resume line.
+    pub fn hover_glyphs(state: TileState, minimized: bool, bare_shell: bool, resumable: bool, unread: bool) -> Vec<TileButton> {
+        let mut out = vec![
+            TileButton::Close,
+            if minimized { TileButton::Restore } else { TileButton::Minimize },
+            if unread { TileButton::MarkRead } else { TileButton::MarkUnread },
+        ];
         if matches!(state, TileState::Working | TileState::Awaiting) {
             out.push(TileButton::Stop);
         }
@@ -583,38 +626,25 @@ pub fn summary_runs(waiting: usize, working: usize, idle: usize) -> Vec<(String,
     runs
 }
 
-/// What the Next pill shows (KovaLink `NextPill.tsx`).
+/// What the Next pill shows (KovaLink `NextPill.tsx`): the unread count, or
+/// nothing to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NextPill {
-    /// Unread panes left: accent pill, count badge.
+    /// Unread panes left: accent pill, count badge, jumps to the next one.
     Next(usize),
-    /// Nothing unread, idle sessions left: neutral pill, count badge.
-    Idle(usize),
-    /// The last unread was just read: a short green flash.
-    CaughtUp,
-    /// Nothing to read at all: dim, not clickable.
+    /// Nothing to read: raised ground, tertiary text, not a button.
     Nothing,
 }
 
 impl NextPill {
-    pub fn of(unread: usize, idle: usize, flashing: bool) -> Self {
-        if unread > 0 {
-            NextPill::Next(unread)
-        } else if idle > 0 {
-            NextPill::Idle(idle)
-        } else if flashing {
-            NextPill::CaughtUp
-        } else {
-            NextPill::Nothing
-        }
+    pub fn of(unread: usize) -> Self {
+        if unread > 0 { NextPill::Next(unread) } else { NextPill::Nothing }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             NextPill::Next(_) => "Next unread",
-            NextPill::Idle(_) => "Next idle",
-            NextPill::CaughtUp => "\u{2713} All caught up",
-            NextPill::Nothing => "\u{2713} Nothing to read",
+            NextPill::Nothing => "Nothing to read",
         }
     }
 
@@ -625,14 +655,36 @@ impl NextPill {
 
     pub fn badge(self) -> Option<usize> {
         match self {
-            NextPill::Next(n) | NextPill::Idle(n) => Some(n),
-            _ => None,
+            NextPill::Next(n) => Some(n),
+            NextPill::Nothing => None,
         }
     }
 
     pub fn clickable(self) -> bool {
-        matches!(self, NextPill::Next(_) | NextPill::Idle(_))
+        matches!(self, NextPill::Next(_))
     }
+}
+
+/// The pane Cmd+J and the pill land on. `order` is every pane in the
+/// sidebar's display order with whether it is unread: the answer is the
+/// first unread pane after `current`'s place in that order, wrapping to the
+/// first; `current` itself never, so a lone unread pane under the eye gives
+/// nothing. A `current` not in the order (another window's) starts at the
+/// head.
+pub fn next_unread(order: &[(PaneId, bool)], current: Option<PaneId>) -> Option<PaneId> {
+    let at = current.and_then(|c| order.iter().position(|&(id, _)| id == c));
+    let start = at.map_or(0, |i| i + 1);
+    order[start..]
+        .iter()
+        .chain(order[..start.min(order.len())].iter())
+        .filter(|&&(id, unread)| unread && Some(id) != current)
+        .map(|&(id, _)| id)
+        .next()
+}
+
+/// How many panes of `order` are unread: the pill's count.
+pub fn unread_count(order: &[(PaneId, bool)]) -> usize {
+    order.iter().filter(|&&(_, unread)| unread).count()
 }
 
 /// `4s`, `12m`, `3h`: how long a pane has been waiting.
@@ -757,16 +809,16 @@ mod tests {
     }
 
     #[test]
-    fn the_next_pill_prefers_unread_then_idle_then_the_flash() {
-        assert_eq!(NextPill::of(3, 2, false), NextPill::Next(3));
-        assert_eq!(NextPill::of(0, 2, true), NextPill::Idle(2));
-        assert_eq!(NextPill::of(0, 0, true), NextPill::CaughtUp);
-        assert_eq!(NextPill::of(0, 0, false), NextPill::Nothing);
+    fn the_next_pill_counts_the_unread_panes_or_says_nothing() {
+        assert_eq!(NextPill::of(3), NextPill::Next(3));
+        assert_eq!(NextPill::of(1), NextPill::Next(1));
+        assert_eq!(NextPill::of(0), NextPill::Nothing);
         assert_eq!(NextPill::Next(3).badge(), Some(3));
-        assert_eq!(NextPill::CaughtUp.badge(), None);
-        assert!(NextPill::Idle(1).clickable());
+        assert_eq!(NextPill::Nothing.badge(), None);
+        assert!(NextPill::Next(1).clickable());
         assert!(!NextPill::Nothing.clickable());
         assert_eq!(NextPill::Next(1).label(), "Next unread");
+        assert_eq!(NextPill::Nothing.label(), "Nothing to read");
         assert_eq!(NextPill::Next(1).icon(), Some(Icon::Play));
         assert_eq!(NextPill::Nothing.icon(), None);
     }
@@ -785,31 +837,81 @@ mod tests {
         use TileState::*;
         let all = PaneFlags {
             permission_prompt: true,
+            prompt_unseen: true,
             bell: true,
             completion: true,
             hook_unseen: true,
             turn_end_unseen: true,
+            manual: false,
             working: true,
             starting: true,
             idle_agent: true,
             seen: false,
         };
         // A prompt on screen loses to the spinner: Claude went back to work.
-        assert_eq!(TileState::from_flags(all), Unread { bell: false });
+        assert_eq!(TileState::from_flags(all), Unread(UnreadKind::Done));
         assert_eq!(TileState::from_flags(PaneFlags { working: false, ..all }), Awaiting);
-        assert_eq!(TileState::from_flags(PaneFlags { permission_prompt: false, completion: false, ..all }), Unread { bell: true });
+        assert_eq!(TileState::from_flags(PaneFlags { permission_prompt: false, completion: false, ..all }), Unread(UnreadKind::Bell));
         // The hook flag alone paints done, never waiting.
-        assert_eq!(TileState::from_flags(PaneFlags { hook_unseen: true, ..PaneFlags::default() }), Unread { bell: false });
-        assert_eq!(TileState::from_flags(PaneFlags { turn_end_unseen: true, ..PaneFlags::default() }), Unread { bell: false });
-        // The pane being looked at never shows unread.
+        assert_eq!(TileState::from_flags(PaneFlags { hook_unseen: true, ..PaneFlags::default() }), Unread(UnreadKind::Done));
+        assert_eq!(TileState::from_flags(PaneFlags { turn_end_unseen: true, ..PaneFlags::default() }), Unread(UnreadKind::Done));
+        // The pane being looked at never shows unread, unless marked by hand.
         assert_eq!(TileState::from_flags(PaneFlags { permission_prompt: false, seen: true, ..all }), Working);
+        assert_eq!(TileState::from_flags(PaneFlags { permission_prompt: false, seen: true, manual: true, ..all }), Unread(UnreadKind::Manual));
+        assert_eq!(TileState::from_flags(PaneFlags { manual: true, ..PaneFlags::default() }), Unread(UnreadKind::Manual));
         assert_eq!(TileState::from_flags(PaneFlags { starting: true, idle_agent: true, ..PaneFlags::default() }), Starting);
         assert_eq!(TileState::from_flags(PaneFlags { idle_agent: true, ..PaneFlags::default() }), Idle);
         assert_eq!(TileState::from_flags(PaneFlags::default()), Shell);
         assert!(Idle.neutral() && Shell.neutral() && !Working.neutral());
-        assert_eq!(Unread { bell: true }.chip(), "bell");
+        assert_eq!(Unread(UnreadKind::Bell).chip(), "bell");
+        assert_eq!(Unread(UnreadKind::Manual).chip(), "unread");
         assert_eq!(Working.color(), tokens::WORKING);
         assert_eq!(Shell.color(), tokens::BORDER_STRONG);
+    }
+
+    #[test]
+    fn a_pane_is_unread_when_something_is_new_or_marked_and_never_for_being_idle() {
+        let quiet = PaneFlags::default();
+        assert!(!quiet.is_unread());
+        assert!(!PaneFlags { idle_agent: true, ..quiet }.is_unread());
+        assert!(!PaneFlags { working: true, ..quiet }.is_unread());
+        // A prompt on screen counts only while unseen.
+        assert!(PaneFlags { permission_prompt: true, prompt_unseen: true, ..quiet }.is_unread());
+        assert!(!PaneFlags { permission_prompt: true, ..quiet }.is_unread());
+        for f in [
+            PaneFlags { bell: true, ..quiet },
+            PaneFlags { completion: true, ..quiet },
+            PaneFlags { hook_unseen: true, ..quiet },
+            PaneFlags { turn_end_unseen: true, ..quiet },
+        ] {
+            assert!(f.is_unread());
+            // Under the eye, the same signals are read.
+            assert!(!PaneFlags { seen: true, ..f }.is_unread());
+        }
+        // The manual mark counts even on the pane being looked at.
+        assert!(PaneFlags { manual: true, ..quiet }.is_unread());
+        assert!(PaneFlags { manual: true, seen: true, ..quiet }.is_unread());
+    }
+
+    #[test]
+    fn next_unread_walks_the_order_after_the_focused_pane_and_wraps() {
+        // Display order 7, 3, 2, 5; unread: 7, 2, 5.
+        let order = [(7, true), (3, false), (2, true), (5, true)];
+        assert_eq!(unread_count(&order), 3);
+        assert_eq!(next_unread(&order, Some(2)), Some(5));
+        assert_eq!(next_unread(&order, Some(5)), Some(7));
+        assert_eq!(next_unread(&order, Some(7)), Some(2));
+        // A read pane under the eye: the next unread one after its place.
+        assert_eq!(next_unread(&order, Some(3)), Some(2));
+        // A pane from elsewhere (another window), or none: the head.
+        assert_eq!(next_unread(&order, Some(9)), Some(7));
+        assert_eq!(next_unread(&order, None), Some(7));
+        // A lone unread pane that is the one under the eye: nowhere to go.
+        assert_eq!(next_unread(&[(4, true)], Some(4)), None);
+        assert_eq!(next_unread(&[(4, true), (6, false)], Some(6)), Some(4));
+        assert_eq!(next_unread(&[(4, false)], Some(9)), None);
+        assert_eq!(next_unread(&[], Some(4)), None);
+        assert_eq!(unread_count(&[]), 0);
     }
 
     #[test]
@@ -819,7 +921,7 @@ mod tests {
         assert_eq!(working, ChipStyle { bg: tokens::WORKING, bg_alpha: 0.10, fg: tokens::WORKING, fg_alpha: 0.85 });
         assert_eq!(Working.chip_style(true), working);
         assert_eq!(Awaiting.chip_style(true).fg, tokens::AWAITING);
-        assert_eq!(Unread { bell: false }.chip_style(false).fg, tokens::ACCENT);
+        assert_eq!(Unread(UnreadKind::Done).chip_style(false).fg, tokens::ACCENT);
         let plain = Shell.chip_style(false);
         assert_eq!(plain, ChipStyle { bg: tokens::WHITE, bg_alpha: 0.05, fg: tokens::TEXT_TERTIARY, fg_alpha: 1.0 });
         assert_eq!(Idle.chip_style(false), plain);
@@ -862,11 +964,13 @@ mod tests {
     #[test]
     fn hover_glyphs_follow_the_tile() {
         use TileButton::*;
-        assert_eq!(TileButton::hover_glyphs(TileState::Working, false, false, false), vec![Close, Minimize, Stop]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Awaiting, true, false, false), vec![Close, Restore, Stop]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, true, false), vec![Close, Minimize, StartClaude]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, false, true), vec![Close, Minimize, Resume]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Idle, false, false, false), vec![Close, Minimize]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Working, false, false, false, false), vec![Close, Minimize, MarkUnread, Stop]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Awaiting, true, false, false, true), vec![Close, Restore, MarkRead, Stop]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, true, false, false), vec![Close, Minimize, MarkUnread, StartClaude]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, false, true, false), vec![Close, Minimize, MarkUnread, Resume]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Idle, false, false, false, true), vec![Close, Minimize, MarkRead]);
+        assert_eq!(MarkUnread.icon(), Icon::Mail);
+        assert_eq!(MarkRead.icon(), Icon::Check);
     }
 
     #[test]

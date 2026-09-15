@@ -202,7 +202,8 @@ IPC):
   focused pane.
 
 Hover actions replace the chip on row 1, right to left: `x` close (error
-red on hover), `minimize-2` / `maximize-2` minimize / restore, `square` stop
+red on hover), `minimize-2` / `maximize-2` minimize / restore, `check` mark
+read (unread tile) or `mail` mark unread (read tile), `square` stop
 (interrupt colour; working or awaiting), `play` start Claude (accent; bare
 shell) or resume (accent; restored session). Each is a 24 pt button
 (radius 7, bare; white 12 % under the one hovered, 20 % pressed) holding a
@@ -243,20 +244,18 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
   window (like Cmd+J).
 - Sort toggle: `⇅ kova` tertiary / `⇅ activity` accent, primary on hover on
   a `bg.pressed` rounded ground.
-- Next pill (`sidebar::NextPill`, from KovaLink `NextPill.tsx`):
+- Next pill (`sidebar::NextPill`, from KovaLink `NextPill.tsx`), one
+  unread model (section 5.2):
 
-| State     | Condition                             | Fill                             | Text                         | Badge                          |
-|-----------|---------------------------------------|----------------------------------|------------------------------|--------------------------------|
-| next      | Cmd+J's unread tier is not empty      | `accent.primary`                 | white filled `play` + `Next unread` | white 18 pt circle, accent digits |
-| idle      | unread empty, idle tier not           | `bg.overlay` + 1 pt `border.strong` | secondary filled `play` + `Next idle` | `bg.pressed` circle, secondary digits |
-| caught up | both empty, unread just dropped to 0  | `bg.overlay`                     | `status.success` `✓ All caught up` | none; 1.6 s, then `nothing` |
-| nothing   | both empty                            | `bg.overlay`                     | tertiary `✓ Nothing to read` | none, not clickable            |
+| State   | Condition          | Fill             | Text                                | Badge                             |
+|---------|--------------------|------------------|-------------------------------------|-----------------------------------|
+| next    | unread count > 0   | `accent.primary` | white filled `play` + `Next unread` | white 18 pt circle, accent digits |
+| nothing | unread count == 0  | `bg.raised`      | tertiary `Nothing to read`          | none; not a button (no hover, no press) |
 
   `⌘J` right-aligned inside at 60 % alpha, the badge to its left. Hover:
-  `accent.primaryPressed` (next) / `bg.pressed` (idle). Pressed: text alpha
-  0.85. The tiers come from `KovaView::collect_attention`
-  (`src/window/attention.rs`), the same collection `do_focus_next_attention`
-  jumps with, read once per tick.
+  `accent.primaryPressed`. Pressed: text alpha 0.85. The count is
+  `KovaView::collect_unread` (`src/window/attention.rs`), the same list
+  `do_focus_next_attention` walks, read once per tick.
 
 ### 3.8 List extras
 
@@ -345,6 +344,7 @@ tile's own buttons go through the same function.
 | Resume the session | `Pane::restored_session()`                            | the line rebuilt by `agent_session::resume_command` (validated id, the pane's own flags), typed after a Ctrl+U (the pre-typed line may still sit at the prompt) and Enter; refused with a status line otherwise |
 | Rename…           | always                                                 | `focus_pane_in_window(id)` then `start_rename_pane()`                     |
 | Bookmark / Unbookmark | always                                             | focus then `do_toggle_bookmark()`; label from `bookmark_keys`             |
+| Mark read / Mark unread | unread / read                                    | `toggle_pane_unread(id)` (5.2): `Pane::mark_read()` or the manual mark   |
 | Minimize / Restore| not minimized / minimized                              | focus then `do_minimize_pane()`; restore = `focus_pane_in_window`         |
 | Close             | always                                                 | `ipc_close_pane(id)`; when `is_working()` an `NSAlert` first (`Close {title}?`, `Close and interrupt` / `Keep working`). Refused on the last pane with a status line |
 
@@ -368,6 +368,10 @@ other tab change.
 ### 4.4 Keys
 
 - `Cmd+J` = `next_attention`, already bound; the pill is its button.
+- `Cmd+U` = `toggle_unread` (`[keys]`, default `cmd+u`; also the Pane menu's
+  `Mark as Unread` / `Mark as Read`, retitled in `validateMenuItem:`, and
+  IPC `dispatch-action` `toggle-unread`): the focused pane becomes read
+  when it is unread for any reason, else manually unread (5.2).
 - `Cmd+1..9`, `Cmd+Shift+[ ]`, `Cmd+P`, `Cmd+O`: unchanged; the sidebar follows.
 - `toggle_sidebar = "cmd+option+s"` (`[keys]`): toggles `layout.mode` and
   persists it. Also reachable over IPC as `dispatch-action` `toggle-sidebar`.
@@ -387,7 +391,7 @@ sort key and the collapsed dot priority.
 | # | Condition                                                                                          | Tile     | Glyph / chip                          |
 |---|----------------------------------------------------------------------------------------------------|----------|---------------------------------------|
 | 1 | `has_permission_prompt()` (a parsed prompt preview) and `!is_working()`                            | awaiting | amber dot, age instead of a chip      |
-| 2 | not focused and (`unread_completion()` or bell or `is_awaiting_unseen()` or `is_turn_end_unseen()`) | unread | accent dot, `done` (`bell`) chip     |
+| 2 | `is_manual_unread()`, or not focused and (`unread_completion()` or bell or `is_awaiting_unseen()` or `is_turn_end_unseen()`) | unread | accent dot, `done` (`bell`, `unread` for the manual mark) chip |
 | 3 | `is_working()`                                                                                     | working  | blue dot, `working`                   |
 | 4 | `is_starting_agent()`                                                                              | starting | blue dot, `starting`                  |
 | 5 | `is_idle_agent()`                                                                                  | idle     | ring, neutral `idle`                  |
@@ -399,6 +403,35 @@ end (see `docs/ipc.md`), and amber is reserved for a detected permission
 prompt, as on the phone. `minimized` adds the `⊟` prefix and the hollow fill
 on top of any state. Bell / completion / seen flags clear on focus as before;
 the sidebar never acks anything itself.
+
+### 5.2 Unread: one rule for Cmd+J, the pill and the tiles
+
+A pane is UNREAD (`PaneFlags::is_unread`) when something is new since it
+was last looked at: an unseen permission prompt (`Pane::is_prompt_unseen`,
+the `Permission` preview's `seen` flag), an unseen completion, turn end or
+hook notification, a bell, or the manual mark. Looking at a pane means
+being the focused pane of the active tab of the key window: the per-frame
+pass in `tick.rs` acks the bell and the completion and marks the waiting
+flag and the preview seen, so the automatic reasons drain there. Idle
+sessions are never unread by themselves (no idle tier any more; `idle`
+stays a chip and a summary count).
+
+The manual mark (`Pane::manual_unread`, `Cmd+U`, the tile's `mail` button,
+the context menu's `Mark unread`) survives while the pane stays focused: it
+is dropped only when the pane BECOMES focused, a transition the frame loop
+detects by comparing the focused pane id with the one it saw last
+(`KovaView::unread_focus`). `Cmd+U` on an unread pane runs
+`Pane::mark_read()` instead: every seen flag set, the manual mark dropped.
+
+`KovaView::collect_unread` lists every pane with its unread bit across
+every window: this window's in the sidebar's display order
+(`sidebar_model::pane_order`: tabs in kova or activity order, panes in tab
+order, minimized panes left out), then the other windows' in tab order. The
+pill shows `sidebar::unread_count`; `Cmd+J` and the pill jump to
+`sidebar::next_unread(order, focused)`: the first unread pane after the
+focused pane's place in that order, wrapping, never the focused pane itself
+(a status line says `Nothing to read` when nothing else is). IPC
+`list-panes` reports the same rule as `unread`.
 
 ### 5.1 Where the question text comes from
 

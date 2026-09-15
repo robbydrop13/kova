@@ -75,6 +75,8 @@ pub enum Action {
     HistoryForward,
     /// Switch the window layout between the tab bar and the sidebar.
     ToggleSidebar,
+    /// Cmd+U: the focused pane's unread mark.
+    ToggleUnread,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -297,6 +299,7 @@ impl Keybindings {
         bind(&keys.history_back, Action::HistoryBack);
         bind(&keys.history_forward, Action::HistoryForward);
         bind(&keys.toggle_sidebar, Action::ToggleSidebar);
+        bind(&keys.toggle_unread, Action::ToggleUnread);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);
@@ -398,8 +401,25 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "history-back" => Action::HistoryBack,
         "history-forward" => Action::HistoryForward,
         "toggle-sidebar" => Action::ToggleSidebar,
+        "toggle-unread" => Action::ToggleUnread,
 
         _ => return None,
     };
     Some(action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmd_u_toggles_the_unread_mark_by_default_and_by_name() {
+        let combo = parse_key_combo("cmd+u");
+        assert!(combo.cmd && !combo.shift && !combo.option && !combo.ctrl);
+        assert_eq!(combo.key, Key::Char('u'));
+        let bindings = Keybindings::from_config(&KeysConfig::default());
+        assert!(matches!(bindings.window_map.get(&combo), Some(Action::ToggleUnread)));
+        assert!(matches!(bindings.window_map.get(&parse_key_combo("cmd+j")), Some(Action::NextAttention)));
+        assert!(matches!(action_from_ipc_name("toggle-unread"), Some(Action::ToggleUnread)));
+    }
 }

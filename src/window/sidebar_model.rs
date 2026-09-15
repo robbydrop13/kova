@@ -8,6 +8,8 @@ use super::sidebar::{
     display_order, format_age, summary_runs, CollapsedSummary, NextPill, PaneFlags, SidebarSort,
     SummaryRun, TileState, AGING_SECS,
 };
+#[cfg(test)]
+use super::sidebar::UnreadKind;
 use crate::pane::{PaneId, TabId};
 use crate::prompt_preview::PromptPreview;
 
@@ -47,6 +49,8 @@ pub struct TileVm {
     /// The column the pane sits in: a drag only reorders within one column.
     pub column: usize,
     pub state: TileState,
+    /// `PaneFlags::is_unread`: the hover action reads Mark read / unread.
+    pub unread: bool,
     pub minimized: bool,
     /// A plain shell: `▶ Start Claude` applies.
     pub bare_shell: bool,
@@ -194,13 +198,13 @@ impl TileVm {
         let mut summary = None;
         let mut age = None;
         match (state, f.preview.as_ref()) {
-            (TileState::Awaiting, Some(PromptPreview::Permission { header, question: q, detail: d, since })) => {
+            (TileState::Awaiting, Some(PromptPreview::Permission { header, question: q, detail: d, since, .. })) => {
                 question = Some(q.clone());
                 detail = Some(d.clone().unwrap_or_else(|| header.clone()));
                 let secs = now.saturating_sub(*since);
                 age = Some((format_age(secs), secs >= AGING_SECS));
             }
-            (TileState::Unread { .. }, Some(PromptPreview::TurnEnd { summary: s, .. })) if !s.is_empty() => {
+            (TileState::Unread(_), Some(PromptPreview::TurnEnd { summary: s, .. })) if !s.is_empty() => {
                 summary = Some(s.clone());
             }
             _ => {}
@@ -218,6 +222,7 @@ impl TileVm {
             pane_id: f.pane_id,
             column: f.column,
             state,
+            unread: f.flags.is_unread(),
             minimized: f.minimized,
             bare_shell: f.bare_shell && !f.resumable,
             resumable: f.bare_shell && f.resumable,
@@ -249,10 +254,27 @@ impl TileVm {
     }
 }
 
+/// The panes of a window in the order Cmd+J and the pill walk them, each
+/// with whether it is unread: the tabs in the sidebar's display order
+/// (`sort`), the panes in tab order, minimized panes left out (never a
+/// landing spot: the user folded them).
+pub fn pane_order(tabs: &[TabFacts], sort: SidebarSort) -> Vec<(PaneId, bool)> {
+    let tab_states: Vec<TileState> = tabs
+        .iter()
+        .map(|t| TileState::most_urgent(t.panes.iter().map(|p| TileState::from_flags(p.flags))))
+        .collect();
+    display_order(sort, &tab_states)
+        .into_iter()
+        .flat_map(|ti| tabs[ti].panes.iter())
+        .filter(|p| !p.minimized)
+        .map(|p| (p.pane_id, p.flags.is_unread()))
+        .collect()
+}
+
 impl SidebarModel {
-    /// Assemble the model. `unread` and `idle` are Cmd+J's tiers across every
-    /// window (the pill), `flashing` the caught-up flash.
-    pub fn build(tabs: &[TabFacts], sort: SidebarSort, unread: usize, idle: usize, flashing: bool, now: u64) -> Self {
+    /// Assemble the model. `unread` is the unread count across every window
+    /// (the pill).
+    pub fn build(tabs: &[TabFacts], sort: SidebarSort, unread: usize, now: u64) -> Self {
         let tab_states: Vec<TileState> = tabs
             .iter()
             .map(|t| TileState::most_urgent(t.panes.iter().map(|p| TileState::from_flags(p.flags))))
@@ -297,7 +319,7 @@ impl SidebarModel {
         SidebarModel {
             summary: summary_runs(waiting, working, idle_here),
             sort,
-            pill: NextPill::of(unread, idle, flashing),
+            pill: NextPill::of(unread),
             groups,
             show_hint: total_panes < 3,
         }
@@ -331,6 +353,7 @@ mod tests {
             question: "Run it?".into(),
             detail: None,
             since: 1000,
+            seen: false,
         });
         let t = TileVm::from_facts(&f, 1000 + 700);
         assert_eq!(t.state, TileState::Awaiting);
@@ -347,7 +370,7 @@ mod tests {
         let mut f = pane(2, PaneFlags { turn_end_unseen: true, ..PaneFlags::default() });
         f.preview = Some(PromptPreview::TurnEnd { summary: "Pushed the copy".into(), seen: false });
         let t = TileVm::from_facts(&f, 0);
-        assert_eq!(t.state, TileState::Unread { bell: false });
+        assert_eq!(t.state, TileState::Unread(UnreadKind::Done));
         assert_eq!(t.summary.as_deref(), Some("Pushed the copy"));
         assert_eq!(t.age, None);
         let mut f = pane(3, PaneFlags { turn_end_unseen: true, seen: true, idle_agent: true, ..PaneFlags::default() });
@@ -462,7 +485,7 @@ mod tests {
             tab(0, vec![pane(1, PaneFlags { permission_prompt: true, ..PaneFlags::default() }), pane(2, PaneFlags { idle_agent: true, ..PaneFlags::default() })]),
             folded,
         ];
-        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, 1, false, 0);
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, 0);
         let text: String = m.summary.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(text, "1 waiting \u{b7} 1 working \u{b7} 1 idle");
         assert_eq!(m.pill, NextPill::Next(2));
@@ -482,11 +505,34 @@ mod tests {
             tab(0, vec![pane(1, PaneFlags::default())]),
             tab(1, vec![pane(2, PaneFlags { permission_prompt: true, ..PaneFlags::default() })]),
         ];
-        let m = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0, true, 0);
+        let m = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0);
         assert_eq!(m.groups.iter().map(|g| g.tab_idx).collect::<Vec<_>>(), vec![1, 0]);
-        assert_eq!(m.pill, NextPill::CaughtUp);
+        assert_eq!(m.pill, NextPill::Nothing);
         assert!(m.show_hint);
-        let same = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0, true, 0);
+        let same = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0);
         assert_eq!(m, same);
+    }
+
+    #[test]
+    fn the_unread_walk_follows_the_display_order_and_skips_minimized_panes() {
+        let unread = PaneFlags { completion: true, ..PaneFlags::default() };
+        let mut folded_away = pane(4, unread);
+        folded_away.minimized = true;
+        let tabs = vec![
+            tab(0, vec![pane(1, PaneFlags::default()), pane(2, unread), folded_away]),
+            tab(1, vec![pane(5, PaneFlags { permission_prompt: true, prompt_unseen: true, ..PaneFlags::default() }), pane(6, PaneFlags { manual: true, seen: true, ..PaneFlags::default() })]),
+            tab(2, vec![pane(7, PaneFlags { idle_agent: true, ..PaneFlags::default() })]),
+        ];
+        // Tab order: every pane but the minimized one, unread where
+        // something is new or marked; the idle one is read.
+        let unread = |order: Vec<(PaneId, bool)>| order.into_iter().filter(|&(_, u)| u).map(|(id, _)| id).collect::<Vec<_>>();
+        let kova = pane_order(&tabs, SidebarSort::Kova);
+        assert_eq!(kova.iter().map(|&(id, _)| id).collect::<Vec<_>>(), vec![1, 2, 5, 6, 7]);
+        assert_eq!(unread(kova), vec![2, 5, 6]);
+        // Activity order: the awaiting tab first.
+        assert_eq!(unread(pane_order(&tabs, SidebarSort::Activity)), vec![5, 6, 2]);
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 3, 0);
+        assert!(m.groups[0].tiles[1].unread && !m.groups[0].tiles[0].unread);
+        assert!(m.groups[1].tiles[1].unread);
     }
 }

@@ -11,9 +11,6 @@ use super::sidebar_model::{header_title, PaneFacts, SidebarModel, TabFacts};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
 
-/// How long `✓ All caught up` stays up once the last unread was read.
-const CAUGHT_UP_SECS: f32 = 1.6;
-
 /// What a tile's context menu can do, dispatched by the item's tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PaneAction {
@@ -26,11 +23,13 @@ pub(super) enum PaneAction {
     ToggleBookmark,
     Minimize,
     Restore,
+    /// Mark read when unread, unread by hand otherwise (Cmd+U on the tile).
+    ToggleUnread,
     Close,
 }
 
 impl PaneAction {
-    const ALL: [PaneAction; 9] = [
+    const ALL: [PaneAction; 10] = [
         PaneAction::Open,
         PaneAction::Stop,
         PaneAction::StartClaude,
@@ -39,6 +38,7 @@ impl PaneAction {
         PaneAction::ToggleBookmark,
         PaneAction::Minimize,
         PaneAction::Restore,
+        PaneAction::ToggleUnread,
         PaneAction::Close,
     ];
 
@@ -114,14 +114,10 @@ enum MenuRow {
 
 
 pub(super) struct SidebarState {
-    sort: SidebarSort,
+    pub(super) sort: SidebarSort,
     /// (active tab, focused pane) the list last scrolled to show, so a focus
     /// change reveals its row exactly once and a manual scroll then sticks.
     last_reveal: Option<(usize, PaneId)>,
-    /// Unread count of the previous frame, to catch it dropping to zero.
-    last_unread: Option<usize>,
-    /// Frames left of the `✓ All caught up` flash.
-    caught_up_frames: u32,
     /// The pane a context menu is open for.
     menu_pane: PaneId,
     /// The tab a context menu is open for.
@@ -133,8 +129,6 @@ impl SidebarState {
         SidebarState {
             sort: SidebarSort::Kova,
             last_reveal: None,
-            last_unread: None,
-            caught_up_frames: 0,
             menu_pane: 0,
             menu_tab: 0,
         }
@@ -227,30 +221,17 @@ impl KovaView {
 
     /// Read the tabs into a model and hand it to the sidebar view, which
     /// redraws only when something changed. Also where the list follows a
-    /// focus change and the caught-up flash counts down. Runs once per tick.
+    /// focus change. Runs once per tick.
     pub(super) fn sync_sidebar(&self) {
         let Some(view) = self.ivars().sidebar_view.get() else { return };
         if !self.sidebar_active() {
             return;
         }
-        // Cmd+J's tiers across every window, for the Next pill.
-        let attention = self.collect_attention();
-        let unread = attention.unread.len();
-        let idle = attention.idle_agent.len();
-        let (flashing, sort) = {
-            let mut st = self.ivars().sidebar.borrow_mut();
-            if st.last_unread.is_some_and(|before| before > 0) && unread == 0 {
-                let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as f32;
-                st.caught_up_frames = (fps * CAUGHT_UP_SECS) as u32;
-            }
-            st.last_unread = Some(unread);
-            if st.caught_up_frames > 0 {
-                st.caught_up_frames -= 1;
-            }
-            (st.caught_up_frames > 0, st.sort)
-        };
+        // The unread count across every window, for the Next pill.
+        let unread = sidebar::unread_count(&self.collect_unread());
+        let sort = self.ivars().sidebar.borrow().sort;
         let facts = self.sidebar_tab_facts();
-        let model = SidebarModel::build(&facts, sort, unread, idle, flashing, now_epoch_secs());
+        let model = SidebarModel::build(&facts, sort, unread, now_epoch_secs());
         view.set_model(model);
 
         // Follow the focus: reveal the focused pane's tile (its header when
@@ -271,7 +252,7 @@ impl KovaView {
     }
 
     /// Every read of the tabs the model is built from.
-    fn sidebar_tab_facts(&self) -> Vec<TabFacts> {
+    pub(super) fn sidebar_tab_facts(&self) -> Vec<TabFacts> {
         let tabs = self.ivars().tabs.borrow();
         let active_idx = self.ivars().active_tab.get();
         let bookmark_keys = self.ivars().bookmark_keys.borrow();
@@ -377,8 +358,7 @@ impl KovaView {
     /// The Next pill: `Nothing to read` is not a button, only a pill with a
     /// badge jumps.
     pub(super) fn sidebar_next_pill_clicked(&self) {
-        let sets = self.collect_attention();
-        if sidebar::NextPill::of(sets.unread.len(), sets.idle_agent.len(), false).clickable() {
+        if sidebar::NextPill::of(sidebar::unread_count(&self.collect_unread())).clickable() {
             self.do_focus_next_attention();
         }
     }
@@ -423,15 +403,17 @@ impl KovaView {
     // ---------------------------------------------------------------
 
     /// The pane `id` lives in, with the reads the menus and actions need.
-    fn pane_snapshot(&self, pane_id: PaneId) -> Option<(String, bool, bool, bool, bool, bool, bool)> {
+    fn pane_snapshot(&self, pane_id: PaneId) -> Option<(String, bool, bool, bool, bool, bool, bool, bool)> {
         let tabs = self.ivars().tabs.borrow();
         let bookmark_keys = self.ivars().bookmark_keys.borrow();
-        for tab in tabs.iter() {
+        let active_idx = self.ivars().active_tab.get();
+        for (ti, tab) in tabs.iter().enumerate() {
             if let Some(pane) = tab.pane(pane_id) {
                 let bookmarked = match pane.agent_session_id() {
                     Some(id) => bookmark_keys.contains(&id),
                     None => pane.cwd().is_some_and(|cwd| bookmark_keys.contains(&cwd)),
                 };
+                let seen = ti == active_idx && tab.focused_pane == pane_id;
                 return Some((
                     pane.display_title("shell"),
                     pane.is_working(),
@@ -440,16 +422,55 @@ impl KovaView {
                     pane.restored_session().is_some(),
                     pane.minimized,
                     bookmarked,
+                    pane_flags(pane, seen).is_unread(),
                 ));
             }
         }
         None
     }
 
+    /// Cmd+U on a tile or on the focused pane: an unread pane becomes read
+    /// (every seen flag set, the manual mark dropped), a read one is marked
+    /// unread by hand. The mark survives while the pane stays focused; the
+    /// next time the pane becomes focused it is dropped (`tick.rs`).
+    pub(super) fn toggle_pane_unread(&self, pane_id: PaneId) {
+        let Some((.., unread)) = self.pane_snapshot(pane_id) else { return };
+        let tabs = self.ivars().tabs.borrow();
+        let Some(pane) = tabs.iter().find_map(|t| t.pane(pane_id)) else { return };
+        if unread {
+            pane.mark_read();
+        } else {
+            pane.set_manual_unread(true);
+        }
+        drop(tabs);
+        self.mark_dirty();
+    }
+
+    /// Cmd+U: `toggle_pane_unread` on the focused pane of the active tab.
+    pub(super) fn do_toggle_unread(&self) {
+        let focused = {
+            let tabs = self.ivars().tabs.borrow();
+            tabs.get(self.ivars().active_tab.get()).map(|t| t.focused_pane)
+        };
+        if let Some(id) = focused {
+            self.toggle_pane_unread(id);
+        }
+    }
+
+    /// Whether the focused pane of the active tab is unread (the Pane menu's
+    /// `Mark as Read` / `Mark as Unread` title).
+    pub(super) fn focused_pane_unread(&self) -> bool {
+        let focused = {
+            let tabs = self.ivars().tabs.borrow();
+            tabs.get(self.ivars().active_tab.get()).map(|t| t.focused_pane)
+        };
+        focused.and_then(|id| self.pane_snapshot(id)).is_some_and(|(.., unread)| unread)
+    }
+
     /// The tile's context menu, KovaLink's swipes and sheets as items,
     /// popped up at `location` in `view`.
     pub(super) fn show_sidebar_pane_menu(&self, view: &objc2_app_kit::NSView, location: CGPoint, pane_id: PaneId) {
-        let Some((_, working, awaiting, bare, resumable, minimized, bookmarked)) = self.pane_snapshot(pane_id) else { return };
+        let Some((_, working, awaiting, bare, resumable, minimized, bookmarked, unread)) = self.pane_snapshot(pane_id) else { return };
         self.ivars().sidebar.borrow_mut().menu_pane = pane_id;
         let mut rows = vec![MenuRow::Item("Open".into(), PaneAction::Open.tag())];
         if working || awaiting {
@@ -466,6 +487,7 @@ impl KovaView {
             if bookmarked { "Unbookmark" } else { "Bookmark" }.into(),
             PaneAction::ToggleBookmark.tag(),
         ));
+        rows.push(MenuRow::Item(if unread { "Mark read" } else { "Mark unread" }.into(), PaneAction::ToggleUnread.tag()));
         rows.push(if minimized {
             MenuRow::Item("Restore".into(), PaneAction::Restore.tag())
         } else {
@@ -586,6 +608,7 @@ impl KovaView {
                     self.do_minimize_pane();
                 }
             }
+            PaneAction::ToggleUnread => self.toggle_pane_unread(pane_id),
             PaneAction::Close => self.close_pane_from_sidebar(pane_id),
         }
         self.mark_dirty();
@@ -742,17 +765,19 @@ fn now_epoch_secs() -> u64 {
 
 /// The flags a pane's tile state is derived from. `seen` is true for the
 /// focused pane of the active tab, whose unread marks are being looked at.
-fn pane_flags(pane: &Pane, seen: bool) -> PaneFlags {
+pub(super) fn pane_flags(pane: &Pane, seen: bool) -> PaneFlags {
     let (bell, completion) = {
         let term = pane.terminal.read();
         (term.bell.load(std::sync::atomic::Ordering::Relaxed), term.unread_completion())
     };
     PaneFlags {
         permission_prompt: pane.has_permission_prompt(),
+        prompt_unseen: pane.is_prompt_unseen(),
         bell,
         completion,
         hook_unseen: pane.is_awaiting_unseen(),
         turn_end_unseen: pane.is_turn_end_unseen(),
+        manual: pane.is_manual_unread(),
         working: pane.is_working(),
         starting: pane.is_starting_agent(),
         idle_agent: pane.is_idle_agent(),

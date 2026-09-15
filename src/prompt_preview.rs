@@ -38,6 +38,8 @@ pub enum PromptPreview {
         detail: Option<String>,
         /// Epoch seconds when the prompt was detected.
         since: u64,
+        /// The pane was looked at since the prompt appeared.
+        seen: bool,
     },
     /// The turn ended with an answer; `seen` once the pane was looked at.
     TurnEnd { summary: String, seen: bool },

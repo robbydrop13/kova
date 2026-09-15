@@ -138,7 +138,9 @@ pub struct KovaViewIvars {
     bookmark_keys: RefCell<std::collections::HashSet<String>>,
     /// Banner painted across the focused pane's status bar (text, colour,
     /// remaining frames): says which attention tier the last Cmd+J landed in.
-    attention_banner: RefCell<Option<(String, [f32; 3], u32)>>,
+    /// The focused pane the manual unread mark was last checked against:
+    /// a change means the pane just became focused (see `tick.rs`).
+    unread_focus: Cell<Option<PaneId>>,
     /// Deferred tabs to restore progressively (tab_index, saved_tab_data).
     /// Deferred tabs keyed by their placeholder's TabId (not by index: the
     /// window is interactive during progressive restore, so indices shift
@@ -1247,9 +1249,26 @@ define_class!(
             self.set_layout_mode(mode);
         }
 
-        /// Keep the View menu's radio mark on the current layout.
+        /// Pane menu: `Rename Pane`.
+        #[unsafe(method(renamePaneFromMenu:))]
+        fn rename_pane_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
+            self.start_rename_pane();
+        }
+
+        /// Pane menu: `Mark as Unread` / `Mark as Read` (Cmd+U).
+        #[unsafe(method(toggleUnreadFromMenu:))]
+        fn toggle_unread_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
+            self.do_toggle_unread();
+        }
+
+        /// Keep the View menu's radio mark on the current layout, and the
+        /// Pane menu's unread item titled for what it will do.
         #[unsafe(method(validateMenuItem:))]
         fn validate_menu_item(&self, item: &objc2_app_kit::NSMenuItem) -> bool {
+            if item.action() == Some(objc2::sel!(toggleUnreadFromMenu:)) {
+                let title = if self.focused_pane_unread() { "Mark as Read" } else { "Mark as Unread" };
+                item.setTitle(&objc2_foundation::NSString::from_str(title));
+            }
             if item.action() == Some(objc2::sel!(setLayoutMode:)) {
                 let current = match sidebar::layout_mode() {
                     crate::config::LayoutMode::Tabs => crate::app::LAYOUT_MENU_TAG_TABS,
@@ -1437,7 +1456,7 @@ impl KovaView {
             resize_feedback: Cell::new(None),
             transient_status: RefCell::new(None),
             bookmark_keys: RefCell::new(crate::bookmarks::keys(&crate::bookmarks::load().items)),
-            attention_banner: RefCell::new(None),
+            unread_focus: Cell::new(None),
             deferred_tabs: RefCell::new(Vec::new()),
             loading_total_panes: Cell::new(0),
             boundary_hit: Cell::new(None),
@@ -2057,6 +2076,7 @@ impl KovaView {
             }
             Action::RepaintPane => self.do_repaint_pane(),
             Action::NextAttention => self.do_focus_next_attention(),
+            Action::ToggleUnread => self.do_toggle_unread(),
             Action::HistoryBack => do_history_step(false),
             Action::HistoryForward => do_history_step(true),
             Action::ToggleSidebar => self.toggle_layout_mode(),

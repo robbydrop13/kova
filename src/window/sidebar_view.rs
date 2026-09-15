@@ -518,7 +518,7 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
     let right = x + w - pad_h;
     let text_w = (right - text_x).max(10.0);
     let line1_y = y + pad_v;
-    let glyphs = TileButton::hover_glyphs(tile.state, tile.minimized, tile.bare_shell, tile.resumable)
+    let glyphs = TileButton::hover_glyphs(tile.state, tile.minimized, tile.bare_shell, tile.resumable, tile.unread)
         .into_iter()
         .enumerate()
         .map(|(k, b)| {
@@ -1323,27 +1323,20 @@ impl SidebarView {
         {
             let hovered = sh.chrome_hovered == ChromeHit::NextPill;
             let pressed = sh.chrome_pressed == ChromeHit::NextPill;
-            let (fill, border, text, badge): ([f32; 3], Option<[f32; 3]>, [f32; 3], Option<([f32; 3], [f32; 3])>) = match sh.model.pill {
+            // Accent when there is something to read (darker under the
+            // mouse), a plain raised ground otherwise: not a button then, so
+            // no hover and no press.
+            let clickable = sh.model.pill.clickable();
+            let (fill, text, badge): ([f32; 3], [f32; 3], Option<([f32; 3], [f32; 3])>) = match sh.model.pill {
                 NextPill::Next(_) => (
                     if hovered { tokens::ACCENT_PRESSED } else { tokens::ACCENT },
-                    None,
                     tokens::TEXT_ON_FILL,
                     Some((tokens::TEXT_ON_FILL, tokens::ACCENT)),
                 ),
-                NextPill::Idle(_) => (
-                    if hovered { tokens::TILE_PRESSED } else { tokens::TILE_HOVER },
-                    Some(tokens::BORDER_STRONG),
-                    tokens::TEXT_SECONDARY,
-                    Some((tokens::TILE_PRESSED, tokens::TEXT_SECONDARY)),
-                ),
-                NextPill::CaughtUp => (tokens::TILE_HOVER, None, tokens::SUCCESS, None),
-                NextPill::Nothing => (tokens::TILE_HOVER, None, tokens::TEXT_TERTIARY, None),
+                NextPill::Nothing => (tokens::TILE, tokens::TEXT_TERTIARY, None),
             };
-            let text_alpha = if pressed { 0.85 } else { 1.0 };
+            let text_alpha = if pressed && clickable { 0.85 } else { 1.0 };
             fill_round(&c.pill, PILL_H / 2.0, fill, 1.0);
-            if let Some(b) = border {
-                stroke_round(&c.pill, PILL_H / 2.0, 1.0, b, 1.0);
-            }
             let mut right = c.pill.right() - 12.0;
             let hint_w = draw_text(&sh, "\u{2318}J", &Rect::new(c.pill.x, c.pill.y, right - c.pill.x, c.pill.h), Style::Sort, text, 0.6 * text_alpha, Align::Right, false);
             right -= hint_w + 8.0;
@@ -1701,6 +1694,7 @@ impl SidebarListView {
                     TileButton::StartClaude => PaneAction::StartClaude,
                     TileButton::Resume => PaneAction::Resume,
                     TileButton::Open => PaneAction::Open,
+                    TileButton::MarkUnread | TileButton::MarkRead => PaneAction::ToggleUnread,
                 };
                 kova.dispatch_pane_action(pane_id, action);
             }
@@ -2044,7 +2038,7 @@ impl SidebarListView {
             let w = draw_text(sh, age, &line1, Style::Secondary, if *aging { tokens::ERROR } else { tokens::TEXT_TERTIARY }, alpha, Align::Right, false);
             title_right -= w + 8.0;
         } else if !awaiting {
-            let dot = matches!(tile.state, TileState::Unread { .. }).then_some(tokens::ACCENT);
+            let dot = matches!(tile.state, TileState::Unread(_)).then_some(tokens::ACCENT);
             let chip = draw_chip(sh, &tile.chip(), right, cy, tile.state.chip_style(selected), dot, alpha);
             title_right = chip.x - 8.0;
         }
@@ -2106,7 +2100,7 @@ impl SidebarListView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::sidebar::{CollapsedSummary, PaneFlags};
+    use super::super::sidebar::{CollapsedSummary, PaneFlags, UnreadKind};
 
     /// Six points per character, one line per 40 points of width.
     struct FakeMetrics;
@@ -2126,6 +2120,7 @@ mod tests {
             pane_id,
             column,
             state,
+            unread: matches!(state, TileState::Unread(_)),
             minimized: false,
             bare_shell: state == TileState::Shell,
             resumable: false,
@@ -2214,7 +2209,7 @@ mod tests {
         awaiting.age = Some(("4m".into(), false));
         let mut short = tile(2, 0, TileState::Awaiting);
         short.question = Some("Run it?".into());
-        let mut unread = tile(3, 0, TileState::Unread { bell: false });
+        let mut unread = tile(3, 0, TileState::Unread(UnreadKind::Done));
         unread.summary = Some("Pushed the copy".into());
         m.groups = vec![group(0, false, vec![awaiting, short, unread, tile(4, 0, TileState::Working)])];
         let l = ListLayout::new(&m, W, &FakeMetrics);
@@ -2304,17 +2299,20 @@ mod tests {
         assert_eq!(l.group_of(ListHit::Tile(99)), None);
         assert_eq!(l.group_of(ListHit::Empty), None);
         assert_eq!(ListHit::Panel(1).group(), None);
-        // Working tile: close, minimize, stop boxes from the right on line 1.
+        // Working tile: close, minimize, mark unread, stop boxes from the
+        // right on line 1.
         let row = &l.rows[2];
         let boxes: Vec<TileButton> = row.glyphs.iter().map(|(b, _)| *b).collect();
-        assert_eq!(boxes, vec![TileButton::Close, TileButton::Minimize, TileButton::Stop]);
+        assert_eq!(boxes, vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread, TileButton::Stop]);
         let (_, close) = row.glyphs[0];
         assert_eq!(close.right(), SR - TILE_PAD_H);
         assert_eq!(close.w, BUTTON_D);
         assert_eq!(l.hit(close.x + 5.0, close.y + 5.0), ListHit::TileButton(11, TileButton::Close));
-        let (_, stop) = row.glyphs[2];
-        // Minimize sits one gap left of close, stop one gap left of minimize.
-        assert_eq!(stop.right(), close.x - 2.0 * BUTTON_GAP - BUTTON_D);
+        let (_, mark) = row.glyphs[2];
+        // Minimize sits one gap left of close, mark one gap left of minimize.
+        assert_eq!(mark.right(), close.x - 2.0 * BUTTON_GAP - BUTTON_D);
+        assert_eq!(l.hit(mark.x + 5.0, mark.y + 5.0), ListHit::TileButton(11, TileButton::MarkUnread));
+        let (_, stop) = row.glyphs[3];
         assert_eq!(l.hit(stop.x + 5.0, stop.y + 5.0), ListHit::TileButton(11, TileButton::Stop));
         // Line 2 carries no glyphs.
         assert_eq!(l.hit(close.x + 5.0, close.y + 30.0), ListHit::Tile(11));
@@ -2340,7 +2338,7 @@ mod tests {
         assert_eq!(resume.w, LINK_ICON_D + LINK_ICON_GAP + RESUME_LABEL.chars().count() as f64 * 6.0 + 8.0);
         assert_eq!(resume.right(), SR - TILE_PAD_H);
         assert_eq!(l.hit(resume.x + 5.0, resume.y + 5.0), ListHit::TileButton(7, TileButton::Resume));
-        assert_eq!(l.rows[1].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::Resume]);
+        assert_eq!(l.rows[1].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread, TileButton::Resume]);
         assert_eq!(l.rows[2].actions[0].0, TileButton::StartClaude);
         assert_eq!(l.rows[1].frame.h, l.rows[2].frame.h);
     }

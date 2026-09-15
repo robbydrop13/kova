@@ -132,6 +132,7 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "awaiting": false,
   "awaiting_since": null,
   "awaiting_seen": false,
+  "unread": false,
   "minimized": false,
   "agent": "claude",
   "agent_session_id": "0b6f…",
@@ -369,7 +370,8 @@ reparent-up|down|left|right        (move a pane across the tree)
 resize-left|right|up|down          (ratio resize, ±5%)
 edge-grow-left|right               (grow the focused pane's edge)
 minimize-pane  restore-minimized
-next-attention                     (focus the next unread pane, else an idle Claude session; skips minimized panes)
+next-attention                     (focus the next unread pane, in the sidebar's order; skips minimized panes)
+toggle-unread                      (mark the focused pane read when unread, else unread by hand)
 history-back|history-forward       (walk the panes you visited, back then forward; skips minimized panes)
 detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)

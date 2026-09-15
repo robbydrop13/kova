@@ -37,7 +37,7 @@ Cmd+Shift+F searches every pane of every tab at once, and the same palette also 
 
 Kova tracks which panes have something you have not seen — a bell, or a command that finished while you were looking elsewhere — and routes you to them instead of making you hunt.
 
-- Cmd+J jumps to the next unread pane, across tabs and windows, and falls back to an idle Claude Code session when nothing is unread. A banner names the tier it landed in.
+- Cmd+J jumps to the next unread pane, across tabs and windows: a pane with a prompt, a finished turn, a bell or a manual mark (Cmd+U) nobody has looked at since. The sidebar's Next pill counts them.
 - Cmd+P opens the tab/pane switcher: every tab with its panes, arrows or click to pick, Enter to focus. `u` flips it to the panes asking for something; Cmd+Shift+J opens that filtered list directly.
 - Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order.
 - The status bar counts working Claude sessions (`✳N`) and unread panes (`●N`).
@@ -130,6 +130,7 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+P | Tab/pane switcher |
 | Cmd+Shift+J | Pane switcher, unread panes only |
 | Cmd+J | Jump to the next unread pane |
+| Cmd+U | Mark the focused pane as unread, or as read when it is unread |
 | Cmd+Shift+Option+Left/Right | Walk the panes you visited, back and forward |
 | Cmd+O | Reopen a closed tab |
 | Cmd+Shift+W | Close tab |

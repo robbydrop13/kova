@@ -789,7 +789,6 @@ impl Tab {
                 pane.clear_awaiting();
                 pane.fg_process.replace(None);
                 pane.agent_session.replace(None);
-                pane.rearm_idle_agent();
                 return;
             }
             if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -798,13 +797,6 @@ impl Tab {
             pane.probe_prompt();
             if refresh_fg {
                 pane.refresh_agent_session();
-                // Cmd+J's idle-Claude tier re-arms as soon as the pane stops
-                // being a session sitting still: one that went back to work, or
-                // whose Claude is gone, is a new state — a "already looked at"
-                // flag kept from before would hide it for good.
-                if pane.agent_session.borrow().is_none() || pane.is_working() {
-                    pane.rearm_idle_agent();
-                }
                 let fg = pane.refresh_fg_process();
                 if fg {
                     fg_any = true;
@@ -1687,11 +1679,10 @@ pub struct Pane {
     /// lookup scans a directory or the process table. `None` = no agent in this
     /// pane; a conversation nobody named is `Some` with a `name` of `None`.
     pub agent_session: RefCell<Option<crate::agent_session::AgentSession>>,
-    /// Whether the idle agent session in this pane has been looked at since it
-    /// last did anything. Backs Cmd+J's third tier (see `is_idle_agent_unseen`):
-    /// an open session nobody is using is a candidate exactly once, then drops
-    /// out until it works again — the same drain rule as the waiting flag.
-    idle_agent_seen: Cell<bool>,
+    /// The user marked this pane unread by hand (Cmd+U, or the tile's Mark
+    /// unread): it counts as unread until it is marked read or gets focus
+    /// again (`Pane::is_unread`, `Pane::mark_read`).
+    manual_unread: Cell<bool>,
     /// Name of the binary running in the foreground (`claude`, `nvim`, `ssh`…),
     /// `None` at a bare shell prompt. Cached because the status bar reads it on
     /// every frame while resolving it costs two syscalls: it is refreshed on the
@@ -1854,7 +1845,7 @@ impl Pane {
             open_timer,
             awaiting: Cell::new(AwaitingFlag::default()),
             agent_session: RefCell::new(None),
-            idle_agent_seen: Cell::new(false),
+            manual_unread: Cell::new(false),
             fg_process: RefCell::new(None),
             prompt_preview: RefCell::new(None),
             prompt_probe: Cell::new(PromptProbe::default()),
@@ -1887,7 +1878,7 @@ impl Pane {
             open_timer: Arc::new(PaneOpenTimer::new()),
             awaiting: Cell::new(AwaitingFlag::default()),
             agent_session: RefCell::new(None),
-            idle_agent_seen: Cell::new(false),
+            manual_unread: Cell::new(false),
             fg_process: RefCell::new(None),
             prompt_preview: RefCell::new(None),
             prompt_probe: Cell::new(PromptProbe::default()),
@@ -2060,12 +2051,45 @@ impl Pane {
         matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::TurnEnd { seen: false, .. }))
     }
 
-    /// Record that the turn-end answer here has been looked at (called by the
-    /// frame loop on the focused pane, alongside `mark_awaiting_seen`).
-    pub fn mark_turn_end_seen(&self) {
-        if let Some(crate::prompt_preview::PromptPreview::TurnEnd { seen, .. }) = self.prompt_preview.borrow_mut().as_mut() {
-            *seen = true;
+    /// A permission prompt sits on screen and nobody has looked at it since
+    /// it appeared.
+    pub fn is_prompt_unseen(&self) -> bool {
+        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::Permission { seen: false, .. }))
+    }
+
+    /// Record that what the preview shows (the prompt or the turn-end answer)
+    /// has been looked at (called by the frame loop on the focused pane,
+    /// alongside `mark_awaiting_seen`).
+    pub fn mark_preview_seen(&self) {
+        use crate::prompt_preview::PromptPreview;
+        match self.prompt_preview.borrow_mut().as_mut() {
+            Some(PromptPreview::TurnEnd { seen, .. }) | Some(PromptPreview::Permission { seen, .. }) => *seen = true,
+            None => {}
         }
+    }
+
+    /// The user's own unread mark (Cmd+U, the tile's Mark unread).
+    pub fn is_manual_unread(&self) -> bool {
+        self.manual_unread.get()
+    }
+
+    pub fn set_manual_unread(&self, unread: bool) {
+        self.manual_unread.set(unread);
+    }
+
+    /// Everything new here has been looked at: the bell and the completion
+    /// are acked, the waiting flag and the preview marked seen, the manual
+    /// mark dropped. What Cmd+U does on an unread pane.
+    pub fn mark_read(&self) {
+        {
+            let term = self.terminal.read();
+            term.bell.store(false, std::sync::atomic::Ordering::Relaxed);
+            term.ack_completion();
+            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.mark_awaiting_seen();
+        self.mark_preview_seen();
+        self.manual_unread.set(false);
     }
 
     /// Follow `is_working` from tick to tick and, one second after it drops
@@ -2103,6 +2127,7 @@ impl Pane {
                 question: p.question,
                 detail: p.detail,
                 since: now_epoch_secs(),
+                seen: false,
             }),
             None => self.transcript_summary().map(|summary| crate::prompt_preview::PromptPreview::TurnEnd { summary, seen: false }),
         };
@@ -2137,48 +2162,12 @@ impl Pane {
         self.is_awaiting() && !self.awaiting.get().is_read()
     }
 
-    /// An agent session lives in this pane, working or not. What Cmd+J's
-    /// non-draining loop walks: an open session is an open loop whether it is
-    /// chewing or waiting to be closed.
-    pub fn has_agent_session(&self) -> bool {
-        self.agent_session.borrow().is_some()
-    }
-
-    /// The mirror of `is_idle_agent`: an agent session that is actively
-    /// working. Never a landing spot for the draining tiers — the loop walks it,
-    /// but it is never announced as something asking for an answer.
-    pub fn is_working_agent(&self) -> bool {
-        self.agent_session.borrow().is_some() && self.is_working()
-    }
-
     /// True if an agent session sits open in this pane and is not working.
     /// "Idle" is the absence of the working spinner (`is_working`), so a session
-    /// chewing on something is never pulled up.
-    ///
-    /// This is what Cmd+J hands back once everything else is dealt with: an open
-    /// session is either closed or picked up again, never quietly accumulated.
+    /// chewing on something is never pulled up. The sidebar's `idle` chip and
+    /// summary count; never unread by itself.
     pub fn is_idle_agent(&self) -> bool {
         self.agent_session.borrow().is_some() && !self.is_working()
-    }
-
-    /// The same, minus the sessions already looked at since they fell idle —
-    /// Cmd+J's draining third tier. The flag is set when the pane gets focus and
-    /// re-armed in `Tab::check_running` as soon as the session works again or
-    /// goes away, so a walk that covered everything hands straight over to the
-    /// non-draining loop.
-    pub fn is_idle_agent_unseen(&self) -> bool {
-        !self.idle_agent_seen.get() && self.is_idle_agent()
-    }
-
-    /// Record that the idle Claude session here has been looked at (called by the
-    /// frame loop on the focused pane, alongside `mark_awaiting_seen`).
-    pub fn mark_idle_agent_seen(&self) {
-        self.idle_agent_seen.set(true);
-    }
-
-    /// Put this pane back in the idle-Claude tier next time it falls idle.
-    pub fn rearm_idle_agent(&self) {
-        self.idle_agent_seen.set(false);
     }
 
     /// A restore command still waits for the shell to be ready.

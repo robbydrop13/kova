@@ -429,23 +429,6 @@ impl KovaView {
             }
         }
 
-        // Attention banner: the tier the last Cmd+J landed in, painted across the
-        // focused pane's own status bar (the renderer places it there).
-        {
-            let mut banner = ivars.attention_banner.borrow_mut();
-            match banner.as_mut() {
-                Some((text, color, frames)) if *frames > 0 => {
-                    *frames -= 1;
-                    r.pane_banner = Some((text.clone(), *color));
-                }
-                Some(_) => {
-                    *banner = None;
-                    r.pane_banner = None;
-                }
-                None => r.pane_banner = None,
-            }
-        }
-
         // Update boundary flash (decrement frames, compute edge position)
         if let Some(mut flash) = ivars.boundary_flash.get() {
             if flash.remaining_frames > 0 {
@@ -717,13 +700,18 @@ impl KovaView {
         // (retracting it is for answering, see `Pane::clear_awaiting`): nothing
         // in the UI draws it any more, but IPC clients still read it, and
         // `awaiting_seen` is what tells them the pane has been looked at.
+        // The manual unread mark (Cmd+U) is dropped only when the pane
+        // BECOMES focused, never by this per-frame pass: Cmd+U on the pane
+        // under the eye has to stick until the eye leaves and comes back.
         if self.window().is_some_and(|w| w.isKeyWindow()) {
             let tabs = ivars.tabs.borrow();
             if let Some(tab) = tabs.get(ivars.active_tab.get()) {
                 if let Some(pane) = tab.pane(tab.focused_pane) {
                     pane.mark_awaiting_seen();
-                    pane.mark_idle_agent_seen();
-                    pane.mark_turn_end_seen();
+                    pane.mark_preview_seen();
+                    if ivars.unread_focus.replace(Some(pane.id)) != Some(pane.id) {
+                        pane.set_manual_unread(false);
+                    }
                 }
             }
         }

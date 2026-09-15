@@ -36,6 +36,10 @@ pub enum Icon {
     Maximize,
     /// `minimize-2`: minimize a pane.
     Minimize,
+    /// `mail`: mark a pane unread.
+    Mail,
+    /// `check`: mark a pane read.
+    Check,
 }
 
 /// One stroke of an icon, in grid coordinates.
@@ -78,6 +82,11 @@ impl Icon {
                 Polyline(vec![(14.0, 10.0), (21.0, 3.0)]),
                 Polyline(vec![(3.0, 21.0), (10.0, 14.0)]),
             ],
+            Icon::Mail => vec![
+                RoundRect(2.0, 4.0, 20.0, 16.0, 2.0),
+                Polyline(vec![(22.0, 6.0), (12.0, 13.0), (2.0, 6.0)]),
+            ],
+            Icon::Check => vec![Polyline(vec![(20.0, 6.0), (9.0, 17.0), (4.0, 12.0)])],
         }
     }
 }
@@ -174,8 +183,10 @@ mod tests {
         assert_eq!(Icon::X.segments().len(), 2);
         assert_eq!(Icon::Maximize.segments().len(), 4);
         assert_eq!(Icon::Minimize.segments().len(), 4);
+        assert_eq!(Icon::Mail.segments()[0], Segment::RoundRect(2.0, 4.0, 20.0, 16.0, 2.0));
+        assert!(matches!(&Icon::Check.segments()[0], Segment::Polyline(p) if p.len() == 3 && p[1] == (9.0, 17.0)));
         // Every point stays on the grid.
-        for icon in [Icon::ChevronDown, Icon::ChevronRight, Icon::Plus, Icon::X, Icon::Play, Icon::Square, Icon::Maximize, Icon::Minimize] {
+        for icon in [Icon::ChevronDown, Icon::ChevronRight, Icon::Plus, Icon::X, Icon::Play, Icon::Square, Icon::Maximize, Icon::Minimize, Icon::Mail, Icon::Check] {
             for seg in icon.segments() {
                 match seg {
                     Segment::Polyline(p) | Segment::Polygon(p) => {

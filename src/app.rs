@@ -1472,6 +1472,31 @@ fn setup_menu(mtm: MainThreadMarker, config: &Config) {
     view_menu_item.setSubmenu(Some(&view_menu));
     menu_bar.addItem(&view_menu_item);
 
+    // Pane menu: the pane shortcuts worth a menu entry. Same responder-chain
+    // rule as the View menu; the key window's KovaView handles them, and
+    // `validateMenuItem:` retitles the unread item to what Cmd+U will do.
+    let pane_menu_item = NSMenuItem::new(mtm);
+    let pane_menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str("Pane"));
+    let pane_item = |title: &str, selector: objc2::runtime::Sel, key: &str| {
+        let (key_eq, mask) = menu_key_equivalent(key);
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &NSString::from_str(title),
+                Some(selector),
+                &NSString::from_str(&key_eq),
+            )
+        };
+        if !key_eq.is_empty() {
+            item.setKeyEquivalentModifierMask(mask);
+        }
+        item
+    };
+    pane_menu.addItem(&pane_item("Rename Pane\u{2026}", objc2::sel!(renamePaneFromMenu:), &config.keys.rename_pane));
+    pane_menu.addItem(&pane_item("Mark as Unread", objc2::sel!(toggleUnreadFromMenu:), &config.keys.toggle_unread));
+    pane_menu_item.setSubmenu(Some(&pane_menu));
+    menu_bar.addItem(&pane_menu_item);
+
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&menu_bar));
 }

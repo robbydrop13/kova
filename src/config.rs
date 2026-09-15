@@ -453,6 +453,8 @@ pub struct KeysConfig {
     pub equalize: String,
     pub repaint_pane: String,
     pub next_attention: String,
+    /// Mark the focused pane unread by hand, or read when it is unread.
+    pub toggle_unread: String,
     pub history_back: String,
     pub history_forward: String,
     pub toggle_sidebar: String,
@@ -523,6 +525,7 @@ impl Default for KeysConfig {
             equalize: "cmd+shift++".into(),
             repaint_pane: "cmd+r".into(),
             next_attention: "cmd+j".into(),
+            toggle_unread: "cmd+u".into(),
             history_back: "cmd+shift+option+left".into(),
             history_forward: "cmd+shift+option+right".into(),
             toggle_sidebar: "cmd+option+s".into(),
@@ -590,6 +593,7 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.layout.mode, LayoutMode::Tabs);
         assert_eq!(config.keys.toggle_sidebar, "cmd+option+s");
+        assert_eq!(config.keys.toggle_unread, "cmd+u");
     }
 
     #[test]
