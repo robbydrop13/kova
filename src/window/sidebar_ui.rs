@@ -179,8 +179,10 @@ impl KovaView {
         sidebar::set_layout_mode(mode);
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let ad = crate::app::app_delegate(mtm);
-        let windows = ad.ivars().windows.borrow();
-        for win in windows.iter() {
+        // Copy the list: `apply_layout` resizes every window, and nothing
+        // that runs under it may find the list borrowed.
+        let windows: Vec<_> = ad.ivars().windows.borrow().clone();
+        for win in &windows {
             if let Some(view) = crate::app::kova_view(win) {
                 view.apply_layout();
             }

@@ -30,11 +30,11 @@ use super::sidebar::{
     self, tab_tint, tokens, NextPill, SidebarSort, SummaryRun, TileButton, TileState, OPEN_LABEL,
     START_CLAUDE_LABEL, STOP_LABEL,
 };
-use super::sidebar_model::{SidebarModel, TileVm};
+use super::sidebar_model::{GroupVm, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
 use super::KovaView;
 use crate::config::LayoutMode;
-use crate::pane::PaneId;
+use crate::pane::{PaneId, TabId};
 
 // ---------------------------------------------------------------
 // Metrics (points)
@@ -386,7 +386,7 @@ impl ListLayout {
     /// same column of the same group as row `idx`: the only slots a dragged
     /// tile can take.
     pub fn pane_run(&self, idx: usize) -> std::ops::Range<usize> {
-        let RowKind::Tile { group, column, .. } = self.rows[idx].kind else {
+        let Some(RowKind::Tile { group, column, .. }) = self.rows.get(idx).map(|r| r.kind) else {
             return idx..idx;
         };
         let same = |r: &Row| matches!(r.kind, RowKind::Tile { group: g, column: c, .. } if g == group && c == column);
@@ -404,6 +404,9 @@ impl ListLayout {
     /// The slot (0 ..= run length) a dragged tile would take in `run`, by the
     /// midpoint rule, `None` when the cursor left the run vertically.
     pub fn pane_insertion_slot(&self, run: &std::ops::Range<usize>, y: f64) -> Option<usize> {
+        if run.is_empty() || run.end > self.rows.len() {
+            return None;
+        }
         let first = &self.rows[run.start].frame;
         let last = &self.rows[run.end - 1].frame;
         if y < first.y - HEADER_H || y >= last.bottom() + HEADER_H {
@@ -547,9 +550,11 @@ impl ChromeLayout {
 // Shared state
 // ---------------------------------------------------------------
 
+/// A drag is anchored to the tab's id, not its group index: the tick
+/// re-lays the list out while the mouse is down, and the groups move.
 #[derive(Clone, Copy)]
 struct TabDrag {
-    group: usize,
+    tab_id: TabId,
     start_y: f64,
     current_y: f64,
     /// Where inside the header the cursor grabbed it, so the floating copy
@@ -558,9 +563,10 @@ struct TabDrag {
     dragging: bool,
 }
 
+/// Same for a tile: the pane id, resolved to a row when drawn or dropped.
 #[derive(Clone, Copy)]
 struct PaneDrag {
-    row: usize,
+    pane_id: PaneId,
     start_y: f64,
     current_y: f64,
     grab_offset: f64,
@@ -1070,10 +1076,12 @@ impl SidebarView {
         let chrome = ChromeLayout::new(b.size.width, b.size.height, sort_w, mode_w);
         let list_rect = chrome.list;
         self.ivars().shared.borrow_mut().chrome = chrome;
+        // Rows first, then the scroll view: the model changed already, and
+        // nothing of AppKit runs between the two.
+        self.relayout_list();
         if let Some(scroll) = self.ivars().scroll.get() {
             scroll.setFrame(list_rect.cg());
         }
-        self.relayout_list();
         self.setNeedsDisplay(true);
         if let Some(win) = self.window() {
             win.invalidateCursorRectsForView(self);
@@ -1246,8 +1254,7 @@ define_class!(
         #[unsafe(method_id(view:stringForToolTip:point:userData:))]
         #[unsafe(method_family = none)]
         unsafe fn tooltip_string(&self, _view: &NSView, _tag: isize, point: CGPoint, _data: *mut std::ffi::c_void) -> Retained<NSString> {
-            let sh = self.ivars().shared.borrow();
-            let text = match sh.layout.hit(point.x, point.y) {
+            let text = match self.ivars().shared.borrow().layout.hit(point.x, point.y) {
                 ListHit::TileButton(_, b) => b.tooltip(),
                 _ => "",
             };
@@ -1257,7 +1264,9 @@ define_class!(
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             let (x, y) = local_point(self, event);
-            self.set_hovered(self.ivars().shared.borrow().layout.hit(x, y));
+            // Bind the hit first: the borrow must end before set_hovered takes it mutably.
+            let hit = self.ivars().shared.borrow().layout.hit(x, y);
+            self.set_hovered(hit);
         }
 
         #[unsafe(method(mouseExited:))]
@@ -1280,8 +1289,9 @@ define_class!(
             match hit {
                 ListHit::Header(g) => {
                     if double {
-                        if let Some(kova) = kova_of(self) {
-                            let tab_idx = self.ivars().shared.borrow().model.groups[g].tab_idx;
+                        // Bind before calling out: the borrow must be gone.
+                        let tab_idx = self.ivars().shared.borrow().model.groups.get(g).map(|g| g.tab_idx);
+                        if let (Some(tab_idx), Some(kova)) = (tab_idx, kova_of(self)) {
                             kova.do_switch_tab(tab_idx);
                             kova.start_rename_tab();
                         }
@@ -1290,8 +1300,10 @@ define_class!(
                         sh.pressed = hit;
                         // Reordering only means something in tab order.
                         if sh.model.sort == SidebarSort::Kova {
-                            let row_y = sh.layout.row_for_group(g).map_or(y, |r| sh.layout.rows[r].frame.y);
-                            sh.tab_drag = Some(TabDrag { group: g, start_y: y, current_y: y, grab_offset: y - row_y, dragging: false });
+                            if let Some(tab_id) = sh.model.groups.get(g).map(|g| g.tab_id) {
+                                let row_y = sh.layout.row_for_group(g).map_or(y, |r| sh.layout.rows[r].frame.y);
+                                sh.tab_drag = Some(TabDrag { tab_id, start_y: y, current_y: y, grab_offset: y - row_y, dragging: false });
+                            }
                         }
                     }
                 }
@@ -1307,7 +1319,7 @@ define_class!(
                         sh.pressed = hit;
                         if let Some(row) = sh.layout.row_for_pane(pane_id) {
                             let row_y = sh.layout.rows[row].frame.y;
-                            sh.pane_drag = Some(PaneDrag { row, start_y: y, current_y: y, grab_offset: y - row_y, dragging: false });
+                            sh.pane_drag = Some(PaneDrag { pane_id, start_y: y, current_y: y, grab_offset: y - row_y, dragging: false });
                         }
                     }
                 }
@@ -1373,9 +1385,9 @@ define_class!(
                 (sh.tab_drag.take(), sh.pane_drag.take(), std::mem::replace(&mut sh.pressed, ListHit::Empty))
             };
             if let Some(d) = tab_drag.filter(|d| d.dragging) {
-                self.drop_tab(d.group, y);
+                self.drop_tab(d.tab_id, y);
             } else if let Some(d) = pane_drag.filter(|d| d.dragging) {
-                self.drop_pane(d.row, y);
+                self.drop_pane(d.pane_id, y);
             } else if pressed != ListHit::Empty {
                 let hit = self.ivars().shared.borrow().layout.hit(x, y);
                 if hit == pressed {
@@ -1393,8 +1405,10 @@ define_class!(
             if let Some(pane_id) = hit.pane() {
                 kova.show_sidebar_pane_menu(self, CGPoint { x, y }, pane_id);
             } else if let Some(g) = hit.group() {
-                let tab_idx = self.ivars().shared.borrow().model.groups[g].tab_idx;
-                kova.show_sidebar_tab_menu(self, CGPoint { x, y }, tab_idx);
+                let tab_idx = self.ivars().shared.borrow().model.groups.get(g).map(|g| g.tab_idx);
+                if let Some(tab_idx) = tab_idx {
+                    kova.show_sidebar_tab_menu(self, CGPoint { x, y }, tab_idx);
+                }
             }
         }
     }
@@ -1417,12 +1431,14 @@ impl SidebarListView {
 
     /// One tooltip zone per glyph button, answered by `tooltip_string`.
     fn install_tooltips(&self) {
+        // Collect first: the tooltip manager may call back into this view.
+        let rects: Vec<CGRect> = {
+            let sh = self.ivars().shared.borrow();
+            sh.layout.rows.iter().flat_map(|row| row.glyphs.iter().map(|(_, r)| r.cg())).collect()
+        };
         self.removeAllToolTips();
-        let sh = self.ivars().shared.borrow();
-        for row in &sh.layout.rows {
-            for (_, r) in &row.glyphs {
-                unsafe { self.addToolTipRect_owner_userData(r.cg(), self.as_ref(), std::ptr::null_mut()) };
-            }
+        for r in rects {
+            unsafe { self.addToolTipRect_owner_userData(r, self.as_ref(), std::ptr::null_mut()) };
         }
     }
 
@@ -1465,10 +1481,10 @@ impl SidebarListView {
     }
 
     /// Drop a dragged header: the tab moves to the insertion position under `y`.
-    fn drop_tab(&self, group: usize, y: f64) {
+    fn drop_tab(&self, tab_id: TabId, y: f64) {
         let (tab_idx, k) = {
             let sh = self.ivars().shared.borrow();
-            let Some(g) = sh.model.groups.get(group) else { return };
+            let Some(g) = sh.model.groups.iter().find(|g| g.tab_id == tab_id) else { return };
             (g.tab_idx, sh.layout.insertion_index(y))
         };
         if let Some(kova) = kova_of(self) {
@@ -1476,23 +1492,20 @@ impl SidebarListView {
         }
     }
 
-    /// Drop a dragged tile at the slot under `y` in its column run.
-    fn drop_pane(&self, row: usize, y: f64) {
+    /// Drop a dragged tile at the slot under `y` in its column run. The pane
+    /// may have gone since the mouse went down: then nothing happens.
+    fn drop_pane(&self, pane_id: PaneId, y: f64) {
         let (tab_idx, ids, from, to) = {
             let sh = self.ivars().shared.borrow();
-            if row >= sh.layout.rows.len() {
-                return;
-            }
+            let Some(row) = sh.layout.row_for_pane(pane_id) else { return };
             let run = sh.layout.pane_run(row);
             let Some(slot) = sh.layout.pane_insertion_slot(&run, y) else { return };
-            let mut tab_idx = 0;
+            let RowKind::Tile { group, .. } = sh.layout.rows[row].kind else { return };
+            let Some(tab_idx) = sh.model.groups.get(group).map(|g| g.tab_idx) else { return };
             let ids: Vec<PaneId> = sh.layout.rows[run.clone()]
                 .iter()
                 .filter_map(|r| match r.kind {
-                    RowKind::Tile { group, pane_id, .. } => {
-                        tab_idx = sh.model.groups[group].tab_idx;
-                        Some(pane_id)
-                    }
+                    RowKind::Tile { pane_id, .. } => Some(pane_id),
                     _ => None,
                 })
                 .collect();
@@ -1516,22 +1529,26 @@ impl SidebarListView {
             if !visible(block) {
                 continue;
             }
-            let g = &sh.model.groups[gi];
+            let Some(g) = sh.model.groups.get(gi) else { continue };
             NSGraphicsContext::saveGraphicsState_class();
             NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(block.cg(), HEADER_RADIUS, HEADER_RADIUS).addClip();
             fill_rect(&Rect::new(block.x, block.y, GROUP_BAR_W, block.h), tab_tint(g.color), if g.active { 1.0 } else { 0.55 });
             NSGraphicsContext::restoreGraphicsState_class();
         }
 
+        // The lifted header or tile, resolved against the current layout: a
+        // tick can re-lay the list out while the mouse is down.
         let lifted_tab = sh.tab_drag.filter(|d| d.dragging);
+        let lifted_group = lifted_tab.and_then(|d| sh.model.groups.iter().position(|g| g.tab_id == d.tab_id));
         let lifted_pane = sh.pane_drag.filter(|d| d.dragging);
+        let lifted_row = lifted_pane.and_then(|d| sh.layout.row_for_pane(d.pane_id));
         for (ri, row) in sh.layout.rows.iter().enumerate() {
             if !visible(&row.frame) {
                 continue;
             }
             let lifted = match row.kind {
-                RowKind::Header { group } => lifted_tab.is_some_and(|d| d.group == group),
-                RowKind::Tile { .. } => lifted_pane.is_some_and(|d| d.row == ri),
+                RowKind::Header { group } => lifted_group == Some(group),
+                RowKind::Tile { .. } => lifted_row == Some(ri),
             };
             let alpha = if lifted { 0.35 } else { 1.0 };
             self.draw_row(&sh, row, row.frame.y, alpha);
@@ -1543,26 +1560,24 @@ impl SidebarListView {
         }
 
         // Drag feedback: the insertion line, then the floating copy.
-        if let Some(d) = lifted_tab {
+        if let (Some(d), Some(g)) = (lifted_tab, lifted_group) {
             let k = sh.layout.insertion_index(d.current_y);
             let ly = sh.layout.insertion_line_y(k);
             fill_round(&Rect::new(PAD_H, ly - 1.0, sh.layout.width - 2.0 * PAD_H - (PAD_H - EDGE_TOLERANCE), 2.0), 1.0, tokens::ACCENT, 1.0);
-            if let Some(r) = sh.layout.row_for_group(d.group) {
+            if let Some(r) = sh.layout.row_for_group(g) {
                 let row = &sh.layout.rows[r];
                 self.draw_row(&sh, row, d.current_y - d.grab_offset, 0.9);
             }
         }
-        if let Some(d) = lifted_pane {
-            if d.row < sh.layout.rows.len() {
-                let run = sh.layout.pane_run(d.row);
-                if let Some(slot) = sh.layout.pane_insertion_slot(&run, d.current_y) {
-                    let ly = sh.layout.pane_insertion_line_y(&run, slot);
-                    let f = &sh.layout.rows[d.row].frame;
-                    fill_round(&Rect::new(f.x, ly - 1.0, f.w, 2.0), 1.0, tokens::ACCENT, 1.0);
-                }
-                let row = &sh.layout.rows[d.row];
-                self.draw_row(&sh, row, d.current_y - d.grab_offset, 0.9);
+        if let (Some(d), Some(ri)) = (lifted_pane, lifted_row) {
+            let run = sh.layout.pane_run(ri);
+            if let Some(slot) = sh.layout.pane_insertion_slot(&run, d.current_y) {
+                let ly = sh.layout.pane_insertion_line_y(&run, slot);
+                let f = &sh.layout.rows[ri].frame;
+                fill_round(&Rect::new(f.x, ly - 1.0, f.w, 2.0), 1.0, tokens::ACCENT, 1.0);
             }
+            let row = &sh.layout.rows[ri];
+            self.draw_row(&sh, row, d.current_y - d.grab_offset, 0.9);
         }
     }
 
@@ -1572,16 +1587,20 @@ impl SidebarListView {
         let dy = y - row.frame.y;
         let frame = Rect::new(row.frame.x, y, row.frame.w, row.frame.h);
         match row.kind {
-            RowKind::Header { group } => self.draw_header(sh, group, &frame, alpha),
+            RowKind::Header { group } => {
+                if let Some(g) = sh.model.groups.get(group) {
+                    self.draw_header(sh, g, group, &frame, alpha);
+                }
+            }
             RowKind::Tile { group, index, .. } => {
-                let tile = &sh.model.groups[group].tiles[index];
-                self.draw_tile(sh, tile, row, &frame, dy, alpha);
+                if let Some(tile) = sh.model.groups.get(group).and_then(|g| g.tiles.get(index)) {
+                    self.draw_tile(sh, tile, row, &frame, dy, alpha);
+                }
             }
         }
     }
 
-    fn draw_header(&self, sh: &Shared, group: usize, frame: &Rect, alpha: f64) {
-        let g = &sh.model.groups[group];
+    fn draw_header(&self, sh: &Shared, g: &GroupVm, group: usize, frame: &Rect, alpha: f64) {
         let tint = tab_tint(g.color);
         let hovered = matches!(sh.hovered, ListHit::Header(h) | ListHit::Chevron(h) if h == group);
         let pressed = matches!(sh.pressed, ListHit::Header(h) | ListHit::Chevron(h) if h == group);
@@ -1758,7 +1777,6 @@ impl SidebarListView {
 mod tests {
     use super::*;
     use super::super::sidebar::{CollapsedSummary, PaneFlags};
-    use super::super::sidebar_model::GroupVm;
 
     /// Six points per character, one line per 40 points of width.
     struct FakeMetrics;
@@ -1952,6 +1970,11 @@ mod tests {
         assert_eq!(l.pane_run(3), 3..4);
         assert_eq!(l.pane_run(5), 5..6);
         assert_eq!(l.pane_run(0), 0..0);
+        // A row that is gone or no longer a tile (the list was re-laid out
+        // mid-drag) has an empty run, and an empty run has no slot.
+        assert_eq!(l.pane_run(99), 99..99);
+        assert_eq!(l.pane_insertion_slot(&(0..0), 50.0), None);
+        assert_eq!(l.pane_insertion_slot(&(99..99), 50.0), None);
         let run = 1..3;
         // Tile 1 spans 40..88 (centre 64), tile 2 spans 94..142 (centre 118).
         assert_eq!(l.pane_insertion_slot(&run, 50.0), Some(0));
