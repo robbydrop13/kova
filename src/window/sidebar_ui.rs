@@ -2,12 +2,12 @@
 //! Metal view (`apply_layout`), the mode switch, the per-tick sync that reads
 //! the tabs into a `SidebarModel` and hands it to the view, the actions the
 //! view calls back (open, stop, close, rename, bookmark, minimize, start
-//! Claude, add a pane, reorder) and the context menus. The drawing and the
-//! mouse live in `sidebar_view.rs`.
+//! Claude, resume, add a pane, reorder) and the context menus. The drawing
+//! and the mouse live in `sidebar_view.rs`.
 
 use super::*;
-use super::sidebar::{self, short_cwd, swap_chain, PaneFlags, SidebarSort};
-use super::sidebar_model::{PaneFacts, SidebarModel, TabFacts};
+use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
+use super::sidebar_model::{header_title, PaneFacts, SidebarModel, TabFacts};
 use crate::config::LayoutMode;
 
 /// How long `✓ All caught up` stays up once the last unread was read.
@@ -19,6 +19,8 @@ pub(super) enum PaneAction {
     Open,
     Stop,
     StartClaude,
+    /// Run the resume line waiting at the pane's prompt.
+    Resume,
     Rename,
     ToggleBookmark,
     Minimize,
@@ -27,10 +29,11 @@ pub(super) enum PaneAction {
 }
 
 impl PaneAction {
-    const ALL: [PaneAction; 8] = [
+    const ALL: [PaneAction; 9] = [
         PaneAction::Open,
         PaneAction::Stop,
         PaneAction::StartClaude,
+        PaneAction::Resume,
         PaneAction::Rename,
         PaneAction::ToggleBookmark,
         PaneAction::Minimize,
@@ -250,7 +253,6 @@ impl KovaView {
     fn sidebar_tab_facts(&self) -> Vec<TabFacts> {
         let tabs = self.ivars().tabs.borrow();
         let active_idx = self.ivars().active_tab.get();
-        let home = std::env::var("HOME").unwrap_or_default();
         let bookmark_keys = self.ivars().bookmark_keys.borrow();
         let rename_tab = self.ivars().rename_tab.borrow();
         let rename_pane = self.ivars().rename_pane.borrow();
@@ -264,45 +266,54 @@ impl KovaView {
             .map(|(ti, tab)| {
                 let is_active = ti == active_idx;
                 let renaming = is_active && rename_tab.is_some();
-                let title = match (renaming, rename_tab.as_ref()) {
-                    (true, Some(rs)) => edit_buffer(&rs.input, rs.cursor),
-                    _ => tab.title(),
-                };
                 let mut panes = Vec::new();
                 for (column, col) in tab.columns.iter().enumerate() {
                     for pane in &col.panes {
                         let focused = is_active && pane.id == tab.focused_pane;
-                        let pane_renaming = focused && rename_pane.is_some();
-                        let title = match (pane_renaming, rename_pane.as_ref()) {
-                            (true, Some(rs)) => edit_buffer(&rs.input, rs.cursor),
-                            _ => pane.display_title("shell"),
+                        let edit = match rename_pane.as_ref() {
+                            Some(rs) if focused => Some(edit_buffer(&rs.input, rs.cursor)),
+                            _ => None,
                         };
                         let (cwd, bookmarked) = {
-                            let term = pane.terminal.read();
-                            let cwd = term.cwd.clone().unwrap_or_default();
+                            // The directory the shell reports (OSC 7); a shell
+                            // without that integration is asked directly (one
+                            // `proc_pidinfo`, only for those panes).
+                            let cwd = pane.terminal.read().cwd.clone().or_else(|| pane.cwd()).unwrap_or_default();
                             let bookmarked = match pane.agent_session.borrow().as_ref() {
                                 Some(session) => bookmark_keys.contains(&session.id),
                                 None => !cwd.is_empty() && bookmark_keys.contains(&cwd),
                             };
                             (cwd, bookmarked)
                         };
+                        let restored = pane.restored_session().map(|(agent, _)| agent);
                         panes.push(PaneFacts {
                             pane_id: pane.id,
                             column,
                             flags: pane_flags(pane, focused),
                             minimized: pane.minimized,
                             bare_shell: pane.is_bare_shell(),
-                            title,
-                            renaming: pane_renaming,
-                            agent: pane.agent_kind().map(|a| a.as_str().to_string()),
+                            session_name: pane.agent_session_name(),
+                            custom_title: pane.custom_title.clone(),
+                            osc_title: pane.osc_title(),
+                            edit,
+                            agent: pane.agent_kind().or(restored).map(|a| a.as_str().to_string()),
+                            resumable: restored.is_some(),
                             process: pane.fg_process().map(|p| p.name),
-                            cwd_short: short_cwd(&cwd, &home),
+                            cwd,
                             bookmarked,
                             focused,
                             preview: pane.prompt_preview.borrow().clone(),
                         });
                     }
                 }
+                // The header: the tab's own name, else its focused pane's name
+                // or project (`header_title`: never a raw directory).
+                let title = match (renaming, rename_tab.as_ref()) {
+                    (true, Some(rs)) => edit_buffer(&rs.input, rs.cursor),
+                    _ => tab.custom_title.clone().unwrap_or_else(|| {
+                        panes.iter().find(|p| p.pane_id == tab.focused_pane).map(header_title).unwrap_or_else(|| "shell".to_string())
+                    }),
+                };
                 TabFacts {
                     tab_idx: ti,
                     tab_id: tab.id,
@@ -391,7 +402,7 @@ impl KovaView {
     // ---------------------------------------------------------------
 
     /// The pane `id` lives in, with the reads the menus and actions need.
-    fn pane_snapshot(&self, pane_id: PaneId) -> Option<(String, bool, bool, bool, bool, bool)> {
+    fn pane_snapshot(&self, pane_id: PaneId) -> Option<(String, bool, bool, bool, bool, bool, bool)> {
         let tabs = self.ivars().tabs.borrow();
         let bookmark_keys = self.ivars().bookmark_keys.borrow();
         for tab in tabs.iter() {
@@ -405,6 +416,7 @@ impl KovaView {
                     pane.is_working(),
                     pane.has_permission_prompt(),
                     pane.is_bare_shell(),
+                    pane.restored_session().is_some(),
                     pane.minimized,
                     bookmarked,
                 ));
@@ -416,13 +428,15 @@ impl KovaView {
     /// The tile's context menu, KovaLink's swipes and sheets as items,
     /// popped up at `location` in `view`.
     pub(super) fn show_sidebar_pane_menu(&self, view: &objc2_app_kit::NSView, location: CGPoint, pane_id: PaneId) {
-        let Some((_, working, awaiting, bare, minimized, bookmarked)) = self.pane_snapshot(pane_id) else { return };
+        let Some((_, working, awaiting, bare, resumable, minimized, bookmarked)) = self.pane_snapshot(pane_id) else { return };
         self.ivars().sidebar.borrow_mut().menu_pane = pane_id;
         let mut rows = vec![MenuRow::Item("Open".into(), PaneAction::Open.tag())];
         if working || awaiting {
             rows.push(MenuRow::Item("Stop".into(), PaneAction::Stop.tag()));
         }
-        if bare {
+        if resumable {
+            rows.push(MenuRow::Item("Resume the session".into(), PaneAction::Resume.tag()));
+        } else if bare {
             rows.push(MenuRow::Item("Start Claude here".into(), PaneAction::StartClaude.tag()));
         }
         rows.push(MenuRow::Separator);
@@ -520,6 +534,7 @@ impl KovaView {
             }
             PaneAction::Stop => self.interrupt_pane(pane_id),
             PaneAction::StartClaude => self.start_claude_in_pane(pane_id),
+            PaneAction::Resume => self.resume_in_pane(pane_id),
             PaneAction::Rename => {
                 if self.focus_pane_in_window(pane_id) {
                     self.start_rename_pane();
@@ -567,6 +582,30 @@ impl KovaView {
                     return;
                 }
                 pane.pty.write(b"claude\r");
+                return;
+            }
+        }
+    }
+
+    /// Run the resume line a restored pane holds (`Pane::restored_session`).
+    /// The line is rebuilt by `resume_command`, which refuses an id that could
+    /// carry a second command, and retyped after a Ctrl+U: the pre-typed one
+    /// may still sit at the prompt or have been cleared. Refused, like `Start
+    /// Claude`, when something already runs there.
+    fn resume_in_pane(&self, pane_id: PaneId) {
+        let tabs = self.ivars().tabs.borrow();
+        for tab in tabs.iter() {
+            if let Some(pane) = tab.pane(pane_id) {
+                let command = pane.restored_session().and_then(|(agent, id)| {
+                    crate::agent_session::resume_command(agent, &id, pane.last_command().as_deref())
+                });
+                match command {
+                    Some(command) => pane.pty.write(format!("\x15{command}\r").as_bytes()),
+                    None => {
+                        drop(tabs);
+                        self.set_transient_status("Nothing to resume in this pane");
+                    }
+                }
                 return;
             }
         }

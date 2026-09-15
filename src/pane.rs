@@ -2195,6 +2195,17 @@ impl Pane {
         self.agent_kind().is_none() && self.fg_process().is_none() && !self.has_pending_command()
     }
 
+    /// The conversation waiting at this shell's prompt: a restored pane (or
+    /// one its agent has left) whose last command is a resume line, with
+    /// nothing running yet. Where the sidebar offers `Resume` instead of
+    /// `Start Claude`, and names the agent the pane belongs to.
+    pub fn restored_session(&self) -> Option<(crate::agent_session::Agent, String)> {
+        if !self.is_bare_shell() {
+            return None;
+        }
+        self.last_command().as_deref().and_then(crate::agent_session::resumed_session)
+    }
+
     /// Claude launched here but its session is not resolved yet: a restore
     /// command pending, or a `claude` foreground process without a session.
     pub fn is_starting_agent(&self) -> bool {

@@ -62,9 +62,46 @@ pub fn resume_command(agent: Agent, session_id: &str, last_command: Option<&str>
     }
 }
 
+/// The conversation a command line hands back, and to which agent: `claude …
+/// --resume <id>` (or `-r <id>`) and `codex resume <id>`, the lines
+/// `resume_command` builds and a restored pane keeps as its last command.
+/// `None` for anything else, a plain `claude` included: that starts a
+/// conversation, it does not resume one. The id comes back unvalidated; a
+/// caller that types it into a shell goes through `resume_command`.
+pub fn resumed_session(command: &str) -> Option<(Agent, String)> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let first = tokens.first()?;
+    let name = first.rsplit('/').next().unwrap_or(first);
+    match name {
+        "claude" => {
+            let at = tokens.iter().position(|t| *t == "--resume" || *t == "-r")?;
+            let id = tokens.get(at + 1).filter(|id| !id.starts_with('-'))?;
+            Some((Agent::Claude, id.to_string()))
+        }
+        "codex" if tokens.get(1) == Some(&"resume") => tokens.get(2).map(|id| (Agent::Codex, id.to_string())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resume_line_names_its_agent_and_a_plain_launch_does_not() {
+        let claude = |id: &str| Some((Agent::Claude, id.to_string()));
+        assert_eq!(resumed_session("claude --resume abc-123"), claude("abc-123"));
+        assert_eq!(resumed_session("claude --dangerously-skip-permissions -r abc"), claude("abc"));
+        assert_eq!(resumed_session("/opt/bin/claude --resume abc"), claude("abc"));
+        assert_eq!(resumed_session("codex resume 01a0"), Some((Agent::Codex, "01a0".to_string())));
+        assert_eq!(resumed_session("claude --resume"), None);
+        assert_eq!(resumed_session("claude --resume --verbose"), None);
+        assert_eq!(resumed_session("claude"), None);
+        assert_eq!(resumed_session("codex"), None);
+        assert_eq!(resumed_session("npm run dev"), None);
+        assert_eq!(resumed_session(""), None);
+    }
+
 
     #[test]
     fn each_agent_resumes_with_its_own_command() {

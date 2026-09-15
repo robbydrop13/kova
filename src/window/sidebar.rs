@@ -312,6 +312,9 @@ pub enum TileButton {
     Stop,
     /// `▶`: the hover glyph, and the bare shell tile's `▶ Start Claude`.
     StartClaude,
+    /// `▶`: the hover glyph, and the `▶ Resume` of a shell holding an
+    /// agent's resume line.
+    Resume,
     /// The awaiting tile's `Open` button.
     Open,
 }
@@ -323,7 +326,7 @@ impl TileButton {
             TileButton::Minimize => "\u{229f}",
             TileButton::Restore => "\u{229e}",
             TileButton::Stop => "\u{25a0}",
-            TileButton::StartClaude => "\u{25b6}",
+            TileButton::StartClaude | TileButton::Resume => "\u{25b6}",
             TileButton::Open => "\u{23ce}",
         }
     }
@@ -335,19 +338,23 @@ impl TileButton {
             TileButton::Restore => "Restore",
             TileButton::Stop => "Stop",
             TileButton::StartClaude => "Start Claude here",
+            TileButton::Resume => "Resume the session",
             TileButton::Open => "Open",
         }
     }
 
     /// The hover glyphs of a tile, right to left: close, minimize / restore,
-    /// stop when something can be interrupted, start Claude on a bare shell.
-    pub fn hover_glyphs(state: TileState, minimized: bool, bare_shell: bool) -> Vec<TileButton> {
+    /// stop when something can be interrupted, start Claude on a bare shell,
+    /// resume on a shell holding a resume line.
+    pub fn hover_glyphs(state: TileState, minimized: bool, bare_shell: bool, resumable: bool) -> Vec<TileButton> {
         let mut out = vec![TileButton::Close, if minimized { TileButton::Restore } else { TileButton::Minimize }];
         if matches!(state, TileState::Working | TileState::Awaiting) {
             out.push(TileButton::Stop);
         }
         if bare_shell {
             out.push(TileButton::StartClaude);
+        } else if resumable {
+            out.push(TileButton::Resume);
         }
         out
     }
@@ -357,6 +364,7 @@ impl TileButton {
 pub const OPEN_LABEL: &str = "Open";
 pub const STOP_LABEL: &str = "\u{25a0} Stop";
 pub const START_CLAUDE_LABEL: &str = "\u{25b6} Start Claude";
+pub const RESUME_LABEL: &str = "\u{25b6} Resume";
 
 // ---------------------------------------------------------------
 // Pane drag arithmetic
@@ -482,34 +490,6 @@ pub fn format_age(secs: u64) -> String {
 /// Seconds after which a waiting pane's age turns red (KovaLink `aging`).
 pub const AGING_SECS: u64 = 600;
 
-// ---------------------------------------------------------------
-// Text rules
-// ---------------------------------------------------------------
-
-/// A working directory with `$HOME` folded to `~`.
-pub fn short_cwd(cwd: &str, home: &str) -> String {
-    if !home.is_empty() {
-        if cwd == home {
-            return "~".to_string();
-        }
-        if let Some(rest) = cwd.strip_prefix(home) {
-            if rest.starts_with('/') {
-                return format!("~{rest}");
-            }
-        }
-    }
-    cwd.to_string()
-}
-
-/// The second line of a pane tile: what runs in it, then where.
-pub fn secondary_line(agent: Option<&str>, process: Option<&str>, cwd_short: &str) -> String {
-    match agent.or(process) {
-        Some(what) if !cwd_short.is_empty() => format!("{what} \u{b7} {cwd_short}"),
-        Some(what) => what.to_string(),
-        None => cwd_short.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,22 +505,6 @@ mod tests {
         assert_eq!(drop_index(0, 1), 0);
         assert_eq!(drop_index(2, 0), 0);
         assert_eq!(drop_index(1, 3), 2);
-    }
-
-    #[test]
-    fn cwd_folds_home_and_leaves_lookalikes_alone() {
-        assert_eq!(short_cwd("/Users/rob/link", "/Users/rob"), "~/link");
-        assert_eq!(short_cwd("/Users/rob", "/Users/rob"), "~");
-        assert_eq!(short_cwd("/Users/robert/x", "/Users/rob"), "/Users/robert/x");
-        assert_eq!(short_cwd("/tmp", ""), "/tmp");
-    }
-
-    #[test]
-    fn secondary_line_names_the_agent_before_the_process() {
-        assert_eq!(secondary_line(Some("claude"), Some("node"), "~/link"), "claude \u{b7} ~/link");
-        assert_eq!(secondary_line(None, Some("nvim"), "~/link"), "nvim \u{b7} ~/link");
-        assert_eq!(secondary_line(None, None, "~/link"), "~/link");
-        assert_eq!(secondary_line(Some("codex"), None, ""), "codex");
     }
 
     #[test]
@@ -616,10 +580,11 @@ mod tests {
     #[test]
     fn hover_glyphs_follow_the_tile() {
         use TileButton::*;
-        assert_eq!(TileButton::hover_glyphs(TileState::Working, false, false), vec![Close, Minimize, Stop]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Awaiting, true, false), vec![Close, Restore, Stop]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, true), vec![Close, Minimize, StartClaude]);
-        assert_eq!(TileButton::hover_glyphs(TileState::Idle, false, false), vec![Close, Minimize]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Working, false, false, false), vec![Close, Minimize, Stop]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Awaiting, true, false, false), vec![Close, Restore, Stop]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, true, false), vec![Close, Minimize, StartClaude]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Shell, false, false, true), vec![Close, Minimize, Resume]);
+        assert_eq!(TileButton::hover_glyphs(TileState::Idle, false, false, false), vec![Close, Minimize]);
     }
 
     #[test]

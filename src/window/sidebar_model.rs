@@ -5,8 +5,8 @@
 //! the facts to the model is pure and tested here.
 
 use super::sidebar::{
-    display_order, format_age, secondary_line, summary_runs, CollapsedSummary, NextPill, PaneFlags,
-    SidebarSort, SummaryRun, TileState, AGING_SECS,
+    display_order, format_age, summary_runs, CollapsedSummary, NextPill, PaneFlags, SidebarSort,
+    SummaryRun, TileState, AGING_SECS,
 };
 use crate::pane::{PaneId, TabId};
 use crate::prompt_preview::PromptPreview;
@@ -48,11 +48,18 @@ pub struct TileVm {
     pub column: usize,
     pub state: TileState,
     pub minimized: bool,
+    /// A plain shell: `▶ Start Claude` applies.
     pub bare_shell: bool,
-    /// Pane title, already the edit buffer while renaming.
+    /// A shell with an agent's resume line waiting at its prompt: the chip
+    /// names the agent and `▶ Resume` replaces `▶ Start Claude`.
+    pub resumable: bool,
+    /// The session name, else the pane's own title, else the agent, else
+    /// `Shell` (`tile_title`); already the edit buffer while renaming.
     pub title: String,
-    /// `claude · ~/cwd`.
+    /// `project · claude`, the agent left out when it is the title.
     pub secondary: String,
+    /// The live or restored agent, for the chip.
+    pub agent: Option<String>,
     pub bookmarked: bool,
     /// The focused pane of the active tab.
     pub focused: bool,
@@ -75,11 +82,20 @@ pub struct PaneFacts {
     pub flags: PaneFlags,
     pub minimized: bool,
     pub bare_shell: bool,
-    pub title: String,
-    pub renaming: bool,
+    /// `Pane::agent_session_name()`: what `/rename` called the conversation.
+    pub session_name: Option<String>,
+    /// `Pane::custom_title`, which the shell's OSC 1 also writes.
+    pub custom_title: Option<String>,
+    /// `Pane::osc_title()`.
+    pub osc_title: Option<String>,
+    /// The rename edit buffer while the pane is being renamed.
+    pub edit: Option<String>,
+    /// The live agent (`claude`, `codex`), or the one whose resume line waits
+    /// at the prompt (`Pane::restored_agent()`), then with `resumable`.
     pub agent: Option<String>,
+    pub resumable: bool,
     pub process: Option<String>,
-    pub cwd_short: String,
+    pub cwd: String,
     pub bookmarked: bool,
     pub focused: bool,
     pub preview: Option<PromptPreview>,
@@ -97,6 +113,77 @@ pub struct TabFacts {
     pub renaming: bool,
     /// Panes column by column, in sidebar order.
     pub panes: Vec<PaneFacts>,
+}
+
+/// The tile title, KovaLink's `paneLabel`: the agent session name, else the
+/// pane's own title (custom or app-set) unless the shell put a directory there,
+/// else the agent, else the foreground process, else `Shell`. A pane is never
+/// titled by its directory: that is the subtitle's job.
+pub fn tile_title(
+    session_name: Option<&str>,
+    custom_title: Option<&str>,
+    osc_title: Option<&str>,
+    agent: Option<&str>,
+    process: Option<&str>,
+    cwd: &str,
+) -> String {
+    if let Some(name) = pane_name(session_name, custom_title, osc_title, cwd) {
+        return name;
+    }
+    if let Some(what) = present(agent).or_else(|| present(process)) {
+        return what.to_string();
+    }
+    "Shell".to_string()
+}
+
+/// The group header of a tab without a custom name: the focused pane's name
+/// when it has one, else its project (a tab is naturally named after its
+/// directory, and that is what the phone groups by), else `shell`.
+pub fn header_title(p: &PaneFacts) -> String {
+    pane_name(p.session_name.as_deref(), p.custom_title.as_deref(), p.osc_title.as_deref(), &p.cwd)
+        .or_else(|| Some(project_name(&p.cwd)).filter(|n| !n.is_empty()))
+        .unwrap_or_else(|| "shell".to_string())
+}
+
+/// What names the pane, if anything: the session name, else its custom or
+/// app-set title unless the shell put a directory there.
+fn pane_name(session_name: Option<&str>, custom_title: Option<&str>, osc_title: Option<&str>, cwd: &str) -> Option<String> {
+    present(session_name)
+        .or_else(|| present(custom_title).or_else(|| present(osc_title)).filter(|t| !names_directory(t, cwd)))
+        .map(str::to_string)
+}
+
+fn present(t: Option<&str>) -> Option<&str> {
+    t.map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// Whether a title is a directory rather than a name: the cwd or its basename,
+/// a path (`/`, `~`, zsh's head-cut `..rectory/Claap`), or a shell prompt
+/// title (`user@host:~/dir`).
+fn names_directory(title: &str, cwd: &str) -> bool {
+    let tail = title.rsplit(':').next().unwrap_or(title).trim_start();
+    title == cwd
+        || (!cwd.is_empty() && title == project_name(cwd))
+        || title.contains('/')
+        || tail.starts_with('~')
+        || title.starts_with("..")
+}
+
+/// KovaLink's `projectName`: the last path segment, the path itself when it
+/// has none.
+pub fn project_name(cwd: &str) -> String {
+    let base = cwd.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    if base.is_empty() { cwd.to_string() } else { base.to_string() }
+}
+
+/// The subtitle, KovaLink's: `project · agent`, the agent left out when it is
+/// already the title.
+pub fn subtitle(project: &str, agent: Option<&str>, title: &str) -> String {
+    match agent {
+        Some(agent) if agent != title && !project.is_empty() => format!("{project} \u{b7} {agent}"),
+        Some(agent) if agent != title => agent.to_string(),
+        _ => project.to_string(),
+    }
 }
 
 impl TileVm {
@@ -118,17 +205,28 @@ impl TileVm {
             }
             _ => {}
         }
+        let title = tile_title(
+            f.session_name.as_deref(),
+            f.custom_title.as_deref(),
+            f.osc_title.as_deref(),
+            f.agent.as_deref(),
+            f.process.as_deref(),
+            &f.cwd,
+        );
+        let secondary = subtitle(&project_name(&f.cwd), f.agent.as_deref(), &title);
         TileVm {
             pane_id: f.pane_id,
             column: f.column,
             state,
             minimized: f.minimized,
-            bare_shell: f.bare_shell,
-            title: f.title.clone(),
-            secondary: secondary_line(f.agent.as_deref(), f.process.as_deref(), &f.cwd_short),
+            bare_shell: f.bare_shell && !f.resumable,
+            resumable: f.bare_shell && f.resumable,
+            title: f.edit.clone().unwrap_or(title),
+            secondary,
+            agent: f.agent.clone(),
             bookmarked: f.bookmarked,
             focused: f.focused,
-            renaming: f.renaming,
+            renaming: f.edit.is_some(),
             question,
             detail,
             summary,
@@ -139,6 +237,15 @@ impl TileVm {
     /// Whether the tile is the tall awaiting card.
     pub fn awaiting(&self) -> bool {
         self.state == TileState::Awaiting
+    }
+
+    /// The chip: the state word, except that a shell holding an agent's
+    /// resume line names that agent (`claude`, `codex`) rather than `shell`.
+    pub fn chip(&self) -> String {
+        match (self.state, self.resumable, self.agent.as_deref()) {
+            (TileState::Shell, true, Some(agent)) => agent.to_string(),
+            _ => self.state.chip().to_string(),
+        }
     }
 }
 
@@ -204,9 +311,9 @@ mod tests {
     fn pane(id: PaneId, flags: PaneFlags) -> PaneFacts {
         PaneFacts {
             pane_id: id,
-            title: format!("pane {id}"),
+            session_name: Some(format!("pane {id}")),
             agent: Some("claude".into()),
-            cwd_short: "~/link".into(),
+            cwd: "/Users/me/link".into(),
             flags,
             ..PaneFacts::default()
         }
@@ -228,7 +335,8 @@ mod tests {
         let t = TileVm::from_facts(&f, 1000 + 700);
         assert_eq!(t.state, TileState::Awaiting);
         assert!(t.awaiting());
-        assert_eq!(t.secondary, "claude \u{b7} ~/link");
+        assert_eq!(t.title, "pane 1");
+        assert_eq!(t.secondary, "link \u{b7} claude");
         assert_eq!(t.question.as_deref(), Some("Run it?"));
         // No detail: the header stands in.
         assert_eq!(t.detail.as_deref(), Some("Bash command"));
@@ -247,6 +355,103 @@ mod tests {
         let t = TileVm::from_facts(&f, 0);
         assert_eq!(t.state, TileState::Idle);
         assert_eq!(t.summary, None);
+    }
+
+    #[test]
+    fn the_session_name_wins_and_a_directory_never_titles_a_tile() {
+        let cwd = "/Users/me/AI directory/Claap";
+        // `/rename` beats everything, the sticky title included.
+        assert_eq!(tile_title(Some("Fix the login"), Some("claude"), Some("Claude Code"), Some("claude"), None, cwd), "Fix the login");
+        assert_eq!(tile_title(Some("  "), Some("my pane"), None, Some("claude"), None, cwd), "my pane");
+        // The shell's OSC 1 titles, head-cut cwd and prompt alike, are not names.
+        assert_eq!(tile_title(None, Some("..rectory/Claap"), Some("me@mac:~/AI directory/Claap"), Some("claude"), None, cwd), "claude");
+        assert_eq!(tile_title(None, Some("~/link"), None, None, None, "/Users/me/link"), "Shell");
+        assert_eq!(tile_title(None, Some("~"), None, None, None, "/Users/me"), "Shell");
+        assert_eq!(tile_title(None, Some("Claap"), None, None, None, cwd), "Shell");
+        assert_eq!(tile_title(None, None, Some("me@mac:~"), None, None, "/Users/me"), "Shell");
+        assert_eq!(tile_title(None, None, Some(cwd), None, None, cwd), "Shell");
+        // The app's own title, then the process, then the fallback.
+        assert_eq!(tile_title(None, None, Some("Claude Code"), Some("claude"), None, cwd), "Claude Code");
+        assert_eq!(tile_title(None, Some("claude"), Some("Claude Code"), Some("claude"), None, cwd), "claude");
+        assert_eq!(tile_title(None, None, None, None, Some("nvim"), cwd), "nvim");
+        assert_eq!(tile_title(None, None, None, None, None, cwd), "Shell");
+        assert_eq!(tile_title(None, None, None, None, None, ""), "Shell");
+    }
+
+    #[test]
+    fn a_header_without_a_tab_name_takes_the_pane_name_then_its_project() {
+        let mut p = PaneFacts { cwd: "/Users/me/AI directory/Perso".into(), custom_title: Some("..rectory/Perso".into()), ..PaneFacts::default() };
+        assert_eq!(header_title(&p), "Perso");
+        p.session_name = Some("Taxes".into());
+        assert_eq!(header_title(&p), "Taxes");
+        let empty = PaneFacts::default();
+        assert_eq!(header_title(&empty), "shell");
+    }
+
+    #[test]
+    fn the_subtitle_is_the_project_then_the_agent_unless_it_is_the_title() {
+        assert_eq!(project_name("/Users/me/AI directory/Claap"), "Claap");
+        assert_eq!(project_name("/Users/me/link/"), "link");
+        assert_eq!(project_name("/"), "/");
+        assert_eq!(project_name(""), "");
+        assert_eq!(subtitle("Claap", Some("claude"), "Fix the login"), "Claap \u{b7} claude");
+        assert_eq!(subtitle("Claap", Some("claude"), "claude"), "Claap");
+        assert_eq!(subtitle("Claap", None, "Shell"), "Claap");
+        assert_eq!(subtitle("", Some("codex"), "Shell"), "codex");
+        assert_eq!(subtitle("", None, "Shell"), "");
+    }
+
+    #[test]
+    fn a_restored_session_resumes_and_a_bare_shell_starts_claude() {
+        // Restored: the resume line waits at the prompt, no agent yet.
+        let restored = PaneFacts {
+            pane_id: 1,
+            bare_shell: true,
+            resumable: true,
+            agent: Some("claude".into()),
+            custom_title: Some("..rectory/Claap".into()),
+            osc_title: Some("me@mac:~/AI directory/Claap".into()),
+            cwd: "/Users/me/AI directory/Claap".into(),
+            ..PaneFacts::default()
+        };
+        let t = TileVm::from_facts(&restored, 0);
+        assert_eq!(t.state, TileState::Shell);
+        assert!(t.resumable);
+        assert!(!t.bare_shell);
+        assert_eq!(t.chip(), "claude");
+        assert_eq!(t.title, "claude");
+        assert_eq!(t.secondary, "Claap");
+
+        // A plain shell: `shell` chip and `Start Claude`.
+        let bare = PaneFacts { pane_id: 2, bare_shell: true, cwd: "/Users/me/link".into(), ..PaneFacts::default() };
+        let t = TileVm::from_facts(&bare, 0);
+        assert!(t.bare_shell);
+        assert!(!t.resumable);
+        assert_eq!(t.chip(), "shell");
+        assert_eq!(t.title, "Shell");
+        assert_eq!(t.secondary, "link");
+
+        // A live idle session keeps its state chip.
+        let live = PaneFacts {
+            pane_id: 3,
+            flags: PaneFlags { idle_agent: true, ..PaneFlags::default() },
+            session_name: Some("Sidebar identity".into()),
+            agent: Some("claude".into()),
+            cwd: "/Users/me/kova".into(),
+            ..PaneFacts::default()
+        };
+        let t = TileVm::from_facts(&live, 0);
+        assert_eq!(t.chip(), "idle");
+        assert_eq!(t.title, "Sidebar identity");
+        assert_eq!(t.secondary, "kova \u{b7} claude");
+        assert!(!t.bare_shell && !t.resumable);
+
+        // Renaming: the edit buffer is the title.
+        let mut renaming = live.clone();
+        renaming.edit = Some("Side\u{258f}".into());
+        let t = TileVm::from_facts(&renaming, 0);
+        assert_eq!(t.title, "Side\u{258f}");
+        assert!(t.renaming);
     }
 
     #[test]

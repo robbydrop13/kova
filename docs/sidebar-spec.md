@@ -14,10 +14,11 @@ Code:
 - `src/window/sidebar.rs`: pure. The process-wide layout setting and its
   persistence, the colour tokens, `TileState` and its priority, the activity
   sort, `CollapsedSummary`, `TileButton`, the Next pill, the pane drag
-  arithmetic (`swap_chain`, `drop_index`), the text rules. Unit tests.
+  arithmetic (`swap_chain`, `drop_index`). Unit tests.
 - `src/window/sidebar_model.rs`: pure. `SidebarModel { summary, sort, pill,
   groups: Vec<GroupVm { tiles: Vec<TileVm> }>, show_hint }`, built from
-  `TabFacts` / `PaneFacts` (plain reads of the tabs). `PartialEq`, so the view
+  `TabFacts` / `PaneFacts` (plain reads of the tabs), and the tile identity
+  rules (`tile_title`, `project_name`, `subtitle`). `PartialEq`, so the view
   can tell whether a tick changed anything. Unit tests.
 - `src/window/sidebar_view.rs`: the AppKit side. `ListLayout` and
   `ChromeLayout` (pure geometry in points, hit tests, drag slots; text widths
@@ -43,11 +44,15 @@ Code:
    collapsed summary, the `+` on a group. Same colour tokens
    (`sidebar::tokens`, from `link/app/src/theme/tokens.ts`).
 3. Same actions as the phone's swipes and sheets, one click away: Open, Stop,
-   Close, Rename, Bookmark, Minimize / Restore, Start Claude, Add a pane.
-4. Native where it is free: SF Pro, `NSScrollView` (elastic, overlay
+   Close, Rename, Bookmark, Minimize / Restore, Start Claude, Resume, Add a
+   pane.
+4. Same words as the phone's session rows (`SessionRow.tsx`): the tile is
+   titled by the session name, subtitled by the project and the agent; a
+   directory is never a title.
+5. Native where it is free: SF Pro, `NSScrollView` (elastic, overlay
    scroller), `scrollRectToVisible`, `autoscroll:`, tooltip rects, cursor
    rects, `NSMenu`, `NSAlert`.
-5. Zero cost when off: in tabs mode the sidebar view is hidden and
+6. Zero cost when off: in tabs mode the sidebar view is hidden and
    `sync_sidebar` returns at once; the tab bar and status bar are untouched.
 
 ## 2. Window structure
@@ -92,13 +97,16 @@ mouse up.
 
 ### 3.3 Typography (`sidebar_view::Style`, `NSFont::systemFontOfSize_weight`)
 
-KovaLink's scale two steps down for a Mac list: header and tile titles 13
-semibold; secondary line, detail, summary, links, hint, number 11 (links
-semibold); chips, sort toggle, footer, pill badge 10 (chips and sort medium,
-badge bold); question and pill label 12 (pill semibold); `+` 14 medium.
-Truncation is AppKit's: titles at the tail, paths and rename edit buffers at
-the head (so the `▏` cursor stays visible), the question wrapped to two lines
-with an ellipsis on the last (`TruncatesLastVisibleLine`).
+KovaLink's row scale, so the Mac reads like the phone: header and tile
+titles 15 semibold (`calloutStrong`); secondary line and question 13
+(`footnote`); detail, links and pill label 12 (links and pill semibold);
+chips, summary, hint, number 11 (chips medium, `caption`); sort toggle,
+footer, pill badge 10 (sort medium, badge bold); `+` 14 medium. Text colours
+are the phone's: primary `#E8EAED`, secondary `#9BA3AF`, tertiary `#7C8593`.
+Truncation is AppKit's: titles and subtitles at the tail (never a head-cut
+`..rectory/Claap`), rename edit buffers at the head (so the `▏` cursor stays
+visible), the question wrapped to two lines with an ellipsis on the last
+(`TruncatesLastVisibleLine`).
 
 ### 3.4 Group (one per tab; `TabGroupView.tsx`)
 
@@ -116,24 +124,48 @@ tertiary. Hover: white at 6 %; pressed 12 %. The tint is `TAB_COLORS[c]` or
 
 ### 3.5 Tile (`SessionRow.tsx`), radius 10, fill `bg.raised`, padding 8 v / 10 h
 
-Row 1 (16 tall): the state glyph at x 10 (an 8 pt dot in the state colour;
+Row 1 (20 tall): the state glyph at x 10 (an 8 pt dot in the state colour;
 a 1.5 pt `border.strong` ring for idle and shell), the title from x 26 (`⊟ `
 prefix when minimized), the chip right-aligned: 18 tall, radius 9, padding 7,
 `workingBg` fill + working text (`working`, `starting`), `accent.subtleBg`
 fill + accent text + 6 pt accent dot (`done`, `bell`), `bg.overlay` fill +
-tertiary text (`idle`, `shell`). Row 2 (14 tall, 2 below): `claude · ~/cwd`
-in secondary, a `★` in amber first when bookmarked; a bare shell shows
-`▶ Start Claude` (accent link, primary on hover) right-aligned instead of the
-end of the path. An unread tile with a turn-end summary adds a third row in
-secondary. Heights 48 / 64. Focused pane of the active tab: fill
+tertiary text (`idle`, `shell`, or the agent of a restored session: see
+below). Row 2 (16 tall, 2 below): the subtitle in secondary, a `★` in amber
+first when bookmarked; a bare shell shows `▶ Start Claude` and a restored
+session `▶ Resume` (accent link, primary on hover) right-aligned instead of
+the end of the subtitle. An unread tile with a turn-end summary adds a third
+row in secondary. Heights 54 / 72. Focused pane of the active tab: fill
 `bg.overlay` and a 1.5 pt accent ring. Hover: `bg.overlay`; pressed:
 `bg.pressed`. Minimized: fill `bg.base`, 1 pt `border.subtle`.
 
+Identity (`sidebar_model::tile_title`, `subtitle`; the phone's `paneLabel`
+and `SessionRow` subtitle, from the same `Pane` reads the daemon gets over
+IPC):
+
+- Title: the agent session name (`/rename`), else the pane's own title
+  (`custom_title`, then the OSC title) unless it names a directory (the cwd or
+  its basename, anything with a `/`, `~…`, zsh's head-cut `..rectory/Claap`,
+  a `user@host:~/dir` prompt title: the shell writes those into OSC 1, which
+  Kova keeps as the sticky title), else the agent (`claude`, `codex`), else
+  the foreground process, else `Shell`. Tail-truncated.
+- Subtitle: `project · agent`, `project` being the cwd's last segment (the
+  phone's `projectName`), the agent left out when it is already the title, and
+  the project alone on a plain shell.
+- Agent: the live one (`Pane::agent_kind()`), else the one whose resume line
+  waits at the prompt (`Pane::restored_session()`: a bare shell whose last
+  command is `claude … --resume <id>` or `codex resume <id>`, which is what a
+  restored pane holds until Enter is pressed). Such a restored session keeps
+  the shell tile (ring) but its chip reads `claude` / `codex` and its call is
+  `▶ Resume`; `shell` and `▶ Start Claude` are for a plain shell only.
+- The group header without a custom tab name is titled the same way from the
+  focused pane.
+
 Hover actions replace the chip on row 1, right to left: `×` close (error
 red on hover), `⊟` / `⊞` minimize / restore, `■` stop (interrupt colour;
-working or awaiting), `▶` start Claude (accent; bare shell). Each is a 20 pt
-round button (`bg.pressed`, a `border.strong` ring on hover), 4 apart, with a
-tooltip (`Close`, `Minimize`, `Restore`, `Stop`, `Start Claude here`) through
+working or awaiting), `▶` start Claude (accent; bare shell) or resume
+(accent; restored session). Each is a 20 pt round button (`bg.pressed`, a
+`border.strong` ring on hover), 4 apart, with a tooltip (`Close`, `Minimize`,
+`Restore`, `Stop`, `Start Claude here`, `Resume the session`) through
 `addToolTipRect:owner:userData:`. Pressed paints on mouse down, the action
 fires on mouse up inside the same button (a leave cancels).
 
@@ -142,11 +174,11 @@ fires on mouse up inside the same button (a leave cancels).
 A 4 pt amber bar at the left edge (clipped by the radius), a 1 pt amber
 border at 35 % (80 % on hover), padding 10 v / 12 h. Row 1: amber dot, title,
 the age (`4m`) right in tertiary, `status.error` past 10 min. Then the
-question (12, primary, 1 or 2 lines, measured), the detail (11, secondary:
+question (13, primary, 1 or 2 lines, measured), the detail (12, secondary:
 the command, the file, or the header), and a 20 pt actions row: `Open`
-(accent pill, white 11 semibold, `primaryPressed` on hover) at the text
+(accent pill, white 12 semibold, `primaryPressed` on hover) at the text
 column, `■ Stop` (interrupt colour, primary on hover) at the right. Heights
-77 (1 line, no detail) to 108.
+82 (1 line, no detail) to 116.
 
 ### 3.7 Summary, sort, Next pill
 
@@ -195,6 +227,7 @@ column, `■ Stop` (interrupt colour, primary on hover) at the right. Heights
 | Awaiting `Open`            | same as tile body                                      |                    | tile menu    |
 | Awaiting `■ Stop`          | interrupt (4.4)                                        |                    | tile menu    |
 | Shell `▶ Start Claude`     | start Claude (4.4)                                     |                    | tile menu    |
+| Restored `▶ Resume`        | resume (4.4)                                           |                    | tile menu    |
 | Next pill                  | `do_focus_next_attention()` (not when `nothing`)       |                    |              |
 | Sort toggle                | kova <-> activity                                      |                    |              |
 | `« Tab bar` footer         | switch `layout.mode` to tabs                           |                    |              |
@@ -233,7 +266,8 @@ tile's own buttons go through the same function.
 |-------------------|--------------------------------------------------------|---------------------------------------------------------------------------|
 | Open              | always                                                 | `focus_pane_in_window(id)`                                                |
 | Stop              | `is_working()` or a permission prompt is on screen     | `interrupt_pane(id)`: `pane.pty.write(b"\x03")`, `pane.clear_awaiting()`, `set_transient_status("Stopped")` |
-| Start Claude here | `Pane::is_bare_shell()`                                | `pane.pty.write(b"claude\r")`; refused with a status line otherwise      |
+| Start Claude here | `Pane::is_bare_shell()` and no resume line             | `pane.pty.write(b"claude\r")`; refused with a status line otherwise      |
+| Resume the session | `Pane::restored_session()`                            | the line rebuilt by `agent_session::resume_command` (validated id, the pane's own flags), typed after a Ctrl+U (the pre-typed line may still sit at the prompt) and Enter; refused with a status line otherwise |
 | Rename…           | always                                                 | `focus_pane_in_window(id)` then `start_rename_pane()`                     |
 | Bookmark / Unbookmark | always                                             | focus then `do_toggle_bookmark()`; label from `bookmark_keys`             |
 | Minimize / Restore| not minimized / minimized                              | focus then `do_minimize_pane()`; restore = `focus_pane_in_window`         |
@@ -270,7 +304,7 @@ sort key and the collapsed dot priority.
 | 3 | `is_working()`                                                                                     | working  | blue dot, `working`                   |
 | 4 | `is_starting_agent()`                                                                              | starting | blue dot, `starting`                  |
 | 5 | `is_idle_agent()`                                                                                  | idle     | ring, neutral `idle`                  |
-| 6 | else                                                                                               | shell    | ring, neutral `shell`, `▶ Start Claude` when bare |
+| 6 | else                                                                                               | shell    | ring, neutral `shell` and `▶ Start Claude` when bare; neutral `claude` / `codex` and `▶ Resume` on a restored session |
 
 The hook's waiting flag alone (`is_awaiting_unseen()` without a parsed
 prompt) paints `done`, never amber: the `Stop` hook raises it at every turn
@@ -318,7 +352,7 @@ tab tint          TAB_COLORS[c] (Kova palette, mirrored by the phone)
 top 36  summary 24  pill region 36 (pill 28, radius 14)  footer 24
 list inset 12 (+6 top, +12 bottom)  group gap 16  tile gap 6  header 28 (radius 6)
 group bar 3 + inset 12  tile radius 10, pad 8/10  card radius 12, pad 10/12, bar 4
-rows: title 16, secondary 14, question 15/line, gap 2  chip 18 (radius 9, pad 7)
+rows: title 20, secondary 16, question 16/line, gap 2  chip 18 (radius 9, pad 7)
 hover button 20 (gap 4)  actions row 20  hint 20  width 280, clamp 200..520
 ```
 

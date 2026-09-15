@@ -28,7 +28,7 @@ use objc2_foundation::{NSDictionary, NSObjectProtocol, NSString};
 
 use super::sidebar::{
     self, tab_tint, tokens, NextPill, SidebarSort, SummaryRun, TileButton, TileState, OPEN_LABEL,
-    START_CLAUDE_LABEL, STOP_LABEL,
+    RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
 };
 use super::sidebar_model::{GroupVm, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
@@ -73,9 +73,9 @@ const CARD_PAD_H: f64 = 12.0;
 const CARD_RADIUS: f64 = 12.0;
 const CARD_BAR_W: f64 = 4.0;
 /// Line boxes inside a tile.
-const LINE_TITLE_H: f64 = 16.0;
-const LINE_SEC_H: f64 = 14.0;
-const LINE_Q_H: f64 = 15.0;
+const LINE_TITLE_H: f64 = 20.0;
+const LINE_SEC_H: f64 = 16.0;
+const LINE_Q_H: f64 = 16.0;
 const LINE_GAP: f64 = 2.0;
 /// State glyph and text columns inside a tile.
 const GLYPH_X: f64 = 10.0;
@@ -144,10 +144,11 @@ impl Style {
 
     pub fn size(self) -> f64 {
         match self {
-            Style::Title => 13.0,
-            Style::Secondary | Style::Detail | Style::Summary | Style::Link | Style::Hint | Style::Number | Style::Glyph => 11.0,
-            Style::Chip | Style::Sort | Style::PillBadge | Style::Footer => 10.0,
-            Style::Question | Style::Pill => 12.0,
+            Style::Title => 15.0,
+            Style::Secondary | Style::Question => 13.0,
+            Style::Detail | Style::Link | Style::Pill => 12.0,
+            Style::Chip | Style::Summary | Style::Hint | Style::Number | Style::Glyph => 11.0,
+            Style::Sort | Style::PillBadge | Style::Footer => 10.0,
             Style::Plus => 14.0,
         }
     }
@@ -437,7 +438,7 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
     let right = x + w - pad_h;
     let text_w = (right - text_x).max(10.0);
     let line1_y = y + pad_v;
-    let glyphs = TileButton::hover_glyphs(tile.state, tile.minimized, tile.bare_shell)
+    let glyphs = TileButton::hover_glyphs(tile.state, tile.minimized, tile.bare_shell, tile.resumable)
         .into_iter()
         .enumerate()
         .map(|(k, b)| {
@@ -463,10 +464,17 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
         h += ACTIONS_H;
     } else {
         h += LINE_GAP + LINE_SEC_H;
-        if tile.bare_shell {
-            let start_w = m.width(START_CLAUDE_LABEL, Style::Link) + 8.0;
+        let call = if tile.bare_shell {
+            Some((TileButton::StartClaude, START_CLAUDE_LABEL))
+        } else if tile.resumable {
+            Some((TileButton::Resume, RESUME_LABEL))
+        } else {
+            None
+        };
+        if let Some((button, label)) = call {
+            let call_w = m.width(label, Style::Link) + 8.0;
             let line2_y = line1_y + LINE_TITLE_H + LINE_GAP;
-            actions.push((TileButton::StartClaude, Rect::new(right - start_w, line2_y - 1.0, start_w, LINE_SEC_H + 2.0)));
+            actions.push((button, Rect::new(right - call_w, line2_y - 1.0, call_w, LINE_SEC_H + 2.0)));
         }
         if tile.summary.is_some() {
             h += LINE_GAP + LINE_SEC_H;
@@ -705,7 +713,8 @@ enum Align {
 }
 
 /// Draw one line of text vertically centred in `r`, truncated with an
-/// ellipsis (at the head for paths and edit buffers). Returns the drawn width.
+/// ellipsis (at the tail; at the head for rename edit buffers, so the cursor
+/// stays visible). Returns the drawn width.
 fn draw_text(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha: f64, align: Align, head: bool) -> f64 {
     let mode = if head { NSLineBreakMode::ByTruncatingHead } else { NSLineBreakMode::ByTruncatingTail };
     let a = attrs(sh.font(style), c, alpha, mode);
@@ -1472,6 +1481,7 @@ impl SidebarListView {
                     TileButton::Restore => PaneAction::Restore,
                     TileButton::Stop => PaneAction::Stop,
                     TileButton::StartClaude => PaneAction::StartClaude,
+                    TileButton::Resume => PaneAction::Resume,
                     TileButton::Open => PaneAction::Open,
                 };
                 kova.dispatch_pane_action(pane_id, action);
@@ -1706,7 +1716,7 @@ impl SidebarListView {
                 let fg = match b {
                     TileButton::Close if b_hovered => tokens::ERROR,
                     TileButton::Stop => tokens::INTERRUPT,
-                    TileButton::StartClaude => tokens::ACCENT,
+                    TileButton::StartClaude | TileButton::Resume => tokens::ACCENT,
                     _ if b_hovered => tokens::TEXT_PRIMARY,
                     _ => tokens::TEXT_SECONDARY,
                 };
@@ -1718,7 +1728,7 @@ impl SidebarListView {
             title_right -= w + 8.0;
         } else if !awaiting {
             let dot = matches!(tile.state, TileState::Unread { .. }).then_some(tokens::ACCENT);
-            let chip = draw_chip(sh, tile.state.chip(), right, cy, tile.state.chip_bg(), tile.state.chip_fg(), dot, alpha);
+            let chip = draw_chip(sh, &tile.chip(), right, cy, tile.state.chip_bg(), tile.state.chip_fg(), dot, alpha);
             title_right = chip.x - 8.0;
         }
         let title = if tile.minimized { format!("\u{229f} {}", tile.title) } else { tile.title.clone() };
@@ -1752,19 +1762,22 @@ impl SidebarListView {
             let line2 = Rect::new(text_x, y, right - text_x, LINE_SEC_H);
             let mut sec_right = right;
             for (b, r) in &row.actions {
-                if *b == TileButton::StartClaude {
-                    let r = shifted(r);
-                    let b_hovered = sh.hovered == ListHit::TileButton(tile.pane_id, *b);
-                    draw_text(sh, START_CLAUDE_LABEL, &r, Style::Link, if b_hovered { tokens::TEXT_PRIMARY } else { tokens::ACCENT }, alpha, Align::Center, false);
-                    sec_right = r.x - 6.0;
-                }
+                let label = match b {
+                    TileButton::StartClaude => START_CLAUDE_LABEL,
+                    TileButton::Resume => RESUME_LABEL,
+                    _ => continue,
+                };
+                let r = shifted(r);
+                let b_hovered = sh.hovered == ListHit::TileButton(tile.pane_id, *b);
+                draw_text(sh, label, &r, Style::Link, if b_hovered { tokens::TEXT_PRIMARY } else { tokens::ACCENT }, alpha, Align::Center, false);
+                sec_right = r.x - 6.0;
             }
             let mut sx = text_x;
             if tile.bookmarked {
                 let w = draw_text(sh, "\u{2605}", &Rect::new(sx, line2.y, 14.0, LINE_SEC_H), Style::Secondary, tokens::AWAITING, alpha, Align::Left, false);
                 sx += w + 4.0;
             }
-            draw_text(sh, &tile.secondary, &Rect::new(sx, line2.y, (sec_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, tokens::TEXT_SECONDARY, alpha, Align::Left, true);
+            draw_text(sh, &tile.secondary, &Rect::new(sx, line2.y, (sec_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, tokens::TEXT_SECONDARY, alpha, Align::Left, false);
             if let Some(summary) = &tile.summary {
                 let line3_y = line2.bottom() + LINE_GAP;
                 draw_text(sh, summary, &Rect::new(text_x, line3_y, right - text_x, LINE_SEC_H), Style::Secondary, tokens::TEXT_SECONDARY, alpha, Align::Left, false);
@@ -1798,8 +1811,10 @@ mod tests {
             state,
             minimized: false,
             bare_shell: state == TileState::Shell,
+            resumable: false,
             title: format!("pane {pane_id}"),
-            secondary: "claude \u{b7} ~/link".into(),
+            secondary: "link \u{b7} claude".into(),
+            agent: Some("claude".into()),
             bookmarked: false,
             focused: false,
             renaming: false,
@@ -1847,16 +1862,16 @@ mod tests {
     fn rows_stack_with_gaps_and_the_tint_bar_spans_each_group() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
         let ys: Vec<f64> = l.rows.iter().map(|r| r.frame.y).collect();
-        // header 6..34, gap 6, tile 40..88, gap 6, tile 94..142, group gap
-        // 16, header 158..186 (collapsed), gap 16, header 202..230, gap 6,
-        // tile 236..284, bottom 12.
-        assert_eq!(ys, vec![6.0, 40.0, 94.0, 158.0, 202.0, 236.0]);
-        assert_eq!(l.rows[1].frame.h, 48.0);
+        // header 6..34, gap 6, tile 40..94, gap 6, tile 100..154, group gap
+        // 16, header 170..198 (collapsed), gap 16, header 214..242, gap 6,
+        // tile 248..302, bottom 12.
+        assert_eq!(ys, vec![6.0, 40.0, 100.0, 170.0, 214.0, 248.0]);
+        assert_eq!(l.rows[1].frame.h, 54.0);
         assert_eq!(l.rows[1].frame.x, CX);
         assert_eq!(l.rows[1].frame.right(), W - 8.0);
-        assert_eq!(l.groups[0], Rect::new(12.0, 6.0, W - 20.0, 136.0));
+        assert_eq!(l.groups[0], Rect::new(12.0, 6.0, W - 20.0, 148.0));
         assert_eq!(l.groups[1].h, HEADER_H);
-        assert_eq!(l.content_h, 284.0 + 12.0);
+        assert_eq!(l.content_h, 302.0 + 12.0);
         assert_eq!(l.hint_y, None);
     }
 
@@ -1874,10 +1889,10 @@ mod tests {
         m.groups = vec![group(0, false, vec![awaiting, short, unread, tile(4, 0, TileState::Working)])];
         let l = ListLayout::new(&m, W, &FakeMetrics);
         let hs: Vec<f64> = l.rows.iter().map(|r| r.frame.h).collect();
-        // 50 chars * 6 = 300 > 217 wide: two lines. 10 + 16 + 2 + 30 + 2 +
-        // 14 + 4 + 20 + 10 = 108; one line, no detail: 10 + 16 + 2 + 15 + 4
-        // + 20 + 10 = 77; unread with a summary: 64; plain: 48.
-        assert_eq!(hs, vec![HEADER_H, 108.0, 77.0, 64.0, 48.0]);
+        // 50 chars * 6 = 300 > 217 wide: two lines. 10 + 20 + 2 + 32 + 2 +
+        // 16 + 4 + 20 + 10 = 116; one line, no detail: 10 + 20 + 2 + 16 + 4
+        // + 20 + 10 = 82; unread with a summary: 72; plain: 54.
+        assert_eq!(hs, vec![HEADER_H, 116.0, 82.0, 72.0, 54.0]);
         assert_eq!(l.rows[1].question_lines, 2);
         assert_eq!(l.rows[2].question_lines, 1);
         // The card's actions: Open at the text column, Stop at the right.
@@ -1894,8 +1909,8 @@ mod tests {
         let mut m = model();
         m.show_hint = true;
         let l = ListLayout::new(&m, W, &FakeMetrics);
-        assert_eq!(l.hint_y, Some(284.0 + 16.0));
-        assert_eq!(l.content_h, 284.0 + 16.0 + 20.0 + 12.0);
+        assert_eq!(l.hint_y, Some(302.0 + 16.0));
+        assert_eq!(l.content_h, 302.0 + 16.0 + 20.0 + 12.0);
         // An empty window still lays out.
         m.groups.clear();
         let l = ListLayout::new(&m, W, &FakeMetrics);
@@ -1917,7 +1932,7 @@ mod tests {
         assert_eq!(l.hit(100.0, 120.0), ListHit::Tile(11));
         // Left of the content column: nothing.
         assert_eq!(l.hit(5.0, 60.0), ListHit::Empty);
-        assert_eq!(l.hit(100.0, 170.0), ListHit::Header(1));
+        assert_eq!(l.hit(100.0, 180.0), ListHit::Header(1));
         assert_eq!(l.hit(100.0, 260.0), ListHit::Tile(30));
         assert_eq!(l.hit(100.0, 1000.0), ListHit::Empty);
         // Working tile: close, minimize, stop boxes from the right on line 1.
@@ -1943,17 +1958,35 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_session_offers_resume_where_a_bare_shell_offers_start_claude() {
+        let mut m = model();
+        let mut restored = tile(7, 0, TileState::Shell);
+        restored.bare_shell = false;
+        restored.resumable = true;
+        m.groups = vec![group(0, false, vec![restored, tile(8, 0, TileState::Shell)])];
+        let l = ListLayout::new(&m, W, &FakeMetrics);
+        let (b, resume) = l.rows[1].actions[0];
+        assert_eq!(b, TileButton::Resume);
+        assert_eq!(resume.w, RESUME_LABEL.chars().count() as f64 * 6.0 + 8.0);
+        assert_eq!(resume.right(), W - 8.0 - TILE_PAD_H);
+        assert_eq!(l.hit(resume.x + 5.0, resume.y + 5.0), ListHit::TileButton(7, TileButton::Resume));
+        assert_eq!(l.rows[1].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::Resume]);
+        assert_eq!(l.rows[2].actions[0].0, TileButton::StartClaude);
+        assert_eq!(l.rows[1].frame.h, l.rows[2].frame.h);
+    }
+
+    #[test]
     fn insertion_index_follows_the_midpoint_rule() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
-        // Headers at 6..34, 158..186, 202..230.
+        // Headers at 6..34, 170..198, 214..242.
         assert_eq!(l.insertion_index(10.0), 0);
         assert_eq!(l.insertion_index(100.0), 1);
-        assert_eq!(l.insertion_index(170.0), 1);
-        assert_eq!(l.insertion_index(180.0), 2);
-        assert_eq!(l.insertion_index(220.0), 3);
+        assert_eq!(l.insertion_index(180.0), 1);
+        assert_eq!(l.insertion_index(190.0), 2);
+        assert_eq!(l.insertion_index(235.0), 3);
         assert_eq!(l.insertion_line_y(0), 6.0 - 8.0);
-        assert_eq!(l.insertion_line_y(1), 158.0 - 8.0);
-        assert_eq!(l.insertion_line_y(3), 284.0 + 8.0);
+        assert_eq!(l.insertion_line_y(1), 170.0 - 8.0);
+        assert_eq!(l.insertion_line_y(3), 302.0 + 8.0);
     }
 
     #[test]
@@ -1976,16 +2009,16 @@ mod tests {
         assert_eq!(l.pane_insertion_slot(&(0..0), 50.0), None);
         assert_eq!(l.pane_insertion_slot(&(99..99), 50.0), None);
         let run = 1..3;
-        // Tile 1 spans 40..88 (centre 64), tile 2 spans 94..142 (centre 118).
+        // Tile 1 spans 40..94 (centre 67), tile 2 spans 100..154 (centre 127).
         assert_eq!(l.pane_insertion_slot(&run, 50.0), Some(0));
         assert_eq!(l.pane_insertion_slot(&run, 100.0), Some(1));
-        assert_eq!(l.pane_insertion_slot(&run, 130.0), Some(2));
+        assert_eq!(l.pane_insertion_slot(&run, 140.0), Some(2));
         // Far above or below the run: no slot, the drop snaps back.
         assert_eq!(l.pane_insertion_slot(&run, 5.0), None);
         assert_eq!(l.pane_insertion_slot(&run, 300.0), None);
         assert_eq!(l.pane_insertion_line_y(&run, 0), 40.0 - 3.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 1), 94.0 - 3.0);
-        assert_eq!(l.pane_insertion_line_y(&run, 2), 142.0 + 3.0);
+        assert_eq!(l.pane_insertion_line_y(&run, 1), 100.0 - 3.0);
+        assert_eq!(l.pane_insertion_line_y(&run, 2), 154.0 + 3.0);
         assert_eq!(l.row_for_pane(3), Some(3));
         assert_eq!(l.row_for_pane(99), None);
         assert_eq!(l.row_for_group(1), Some(4));
@@ -2017,11 +2050,13 @@ mod tests {
     }
 
     #[test]
-    fn styles_scale_down_from_the_phone() {
-        assert_eq!(Style::Title.size(), 13.0);
+    fn styles_match_the_phone_rows() {
+        // KovaLink's `calloutStrong`, `footnote` and `caption`.
+        assert_eq!(Style::Title.size(), 15.0);
         assert_eq!(Style::Title.weight(), Weight::Semibold);
-        assert_eq!(Style::Secondary.size(), 11.0);
-        assert_eq!(Style::Chip.size(), 10.0);
+        assert_eq!(Style::Secondary.size(), 13.0);
+        assert_eq!(Style::Secondary.weight(), Weight::Regular);
+        assert_eq!(Style::Chip.size(), 11.0);
         assert_eq!(Style::Chip.weight(), Weight::Medium);
         assert_eq!(Style::PillBadge.weight(), Weight::Bold);
         assert_eq!(Style::ALL.len(), 15);
