@@ -147,20 +147,20 @@ impl KovaView {
         let bounds = container.bounds();
         let width = sidebar::width_pt() as f64;
         let min_split = self.ivars().config.get().map(|c| c.splits.min_width).unwrap_or(300.0) as f64;
-        let show = sidebar::layout_mode() == LayoutMode::Sidebar && bounds.size.width - width >= min_split;
+        let wanted = sidebar::layout_mode() == LayoutMode::Sidebar;
+        let (show, sidebar_frame, my_frame) = split_layout(bounds, width, min_split, wanted);
         self.ivars().sidebar_shown.set(show);
-        let sidebar_frame = CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height: bounds.size.height },
-        };
-        let my_frame = if show {
-            CGRect {
-                origin: CGPoint { x: width, y: 0.0 },
-                size: CGSize { width: (bounds.size.width - width).max(1.0), height: bounds.size.height },
-            }
-        } else {
-            bounds
-        };
+        log::debug!(
+            "apply_layout: container {}x{} sidebar {} at x={} w={} kova at x={} w={} h={}",
+            bounds.size.width,
+            bounds.size.height,
+            if show { "shown" } else { "hidden" },
+            sidebar_frame.origin.x,
+            sidebar_frame.size.width,
+            my_frame.origin.x,
+            my_frame.size.width,
+            my_frame.size.height
+        );
         if sidebar.isHidden() == show {
             sidebar.setHidden(!show);
         }
@@ -668,6 +668,28 @@ impl KovaView {
     }
 }
 
+/// How the container `bounds` split between the sidebar and the Metal view:
+/// whether the sidebar shows (wanted, and the window keeps at least
+/// `min_split` for the terminal next to it), its frame, and the Metal view's.
+/// Both frames sit at y = 0 and take the full height; the Metal view takes
+/// the whole container when the sidebar is hidden.
+fn split_layout(bounds: CGRect, width: f64, min_split: f64, wanted: bool) -> (bool, CGRect, CGRect) {
+    let show = wanted && bounds.size.width - width >= min_split;
+    let sidebar_frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize { width, height: bounds.size.height },
+    };
+    let my_frame = if show {
+        CGRect {
+            origin: CGPoint { x: width, y: 0.0 },
+            size: CGSize { width: (bounds.size.width - width).max(1.0), height: bounds.size.height },
+        }
+    } else {
+        bounds
+    };
+    (show, sidebar_frame, my_frame)
+}
+
 fn rect_eq(a: CGRect, b: CGRect) -> bool {
     (a.origin.x - b.origin.x).abs() < 0.01
         && (a.origin.y - b.origin.y).abs() < 0.01
@@ -699,5 +721,41 @@ fn pane_flags(pane: &Pane, seen: bool) -> PaneFlags {
         starting: pane.is_starting_agent(),
         idle_agent: pane.is_idle_agent(),
         seen,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds(w: f64, h: f64) -> CGRect {
+        CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w, height: h } }
+    }
+
+    #[test]
+    fn the_split_follows_the_container_size() {
+        let (show, sidebar, kova) = split_layout(bounds(2000.0, 1230.0), 280.0, 300.0, true);
+        assert!(show);
+        assert!(rect_eq(sidebar, CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 280.0, height: 1230.0 } }));
+        assert!(rect_eq(kova, CGRect { origin: CGPoint { x: 280.0, y: 0.0 }, size: CGSize { width: 1720.0, height: 1230.0 } }));
+        assert_eq!(sidebar.size.width + kova.size.width, 2000.0);
+
+        let (show, _, kova) = split_layout(bounds(1230.0, 780.0), 280.0, 300.0, true);
+        assert!(show);
+        assert!(rect_eq(kova, CGRect { origin: CGPoint { x: 280.0, y: 0.0 }, size: CGSize { width: 950.0, height: 780.0 } }));
+    }
+
+    #[test]
+    fn the_sidebar_hides_in_tab_mode_and_when_the_window_is_too_narrow() {
+        let (show, _, kova) = split_layout(bounds(2000.0, 1230.0), 280.0, 300.0, false);
+        assert!(!show);
+        assert!(rect_eq(kova, bounds(2000.0, 1230.0)));
+
+        let (show, _, kova) = split_layout(bounds(500.0, 600.0), 280.0, 300.0, true);
+        assert!(!show);
+        assert!(rect_eq(kova, bounds(500.0, 600.0)));
+
+        let (show, ..) = split_layout(bounds(580.0, 600.0), 280.0, 300.0, true);
+        assert!(show);
     }
 }

@@ -23,7 +23,7 @@ use switcher::{PaneSwitcherState, SwitcherRow};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSBackingStoreType, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSObjectProtocol, NSString};
 use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -329,6 +329,15 @@ define_class!(
         fn window_should_close(&self, _sender: &objc2::runtime::AnyObject) -> bool {
             self.do_close_window();
             false // we handle closing via the closing flag + timer
+        }
+
+        /// Every window resize (manual, zoom, full screen, a restored frame)
+        /// re-splits the content view. The autoresizing masks already do
+        /// most of it; this settles the exact split and is a no-op when the
+        /// frames already match.
+        #[unsafe(method(windowDidResize:))]
+        fn window_did_resize(&self, _notification: &objc2_foundation::NSNotification) {
+            self.apply_layout();
         }
     }
     unsafe impl NSTextInputClient for KovaView {
@@ -2561,10 +2570,24 @@ pub fn create_window(mtm: MainThreadMarker, config: &Config, tabs: Vec<Tab>, act
     // the whole width in tab-bar mode) and again on every resize.
     let container = objc2_app_kit::NSView::initWithFrame(mtm.alloc(), content_rect);
     container.setWantsLayer(true);
+    container.setAutoresizesSubviews(true);
     let sidebar = sidebar_view::SidebarView::new(mtm, content_rect);
+    // Both children need a mask: AppKit skips `resizeWithOldSuperviewSize:`
+    // for a subview left at `NSViewNotSizable`, so without one the split was
+    // never recomputed and a window restored at a larger frame kept its two
+    // views at their creation size in the bottom-left corner. The masks give
+    // the right shape on their own (sidebar pinned left at a fixed width,
+    // Metal view taking the rest); `apply_layout` then settles the exact
+    // split and the narrow fallback.
+    sidebar.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewMaxXMargin);
+    view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
     container.addSubview(&sidebar);
     container.addSubview(&view);
     view.ivars().sidebar_view.set(sidebar).ok();
+    // The window paints its own background wherever a view does not: make it
+    // the terminal's, so a resize can never flash the light grey default.
+    let bg = config.colors.background;
+    window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(bg[0] as f64, bg[1] as f64, bg[2] as f64, 1.0)));
     window.setContentView(Some(&container));
     view.apply_layout();
     window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*view)));
