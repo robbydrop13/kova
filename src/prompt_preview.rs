@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn the_transcript_tail_yields_the_last_assistant_text_as_one_clean_line() {
         let s = turn_end_summary(TRANSCRIPT).expect("summary");
-        assert!(s.starts_with("Les fichiers, oui : 0 trace."), "{s}");
+        assert!(s.starts_with("The file is renamed."), "{s}");
         assert!(!s.contains('*'));
         assert!(s.chars().count() <= 120);
         assert_eq!(turn_end_summary(""), None);
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn transcript_path_slugs_the_cwd_like_the_daemon() {
-        let p = transcript_path("/Users/rob", "/Users/rob/AI directory/link", "abc-123");
-        assert_eq!(p, PathBuf::from("/Users/rob/.claude/projects/-Users-rob-AI-directory-link/abc-123.jsonl"));
+        let p = transcript_path("/Users/alice", "/Users/alice/dev/link", "abc-123");
+        assert_eq!(p, PathBuf::from("/Users/alice/.claude/projects/-Users-alice-dev-link/abc-123.jsonl"));
     }
 }

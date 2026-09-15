@@ -106,7 +106,7 @@ chips, summary, hint, number 11 (chips medium, `caption`); sort toggle and
 pill badge 10 (sort medium, badge bold); `+` 14 medium. Text colours
 are the phone's: primary `#E8EAED`, secondary `#9BA3AF`, tertiary `#7C8593`.
 Truncation is AppKit's: titles and subtitles at the tail (never a head-cut
-`..rectory/Claap`), rename edit buffers at the head (so the `▏` cursor stays
+`..jects/Acme`), rename edit buffers at the head (so the `▏` cursor stays
 visible), the question wrapped to two lines with an ellipsis on the last
 (`TruncatesLastVisibleLine`).
 
@@ -187,7 +187,7 @@ IPC):
 
 - Title: the agent session name (`/rename`), else the pane's own title
   (`custom_title`, then the OSC title) unless it names a directory (the cwd or
-  its basename, anything with a `/`, `~…`, zsh's head-cut `..rectory/Claap`,
+  its basename, anything with a `/`, `~…`, zsh's head-cut `..jects/Acme`,
   a `user@host:~/dir` prompt title: the shell writes those into OSC 1, which
   Kova keeps as the sticky title), else the agent (`claude`, `codex`), else
   the foreground process, else `Shell`. Tail-truncated.

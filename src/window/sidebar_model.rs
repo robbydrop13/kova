@@ -162,7 +162,7 @@ fn present(t: Option<&str>) -> Option<&str> {
 }
 
 /// Whether a title is a directory rather than a name: the cwd or its basename,
-/// a path (`/`, `~`, zsh's head-cut `..rectory/Claap`), or a shell prompt
+/// a path (`/`, `~`, zsh's head-cut `..jects/Acme`), or a shell prompt
 /// title (`user@host:~/dir`).
 fn names_directory(title: &str, cwd: &str) -> bool {
     let tail = title.rsplit(':').next().unwrap_or(title).trim_start();
@@ -382,15 +382,15 @@ mod tests {
 
     #[test]
     fn the_session_name_wins_and_a_directory_never_titles_a_tile() {
-        let cwd = "/Users/me/AI directory/Claap";
+        let cwd = "/Users/me/Projects/Acme";
         // `/rename` beats everything, the sticky title included.
         assert_eq!(tile_title(Some("Fix the login"), Some("claude"), Some("Claude Code"), Some("claude"), None, cwd), "Fix the login");
         assert_eq!(tile_title(Some("  "), Some("my pane"), None, Some("claude"), None, cwd), "my pane");
         // The shell's OSC 1 titles, head-cut cwd and prompt alike, are not names.
-        assert_eq!(tile_title(None, Some("..rectory/Claap"), Some("me@mac:~/AI directory/Claap"), Some("claude"), None, cwd), "claude");
+        assert_eq!(tile_title(None, Some("..jects/Acme"), Some("me@mac:~/Projects/Acme"), Some("claude"), None, cwd), "claude");
         assert_eq!(tile_title(None, Some("~/link"), None, None, None, "/Users/me/link"), "Shell");
         assert_eq!(tile_title(None, Some("~"), None, None, None, "/Users/me"), "Shell");
-        assert_eq!(tile_title(None, Some("Claap"), None, None, None, cwd), "Shell");
+        assert_eq!(tile_title(None, Some("Acme"), None, None, None, cwd), "Shell");
         assert_eq!(tile_title(None, None, Some("me@mac:~"), None, None, "/Users/me"), "Shell");
         assert_eq!(tile_title(None, None, Some(cwd), None, None, cwd), "Shell");
         // The app's own title, then the process, then the fallback.
@@ -403,8 +403,8 @@ mod tests {
 
     #[test]
     fn a_header_without_a_tab_name_takes_the_pane_name_then_its_project() {
-        let mut p = PaneFacts { cwd: "/Users/me/AI directory/Perso".into(), custom_title: Some("..rectory/Perso".into()), ..PaneFacts::default() };
-        assert_eq!(header_title(&p), "Perso");
+        let mut p = PaneFacts { cwd: "/Users/me/Projects/Home".into(), custom_title: Some("..jects/Home".into()), ..PaneFacts::default() };
+        assert_eq!(header_title(&p), "Home");
         p.session_name = Some("Taxes".into());
         assert_eq!(header_title(&p), "Taxes");
         let empty = PaneFacts::default();
@@ -413,13 +413,13 @@ mod tests {
 
     #[test]
     fn the_subtitle_is_the_project_then_the_agent_unless_it_is_the_title() {
-        assert_eq!(project_name("/Users/me/AI directory/Claap"), "Claap");
+        assert_eq!(project_name("/Users/me/Projects/Acme"), "Acme");
         assert_eq!(project_name("/Users/me/link/"), "link");
         assert_eq!(project_name("/"), "/");
         assert_eq!(project_name(""), "");
-        assert_eq!(subtitle("Claap", Some("claude"), "Fix the login"), "Claap \u{b7} claude");
-        assert_eq!(subtitle("Claap", Some("claude"), "claude"), "Claap");
-        assert_eq!(subtitle("Claap", None, "Shell"), "Claap");
+        assert_eq!(subtitle("Acme", Some("claude"), "Fix the login"), "Acme \u{b7} claude");
+        assert_eq!(subtitle("Acme", Some("claude"), "claude"), "Acme");
+        assert_eq!(subtitle("Acme", None, "Shell"), "Acme");
         assert_eq!(subtitle("", Some("codex"), "Shell"), "codex");
         assert_eq!(subtitle("", None, "Shell"), "");
     }
@@ -432,9 +432,9 @@ mod tests {
             bare_shell: true,
             resumable: true,
             agent: Some("claude".into()),
-            custom_title: Some("..rectory/Claap".into()),
-            osc_title: Some("me@mac:~/AI directory/Claap".into()),
-            cwd: "/Users/me/AI directory/Claap".into(),
+            custom_title: Some("..jects/Acme".into()),
+            osc_title: Some("me@mac:~/Projects/Acme".into()),
+            cwd: "/Users/me/Projects/Acme".into(),
             ..PaneFacts::default()
         };
         let t = TileVm::from_facts(&restored, 0);
@@ -443,7 +443,7 @@ mod tests {
         assert!(!t.bare_shell);
         assert_eq!(t.chip(), "claude");
         assert_eq!(t.title, "claude");
-        assert_eq!(t.secondary, "Claap");
+        assert_eq!(t.secondary, "Acme");
 
         // A plain shell: `shell` chip and `Start Claude`.
         let bare = PaneFacts { pane_id: 2, bare_shell: true, cwd: "/Users/me/link".into(), ..PaneFacts::default() };
