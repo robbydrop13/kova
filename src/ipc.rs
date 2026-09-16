@@ -132,6 +132,15 @@ pub enum IpcCommand {
     /// Run the pane's resume line, exactly as the sidebar's `Resume` button
     /// (`Pane::run_resume`). The line is Kova's own, never the client's.
     ResumePane(u32),
+    /// Set a pane's read state directly, with no focus and no window side
+    /// effect. `unread: false` calls `Pane::mark_read`; `unread: true` raises
+    /// the manual mark. Idempotent, unlike the `toggle-unread` action, which
+    /// focuses the pane first and would therefore mark a remotely read pane
+    /// unread instead of read.
+    SetPaneUnread {
+        pane_id: u32,
+        unread: bool,
+    },
     /// Trigger any keyboard action by its stable name (see `action_from_ipc_name`).
     /// `pane_id` optionally targets (and focuses) a specific pane's window first;
     /// without it, the action runs against the key window.
@@ -414,6 +423,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "resize-pane" => &["pane_id", "axis", "direction", "amount_pct"],
         "rename-pane" => &["pane_id", "title"],
         "set-pane-status" => &["pane_id", "status"],
+        "set-pane-unread" => &["pane_id", "unread"],
         "dispatch-action" => &["action", "pane_id"],
         "resume-pane" => &["pane_id"],
         "merge-window" => &["source_window", "target_window"],
@@ -697,6 +707,21 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 }
             };
             Ok(IpcCommand::SetPaneStatus { pane_id, waiting })
+        }
+        "set-pane-unread" => {
+            let pane_id = v
+                .get("pane_id")
+                .and_then(|p| p.as_u64())
+                .ok_or_else(|| "missing \"pane_id\" field".to_string())?
+                as u32;
+            // No default: a client that forgets the field would otherwise get
+            // whichever state we picked, on a command whose whole point is to
+            // say which one it wants.
+            let unread = match v.get("unread") {
+                Some(serde_json::Value::Bool(b)) => *b,
+                _ => return Err("\"unread\" must be a boolean".to_string()),
+            };
+            Ok(IpcCommand::SetPaneUnread { pane_id, unread })
         }
         "dispatch-action" => {
             let action = v
@@ -1194,6 +1219,56 @@ mod tests {
         assert_eq!(
             err(r#"{"cmd":"set-pane-status","status":"waiting"}"#),
             "missing \"pane_id\" field"
+        );
+    }
+
+    #[test]
+    fn set_pane_unread_parses_both_states() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-pane-unread","pane_id":7,"unread":false}"#),
+            Ok(IpcCommand::SetPaneUnread { pane_id: 7, unread: false })
+        ));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-pane-unread","pane_id":7,"unread":true}"#),
+            Ok(IpcCommand::SetPaneUnread { pane_id: 7, unread: true })
+        ));
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-unread","unread":false}"#),
+            "missing \"pane_id\" field"
+        );
+    }
+
+    #[test]
+    fn set_pane_unread_has_no_default_state() {
+        // The command says which state it wants; there is nothing sensible to
+        // assume for a client that forgot the flag, and guessing would move the
+        // bit the wrong way exactly like the toggle it exists to replace.
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-unread","pane_id":7}"#),
+            "\"unread\" must be a boolean"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-unread","pane_id":7,"unread":"false"}"#),
+            "\"unread\" must be a boolean"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-unread","pane_id":7,"unread":null}"#),
+            "\"unread\" must be a boolean"
+        );
+    }
+
+    #[test]
+    fn set_pane_unread_rejects_the_fields_of_its_neighbours() {
+        // It is neither `set-pane-status` nor the `toggle-unread` action: a
+        // client that mixes them up hears about it instead of getting a command
+        // that does something else.
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-unread","pane_id":7,"status":"none"}"#),
+            "unknown field \"status\" for command \"set-pane-unread\""
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-unread","pane_id":7,"unread":false,"action":"toggle-unread"}"#),
+            "unknown field \"action\" for command \"set-pane-unread\""
         );
     }
 

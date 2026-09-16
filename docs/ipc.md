@@ -388,7 +388,12 @@ resize-left|right|up|down          (ratio resize, ±5%)
 edge-grow-left|right               (grow the focused pane's edge)
 minimize-pane  restore-minimized
 next-attention                     (focus the next unread pane, in the sidebar's order; skips minimized panes)
-toggle-unread                      (mark the focused pane read when unread, else unread by hand)
+toggle-unread                      (mark the focused pane read when unread, else unread by hand.
+                                    With pane_id the target pane is FOCUSED first, like every
+                                    action here, and a focused pane counts as seen: the toggle
+                                    then finds it read and marks it unread. To write the read
+                                    state from outside, use set-pane-unread, which focuses
+                                    nothing.)
 history-back|history-forward       (walk the panes you visited, back then forward; skips minimized panes)
 detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
@@ -400,6 +405,29 @@ toggle-sidebar                     (switch the layout between the tab bar and th
 ```
 
 Note: a few actions open an **interactive overlay** that then expects keyboard input — `merge-tab`, `merge-window`, `detach-tab` (when several windows exist), `rename-tab`, `rename-pane`, `open-recent-project`, `open-search`, `open-pane-switcher`, `open-unread-switcher`. For headless automation, prefer the deterministic typed commands where one exists (e.g. `merge-window` with explicit indices, `rename-pane` with a title).
+
+---
+
+### `set-pane-unread`: write a pane's read state, without focusing it
+
+```json
+{ "cmd": "set-pane-unread", "pane_id": 42, "unread": false }
+```
+
+Writes the `unread` bit `list-panes` reports for that pane.
+
+- `unread: false` marks the pane **read**, exactly as the Mac does on `Cmd+U` over an unread pane (`Pane::mark_read`): the bell is cleared, a finished command is acknowledged, the waiting flag and the prompt preview are marked seen, and the manual mark is dropped.
+- `unread: true` raises the **manual** mark alone, what `Cmd+U` sets on a pane that was read.
+
+**Nothing else moves.** The pane is not focused, its tab is not made active, its window is neither raised nor made key, and a minimized pane stays minimized. This is what separates it from the `toggle-unread` action above: `dispatch-action` focuses the target pane first, a focused pane counts as *seen*, so the toggle sees a read pane and marks it unread, the opposite of what a client that read the pane somewhere else wants.
+
+**Idempotent.** It is a set, not a toggle: sending the same value twice leaves the pane exactly as it was.
+
+Both fields are required. `unread` must be a boolean; there is no default, because a missing flag would otherwise move the bit in a direction the client never asked for.
+
+Response: `{ "ok": true }`, or `{ "ok": false, "error": "pane 42 not found" }` for an unknown pane. An older Kova answers `unknown command: set-pane-unread`; a client that treats that answer as a benign no-op keeps working against it.
+
+On the pane currently focused on the Mac, `mark_read` still applies normally, and Kova's own frame pass re-acknowledges that pane on its next tick anyway.
 
 ---
 

@@ -782,4 +782,34 @@ impl KovaView {
         }
         false
     }
+
+    /// IPC: write the pane's read state, the bit `list-panes` reports as
+    /// `unread`. `false` is `Pane::mark_read` (bell cleared, completion acked,
+    /// waiting flag and preview marked seen, manual mark dropped); `true`
+    /// raises the manual mark alone, like Cmd+U on a read pane.
+    ///
+    /// NOTHING else moves: no focus, no tab activation, no window raise, no
+    /// restore of a minimized pane. That is the point. The `toggle-unread`
+    /// action cannot do this job, because `dispatch-action` focuses the target
+    /// first, so the pane already counts as seen and the toggle marks it
+    /// unread instead of read.
+    ///
+    /// Idempotent: the same value twice is a no-op, it is a set and not a
+    /// toggle. On the pane focused on this Mac, `mark_read` still applies and
+    /// the frame pass re-acks it on the next tick anyway.
+    ///
+    /// Returns true if the pane was found in this window.
+    pub fn ipc_set_pane_unread(&self, pane_id: PaneId, unread: bool) -> bool {
+        let tabs = self.ivars().tabs.borrow();
+        let Some(pane) = tabs.iter().find_map(|tab| tab.pane(pane_id)) else { return false };
+        if unread {
+            pane.set_manual_unread(true);
+        } else {
+            pane.mark_read();
+        }
+        drop(tabs);
+        self.mark_dirty();
+        log::info!("IPC: pane {} unread={}", pane_id, unread);
+        true
+    }
 }

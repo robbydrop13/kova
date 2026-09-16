@@ -630,6 +630,9 @@ fn handle_ipc_command_sync(
         IpcCommand::ResumePane(pane_id) => {
             handle_ipc_resume_pane(windows, pane_id)
         }
+        IpcCommand::SetPaneUnread { pane_id, unread } => {
+            handle_ipc_set_pane_unread(windows, pane_id, unread)
+        }
         IpcCommand::MergeWindow { source_window, target_window } => {
             handle_ipc_merge_window(windows, source_window, target_window)
         }
@@ -1340,6 +1343,31 @@ fn handle_ipc_resume_pane(
                 return IpcResponse::Error { message: format!("nothing to resume in pane {}", pane_id) }
             }
             None => continue,
+        }
+    }
+
+    IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: set a pane's read state directly.
+///
+/// Scans the windows exactly like `handle_ipc_set_pane_status` and touches
+/// nothing but the pane's own flags. Deliberately NOT modelled on
+/// `handle_ipc_dispatch_action` just below, which focuses the target pane and
+/// raises its window before dispatching: that focus is what makes a pane count
+/// as seen, and it would turn a "mark read" into a "mark unread".
+fn handle_ipc_set_pane_unread(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    unread: bool,
+) -> crate::ipc::IpcResponse {
+    use crate::ipc::IpcResponse;
+
+    let wins = windows.borrow();
+    for win in wins.iter() {
+        let Some(view) = kova_view(win) else { continue };
+        if view.ipc_set_pane_unread(pane_id, unread) {
+            return IpcResponse::Ok { data: None };
         }
     }
 
