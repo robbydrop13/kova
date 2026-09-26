@@ -300,6 +300,25 @@ pub enum ListHit {
     Empty,
 }
 
+/// Whether a press on this target should be armed on mouse down.
+///
+/// `mouse_up` only activates what `mouse_down` armed, so a target missing
+/// here is dead on click while still hovering and hit-testing perfectly — the
+/// symptom is "nothing happens", with no error anywhere. Every new clickable
+/// row belongs in this list and in its test.
+fn arms_press(hit: ListHit) -> bool {
+    match hit {
+        ListHit::Chevron(_)
+        | ListHit::HeaderDot(_)
+        | ListHit::HeaderAdd(_)
+        | ListHit::TileButton(..)
+        | ListHit::Panel(_)
+        | ListHit::Routine(_) => true,
+        // Headers and tiles arm themselves: they may become a drag instead.
+        ListHit::Header(_) | ListHit::Tile(_) | ListHit::Empty => false,
+    }
+}
+
 impl ListHit {
     pub fn pane(self) -> Option<PaneId> {
         match self {
@@ -1661,9 +1680,6 @@ define_class!(
             self.ivars().mouse_down.set(true);
             let double = event.clickCount() == 2;
             match hit {
-                // A routine opens on mouse up, like every other row: nothing
-                // to arm here, and a double click is just two opens.
-                ListHit::Routine(_) => {}
                 ListHit::Header(g) => {
                     if double {
                         // Bind before calling out: the borrow must be gone.
@@ -1700,10 +1716,10 @@ define_class!(
                         }
                     }
                 }
-                ListHit::Chevron(_) | ListHit::HeaderDot(_) | ListHit::HeaderAdd(_) | ListHit::TileButton(..) | ListHit::Panel(_) => {
+                hit if arms_press(hit) => {
                     self.ivars().shared.borrow_mut().pressed = hit;
                 }
-                ListHit::Empty => {}
+                _ => {}
             }
             self.setNeedsDisplay(true);
         }
@@ -2363,6 +2379,27 @@ mod tests {
             summary: CollapsedSummary { awaiting: 0, working: 0, count: tiles.len() },
             tiles: if collapsed { Vec::new() } else { tiles },
         }
+    }
+
+    #[test]
+    fn every_clickable_target_is_armed_on_press_or_arms_itself() {
+        // A target that neither arms here nor starts a drag is dead on click
+        // while hovering perfectly — the bug this guards is silent.
+        for hit in [
+            ListHit::Chevron(0),
+            ListHit::HeaderDot(0),
+            ListHit::HeaderAdd(0),
+            ListHit::TileButton(1, TileButton::Open),
+            ListHit::Panel(0),
+            ListHit::Routine(0),
+        ] {
+            assert!(arms_press(hit), "{hit:?} would never reach activate()");
+        }
+        // These two arm themselves, because a press on them may turn into a
+        // drag; empty space arms nothing.
+        assert!(!arms_press(ListHit::Header(0)));
+        assert!(!arms_press(ListHit::Tile(1)));
+        assert!(!arms_press(ListHit::Empty));
     }
 
     #[test]
