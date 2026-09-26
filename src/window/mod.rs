@@ -24,7 +24,7 @@ use switcher::{PaneSwitcherState, SwitcherRow};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSObjectProtocol, NSString};
 use objc2_metal::MTLCreateSystemDefaultDevice;

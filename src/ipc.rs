@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, OnceLock};
 
 /// Maximum length of a single JSON line from a client (64 KB).
 const MAX_LINE_LEN: usize = 65536;
@@ -224,6 +224,26 @@ impl Drop for SocketCleanup {
     }
 }
 
+/// Wakes the main thread so a queued request is served on the next run-loop
+/// pass instead of waiting for the render timer. Installed by the app delegate
+/// once the main run loop exists; `None` until then, and in unit tests.
+static MAIN_WAKER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Register the main-thread wake-up. Called once, from the main thread.
+pub fn set_main_waker(waker: Box<dyn Fn() + Send + Sync>) {
+    if MAIN_WAKER.set(waker).is_err() {
+        log::warn!("IPC: main-thread waker was already installed");
+    }
+}
+
+/// Nudge the main thread. A no-op before the waker is installed: the render
+/// tick still drains the channel, so the request is served either way.
+fn wake_main() {
+    if let Some(wake) = MAIN_WAKER.get() {
+        wake();
+    }
+}
+
 /// Start the IPC server on a background thread.
 ///
 /// Returns the receiver end of the channel — the main thread polls this
@@ -387,6 +407,9 @@ fn dispatch(tx: &mpsc::Sender<IpcRequest>, cmd: IpcCommand) -> IpcResponse {
             message: "app shutting down".to_string(),
         };
     }
+    // Signal after the send, never before: the main thread must find the
+    // request already in the channel when it wakes.
+    wake_main();
     match resp_rx.recv_timeout(timeout) {
         Ok(r) => r,
         Err(_) => IpcResponse::Error {

@@ -37,6 +37,30 @@ pub struct AppDelegateIvars {
     /// methods rather than polled: the tick has no `MainThreadMarker` to ask
     /// `NSApplication` with, and an edge-driven flag is exact anyway.
     app_active: Cell<bool>,
+    /// True while the main thread is inside its own frame work. The IPC
+    /// run-loop source checks it and stands down rather than handling a command
+    /// re-entrantly, which would break the borrows the frame is holding.
+    main_busy: Cell<bool>,
+}
+
+/// Marks the main thread as busy with Kova's own work for as long as it lives,
+/// restoring whatever the previous state was on the way out.
+struct BusyGuard<'a> {
+    cell: &'a Cell<bool>,
+    prev: bool,
+}
+
+impl<'a> BusyGuard<'a> {
+    fn enter(cell: &'a Cell<bool>) -> Self {
+        let prev = cell.replace(true);
+        Self { cell, prev }
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.prev);
+    }
 }
 
 /// A `wait-for-completion` request the main thread is still polling.
@@ -111,6 +135,10 @@ define_class!(
             // Start IPC server (Unix socket for external process control)
             let ipc_rx = crate::ipc::start();
             *self.ivars().ipc_rx.borrow_mut() = Some(ipc_rx);
+
+            // Let a listener thread wake the main thread the moment it queues a
+            // request, instead of the request waiting for the next render frame.
+            install_ipc_wakeup();
 
             // Start global render timer — single timer for all windows
             self.start_global_timer(config.terminal.fps);
@@ -219,6 +247,7 @@ impl AppDelegate {
             pending_waits: RefCell::new(Vec::new()),
             events: RefCell::new(crate::events::EventState::new()),
             app_active: Cell::new(false),
+            main_busy: Cell::new(false),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -234,6 +263,12 @@ impl AppDelegate {
                 true,
                 &RcBlock::new(move |_timer: NonNull<NSTimer>| {
                     let ivars = &*ivars;
+
+                    // Hold the frame open for its whole duration: the IPC
+                    // run-loop source must not serve a command in the middle of
+                    // a render, nor while a nested run loop (a modal opened from
+                    // this tick) is spinning with borrows outstanding.
+                    let _busy = BusyGuard::enter(&ivars.main_busy);
 
                     // Drop windows pending close from the previous tick.
                     // Deferring by one tick lets AppKit finish run-loop work
@@ -268,51 +303,10 @@ impl AppDelegate {
                         }
                     }
 
-                    // Process IPC commands from external processes
-                    {
-                        let rx_borrow = ivars.ipc_rx.borrow();
-                        if let Some(ref rx) = *rx_borrow {
-                            while let Ok((cmd, responder)) = rx.try_recv() {
-                                // `subscribe` is the one command that needs the
-                                // event state, so it is served here rather than in
-                                // `handle_ipc_command`.
-                                if let crate::ipc::IpcCommand::Subscribe { topics } = cmd {
-                                    let app_active = ivars.app_active.get();
-                                    // Flush what is already pending first: the
-                                    // subscribers that were here before this one
-                                    // must not learn of a change *after* the new
-                                    // client has been handed it as settled state.
-                                    ivars.events.borrow_mut().poll(
-                                        &ivars.windows,
-                                        app_active,
-                                        fps,
-                                        true,
-                                    );
-                                    let data = crate::events::snapshot(
-                                        &ivars.windows,
-                                        app_active,
-                                        topics,
-                                    );
-                                    let _ = responder.send(crate::ipc::IpcResponse::Ok {
-                                        data: Some(data),
-                                    });
-                                    continue;
-                                }
-                                match handle_ipc_command(cmd, &ivars.windows, &ivars.config) {
-                                    Disposition::Reply(response) => {
-                                        let _ = responder.send(response);
-                                    }
-                                    Disposition::Pending(wait) => {
-                                        ivars.pending_waits.borrow_mut().push(PendingWait {
-                                            pane_id: wait.pane_id,
-                                            response_tx: responder,
-                                            deadline: wait.deadline,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Serve whatever the IPC listener threads have queued.
+                    // The run-loop source below normally gets there first; this
+                    // is the belt-and-braces path for a signal that was missed.
+                    drain_ipc(ivars, fps);
 
                     // Focus the panes whose notification was clicked. Done here
                     // rather than in the delegate callback because this is the
@@ -388,6 +382,134 @@ impl AppDelegate {
         let run_loop = NSRunLoop::currentRunLoop();
         unsafe { run_loop.addTimer_forMode(&timer, NSRunLoopCommonModes) };
     }
+}
+
+/// Serve every IPC request the listener threads have queued.
+///
+/// Reached from two places: the run-loop source signalled by the listener
+/// thread, which is the fast path and answers within the same run-loop pass,
+/// and the render tick, which is the fallback for a signal that never arrived.
+/// Both run on the main thread and neither can nest inside the other, so the
+/// handlers still see the single-threaded world they were written for.
+fn drain_ipc(ivars: &AppDelegateIvars, fps: u32) {
+    let rx_borrow = ivars.ipc_rx.borrow();
+    let Some(ref rx) = *rx_borrow else { return };
+    while let Ok((cmd, responder)) = rx.try_recv() {
+        // `subscribe` is the one command that needs the event state, so it is
+        // served here rather than in `handle_ipc_command`.
+        if let crate::ipc::IpcCommand::Subscribe { topics } = cmd {
+            let app_active = ivars.app_active.get();
+            // Flush what is already pending first: the subscribers that were
+            // here before this one must not learn of a change *after* the new
+            // client has been handed it as settled state.
+            ivars.events.borrow_mut().poll(&ivars.windows, app_active, fps, true);
+            let data = crate::events::snapshot(&ivars.windows, app_active, topics);
+            let _ = responder.send(crate::ipc::IpcResponse::Ok { data: Some(data) });
+            continue;
+        }
+        match handle_ipc_command(cmd, &ivars.windows, &ivars.config) {
+            Disposition::Reply(response) => {
+                let _ = responder.send(response);
+            }
+            Disposition::Pending(wait) => {
+                ivars.pending_waits.borrow_mut().push(PendingWait {
+                    pane_id: wait.pane_id,
+                    response_tx: responder,
+                    deadline: wait.deadline,
+                });
+            }
+        }
+    }
+}
+
+/// The run-loop source fired: a listener thread has queued an IPC request.
+///
+/// SAFETY / invariants: a source added to the main run loop only ever performs
+/// on the main thread, which is what makes `MainThreadMarker::new_unchecked`
+/// and the ivar access below sound.
+unsafe extern "C-unwind" fn ipc_source_perform(_info: *mut std::ffi::c_void) {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let ivars = app_delegate(mtm).ivars();
+    if ivars.main_busy.get() {
+        // A frame is in flight and holding borrows. Leave the request in the
+        // channel: that same frame drains it before it ends, so the wait is
+        // never longer than it used to be.
+        return;
+    }
+    let _busy = BusyGuard::enter(&ivars.main_busy);
+    let fps = ivars
+        .config
+        .get()
+        .map(|c| c.terminal.fps)
+        // The config is set before the delegate ever runs, so this is only a
+        // formality; 60 is what `TerminalConfig::default` uses.
+        .unwrap_or(60);
+    drain_ipc(ivars, fps);
+}
+
+/// The signalling half of the IPC wake-up, kept alive for the life of the
+/// process and called from the listener threads.
+struct IpcWaker {
+    source: objc2_core_foundation::CFRetained<objc2_core_foundation::CFRunLoopSource>,
+    run_loop: objc2_core_foundation::CFRetained<objc2_core_foundation::CFRunLoop>,
+}
+
+// SAFETY: `CFRunLoopSourceSignal` and `CFRunLoopWakeUp` are documented as safe
+// to call from any thread, and `wake` below is the only thing ever done with
+// these two objects once the source has been added to the run loop.
+unsafe impl Send for IpcWaker {}
+unsafe impl Sync for IpcWaker {}
+
+impl IpcWaker {
+    fn wake(&self) {
+        self.source.signal();
+        self.run_loop.wake_up();
+    }
+}
+
+/// Add the run-loop source that an IPC listener thread signals, and hand the
+/// signalling half to `crate::ipc`.
+///
+/// Without this, a request sits in the channel until the render timer next
+/// fires: one frame of latency on an idle app (16 ms at 60 fps), and the full
+/// length of any main-thread stall when the app is busy, which is what left a
+/// pasted prompt sitting unsent in a Claude Code composer.
+fn install_ipc_wakeup() {
+    use objc2_core_foundation::{
+        kCFRunLoopCommonModes, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext,
+    };
+
+    let mut context = CFRunLoopSourceContext {
+        version: 0,
+        info: std::ptr::null_mut(),
+        retain: None,
+        release: None,
+        copyDescription: None,
+        equal: None,
+        hash: None,
+        schedule: None,
+        cancel: None,
+        perform: Some(ipc_source_perform),
+    };
+    // SAFETY: the default allocator is accepted, and `context` is a valid
+    // pointer to a correctly versioned (0) source context for the call.
+    let Some(source) = (unsafe { CFRunLoopSource::new(None, 0, &mut context) }) else {
+        log::error!("IPC: could not create the run-loop source, falling back to the render tick");
+        return;
+    };
+    let Some(run_loop) = CFRunLoop::main() else {
+        log::error!("IPC: no main run loop, falling back to the render tick");
+        return;
+    };
+    // Common modes so the source is still served while a menu is tracking or a
+    // modal sheet is up, exactly like the render timer.
+    run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
+
+    let waker = IpcWaker { source, run_loop };
+    // `waker.wake()` rather than the two fields: a closure that touched the
+    // fields would capture them one by one and lose the `Send` impl above.
+    crate::ipc::set_main_waker(Box::new(move || waker.wake()));
+    log::debug!("IPC: run-loop source installed");
 }
 
 /// Collect session data from all live windows.

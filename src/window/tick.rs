@@ -59,6 +59,16 @@ fn boundary_flash_line(vp: &PaneViewport, is_right: bool) -> (f32, f32, f32, f32
     (edge_x, vp.y, vp.y + vp.height, 1.0, is_right)
 }
 
+/// Whether the window has just come back into view and owes the user a frame.
+///
+/// Frames are skipped while the window is not being composited, and a pane that
+/// changed in the meantime kept its dirty flag, so the reveal itself has to ask
+/// for one full frame: without it a window whose panes happen to be quiet would
+/// stay on whatever was last presented.
+fn owes_a_frame(was_occluded: bool, now_occluded: bool) -> bool {
+    was_occluded && !now_occluded
+}
+
 /// The loading bar's `(ready, total)`, or `None` once the restore is over.
 ///
 /// A tab still waiting its turn holds the bar up even when every pane already
@@ -470,6 +480,26 @@ impl KovaView {
                 }
             }
         }
+
+        // Skip the frame outright when the window is not on screen: another
+        // Space, behind a fullscreen app, miniaturized or fully covered. There
+        // is no drawable to be had, and asking for one blocks the main thread,
+        // which is the whole reason an IPC command could be left unanswered.
+        // No window at all (mid-teardown) counts as visible: that is the old
+        // behaviour, and `render_panes` handles it.
+        let occluded = self
+            .window()
+            .is_some_and(|w| !w.occlusionState().contains(NSWindowOcclusionState::Visible));
+        if occluded != r.window_occluded {
+            log::debug!(
+                "Render: window went {}",
+                if occluded { "off screen, frames skipped" } else { "on screen, one full frame forced" }
+            );
+        }
+        if owes_a_frame(r.window_occluded, occluded) {
+            r.force_redraw = true;
+        }
+        r.window_occluded = occluded;
 
         r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, show_tab_bar, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
@@ -1010,6 +1040,18 @@ impl KovaView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coming_back_into_view_asks_for_one_full_frame() {
+        // The reveal, and only the reveal.
+        assert!(owes_a_frame(true, false));
+        // Still hidden, still nothing to draw.
+        assert!(!owes_a_frame(true, true));
+        // Going away owes nothing.
+        assert!(!owes_a_frame(false, true));
+        // Visible all along: the dirty flags decide, as before.
+        assert!(!owes_a_frame(false, false));
+    }
 
     #[test]
     fn closing_background_tabs_preserves_the_selected_tab() {

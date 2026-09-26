@@ -509,6 +509,14 @@ pub struct Renderer {
     pub hovered_url_text: Option<String>,
     /// Resize mode feedback text, displayed on the left of the global status bar.
     pub resize_feedback_text: Option<String>,
+    /// Whether the window this renderer draws into is currently not being
+    /// composited: on another Space, behind a fullscreen app, miniaturized or
+    /// fully covered. Set by the tick, read at the top of `render_panes`.
+    pub window_occluded: bool,
+    /// Draw the next frame even if nothing is dirty. Set when the window comes
+    /// back into view, and when a drawable could not be obtained, so a frame is
+    /// never silently lost after the dirty flags have been consumed.
+    pub force_redraw: bool,
     /// Banner to paint across the focused pane's status bar (text, background):
     /// which attention tier the last Cmd+J landed in. `None` most of the time.
     pub pane_banner: Option<(String, [f32; 3])>,
@@ -642,6 +650,8 @@ impl Renderer {
             hovered_url: None,
             hovered_url_text: None,
             resize_feedback_text: None,
+            window_occluded: false,
+            force_redraw: false,
             pane_banner: None,
             boundary_flash: None,
             pane_flash: None,
@@ -813,6 +823,20 @@ impl Renderer {
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
+        // A window that is not being composited has no drawable to hand out:
+        // on another Space or behind a fullscreen app, `nextDrawable()` parks
+        // the main thread for up to a second and then returns nil anyway. That
+        // stall is what used to strand an IPC command mid-sequence, so the
+        // frame is dropped here instead, before anything is consumed.
+        //
+        // Nothing below runs: the panes keep their dirty flag, the blink and
+        // clock counters stay where they are, and the vertex cache is left
+        // alone. Coming back into view sets `force_redraw` (see the tick), so
+        // the first visible frame is rebuilt from the live terminal state.
+        if self.window_occluded {
+            return;
+        }
+
         // Reset blink on cursor movement of focused pane
         if let Some(focused_pane) = panes.iter().find(|p| p.is_focused) {
             let epoch = focused_pane.terminal.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
@@ -898,13 +922,21 @@ impl Renderer {
         let has_loading = self.loading_progress.is_some();
         let has_pane_flash = self.pane_flash.is_some();
         let has_status_text = self.resize_feedback_text.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading {
+        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading && !self.force_redraw {
             return;
         }
+        // Past the gate: this frame is being drawn, so the debt is settled.
+        self.force_redraw = false;
 
         let drawable = match layer.nextDrawable() {
             Some(d) => d,
-            None => return,
+            None => {
+                // The dirty flags were consumed above, so without asking for
+                // another frame this one would be lost and the panes would sit
+                // on stale content until something else dirtied them.
+                self.force_redraw = true;
+                return;
+            }
         };
 
         let drawable_size = layer.drawableSize();
