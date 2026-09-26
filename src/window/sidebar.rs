@@ -108,8 +108,9 @@ pub mod tokens {
 // ---------------------------------------------------------------
 
 /// Alpha of the tab colour at the top of a group's panel: the selected tab's
-/// strength, and the other tabs'.
-pub const WASH_SELECTED: f64 = 0.40;
+/// strength, the strength under the mouse, and the other tabs'.
+pub const WASH_SELECTED: f64 = 0.65;
+pub const WASH_HOVER: f64 = 0.40;
 pub const WASH_OTHER: f64 = 0.20;
 /// Alpha of the white the selected group's tiles are filled with.
 pub const SEL_TILE_ALPHA: f64 = 0.12;
@@ -125,10 +126,17 @@ pub fn wash_stops(strength: f64) -> [(f64, f64); 3] {
     [(strength, 0.0), (strength * 0.45, 0.42), (strength * 0.14, 1.0)]
 }
 
-/// The wash strength of a group: `WASH_SELECTED` on the active tab, and on
-/// the tab under the mouse (the whole panel reacts), `WASH_OTHER` otherwise.
+/// The wash strength of a group: `WASH_SELECTED` on the active tab, which
+/// stays clearly the brightest, `WASH_HOVER` on the tab under the mouse (the
+/// whole panel reacts), `WASH_OTHER` otherwise.
 pub fn wash_strength(selected: bool, hovered: bool) -> f64 {
-    if selected || hovered { WASH_SELECTED } else { WASH_OTHER }
+    if selected {
+        WASH_SELECTED
+    } else if hovered {
+        WASH_HOVER
+    } else {
+        WASH_OTHER
+    }
 }
 
 /// Fill alpha of a tile in the selected group.
@@ -929,12 +937,14 @@ mod tests {
     fn the_wash_fades_from_the_top_and_tiles_lift_under_focus_and_hover() {
         assert_eq!(wash_strength(true, false), WASH_SELECTED);
         assert_eq!(wash_strength(true, true), WASH_SELECTED);
-        assert_eq!(wash_strength(false, true), WASH_SELECTED);
+        assert_eq!(wash_strength(false, true), WASH_HOVER);
         assert_eq!(wash_strength(false, false), WASH_OTHER);
+        // The selected tab reads louder than a merely hovered one.
+        assert!(WASH_SELECTED > WASH_HOVER && WASH_HOVER > WASH_OTHER);
         let stops = wash_stops(wash_strength(true, false));
-        assert_eq!(stops[0], (0.40, 0.0));
-        assert!((stops[1].0 - 0.18).abs() < 1e-9 && stops[1].1 == 0.42);
-        assert!((stops[2].0 - 0.056).abs() < 1e-9 && stops[2].1 == 1.0);
+        assert_eq!(stops[0], (0.65, 0.0));
+        assert!((stops[1].0 - 0.2925).abs() < 1e-9 && stops[1].1 == 0.42);
+        assert!((stops[2].0 - 0.091).abs() < 1e-9 && stops[2].1 == 1.0);
         assert!(stops.windows(2).all(|w| w[0].0 > w[1].0 && w[0].1 < w[1].1));
         let other = wash_stops(wash_strength(false, false));
         assert_eq!(other[0], (0.20, 0.0));
