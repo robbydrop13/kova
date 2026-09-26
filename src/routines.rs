@@ -29,11 +29,12 @@ pub struct Routine {
     pub name: String,
     /// launchd's label, the handle `launchctl` takes.
     pub label: String,
-    /// When it runs, in words ("tous les jours 9h07").
+    /// When it runs, in words ("every day 09:07").
     pub schedule: String,
     /// True when launchd has it loaded. A plist alone never fires.
     pub loaded: bool,
-    /// True when `<name>.done` neutralises it.
+    /// True when `<name>.done` neutralises it, or when its plist is parked
+    /// as `.plist.disabled`: switched off on purpose, not broken.
     pub done: bool,
     /// True when the prompt file is missing: the run would fail at once.
     pub prompt_missing: bool,
@@ -43,12 +44,15 @@ pub struct Routine {
 
 impl Routine {
     /// What is wrong with this routine, if anything — the line the view shows
-    /// in place of the schedule.
+    /// in place of the schedule. A routine switched off on purpose has no
+    /// problem: `done` already says so, and its schedule stays readable.
     pub fn problem(&self) -> Option<&'static str> {
-        if self.prompt_missing {
-            Some("prompt manquant")
+        if self.done {
+            None
+        } else if self.prompt_missing {
+            Some("no prompt")
         } else if !self.loaded {
-            Some("pas chargée")
+            Some("not loaded")
         } else {
             None
         }
@@ -103,15 +107,20 @@ fn read_all() -> Vec<Routine> {
     let Ok(entries) = std::fs::read_dir(&agents) else { return out };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("plist") {
+        // A plist parked as `<label>.plist.disabled` is off on purpose. It
+        // still belongs on the list — a routine you switched off and forgot
+        // is exactly what this view is for — so read it and mark it.
+        let ext = path.extension().and_then(|e| e.to_str());
+        let disabled = ext == Some("disabled") && path.file_stem().is_some_and(|s| Path::new(s).extension().and_then(|e| e.to_str()) == Some("plist"));
+        if ext != Some("plist") && !disabled {
             continue;
         }
         let Some(json) = plist_json(&path) else { continue };
         let Some((label, name, schedule)) = parse_agent(&json) else { continue };
         let log = dir.join(format!("logs/{name}.log"));
         out.push(Routine {
-            loaded: loaded.iter().any(|l| l == &label),
-            done: dir.join(format!("{name}.done")).exists(),
+            loaded: !disabled && loaded.iter().any(|l| l == &label),
+            done: disabled || dir.join(format!("{name}.done")).exists(),
             prompt_missing: !dir.join(format!("prompts/{name}.md")).exists(),
             last_run: std::fs::read_to_string(&log).ok().as_deref().and_then(last_run),
             name,
@@ -165,27 +174,27 @@ fn parse_agent(v: &serde_json::Value) -> Option<(String, String, String)> {
 pub fn schedule_of(v: &serde_json::Value) -> String {
     if let Some(secs) = v.get("StartInterval").and_then(|s| s.as_i64()) {
         return if secs % 3600 == 0 {
-            format!("toutes les {} h", secs / 3600)
+            format!("every {} h", secs / 3600)
         } else {
-            format!("toutes les {} min", (secs / 60).max(1))
+            format!("every {} min", (secs / 60).max(1))
         };
     }
-    let Some(cal) = v.get("StartCalendarInterval") else { return "au chargement".into() };
+    let Some(cal) = v.get("StartCalendarInterval") else { return "at load".into() };
     let entries: Vec<&serde_json::Value> = match cal.as_array() {
         Some(a) => a.iter().collect(),
         None => vec![cal],
     };
     let parts: Vec<String> = entries.iter().map(|e| one_calendar(e)).collect();
     if parts.is_empty() {
-        return "au chargement".into();
+        return "at load".into();
     }
-    // Several times the same day: say the day once ("tous les jours 10h02 et
-    // 15h02"), not the whole phrase twice.
+    // Several times the same day: say the day once ("every day 10:02 and
+    // 15:02"), not the whole phrase twice.
     let day_of = |s: &String| s.rsplit_once(' ').map(|(d, _)| d.to_string()).unwrap_or_default();
     let first_day = day_of(&parts[0]);
     if parts.len() > 1 && parts.iter().all(|p| day_of(p) == first_day) {
         let times: Vec<&str> = parts.iter().map(|p| p.rsplit(' ').next().unwrap_or("")).collect();
-        return format!("{first_day} {}", times.join(" et "));
+        return format!("{first_day} {}", times.join(" and "));
     }
     parts.join(", ")
 }
@@ -195,23 +204,24 @@ fn one_calendar(e: &serde_json::Value) -> String {
     let (h, m) = (num("Hour").unwrap_or(0), num("Minute").unwrap_or(0));
     let mut when = String::new();
     if let Some(d) = num("Day") {
-        when.push_str(&format!("le {d} "));
+        when.push_str(&format!("{d} "));
         if let Some(mo) = num("Month") {
             const MONTHS: [&str; 12] =
-                ["janv.", "févr.", "mars", "avril", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
+                ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
             if let Some(name) = MONTHS.get((mo - 1).clamp(0, 11) as usize) {
                 when.push_str(name);
                 when.push(' ');
             }
         }
     } else if let Some(wd) = num("Weekday") {
-        const DAYS: [&str; 7] = ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"];
-        when.push_str(DAYS.get((wd % 7) as usize).copied().unwrap_or("chaque jour"));
+        const DAYS: [&str; 7] = ["Sundays", "Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays"];
+        when.push_str(DAYS.get((wd % 7) as usize).copied().unwrap_or("every day"));
         when.push(' ');
     } else {
-        when.push_str("tous les jours ");
+        when.push_str("every day ");
     }
-    format!("{when}{h}h{m:02}")
+    // 24-hour, zero-padded: the rows line up under each other.
+    format!("{when}{h:02}:{m:02}")
 }
 
 /// The end of the last run in a log: the runner writes
@@ -235,15 +245,15 @@ mod tests {
 
     #[test]
     fn a_bare_hour_and_minute_means_every_day() {
-        assert_eq!(schedule_of(&json!({"StartCalendarInterval": {"Hour": 9, "Minute": 7}})), "tous les jours 9h07");
+        assert_eq!(schedule_of(&json!({"StartCalendarInterval": {"Hour": 9, "Minute": 7}})), "every day 09:07");
     }
 
     #[test]
     fn a_weekday_and_a_date_name_themselves() {
-        assert_eq!(schedule_of(&json!({"StartCalendarInterval": {"Weekday": 1, "Hour": 8, "Minute": 3}})), "lundi 8h03");
+        assert_eq!(schedule_of(&json!({"StartCalendarInterval": {"Weekday": 1, "Hour": 8, "Minute": 3}})), "Mondays 08:03");
         assert_eq!(
             schedule_of(&json!({"StartCalendarInterval": {"Month": 10, "Day": 1, "Hour": 9, "Minute": 3}})),
-            "le 1 oct. 9h03"
+            "1 Oct 09:03"
         );
     }
 
@@ -253,7 +263,7 @@ mod tests {
             {"Hour": 10, "Minute": 2},
             {"Hour": 15, "Minute": 2},
         ]});
-        assert_eq!(schedule_of(&v), "tous les jours 10h02 et 15h02");
+        assert_eq!(schedule_of(&v), "every day 10:02 and 15:02");
     }
 
     #[test]
@@ -262,13 +272,13 @@ mod tests {
             {"Weekday": 1, "Hour": 8, "Minute": 3},
             {"Weekday": 5, "Hour": 17, "Minute": 3},
         ]});
-        assert_eq!(schedule_of(&v), "lundi 8h03, vendredi 17h03");
+        assert_eq!(schedule_of(&v), "Mondays 08:03, Fridays 17:03");
     }
 
     #[test]
     fn an_interval_is_read_in_hours_when_it_divides() {
-        assert_eq!(schedule_of(&json!({"StartInterval": 7200})), "toutes les 2 h");
-        assert_eq!(schedule_of(&json!({"StartInterval": 900})), "toutes les 15 min");
+        assert_eq!(schedule_of(&json!({"StartInterval": 7200})), "every 2 h");
+        assert_eq!(schedule_of(&json!({"StartInterval": 900})), "every 15 min");
     }
 
     #[test]
@@ -281,7 +291,7 @@ mod tests {
         let parsed = parse_agent(&ours).expect("a routine");
         assert_eq!(parsed.0, "com.robin.routine.tri-inbox");
         assert_eq!(parsed.1, "tri-inbox");
-        assert_eq!(parsed.2, "tous les jours 10h02");
+        assert_eq!(parsed.2, "every day 10:02");
 
         // Somebody else's launch agent is not a routine.
         let other = json!({"Label": "com.apple.thing", "ProgramArguments": ["/usr/bin/true"]});
@@ -304,8 +314,12 @@ mod tests {
         let mut r = Routine { loaded: true, ..Default::default() };
         assert_eq!(r.problem(), None);
         r.loaded = false;
-        assert_eq!(r.problem(), Some("pas chargée"));
+        assert_eq!(r.problem(), Some("not loaded"));
         r.prompt_missing = true;
-        assert_eq!(r.problem(), Some("prompt manquant"));
+        assert_eq!(r.problem(), Some("no prompt"));
+        // Switched off on purpose is not a fault to report: `done` says it,
+        // and the row keeps showing when it would have run.
+        r.done = true;
+        assert_eq!(r.problem(), None);
     }
 }

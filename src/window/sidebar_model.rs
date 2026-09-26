@@ -395,13 +395,13 @@ mod tests {
     fn a_routine_shows_its_schedule_until_something_stops_it_from_running() {
         let ok = crate::routines::Routine {
             name: "tri-inbox".into(),
-            schedule: "tous les jours 10h02".into(),
+            schedule: "every day 10:02".into(),
             loaded: true,
             last_run: Some(("2026-09-26 10:04:34".into(), 0)),
             ..Default::default()
         };
         let vm = RoutineVm::of(&ok);
-        assert_eq!(vm.detail, "tous les jours 10h02");
+        assert_eq!(vm.detail, "every day 10:02");
         assert!(!vm.broken);
         assert_eq!(vm.last_run, "2026-09-26 10:04:34");
         assert_eq!(vm.failed, None);
@@ -409,7 +409,7 @@ mod tests {
         // A plist launchd never loaded: the schedule is a lie, say so instead.
         let never = crate::routines::Routine { loaded: false, ..ok.clone() };
         let vm = RoutineVm::of(&never);
-        assert_eq!(vm.detail, "pas chargée");
+        assert_eq!(vm.detail, "not loaded");
         assert!(vm.broken);
 
         // A non-zero exit is worth surfacing next to the date.

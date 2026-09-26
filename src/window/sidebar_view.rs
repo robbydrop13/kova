@@ -996,7 +996,7 @@ fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, alpha: f64) {
     y += 17.0;
 
     let (detail_fg, detail) = if r.done {
-        (tokens::TEXT_TERTIARY, format!("{} · neutralisée", r.detail))
+        (tokens::TEXT_TERTIARY, format!("{} \u{b7} disabled", r.detail))
     } else if r.broken {
         (tokens::ERROR, r.detail.clone())
     } else {
@@ -1006,8 +1006,8 @@ fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, alpha: f64) {
     y += 16.0;
 
     let (last_fg, last) = match (r.failed, r.last_run.is_empty()) {
-        (_, true) => (tokens::TEXT_TERTIARY, "jamais exécutée".to_string()),
-        (Some(code), false) => (tokens::ERROR, format!("{} · code {code}", r.last_run)),
+        (_, true) => (tokens::TEXT_TERTIARY, "never run".to_string()),
+        (Some(code), false) => (tokens::ERROR, format!("{} \u{b7} exit {code}", r.last_run)),
         (None, false) => (tokens::TEXT_TERTIARY, r.last_run.clone()),
     };
     draw_text(sh, &last, &Rect::new(x, y, w, 15.0), Style::Detail, last_fg, alpha, Align::Left, false);
@@ -1940,8 +1940,8 @@ impl SidebarListView {
             // The Routines view borrows the hint's slot for its empty line:
             // "no routines" is the only thing it ever has to say there.
             let hint = match sh.model.view {
-                SidebarList::Routines if !sh.model.routines_loaded => "lecture des routines…",
-                SidebarList::Routines => "aucune routine planifiée",
+                SidebarList::Routines if !sh.model.routines_loaded => "reading routines\u{2026}",
+                SidebarList::Routines => "no routines scheduled",
                 SidebarList::Panes => "\u{2318}T new tab \u{b7} \u{2318}D split",
             };
             draw_text(&sh, hint, &r, Style::Hint, tokens::TEXT_TERTIARY, 1.0, Align::Center, false);

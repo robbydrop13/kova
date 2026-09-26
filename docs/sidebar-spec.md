@@ -289,14 +289,15 @@ routine, 58 pt, 6 pt apart, on the tile ground at radius 10:
 | Line | Content | Colour |
 |---|---|---|
 | Title | the routine's name | primary |
-| Detail | the schedule in words, or what stops it firing (`pas chargée`, `prompt manquant`) | secondary, `error` when it is a problem |
-| Last run | `2026-09-26 10:04:34`, plus `· code N` when it failed | tertiary, `error` on a failure |
+| Detail | the schedule in words (`every day 10:02 and 15:02`), or what stops it firing (`not loaded`, `no prompt`) | secondary, `error` when it is a problem |
+| Last run | `2026-09-26 10:04:34`, plus `· exit N` when it failed, `never run` when it has not | tertiary, `error` on a failure |
 
-A routine neutralised by its `.done` marker keeps its row at alpha 0.55
-with `· neutralisée` after the schedule: switched off is not the same as
-gone, and that is the state easiest to forget. An empty list borrows the
-hint slot: `lecture des routines…` until the first background read lands,
-`aucune routine planifiée` after it. The rows come from
+A routine switched off — its `.done` marker, or a plist parked as
+`.plist.disabled` — keeps its row at alpha 0.55 with `· disabled` after the
+schedule, and reports no problem: off on purpose is not broken, and a
+routine switched off and forgotten is exactly what this view is for. An
+empty list borrows the hint slot: `reading routines…` until the first
+background read lands, `no routines scheduled` after it. The rows come from
 `routines::snapshot`, which serves a cache and refreshes on a thread at
 most every 30 s, and only while this view is up — the panes list never
 shells out to `launchctl`.
