@@ -40,6 +40,15 @@ pub struct Routine {
     pub prompt_missing: bool,
     /// The last run: the time it ended and its exit code, from the log.
     pub last_run: Option<(String, i32)>,
+    /// Where it runs — which decides, for a Claude routine, whose accounts it
+    /// speaks with. The plist's 4th argument.
+    pub workdir: String,
+    /// The prompt it is handed, verbatim.
+    pub prompt: String,
+    /// Extra MCP tools granted to it, one per line of `prompts/<name>.tools`.
+    pub tools: Vec<String>,
+    /// Extra writable directories, from `prompts/<name>.dirs`.
+    pub dirs: Vec<String>,
 }
 
 impl Routine {
@@ -118,11 +127,22 @@ fn read_all() -> Vec<Routine> {
         let Some(json) = plist_json(&path) else { continue };
         let Some((label, name, schedule)) = parse_agent(&json) else { continue };
         let log = dir.join(format!("logs/{name}.log"));
+        let prompt_path = dir.join(format!("prompts/{name}.md"));
         out.push(Routine {
             loaded: !disabled && loaded.iter().any(|l| l == &label),
             done: disabled || dir.join(format!("{name}.done")).exists(),
-            prompt_missing: !dir.join(format!("prompts/{name}.md")).exists(),
+            prompt_missing: !prompt_path.exists(),
             last_run: std::fs::read_to_string(&log).ok().as_deref().and_then(last_run),
+            prompt: std::fs::read_to_string(&prompt_path).unwrap_or_default(),
+            tools: lines_of(&dir.join(format!("prompts/{name}.tools"))),
+            dirs: lines_of(&dir.join(format!("prompts/{name}.dirs"))),
+            workdir: json
+                .get("ProgramArguments")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.get(3))
+                .and_then(|w| w.as_str())
+                .unwrap_or_default()
+                .to_string(),
             name,
             label,
             schedule,
@@ -130,6 +150,18 @@ fn read_all() -> Vec<Routine> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// The meaningful lines of a sidecar file: the runner skips blanks and `#`
+/// comments, so the view must not show what the run will ignore.
+fn lines_of(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
 }
 
 /// `launchctl list`, reduced to the labels it knows.
@@ -296,6 +328,18 @@ mod tests {
         // Somebody else's launch agent is not a routine.
         let other = json!({"Label": "com.apple.thing", "ProgramArguments": ["/usr/bin/true"]});
         assert!(parse_agent(&other).is_none());
+    }
+
+    #[test]
+    fn a_sidecar_file_yields_only_the_lines_the_runner_would_use() {
+        let dir = std::env::temp_dir().join(format!("kova-routines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.tools");
+        std::fs::write(&f, "# les outils\nmcp__gmail__search\n\n  mcp__drive__read  \n#mcp__off\n").unwrap();
+        assert_eq!(lines_of(&f), vec!["mcp__gmail__search", "mcp__drive__read"]);
+        // A routine with no sidecar simply has none.
+        assert!(lines_of(&dir.join("absent.tools")).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

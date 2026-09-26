@@ -41,12 +41,26 @@ pub struct RoutineVm {
     pub last_run: String,
     /// The last run failed: its exit code.
     pub failed: Option<i32>,
+    /// Clicked open: the row also shows where it runs, the extra tools and
+    /// directories it is granted, and the prompt it is handed.
+    pub expanded: bool,
+    pub workdir: String,
+    pub tools: Vec<String>,
+    pub dirs: Vec<String>,
+    pub prompt: String,
 }
 
 impl RoutineVm {
-    pub fn of(r: &crate::routines::Routine) -> Self {
+    pub fn of(r: &crate::routines::Routine, expanded: bool) -> Self {
         let problem = r.problem();
         RoutineVm {
+            expanded,
+            // The body is only read when it is open, so an unexpanded list
+            // stays as cheap to compare as it was.
+            workdir: if expanded { r.workdir.clone() } else { String::new() },
+            tools: if expanded { r.tools.clone() } else { Vec::new() },
+            dirs: if expanded { r.dirs.clone() } else { Vec::new() },
+            prompt: if expanded { r.prompt.clone() } else { String::new() },
             name: r.name.clone(),
             detail: problem.map(String::from).unwrap_or_else(|| r.schedule.clone()),
             broken: problem.is_some(),
@@ -400,7 +414,7 @@ mod tests {
             last_run: Some(("2026-09-26 10:04:34".into(), 0)),
             ..Default::default()
         };
-        let vm = RoutineVm::of(&ok);
+        let vm = RoutineVm::of(&ok, false);
         assert_eq!(vm.detail, "every day 10:02");
         assert!(!vm.broken);
         assert_eq!(vm.last_run, "2026-09-26 10:04:34");
@@ -408,13 +422,27 @@ mod tests {
 
         // A plist launchd never loaded: the schedule is a lie, say so instead.
         let never = crate::routines::Routine { loaded: false, ..ok.clone() };
-        let vm = RoutineVm::of(&never);
+        let vm = RoutineVm::of(&never, false);
         assert_eq!(vm.detail, "not loaded");
         assert!(vm.broken);
 
         // A non-zero exit is worth surfacing next to the date.
-        let failed = crate::routines::Routine { last_run: Some(("2026-09-26 10:05:12".into(), 2)), ..ok };
-        assert_eq!(RoutineVm::of(&failed).failed, Some(2));
+        let failed = crate::routines::Routine { last_run: Some(("2026-09-26 10:05:12".into(), 2)), ..ok.clone() };
+        assert_eq!(RoutineVm::of(&failed, false).failed, Some(2));
+
+        // Closed, the body is not even carried: the model stays small and
+        // cheap to compare on every tick.
+        let fat = crate::routines::Routine {
+            prompt: "a long prompt".into(),
+            tools: vec!["mcp__gmail__search".into()],
+            workdir: "/Users/x/Perso".into(),
+            ..ok.clone()
+        };
+        assert_eq!(RoutineVm::of(&fat, false).prompt, "");
+        assert!(RoutineVm::of(&fat, false).tools.is_empty());
+        let open = RoutineVm::of(&fat, true);
+        assert_eq!(open.prompt, "a long prompt");
+        assert_eq!(open.workdir, "/Users/x/Perso");
     }
 
     #[test]

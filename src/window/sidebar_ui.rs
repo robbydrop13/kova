@@ -117,6 +117,9 @@ pub(super) struct SidebarState {
     pub(super) sort: SidebarSort,
     /// Which list the switcher left of the Next pill has selected.
     pub(super) list: SidebarList,
+    /// The routine clicked open, by name. One at a time: the body is long,
+    /// and two open at once turns the list into a wall of prompt.
+    open_routine: Option<String>,
     /// (active tab, focused pane) the list last scrolled to show, so a focus
     /// change reveals its row exactly once and a manual scroll then sticks.
     last_reveal: Option<(usize, PaneId)>,
@@ -131,6 +134,7 @@ impl SidebarState {
         SidebarState {
             sort: SidebarSort::Kova,
             list: SidebarList::default(),
+            open_routine: None,
             last_reveal: None,
             menu_pane: 0,
             menu_tab: 0,
@@ -241,7 +245,9 @@ impl KovaView {
         // tick: an open Panes view never shells out to launchctl.
         let routines = match list {
             SidebarList::Routines => {
-                crate::routines::snapshot().map(|rs| rs.iter().map(RoutineVm::of).collect())
+                let open = self.ivars().sidebar.borrow().open_routine.clone();
+                crate::routines::snapshot()
+                    .map(|rs| rs.iter().map(|r| RoutineVm::of(r, open.as_deref() == Some(&r.name))).collect())
             }
             SidebarList::Panes => None,
         };
@@ -373,6 +379,15 @@ impl KovaView {
     /// like a segmented control.
     pub(super) fn sidebar_show_list(&self, list: SidebarList) {
         self.ivars().sidebar.borrow_mut().list = list;
+    }
+
+    /// Click a routine: open it, or close it when it is the open one.
+    pub(super) fn sidebar_toggle_routine(&self, name: &str) {
+        let mut st = self.ivars().sidebar.borrow_mut();
+        st.open_routine = match st.open_routine.as_deref() {
+            Some(open) if open == name => None,
+            _ => Some(name.to_string()),
+        };
     }
 
     /// The Next pill: `Nothing to read` is not a button, only a pill with a

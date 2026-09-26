@@ -92,6 +92,28 @@ const TILE_PAD_V: f64 = 8.0;
 /// them, on the same rounded ground as a pane tile.
 const ROUTINE_H: f64 = 58.0;
 const ROUTINE_GAP: f64 = 6.0;
+/// The open row's body: a `where` line, one line per tool and per extra
+/// directory, and the prompt. The prompt is capped because a row taller than
+/// the screen is a scroll trap, not a reading pane — the file is on disk for
+/// the rest.
+const PROMPT_MAX_LINES: usize = 40;
+const ROUTINE_SECTION_GAP: f64 = 8.0;
+const ROUTINE_LINE_H: f64 = 15.0;
+
+/// The height the body of an open routine needs, `prompt_lines` already
+/// measured. Shared by the layout and the draw so they cannot disagree.
+fn body_height(r: &RoutineVm, prompt_lines: usize) -> f64 {
+    let mut h = ROUTINE_SECTION_GAP + ROUTINE_LINE_H; // the `where` line
+    for list in [&r.tools, &r.dirs] {
+        if !list.is_empty() {
+            h += ROUTINE_SECTION_GAP + ROUTINE_LINE_H * (1.0 + list.len() as f64);
+        }
+    }
+    if prompt_lines > 0 {
+        h += ROUTINE_SECTION_GAP + ROUTINE_LINE_H + prompt_lines as f64 * ROUTINE_LINE_H;
+    }
+    h + TILE_PAD_H
+}
 
 const TILE_PAD_H: f64 = 10.0;
 const TILE_RADIUS: f64 = 10.0;
@@ -273,6 +295,8 @@ pub enum ListHit {
     /// The rest of a group's panel (its padding, the gaps, the empty
     /// bottom): select the tab.
     Panel(usize),
+    /// A routine row: open it, or close it when it is already open.
+    Routine(usize),
     Empty,
 }
 
@@ -316,18 +340,25 @@ impl ListLayout {
         if model.view == SidebarList::Routines {
             // A flat list: no groups, no drag, no tint bars. The empty case
             // draws its own line, so an empty list still has room for it.
-            for i in 0..model.routines.len() {
+            for (i, r) in model.routines.iter().enumerate() {
                 if i > 0 {
                     y += ROUTINE_GAP;
                 }
+                // Closed rows are three lines; the open one carries its body
+                // under them, and `question_lines` counts the prompt's wrap
+                // so the draw and the layout agree on the height.
+                let text_w = (content_w - 2.0 * TILE_PAD_H).max(40.0);
+                let prompt_lines =
+                    if r.expanded && !r.prompt.is_empty() { m.lines(&r.prompt, Style::Detail, text_w, PROMPT_MAX_LINES).max(1) } else { 0 };
+                let h = ROUTINE_H + if r.expanded { body_height(r, prompt_lines) } else { 0.0 };
                 rows.push(Row {
                     kind: RowKind::Routine { index: i },
-                    frame: Rect::new(content_x, y, content_w, ROUTINE_H),
+                    frame: Rect::new(content_x, y, content_w, h),
                     glyphs: Vec::new(),
                     actions: Vec::new(),
-                    question_lines: 0,
+                    question_lines: prompt_lines,
                 });
-                y += ROUTINE_H;
+                y += h;
             }
             let hint_y = model.routines.is_empty().then(|| {
                 let hy = y;
@@ -397,8 +428,9 @@ impl ListLayout {
                 continue;
             }
             return match row.kind {
-                // Read-only: nothing to click on a routine.
-                RowKind::Routine { .. } => ListHit::Empty,
+                // The only thing a routine row does: open its body. It never
+                // runs or stops anything — launchctl stays that door.
+                RowKind::Routine { index } => ListHit::Routine(index),
                 RowKind::Header { group } => {
                     if x < row.frame.x + CHEVRON_ZONE_W {
                         ListHit::Chevron(group)
@@ -983,11 +1015,18 @@ fn draw_chip(sh: &Shared, text: &str, right: f64, cy: f64, style: ChipStyle, dot
 /// One routine: its name, then the schedule (or what keeps it from running),
 /// then the last run. Read-only, so no hover ground and no buttons — the row
 /// says what is true, `launchctl` is still where it changes.
-fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, alpha: f64) {
+fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, prompt_lines: usize, hovered: bool, alpha: f64) {
     // A neutralised routine still belongs on the list, faded: it is not gone,
     // it is switched off, and that is exactly what is easy to forget.
     let alpha = if r.done { alpha * 0.55 } else { alpha };
-    fill_round(frame, 10.0, tokens::TILE, alpha);
+    let ground = if r.expanded {
+        tokens::TILE_PRESSED
+    } else if hovered {
+        tokens::TILE_HOVER
+    } else {
+        tokens::TILE
+    };
+    fill_round(frame, 10.0, ground, alpha);
     let x = frame.x + TILE_PAD_H;
     let w = (frame.w - 2.0 * TILE_PAD_H).max(0.0);
     let mut y = frame.y + 8.0;
@@ -1011,6 +1050,37 @@ fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, alpha: f64) {
         (None, false) => (tokens::TEXT_TERTIARY, r.last_run.clone()),
     };
     draw_text(sh, &last, &Rect::new(x, y, w, 15.0), Style::Detail, last_fg, alpha, Align::Left, false);
+    if !r.expanded {
+        return;
+    }
+    y += 15.0;
+
+    // The body, in the order that answers "what will this thing actually do":
+    // where it runs (which accounts it speaks with), what it is allowed to
+    // reach beyond the defaults, then the prompt itself.
+    let mut section = |sh: &Shared, y: &mut f64, heading: &str, body: &[String], fg: [f32; 3]| {
+        if body.is_empty() {
+            return;
+        }
+        *y += ROUTINE_SECTION_GAP;
+        draw_text(sh, heading, &Rect::new(x, *y, w, ROUTINE_LINE_H), Style::Chip, tokens::TEXT_TERTIARY, alpha, Align::Left, false);
+        *y += ROUTINE_LINE_H;
+        for line in body {
+            draw_text(sh, line, &Rect::new(x, *y, w, ROUTINE_LINE_H), Style::Detail, fg, alpha, Align::Left, true);
+            *y += ROUTINE_LINE_H;
+        }
+    };
+    section(sh, &mut y, "WHERE", std::slice::from_ref(&r.workdir), tokens::TEXT_SECONDARY);
+    section(sh, &mut y, "TOOLS", &r.tools, tokens::TEXT_SECONDARY);
+    section(sh, &mut y, "WRITES TO", &r.dirs, tokens::TEXT_SECONDARY);
+
+    if prompt_lines > 0 {
+        y += ROUTINE_SECTION_GAP;
+        draw_text(sh, "PROMPT", &Rect::new(x, y, w, ROUTINE_LINE_H), Style::Chip, tokens::TEXT_TERTIARY, alpha, Align::Left, false);
+        y += ROUTINE_LINE_H;
+        let h = prompt_lines as f64 * ROUTINE_LINE_H;
+        draw_wrapped(sh, &r.prompt, &Rect::new(x, y, w, h), Style::Detail, tokens::TEXT_SECONDARY, alpha);
+    }
 }
 
 fn draw_link(sh: &Shared, icon: Icon, label: &str, r: &Rect, c: [f32; 3], alpha: f64) {
@@ -1119,7 +1189,7 @@ define_class!(
             let (x, y) = local_point(self, event);
             let hit = self.ivars().shared.borrow().chrome.hit(x, y);
             let hovered = match hit {
-                ChromeHit::SortToggle | ChromeHit::NextPill => hit,
+                ChromeHit::SortToggle | ChromeHit::NextPill | ChromeHit::ViewSwitch(_) => hit,
                 _ => ChromeHit::Empty,
             };
             let mut sh = self.ivars().shared.borrow_mut();
@@ -1535,11 +1605,19 @@ define_class!(
             install_tracking_area(self);
         }
 
-        /// The hand over every panel: the whole tab is a click target.
+        /// The hand over every panel: the whole tab is a click target. In the
+        /// routines view there are no panels, and each row is the target.
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
             // Bind the rects first: adding a cursor rect is an AppKit call.
-            let panels: Vec<CGRect> = self.ivars().shared.borrow().layout.groups.iter().map(|r| r.cg()).collect();
+            let panels: Vec<CGRect> = {
+                let sh = self.ivars().shared.borrow();
+                if sh.model.view == SidebarList::Routines {
+                    sh.layout.rows.iter().map(|r| r.frame.cg()).collect()
+                } else {
+                    sh.layout.groups.iter().map(|r| r.cg()).collect()
+                }
+            };
             for r in panels {
                 #[allow(deprecated)]
                 self.addCursorRect_cursor(r, &NSCursor::pointingHandCursor());
@@ -1583,6 +1661,9 @@ define_class!(
             self.ivars().mouse_down.set(true);
             let double = event.clickCount() == 2;
             match hit {
+                // A routine opens on mouse up, like every other row: nothing
+                // to arm here, and a double click is just two opens.
+                ListHit::Routine(_) => {}
                 ListHit::Header(g) => {
                     if double {
                         // Bind before calling out: the borrow must be gone.
@@ -1764,6 +1845,14 @@ impl SidebarListView {
         let Some(kova) = kova_of(self) else { return };
         let tab_of = |g: usize| self.ivars().shared.borrow().model.groups.get(g).map(|g| g.tab_idx);
         match hit {
+            ListHit::Routine(index) => {
+                // Bind the name before calling out: the borrow must be gone,
+                // and the tick may re-lay the list out meanwhile.
+                let name = self.ivars().shared.borrow().model.routines.get(index).map(|r| r.name.clone());
+                if let Some(name) = name {
+                    kova.sidebar_toggle_routine(&name);
+                }
+            }
             ListHit::Chevron(g) => {
                 if let Some(t) = tab_of(g) {
                     kova.sidebar_toggle_collapsed(t);
@@ -1991,7 +2080,7 @@ impl SidebarListView {
         match row.kind {
             RowKind::Routine { index } => {
                 if let Some(r) = sh.model.routines.get(index) {
-                    draw_routine(sh, r, &frame, alpha);
+                    draw_routine(sh, r, &frame, row.question_lines, sh.hovered == ListHit::Routine(index), alpha);
                 }
             }
             RowKind::Header { group } => {
@@ -2293,9 +2382,27 @@ mod tests {
         assert_eq!(l.rows[1].frame.y, l.rows[0].frame.bottom() + ROUTINE_GAP);
         assert!(l.groups.is_empty());
         assert_eq!(l.hint_y, None);
-        // Nothing on a routine row is clickable.
+        // A click opens the row, and that is all it does.
         let r = &l.rows[0].frame;
-        assert_eq!(l.hit(r.x + 5.0, r.y + 5.0), ListHit::Empty);
+        assert_eq!(l.hit(r.x + 5.0, r.y + 5.0), ListHit::Routine(0));
+        assert_eq!(l.rows[0].frame.h, ROUTINE_H);
+
+        // The open row grows by its body and pushes the next one down; the
+        // others keep their closed height.
+        m.routines[0].expanded = true;
+        m.routines[0].workdir = "/Users/me/Perso".into();
+        m.routines[0].tools = vec!["mcp__gmail__search".into(), "mcp__drive__read".into()];
+        m.routines[0].prompt = "a prompt of some length".into();
+        let open = ListLayout::new(&m, 260.0, &FakeMetrics);
+        assert!(open.rows[0].frame.h > ROUTINE_H);
+        assert!(open.rows[0].question_lines >= 1);
+        assert_eq!(open.rows[1].frame.h, ROUTINE_H);
+        assert_eq!(open.rows[1].frame.y, open.rows[0].frame.bottom() + ROUTINE_GAP);
+        assert!(open.content_h > l.content_h);
+        // Its whole height is the hit region, body included.
+        let br = &open.rows[0].frame;
+        assert_eq!(open.hit(br.x + 5.0, br.bottom() - 2.0), ListHit::Routine(0));
+        m.routines[0] = RoutineVm { name: "tri-inbox".into(), ..RoutineVm::default() };
 
         // With no routines at all, the empty line takes the hint's slot.
         m.routines.clear();

@@ -292,6 +292,23 @@ routine, 58 pt, 6 pt apart, on the tile ground at radius 10:
 | Detail | the schedule in words (`every day 10:02 and 15:02`), or what stops it firing (`not loaded`, `no prompt`) | secondary, `error` when it is a problem |
 | Last run | `2026-09-26 10:04:34`, plus `· exit N` when it failed, `never run` when it has not | tertiary, `error` on a failure |
 
+Clicking a row opens it, and clicking it again closes it; one at a time,
+since the body is long. The open row keeps a `bg.pressed` ground and grows
+to carry, in the order that answers "what will this actually do":
+
+| Section | Content |
+|---|---|
+| `WHERE` | the working directory, the plist's 4th argument — which decides whose accounts a Claude routine speaks with |
+| `TOOLS` | `prompts/<name>.tools`, the extra MCP tools it is granted, blanks and `#` comments dropped as the runner drops them |
+| `WRITES TO` | `prompts/<name>.dirs`, the extra `--add-dir` directories |
+| `PROMPT` | `prompts/<name>.md` verbatim, wrapped, capped at `PROMPT_MAX_LINES` (40) — a row taller than the screen is a scroll trap, and the file is on disk for the rest |
+
+`TOOLS` and `WRITES TO` are skipped when the routine has no such file. The
+body is carried in the model only while the row is open, so a closed list
+stays as cheap to compare on the tick as it was. Rows take the hand cursor
+and lift to `bg.hover` under the mouse; `body_height` is shared by the
+layout and the draw so the two cannot disagree on the height.
+
 A routine switched off — its `.done` marker, or a plist parked as
 `.plist.disabled` — keeps its row at alpha 0.55 with `· disabled` after the
 schedule, and reports no problem: off on purpose is not broken, and a
@@ -332,7 +349,7 @@ shells out to `launchctl`.
 | Next pill                  | `do_focus_next_attention()` (not when `nothing`)       |                    |              |
 | Sort toggle                | kova <-> activity                                      |                    |              |
 | View switcher              | show that list (`sidebar_show_list`)                   |                    |              |
-| Routine row                | nothing: the list is read-only                         |                    |              |
+| Routine row                | open it, or close it when it is open (`sidebar_toggle_routine`) |            |              |
 | Top area                   | window drag                                            | zoom               |              |
 | Separator +-4 pt           | drag resizes the sidebar                               |                    |              |
 
