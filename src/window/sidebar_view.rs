@@ -32,7 +32,7 @@ use super::sidebar::{
     wash_strength, ChipStyle, NextPill, SidebarSort, Slot, SummaryRun, TileButton, TileState, OPEN_LABEL,
     RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
 };
-use super::sidebar_model::{GroupVm, SidebarModel, TileVm};
+use super::sidebar_model::{GroupVm, RoutineVm, SidebarList, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
 use super::KovaView;
 use crate::pane::{PaneId, TabId};
@@ -82,7 +82,17 @@ const ICON_D: f64 = 16.0;
 const LINK_ICON_D: f64 = 11.0;
 const LINK_ICON_GAP: f64 = 4.0;
 const PILL_ICON_D: f64 = 12.0;
+/// The view switcher, left of the Next pill: two icon buttons sharing a row
+/// with it, the selected one on a rounded ground (Notion's segmented look).
+const SWITCH_BTN: f64 = 26.0;
+const SWITCH_ICON_D: f64 = 15.0;
+const SWITCH_GAP: f64 = 2.0;
 const TILE_PAD_V: f64 = 8.0;
+/// A routine row: two lines (name over schedule) and the last run under
+/// them, on the same rounded ground as a pane tile.
+const ROUTINE_H: f64 = 58.0;
+const ROUTINE_GAP: f64 = 6.0;
+
 const TILE_PAD_H: f64 = 10.0;
 const TILE_RADIUS: f64 = 10.0;
 const CARD_PAD_V: f64 = 10.0;
@@ -230,6 +240,8 @@ impl Rect {
 pub enum RowKind {
     Header { group: usize },
     Tile { group: usize, index: usize, pane_id: PaneId, column: usize },
+    /// One routine of the Routines view.
+    Routine { index: usize },
 }
 
 /// One laid-out row, in list (document) coordinates.
@@ -301,6 +313,30 @@ impl ListLayout {
         let mut rows = Vec::new();
         let mut groups = Vec::with_capacity(model.groups.len());
         let mut y = LIST_TOP;
+        if model.view == SidebarList::Routines {
+            // A flat list: no groups, no drag, no tint bars. The empty case
+            // draws its own line, so an empty list still has room for it.
+            for i in 0..model.routines.len() {
+                if i > 0 {
+                    y += ROUTINE_GAP;
+                }
+                rows.push(Row {
+                    kind: RowKind::Routine { index: i },
+                    frame: Rect::new(content_x, y, content_w, ROUTINE_H),
+                    glyphs: Vec::new(),
+                    actions: Vec::new(),
+                    question_lines: 0,
+                });
+                y += ROUTINE_H;
+            }
+            let hint_y = model.routines.is_empty().then(|| {
+                let hy = y;
+                y += HINT_H;
+                hy
+            });
+            y += LIST_BOTTOM;
+            return ListLayout { width, rows, groups, hint_y, content_h: y };
+        }
         for (gi, g) in model.groups.iter().enumerate() {
             if gi > 0 {
                 y += GROUP_GAP;
@@ -361,6 +397,8 @@ impl ListLayout {
                 continue;
             }
             return match row.kind {
+                // Read-only: nothing to click on a routine.
+                RowKind::Routine { .. } => ListHit::Empty,
                 RowKind::Header { group } => {
                     if x < row.frame.x + CHEVRON_ZONE_W {
                         ListHit::Chevron(group)
@@ -586,6 +624,8 @@ pub enum ChromeHit {
     TopArea,
     SortToggle,
     NextPill,
+    /// One of the two view-switcher buttons, left of the pill.
+    ViewSwitch(SidebarList),
     /// The resize handle at the right edge.
     Edge,
     Empty,
@@ -601,8 +641,13 @@ pub struct ChromeLayout {
     /// The Next pill: sized to its content, against the right edge. Also
     /// its hit region.
     pub pill: Rect,
+    /// The two view-switcher buttons on the pill's row, left to right.
+    pub switch: [Rect; 2],
     pub list: Rect,
 }
+
+/// The list each switcher button selects, in the order they are drawn.
+pub const SWITCH_LISTS: [SidebarList; 2] = [SidebarList::Panes, SidebarList::Routines];
 
 /// The width of the Next pill around its content: the side padding, the
 /// filled play and its gap when the pill is clickable, the label, and the
@@ -626,11 +671,21 @@ impl ChromeLayout {
         let sort = Rect::new(summary.right() - sort_w, TOP_H + (SUMMARY_H - 20.0) / 2.0, sort_w, 20.0);
         // Right-aligned, never wider than the inset width on a narrow
         // sidebar.
-        let pill_w = pill_w.min(inner_w - 2.0 * PILL_INSET).max(0.0);
-        let pill = Rect::new(inner_w - PILL_INSET - pill_w, TOP_H + SUMMARY_H + (PILL_REGION_H - PILL_H) / 2.0, pill_w, PILL_H);
+        // The switcher takes its room on the left of the row first; the pill
+        // gets what is left, so a narrow sidebar shrinks the pill, never the
+        // buttons (an unreachable button is worse than a clipped label).
+        let switch_row_y = TOP_H + SUMMARY_H;
+        let switch_y = switch_row_y + (PILL_REGION_H - SWITCH_BTN) / 2.0;
+        let switch = [
+            Rect::new(PILL_INSET, switch_y, SWITCH_BTN, SWITCH_BTN),
+            Rect::new(PILL_INSET + SWITCH_BTN + SWITCH_GAP, switch_y, SWITCH_BTN, SWITCH_BTN),
+        ];
+        let pill_left = switch[1].right() + PILL_INSET;
+        let pill_w = pill_w.min(inner_w - PILL_INSET - pill_left).max(0.0);
+        let pill = Rect::new(inner_w - PILL_INSET - pill_w, switch_row_y + (PILL_REGION_H - PILL_H) / 2.0, pill_w, PILL_H);
         let list_y = TOP_H + SUMMARY_H + PILL_REGION_H;
         let list = Rect::new(0.0, list_y, inner_w - EDGE_TOLERANCE, (height - list_y).max(0.0));
-        ChromeLayout { width, height, summary, sort, pill, list }
+        ChromeLayout { width, height, summary, sort, pill, switch, list }
     }
 
     pub fn hit(&self, x: f64, y: f64) -> ChromeHit {
@@ -645,6 +700,11 @@ impl ChromeLayout {
         }
         if self.sort.contains(x, y) {
             return ChromeHit::SortToggle;
+        }
+        for (rect, list) in self.switch.iter().zip(SWITCH_LISTS) {
+            if rect.contains(x, y) {
+                return ChromeHit::ViewSwitch(list);
+            }
         }
         if self.pill.contains(x, y) {
             return ChromeHit::NextPill;
@@ -920,6 +980,39 @@ fn draw_chip(sh: &Shared, text: &str, right: f64, cy: f64, style: ChipStyle, dot
 }
 
 /// A link: a filled Feather icon, a gap, the word, the pair centred in `r`.
+/// One routine: its name, then the schedule (or what keeps it from running),
+/// then the last run. Read-only, so no hover ground and no buttons — the row
+/// says what is true, `launchctl` is still where it changes.
+fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, alpha: f64) {
+    // A neutralised routine still belongs on the list, faded: it is not gone,
+    // it is switched off, and that is exactly what is easy to forget.
+    let alpha = if r.done { alpha * 0.55 } else { alpha };
+    fill_round(frame, 10.0, tokens::TILE, alpha);
+    let x = frame.x + TILE_PAD_H;
+    let w = (frame.w - 2.0 * TILE_PAD_H).max(0.0);
+    let mut y = frame.y + 8.0;
+
+    draw_text(sh, &r.name, &Rect::new(x, y, w, 16.0), Style::Title, tokens::TEXT_PRIMARY, alpha, Align::Left, true);
+    y += 17.0;
+
+    let (detail_fg, detail) = if r.done {
+        (tokens::TEXT_TERTIARY, format!("{} · neutralisée", r.detail))
+    } else if r.broken {
+        (tokens::ERROR, r.detail.clone())
+    } else {
+        (tokens::TEXT_SECONDARY, r.detail.clone())
+    };
+    draw_text(sh, &detail, &Rect::new(x, y, w, 15.0), Style::Secondary, detail_fg, alpha, Align::Left, false);
+    y += 16.0;
+
+    let (last_fg, last) = match (r.failed, r.last_run.is_empty()) {
+        (_, true) => (tokens::TEXT_TERTIARY, "jamais exécutée".to_string()),
+        (Some(code), false) => (tokens::ERROR, format!("{} · code {code}", r.last_run)),
+        (None, false) => (tokens::TEXT_TERTIARY, r.last_run.clone()),
+    };
+    draw_text(sh, &last, &Rect::new(x, y, w, 15.0), Style::Detail, last_fg, alpha, Align::Left, false);
+}
+
 fn draw_link(sh: &Shared, icon: Icon, label: &str, r: &Rect, c: [f32; 3], alpha: f64) {
     let text_w = AppKitMetrics(sh).width(label, Style::Link).min(r.w - LINK_ICON_D - LINK_ICON_GAP).max(0.0);
     let w = LINK_ICON_D + LINK_ICON_GAP + text_w;
@@ -1075,7 +1168,7 @@ define_class!(
                         }
                     }
                 }
-                ChromeHit::SortToggle | ChromeHit::NextPill => {
+                ChromeHit::SortToggle | ChromeHit::NextPill | ChromeHit::ViewSwitch(_) => {
                     self.ivars().shared.borrow_mut().chrome_pressed = hit;
                     self.setNeedsDisplay(true);
                 }
@@ -1125,6 +1218,7 @@ define_class!(
                     if let Some(kova) = kova_of(self) {
                         match pressed {
                             ChromeHit::SortToggle => kova.sidebar_toggle_sort(),
+                            ChromeHit::ViewSwitch(list) => kova.sidebar_show_list(list),
                             ChromeHit::NextPill => kova.sidebar_next_pill_clicked(),
                             _ => {}
                         }
@@ -1157,6 +1251,9 @@ impl SidebarView {
     pub fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
         let shared = Rc::new(RefCell::new(Shared {
             model: SidebarModel {
+                view: SidebarList::default(),
+                routines: Vec::new(),
+                routines_loaded: false,
                 summary: Vec::new(),
                 sort: SidebarSort::Kova,
                 pill: NextPill::Nothing,
@@ -1301,6 +1398,25 @@ impl SidebarView {
         // Ground and separator.
         fill_rect(&Rect::new(0.0, 0.0, b.size.width, b.size.height), tokens::GROUND, 1.0);
         fill_rect(&Rect::new(b.size.width - SEP_W, 0.0, SEP_W, b.size.height), tokens::SEPARATOR, 1.0);
+
+        // View switcher, left of the pill: the selected icon on a raised
+        // ground, the other one bare and tertiary until the mouse finds it.
+        for (rect, list) in c.switch.iter().zip(SWITCH_LISTS) {
+            let selected = sh.model.view == list;
+            let hovered = sh.chrome_hovered == ChromeHit::ViewSwitch(list);
+            let pressed = sh.chrome_pressed == ChromeHit::ViewSwitch(list);
+            if selected {
+                fill_round(rect, 7.0, tokens::TILE_PRESSED, 1.0);
+            } else if hovered || pressed {
+                fill_round(rect, 7.0, tokens::TILE_PRESSED, if pressed { 0.9 } else { 0.55 });
+            }
+            let fg = if selected || hovered { tokens::TEXT_PRIMARY } else { tokens::TEXT_TERTIARY };
+            let icon = match list {
+                SidebarList::Panes => Icon::Sidebar,
+                SidebarList::Routines => Icon::Clock,
+            };
+            stroke_icon(icon, rect, SWITCH_ICON_D, fg, if pressed { 0.85 } else { 1.0 });
+        }
 
         // Summary row: coloured counts on the left, sort toggle on the right.
         let sort_hovered = sh.chrome_hovered == ChromeHit::SortToggle;
@@ -1803,6 +1919,7 @@ impl SidebarListView {
             let lifted = match row.kind {
                 RowKind::Header { group } => lifted_group == Some(group),
                 RowKind::Tile { .. } => lifted_row == Some(ri),
+                RowKind::Routine { .. } => false,
             };
             // The held tile is drawn later, floating; its skeleton takes
             // its place. The rows of its run step aside.
@@ -1820,7 +1937,14 @@ impl SidebarListView {
 
         if let Some(hy) = sh.layout.hint_y {
             let r = Rect::new(PAD_H, hy, sh.layout.width - 2.0 * PAD_H, HINT_H);
-            draw_text(&sh, "\u{2318}T new tab \u{b7} \u{2318}D split", &r, Style::Hint, tokens::TEXT_TERTIARY, 1.0, Align::Center, false);
+            // The Routines view borrows the hint's slot for its empty line:
+            // "no routines" is the only thing it ever has to say there.
+            let hint = match sh.model.view {
+                SidebarList::Routines if !sh.model.routines_loaded => "lecture des routines…",
+                SidebarList::Routines => "aucune routine planifiée",
+                SidebarList::Panes => "\u{2318}T new tab \u{b7} \u{2318}D split",
+            };
+            draw_text(&sh, hint, &r, Style::Hint, tokens::TEXT_TERTIARY, 1.0, Align::Center, false);
         }
 
         // Drag feedback: the insertion line, then the floating copy.
@@ -1865,6 +1989,11 @@ impl SidebarListView {
         let dy = y - row.frame.y;
         let frame = Rect::new(row.frame.x, y, row.frame.w, row.frame.h);
         match row.kind {
+            RowKind::Routine { index } => {
+                if let Some(r) = sh.model.routines.get(index) {
+                    draw_routine(sh, r, &frame, alpha);
+                }
+            }
             RowKind::Header { group } => {
                 if let Some(g) = sh.model.groups.get(group) {
                     self.draw_header(sh, g, group, &frame, alpha);
@@ -2147,9 +2276,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_routines_view_is_a_flat_list_with_no_groups_to_drag() {
+        let mut m = model();
+        m.view = SidebarList::Routines;
+        m.routines_loaded = true;
+        m.routines = vec![
+            RoutineVm { name: "tri-inbox".into(), ..RoutineVm::default() },
+            RoutineVm { name: "etat-des-lieux".into(), ..RoutineVm::default() },
+        ];
+        let l = ListLayout::new(&m, 260.0, &FakeMetrics);
+        assert_eq!(l.rows.len(), 2);
+        assert_eq!(l.rows[0].kind, RowKind::Routine { index: 0 });
+        assert_eq!(l.rows[1].kind, RowKind::Routine { index: 1 });
+        // Stacked one gap apart, and the panes' groups and hint stay out.
+        assert_eq!(l.rows[1].frame.y, l.rows[0].frame.bottom() + ROUTINE_GAP);
+        assert!(l.groups.is_empty());
+        assert_eq!(l.hint_y, None);
+        // Nothing on a routine row is clickable.
+        let r = &l.rows[0].frame;
+        assert_eq!(l.hit(r.x + 5.0, r.y + 5.0), ListHit::Empty);
+
+        // With no routines at all, the empty line takes the hint's slot.
+        m.routines.clear();
+        let empty = ListLayout::new(&m, 260.0, &FakeMetrics);
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.hint_y, Some(LIST_TOP));
+    }
+
     /// Tab 0 expanded with two tiles, tab 1 collapsed, tab 2 with one tile.
     fn model() -> SidebarModel {
         SidebarModel {
+            view: SidebarList::default(),
+            routines: Vec::new(),
+            routines_loaded: false,
             summary: Vec::new(),
             sort: SidebarSort::Kova,
             pill: NextPill::Nothing,
@@ -2428,13 +2588,23 @@ mod tests {
         assert_eq!(c.hit(c.pill.x + 5.0, 70.0), ChromeHit::NextPill);
         assert_eq!(c.hit(c.pill.right() - 1.0, 70.0), ChromeHit::NextPill);
         assert_eq!(c.hit(c.pill.x - 5.0, 70.0), ChromeHit::Empty);
-        assert_eq!(c.hit(20.0, 70.0), ChromeHit::Empty);
+        // The two switcher buttons sit at the left of that same row.
+        assert_eq!(c.switch[0], Rect::new(12.0, 65.0, 26.0, 26.0));
+        assert_eq!(c.switch[1], Rect::new(40.0, 65.0, 26.0, 26.0));
+        assert_eq!(c.hit(20.0, 70.0), ChromeHit::ViewSwitch(SidebarList::Panes));
+        assert_eq!(c.hit(45.0, 70.0), ChromeHit::ViewSwitch(SidebarList::Routines));
+        // Between them, and above the row, nothing.
+        assert_eq!(c.hit(39.0, 70.0), ChromeHit::Empty);
+        assert_eq!(c.hit(20.0, 50.0), ChromeHit::Empty);
         assert_eq!(c.hit(c.pill.x + 5.0, 61.0), ChromeHit::Empty);
         assert_eq!(c.hit(100.0, 300.0), ChromeHit::Empty);
         assert_eq!(c.hit(100.0, 585.0), ChromeHit::Empty);
-        // A pill wider than the sidebar is clamped to the inset width.
+        // A pill wider than the sidebar is clamped to what the switcher
+        // leaves: the buttons keep their size, the pill gives way.
         let narrow = ChromeLayout::new(200.0, 600.0, 40.0, 400.0);
-        assert_eq!(narrow.pill, Rect::new(12.0, 64.0, 200.0 - 1.0 - 24.0, 28.0));
+        assert_eq!(narrow.switch[1].right(), 66.0);
+        assert_eq!(narrow.pill, Rect::new(78.0, 64.0, 200.0 - 1.0 - 12.0 - 78.0, 28.0));
+        assert_eq!(narrow.pill.right(), 200.0 - 1.0 - 12.0);
         // The resize handle wins near the separator, on both sides.
         assert_eq!(c.hit(W - 4.0, 300.0), ChromeHit::Edge);
         assert_eq!(c.hit(W + 3.0, 300.0), ChromeHit::Edge);

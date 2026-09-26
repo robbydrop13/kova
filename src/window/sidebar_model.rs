@@ -13,9 +13,60 @@ use super::sidebar::UnreadKind;
 use crate::pane::{PaneId, TabId};
 use crate::prompt_preview::PromptPreview;
 
+/// Which list the sidebar is showing. The chrome above the list is the same
+/// either way; only the scroll view's contents change. Named for the list,
+/// not the view: `SidebarView` is already the AppKit class.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarList {
+    /// The panes of this window, grouped by tab.
+    #[default]
+    Panes,
+    /// The scheduled local routines (`crate::routines`).
+    Routines,
+}
+
+
+/// One routine as the sidebar shows it: its name, when it runs (or what stops
+/// it from running), and how the last run ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutineVm {
+    pub name: String,
+    /// The schedule, or the reason it will never fire.
+    pub detail: String,
+    /// The schedule is really a problem to fix: draw it in the warning colour.
+    pub broken: bool,
+    /// Neutralised by its `.done` marker: it stays listed, dimmed.
+    pub done: bool,
+    /// `2026-09-26 10:04:34`, empty when it has never run.
+    pub last_run: String,
+    /// The last run failed: its exit code.
+    pub failed: Option<i32>,
+}
+
+impl RoutineVm {
+    pub fn of(r: &crate::routines::Routine) -> Self {
+        let problem = r.problem();
+        RoutineVm {
+            name: r.name.clone(),
+            detail: problem.map(String::from).unwrap_or_else(|| r.schedule.clone()),
+            broken: problem.is_some(),
+            done: r.done,
+            last_run: r.last_run.as_ref().map(|(w, _)| w.clone()).unwrap_or_default(),
+            failed: r.last_run.as_ref().map(|&(_, c)| c).filter(|&c| c != 0),
+        }
+    }
+}
+
 /// Everything the sidebar shows for one window.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarModel {
+    /// Which list is showing; the switcher sits left of the Next pill.
+    pub view: SidebarList,
+    /// The routines, read only while the Routines view is up.
+    pub routines: Vec<RoutineVm>,
+    /// False until the first background read lands: an empty list then means
+    /// "not read yet", not "nothing scheduled".
+    pub routines_loaded: bool,
     /// `2 waiting · 3 working · 4 idle`, one coloured run at a time.
     pub summary: Vec<(String, SummaryRun)>,
     pub sort: SidebarSort,
@@ -274,7 +325,14 @@ pub fn pane_order(tabs: &[TabFacts], sort: SidebarSort) -> Vec<(PaneId, bool)> {
 impl SidebarModel {
     /// Assemble the model. `unread` is the unread count across every window
     /// (the pill).
-    pub fn build(tabs: &[TabFacts], sort: SidebarSort, unread: usize, now: u64) -> Self {
+    pub fn build(
+        tabs: &[TabFacts],
+        sort: SidebarSort,
+        unread: usize,
+        now: u64,
+        view: SidebarList,
+        routines: Option<Vec<RoutineVm>>,
+    ) -> Self {
         let tab_states: Vec<TileState> = tabs
             .iter()
             .map(|t| TileState::most_urgent(t.panes.iter().map(|p| TileState::from_flags(p.flags))))
@@ -317,6 +375,9 @@ impl SidebarModel {
             })
             .collect();
         SidebarModel {
+            view,
+            routines_loaded: routines.is_some(),
+            routines: routines.unwrap_or_default(),
             summary: summary_runs(waiting, working, idle_here),
             sort,
             pill: NextPill::of(unread),
@@ -329,6 +390,37 @@ impl SidebarModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_routine_shows_its_schedule_until_something_stops_it_from_running() {
+        let ok = crate::routines::Routine {
+            name: "tri-inbox".into(),
+            schedule: "tous les jours 10h02".into(),
+            loaded: true,
+            last_run: Some(("2026-09-26 10:04:34".into(), 0)),
+            ..Default::default()
+        };
+        let vm = RoutineVm::of(&ok);
+        assert_eq!(vm.detail, "tous les jours 10h02");
+        assert!(!vm.broken);
+        assert_eq!(vm.last_run, "2026-09-26 10:04:34");
+        assert_eq!(vm.failed, None);
+
+        // A plist launchd never loaded: the schedule is a lie, say so instead.
+        let never = crate::routines::Routine { loaded: false, ..ok.clone() };
+        let vm = RoutineVm::of(&never);
+        assert_eq!(vm.detail, "pas chargée");
+        assert!(vm.broken);
+
+        // A non-zero exit is worth surfacing next to the date.
+        let failed = crate::routines::Routine { last_run: Some(("2026-09-26 10:05:12".into(), 2)), ..ok };
+        assert_eq!(RoutineVm::of(&failed).failed, Some(2));
+    }
+
+    #[test]
+    fn the_sidebar_opens_on_the_panes_list() {
+        assert_eq!(SidebarList::default(), SidebarList::Panes);
+    }
 
     fn pane(id: PaneId, flags: PaneFlags) -> PaneFacts {
         PaneFacts {
@@ -485,7 +577,7 @@ mod tests {
             tab(0, vec![pane(1, PaneFlags { permission_prompt: true, ..PaneFlags::default() }), pane(2, PaneFlags { idle_agent: true, ..PaneFlags::default() })]),
             folded,
         ];
-        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, 0);
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, 0, SidebarList::default(), None);
         let text: String = m.summary.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(text, "1 waiting \u{b7} 1 working \u{b7} 1 idle");
         assert_eq!(m.pill, NextPill::Next(2));
@@ -505,11 +597,11 @@ mod tests {
             tab(0, vec![pane(1, PaneFlags::default())]),
             tab(1, vec![pane(2, PaneFlags { permission_prompt: true, ..PaneFlags::default() })]),
         ];
-        let m = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0);
+        let m = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0, SidebarList::default(), None);
         assert_eq!(m.groups.iter().map(|g| g.tab_idx).collect::<Vec<_>>(), vec![1, 0]);
         assert_eq!(m.pill, NextPill::Nothing);
         assert!(m.show_hint);
-        let same = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0);
+        let same = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0, SidebarList::default(), None);
         assert_eq!(m, same);
     }
 
@@ -531,7 +623,7 @@ mod tests {
         assert_eq!(unread(kova), vec![2, 5, 6]);
         // Activity order: the awaiting tab first.
         assert_eq!(unread(pane_order(&tabs, SidebarSort::Activity)), vec![5, 6, 2]);
-        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 3, 0);
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 3, 0, SidebarList::default(), None);
         assert!(m.groups[0].tiles[1].unread && !m.groups[0].tiles[0].unread);
         assert!(m.groups[1].tiles[1].unread);
     }

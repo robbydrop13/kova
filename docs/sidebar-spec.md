@@ -268,6 +268,39 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
   `do_focus_next_attention` walks, read once per tick. A change of the pill's
   content re-lays the chrome, like a change of the sort label.
 
+### 3.7.1 View switcher
+
+Two icon buttons at the left of the pill's row, 26 pt square, 2 pt apart,
+12 pt from the sidebar edge (`ChromeLayout::switch`): `sidebar` selects the
+panes list, `clock` the routines list. The selected one sits on a
+`bg.pressed` ground, radius 7; the other is tertiary and takes the same
+ground at 0.55 on hover. Clicking the selected icon does nothing, like a
+segmented control. The buttons take their width from the row first, so a
+narrow sidebar shrinks the pill and never them. The selection lives in
+`SidebarState::list` and is per window; it is not saved to the session, so
+a restart opens on the panes list.
+
+### 3.7.2 Routines list (`SidebarList::Routines`)
+
+A flat list of `crate::routines` rows, no groups, no drag, nothing
+clickable: `launchctl` stays the only way to change a routine. One row per
+routine, 58 pt, 6 pt apart, on the tile ground at radius 10:
+
+| Line | Content | Colour |
+|---|---|---|
+| Title | the routine's name | primary |
+| Detail | the schedule in words, or what stops it firing (`pas chargée`, `prompt manquant`) | secondary, `error` when it is a problem |
+| Last run | `2026-09-26 10:04:34`, plus `· code N` when it failed | tertiary, `error` on a failure |
+
+A routine neutralised by its `.done` marker keeps its row at alpha 0.55
+with `· neutralisée` after the schedule: switched off is not the same as
+gone, and that is the state easiest to forget. An empty list borrows the
+hint slot: `lecture des routines…` until the first background read lands,
+`aucune routine planifiée` after it. The rows come from
+`routines::snapshot`, which serves a cache and refreshes on a thread at
+most every 30 s, and only while this view is up — the panes list never
+shells out to `launchctl`.
+
 ### 3.8 List extras
 
 - Hint `⌘T new tab · ⌘D split` (11, tertiary, centred) under the last group
@@ -297,6 +330,8 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
 | Restored `Resume`          | resume (4.4)                                           |                    | tile menu    |
 | Next pill                  | `do_focus_next_attention()` (not when `nothing`)       |                    |              |
 | Sort toggle                | kova <-> activity                                      |                    |              |
+| View switcher              | show that list (`sidebar_show_list`)                   |                    |              |
+| Routine row                | nothing: the list is read-only                         |                    |              |
 | Top area                   | window drag                                            | zoom               |              |
 | Separator +-4 pt           | drag resizes the sidebar                               |                    |              |
 

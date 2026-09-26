@@ -7,7 +7,7 @@
 
 use super::*;
 use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
-use super::sidebar_model::{header_title, PaneFacts, SidebarModel, TabFacts};
+use super::sidebar_model::{header_title, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
 
@@ -115,6 +115,8 @@ enum MenuRow {
 
 pub(super) struct SidebarState {
     pub(super) sort: SidebarSort,
+    /// Which list the switcher left of the Next pill has selected.
+    pub(super) list: SidebarList,
     /// (active tab, focused pane) the list last scrolled to show, so a focus
     /// change reveals its row exactly once and a manual scroll then sticks.
     last_reveal: Option<(usize, PaneId)>,
@@ -128,6 +130,7 @@ impl SidebarState {
     pub(super) fn new() -> Self {
         SidebarState {
             sort: SidebarSort::Kova,
+            list: SidebarList::default(),
             last_reveal: None,
             menu_pane: 0,
             menu_tab: 0,
@@ -229,9 +232,20 @@ impl KovaView {
         }
         // The unread count across every window, for the Next pill.
         let unread = sidebar::unread_count(&self.collect_unread());
-        let sort = self.ivars().sidebar.borrow().sort;
+        let (sort, list) = {
+            let st = self.ivars().sidebar.borrow();
+            (st.sort, st.list)
+        };
         let facts = self.sidebar_tab_facts();
-        let model = SidebarModel::build(&facts, sort, unread, now_epoch_secs());
+        // Only the Routines view reads them, and `snapshot` refreshes off the
+        // tick: an open Panes view never shells out to launchctl.
+        let routines = match list {
+            SidebarList::Routines => {
+                crate::routines::snapshot().map(|rs| rs.iter().map(RoutineVm::of).collect())
+            }
+            SidebarList::Panes => None,
+        };
+        let model = SidebarModel::build(&facts, sort, unread, now_epoch_secs(), list, routines);
         view.set_model(model);
 
         // Follow the focus: reveal the focused pane's tile (its header when
@@ -353,6 +367,12 @@ impl KovaView {
     pub(super) fn sidebar_toggle_sort(&self) {
         let mut st = self.ivars().sidebar.borrow_mut();
         st.sort = st.sort.toggled();
+    }
+
+    /// The view switcher: show `list`. Clicking the selected icon is a no-op,
+    /// like a segmented control.
+    pub(super) fn sidebar_show_list(&self, list: SidebarList) {
+        self.ivars().sidebar.borrow_mut().list = list;
     }
 
     /// The Next pill: `Nothing to read` is not a button, only a pill with a

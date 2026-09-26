@@ -40,6 +40,10 @@ pub enum Icon {
     Mail,
     /// `check`: mark a pane read.
     Check,
+    /// `sidebar`: the panes view of the sidebar.
+    Sidebar,
+    /// `clock`: the routines view of the sidebar.
+    Clock,
 }
 
 /// One stroke of an icon, in grid coordinates.
@@ -87,6 +91,15 @@ impl Icon {
                 Polyline(vec![(22.0, 6.0), (12.0, 13.0), (2.0, 6.0)]),
             ],
             Icon::Check => vec![Polyline(vec![(20.0, 6.0), (9.0, 17.0), (4.0, 12.0)])],
+            Icon::Sidebar => vec![
+                RoundRect(3.0, 3.0, 18.0, 18.0, 2.0),
+                Polyline(vec![(9.0, 3.0), (9.0, 21.0)]),
+            ],
+            // A circle is a rounded rect whose radius is half its side.
+            Icon::Clock => vec![
+                RoundRect(2.0, 2.0, 20.0, 20.0, 10.0),
+                Polyline(vec![(12.0, 6.0), (12.0, 12.0), (16.0, 14.0)]),
+            ],
         }
     }
 }
@@ -186,7 +199,11 @@ mod tests {
         assert_eq!(Icon::Mail.segments()[0], Segment::RoundRect(2.0, 4.0, 20.0, 16.0, 2.0));
         assert!(matches!(&Icon::Check.segments()[0], Segment::Polyline(p) if p.len() == 3 && p[1] == (9.0, 17.0)));
         // Every point stays on the grid.
-        for icon in [Icon::ChevronDown, Icon::ChevronRight, Icon::Plus, Icon::X, Icon::Play, Icon::Square, Icon::Maximize, Icon::Minimize, Icon::Mail, Icon::Check] {
+        // The view switcher: a panel with its rail, and a clock face.
+        assert_eq!(Icon::Sidebar.segments()[0], Segment::RoundRect(3.0, 3.0, 18.0, 18.0, 2.0));
+        assert!(matches!(&Icon::Sidebar.segments()[1], Segment::Polyline(p) if p[0].0 == p[1].0));
+        assert_eq!(Icon::Clock.segments()[0], Segment::RoundRect(2.0, 2.0, 20.0, 20.0, 10.0));
+        for icon in [Icon::ChevronDown, Icon::ChevronRight, Icon::Plus, Icon::X, Icon::Play, Icon::Square, Icon::Maximize, Icon::Minimize, Icon::Mail, Icon::Check, Icon::Sidebar, Icon::Clock] {
             for seg in icon.segments() {
                 match seg {
                     Segment::Polyline(p) | Segment::Polygon(p) => {
