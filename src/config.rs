@@ -14,6 +14,22 @@ pub struct Config {
     pub global_status_bar: GlobalStatusBarConfig,
     pub layout: LayoutConfig,
     pub keys: KeysConfig,
+    pub agent: AgentConfig,
+}
+
+/// How Kova rebuilds an agent's command line when it puts a conversation back.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// Add `--dangerously-skip-permissions` to every Claude resume line, even
+    /// when the command that started the conversation did not carry it.
+    ///
+    /// The flag normally survives on its own: `resume_command` reuses the flags
+    /// of the line that started the session. It is lost when that line was an
+    /// alias (`alias cc="claude --dangerously-skip-permissions"`), which Kova
+    /// refuses to rewrite because it cannot know what the alias expands to.
+    /// This setting says to put it back.
+    pub claude_skip_permissions: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,6 +270,7 @@ impl Default for Config {
             global_status_bar: GlobalStatusBarConfig::default(),
             layout: LayoutConfig::default(),
             keys: KeysConfig::default(),
+            agent: AgentConfig::default(),
         }
     }
 }

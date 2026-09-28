@@ -19,6 +19,11 @@
 # cursor_blink_frames = 60
 # scroll_sensitivity = 6.0
 
+# [agent]
+# claude_skip_permissions = false   # add --dangerously-skip-permissions to every Claude resume line
+#                                   # (the flag survives on its own when the session was started with a
+#                                   #  plain `claude …`; it is lost when it was started through an alias)
+
 # [splits]
 # min_width = 300.0            # minimum pane width before horizontal scroll kicks in
 # dim_opacity = 0.3            # how much an unfocused pane is faded (0.0 .. 1.0)

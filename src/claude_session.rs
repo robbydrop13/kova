@@ -13,6 +13,7 @@
 //! That costs a handful of syscalls and works even when `claude` sits under a
 //! wrapper process rather than directly under the shell.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -203,8 +204,38 @@ pub fn resume_command(last_command: Option<&str>, session_id: &str) -> Option<St
         .map(|cmd| strip_session_flags(cmd))
         .filter(|tokens| !tokens.is_empty())
         .unwrap_or_else(|| vec!["claude".to_string()]);
+    let base = with_skip_permissions(base, skip_permissions());
 
     Some(format!("{} --resume {}", base.join(" "), session_id))
+}
+
+/// The flag `[agent] claude_skip_permissions` adds.
+const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
+
+/// Whether every resume line carries `--dangerously-skip-permissions`, from
+/// `[agent] claude_skip_permissions`.
+///
+/// A process-wide switch rather than a parameter: `resume_command` is reached
+/// from the restore path, the sidebar button, the search palette and the
+/// bookmarks, none of which otherwise need the config.
+static SKIP_PERMISSIONS: AtomicBool = AtomicBool::new(false);
+
+/// Apply the config setting. Called once at startup, before any pane exists.
+pub fn set_skip_permissions(on: bool) {
+    SKIP_PERMISSIONS.store(on, Ordering::Relaxed);
+}
+
+fn skip_permissions() -> bool {
+    SKIP_PERMISSIONS.load(Ordering::Relaxed)
+}
+
+/// Add the flag to a rebuilt `claude` line, unless it is already there — the
+/// session was started with it, and Claude Code takes it once.
+fn with_skip_permissions(mut tokens: Vec<String>, skip: bool) -> Vec<String> {
+    if skip && !tokens.iter().any(|t| t == SKIP_PERMISSIONS_FLAG) {
+        tokens.push(SKIP_PERMISSIONS_FLAG.to_string());
+    }
+    tokens
 }
 
 /// True if `cmd` starts with a plain `claude` invocation (no alias, no env
@@ -246,6 +277,22 @@ fn strip_session_flags(cmd: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_permissions_adds_the_flag_to_a_rebuilt_line() {
+        let base = vec!["claude".to_string()];
+        assert_eq!(
+            with_skip_permissions(base.clone(), true).join(" "),
+            "claude --dangerously-skip-permissions"
+        );
+        assert_eq!(with_skip_permissions(base, false).join(" "), "claude");
+    }
+
+    #[test]
+    fn skip_permissions_never_repeats_a_flag_the_line_already_carries() {
+        let base = vec!["claude".to_string(), "--dangerously-skip-permissions".to_string()];
+        assert_eq!(with_skip_permissions(base.clone(), true), base);
+    }
 
     #[test]
     fn session_file_written_long_after_exec_still_belongs_to_its_process() {

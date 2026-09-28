@@ -295,6 +295,7 @@ fn main() {
     }));
 
     let config = config::Config::load();
+    claude_session::set_skip_permissions(config.agent.claude_skip_permissions);
 
     let mtm = MainThreadMarker::new().expect("must run on main thread");
     let app = NSApplication::sharedApplication(mtm);
