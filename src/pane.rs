@@ -1,6 +1,6 @@
 use parking_lot::RwLock;
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -1656,6 +1656,10 @@ pub struct Pane {
     pub pty: Pty,
     pub shell_exited: Arc<AtomicBool>,
     pub shell_ready: Arc<AtomicBool>,
+    /// When the shell's first byte arrived and when it last wrote, both on the
+    /// monotonic clock of `monotonic_ms`. Read by `prompt_settled`.
+    pub ready_at_ms: Arc<AtomicU64>,
+    pub last_output_ms: Arc<AtomicU64>,
     pub scroll_accumulator: Cell<f64>,
     /// Command to inject into PTY once shell is ready (for session restore).
     pub pending_command: Cell<Option<String>>,
@@ -1718,6 +1722,13 @@ const PROMPT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 /// asterisk — is the reliable "the app is busy" signal.
 /// Wall-clock seconds since the epoch. Used to stamp when a pane started
 /// waiting; a jump in system time only skews a displayed age, never a decision.
+/// Milliseconds since this process started, on a monotonic clock. Used to time
+/// the gap between two PTY writes, where wall-clock time could jump.
+pub(crate) fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1822,12 +1833,16 @@ impl Pane {
         )));
         let shell_exited = Arc::new(AtomicBool::new(false));
         let shell_ready = Arc::new(AtomicBool::new(false));
+        let ready_at_ms = Arc::new(AtomicU64::new(0));
+        let last_output_ms = Arc::new(AtomicU64::new(0));
         let pty = Pty::spawn(
             cols,
             rows,
             terminal.clone(),
             shell_exited.clone(),
             shell_ready.clone(),
+            ready_at_ms.clone(),
+            last_output_ms.clone(),
             working_dir,
             id,
             open_timer.clone(),
@@ -1838,6 +1853,8 @@ impl Pane {
             pty,
             shell_exited,
             shell_ready,
+            ready_at_ms,
+            last_output_ms,
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
             custom_title: None,
@@ -1871,6 +1888,8 @@ impl Pane {
             pty,
             shell_exited: Arc::new(AtomicBool::new(false)),
             shell_ready: Arc::new(AtomicBool::new(true)), // placeholder is immediately "ready"
+            ready_at_ms: Arc::new(AtomicU64::new(0)),
+            last_output_ms: Arc::new(AtomicU64::new(0)),
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
             custom_title: None,
@@ -2226,10 +2245,18 @@ impl Pane {
             || (self.agent_kind().is_none() && self.fg_process().is_some_and(|p| p.name == "claude"))
     }
 
-    /// If the shell is ready and there's a pending command, write it to the PTY
-    /// (without \r so the user can review before pressing Enter).
+    /// If the shell has settled at its prompt and there's a pending command,
+    /// write it to the PTY (without \r so the user can review before pressing
+    /// Enter).
     pub fn inject_pending_command(&self) {
         if !self.is_ready() {
+            return;
+        }
+        if !prompt_settled(
+            monotonic_ms(),
+            self.ready_at_ms.load(Ordering::Relaxed),
+            self.last_output_ms.load(Ordering::Relaxed),
+        ) {
             return;
         }
         let cmd = self.pending_command.take();
@@ -2237,6 +2264,25 @@ impl Pane {
             self.pty.write(command.as_bytes());
         }
     }
+}
+
+/// How long the shell must stay silent, after its first byte, before Kova types
+/// the restored command into it.
+const PROMPT_QUIET_MS: u64 = 250;
+/// A shell that never falls silent still gets its command, this late at worst.
+const PROMPT_SETTLE_CAP_MS: u64 = 5_000;
+
+/// Whether the shell is done drawing its prompt.
+///
+/// The first byte out of the PTY is not the prompt: a theme that prints an
+/// instant prompt (powerlevel10k) draws a placeholder, finishes sourcing the
+/// rc file, then erases it and redraws the real one. Anything typed in between
+/// is echoed where it landed AND replayed in the redraw, so the restored
+/// command showed up twice. Waiting for the output to stop covers that without
+/// depending on shell integration: Kova gets no OSC 133;A from a plain shell.
+fn prompt_settled(now_ms: u64, ready_at_ms: u64, last_output_ms: u64) -> bool {
+    now_ms.saturating_sub(last_output_ms) >= PROMPT_QUIET_MS
+        || now_ms.saturating_sub(ready_at_ms) >= PROMPT_SETTLE_CAP_MS
 }
 
 /// The bytes `Resume` writes: Ctrl+U clears whatever sits at the prompt, then
@@ -2525,7 +2571,30 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjacent_visible_pairs, geometry_ratio, pinned_virtual_width, AwaitingFlag, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+    use super::{adjacent_visible_pairs, geometry_ratio, prompt_settled, PROMPT_QUIET_MS, PROMPT_SETTLE_CAP_MS, pinned_virtual_width, AwaitingFlag, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
+
+    #[test]
+    fn a_shell_still_redrawing_its_prompt_does_not_get_the_command_yet() {
+        // powerlevel10k: first byte at 0, instant prompt still being replaced.
+        let ready = 0;
+        let last_output = 100;
+        assert!(!prompt_settled(last_output + PROMPT_QUIET_MS - 1, ready, last_output));
+    }
+
+    #[test]
+    fn the_command_goes_in_once_the_shell_has_stopped_writing() {
+        let ready = 0;
+        let last_output = 100;
+        assert!(prompt_settled(last_output + PROMPT_QUIET_MS, ready, last_output));
+    }
+
+    #[test]
+    fn a_shell_that_never_falls_silent_still_gets_its_command() {
+        // Output every 10 ms forever: the quiet window never opens, the cap does.
+        let ready = 0;
+        let now = PROMPT_SETTLE_CAP_MS;
+        assert!(prompt_settled(now, ready, now - 10));
+    }
 
     #[test]
     fn a_read_waiting_pane_re_enters_the_jump_cycle_only_on_a_new_question() {

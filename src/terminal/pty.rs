@@ -211,6 +211,8 @@ impl Pty {
         terminal: Arc<RwLock<TerminalState>>,
         shell_exited: Arc<AtomicBool>,
         shell_ready: Arc<AtomicBool>,
+        ready_at_ms: Arc<AtomicU64>,
+        last_output_ms: Arc<AtomicU64>,
         working_dir: Option<&str>,
         pane_id: u32,
         open_timer: Arc<crate::pane::PaneOpenTimer>,
@@ -392,9 +394,15 @@ impl Pty {
                     match file.read(&mut buf) {
                         Ok(0) => { eof = true; break; }
                         Ok(n) => {
+                            // Stamped on every read: `prompt_settled` waits for a
+                            // gap here before typing a restored command, so a
+                            // prompt still being redrawn does not echo it twice.
+                            last_output_ms.store(crate::pane::monotonic_ms(), Ordering::Relaxed);
                             if !shell_ready.load(Ordering::Relaxed) {
                                 shell_ready.store(true, Ordering::Relaxed);
-                                // First byte from the shell = first prompt is ready.
+                                ready_at_ms.store(crate::pane::monotonic_ms(), Ordering::Relaxed);
+                                // First byte from the shell — the prompt itself may
+                                // still be a few redraws away.
                                 open_timer.mark_shell_ready(pane_id);
                             }
                             if capture.is_some() {
