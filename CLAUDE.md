@@ -22,7 +22,9 @@ Voir `roadmap.md` pour le détail des versions et l'avancement.
 
 ## Upstream / Sync avec le projet de Micka
 
-Ce repo (`claap-app/kova`) part de la base du projet de Micka, qui **continue de développer activement** sa version. Son repo est configuré comme remote `micktaiwan` (`git@github.com:micktaiwan/kova.git`).
+Ce repo est le fork `robbydrop13/kova` (remote `origin`). Il part de la base du projet de Micka, qui **continue de développer activement** sa version, configurée comme remote `micktaiwan` (`git@github.com:micktaiwan/kova.git`).
+
+Attention, la vérification de mise à jour (`src/update_check.rs`) interroge toujours les releases de **`micktaiwan/kova`**, pas celles d'`origin` : une release faite ici ne se signale pas dans l'app, et une release de Micka s'y annonce même si ce fork ne l'a pas encore reprise.
 
 On voudra **récupérer et synchroniser régulièrement ses avancées** dans le futur :
 
