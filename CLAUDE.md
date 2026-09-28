@@ -103,8 +103,9 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 ## Le skill `kova` est la surface publique de cet outil
 
 `~/.claude/skills/kova/SKILL.md` — le vrai fichier est
-`~/projects/perso/dotfiles/claude/skills/kova/SKILL.md`, le symlink n'est que la façon dont Claude
-Code le voit — décrit comment une session, depuis n'importe où sur ce Mac, se sert de kova : les
+`~/AI directory/claude-config/skills/kova/SKILL.md`, suivi par git comme le reste de la conf
+Claude ; `~/.claude/skills` n'est qu'un symlink vers ce dossier — décrit comment une session,
+depuis n'importe où sur ce Mac, se sert de kova : les
 commandes, les chemins, les ports, ce qu'elle n'a pas le droit de faire. Rien ne le synchronise
 automatiquement.
 
