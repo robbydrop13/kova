@@ -33,11 +33,16 @@ pub enum PaneFilter {
 
 /// A command received from an IPC client.
 pub enum IpcCommand {
-    /// Create a new split in the focused pane of the active window.
+    /// Create a new split. Without `target`, in the focused pane of the active
+    /// window, and the new pane takes the focus. With `target`, next to that
+    /// pane wherever it sits, and nothing moves on screen: the active tab, the
+    /// focus and the scroll stay as they are (a background agent opening a
+    /// session in another tab must not pull the user there).
     Split {
         direction: String,
         cmd: Option<String>,
         cwd: Option<String>,
+        target: Option<u32>,
     },
     /// List all panes across all windows.
     ListPanes,
@@ -426,7 +431,7 @@ fn dispatch(tx: &mpsc::Sender<IpcRequest>, cmd: IpcCommand) -> IpcResponse {
 /// `parse_pane_content_args` for the two pane-content commands).
 fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
     Some(match cmd {
-        "split" => &["direction", "command", "cwd"],
+        "split" => &["direction", "command", "cwd", "pane_id"],
         "list-panes" => &[],
         "close-pane" => &["pane_id"],
         "send-keys" => &["pane_id", "text"],
@@ -501,10 +506,17 @@ fn parse_command(line: &str) -> Result<IpcCommand, String> {
                     return Err(format!("cwd does not exist or is not a directory: {}", p));
                 }
             }
+            let target = match v.get("pane_id") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(p) => Some(
+                    p.as_u64().ok_or_else(|| "\"pane_id\" must be a number".to_string())? as u32,
+                ),
+            };
             Ok(IpcCommand::Split {
                 direction,
                 cmd: cmd_str,
                 cwd,
+                target,
             })
         }
         "list-panes" => Ok(IpcCommand::ListPanes),
@@ -1124,6 +1136,12 @@ mod tests {
             r#"{"cmd":"split","direction":"vertical","command":"ls"}"#
         )
         .is_ok());
+        // `split` may name the pane to split, to open one outside the focused tab.
+        assert!(matches!(
+            parse_command(r#"{"cmd":"split","pane_id":7,"command":"ls"}"#),
+            Ok(IpcCommand::Split { target: Some(7), .. })
+        ));
+        assert!(parse_command(r#"{"cmd":"split","pane_id":"7"}"#).is_err());
         assert!(parse_command(r#"{"cmd":"list-panes"}"#).is_ok());
     }
 

@@ -688,8 +688,8 @@ fn handle_ipc_command_sync(
     use crate::ipc::IpcCommand;
 
     match cmd {
-        IpcCommand::Split { direction, cmd: command, cwd } => {
-            handle_ipc_split(windows, config_cell, &direction, command, cwd)
+        IpcCommand::Split { direction, cmd: command, cwd, target } => {
+            handle_ipc_split(windows, config_cell, &direction, command, cwd, target)
         }
         IpcCommand::ListPanes => {
             handle_ipc_list_panes(windows)
@@ -1048,6 +1048,7 @@ fn handle_ipc_split(
     direction: &str,
     command: Option<String>,
     cwd: Option<String>,
+    target: Option<u32>,
 ) -> crate::ipc::IpcResponse {
     use crate::ipc::IpcResponse;
 
@@ -1057,6 +1058,27 @@ fn handle_ipc_split(
     };
 
     let wins = windows.borrow();
+
+    // A named pane: split next to it, in whichever window and tab hold it,
+    // without touching the focus.
+    if let Some(target) = target {
+        let split_dir = match direction {
+            "vertical" => crate::pane::SplitDirection::Vertical,
+            _ => crate::pane::SplitDirection::Horizontal,
+        };
+        for win in wins.iter() {
+            let Some(view) = kova_view(win) else { continue };
+            match view.ipc_split_at(config, target, split_dir, cwd.as_deref(), command.clone()) {
+                None => continue,
+                Some(Some(id)) => {
+                    return IpcResponse::Ok { data: Some(serde_json::json!({"pane_id": id})) }
+                }
+                Some(None) => return IpcResponse::Error { message: "split failed".to_string() },
+            }
+        }
+        return IpcResponse::Error { message: format!("pane {} not found", target) };
+    }
+
     // Find the key window (first one, or the one that isKeyWindow)
     let win = wins.iter()
         .find(|w| w.isKeyWindow())

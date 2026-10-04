@@ -181,6 +181,75 @@ impl KovaView {
         Some(new_id)
     }
 
+    /// IPC: split next to `target`, wherever it sits in this window, and leave
+    /// the screen alone: the active tab, each tab's focused pane and the scroll
+    /// are untouched. `None` when this window does not hold the pane,
+    /// `Some(None)` when the spawn failed, `Some(Some(id))` on success.
+    /// The new pane starts in `cwd`, else in the target's own directory.
+    pub fn ipc_split_at(
+        &self,
+        config: &crate::config::Config,
+        target: PaneId,
+        direction: SplitDirection,
+        cwd: Option<&str>,
+        command: Option<String>,
+    ) -> Option<Option<PaneId>> {
+        let (tab_idx, target_vp, target_cwd) = {
+            let tabs = self.ivars().tabs.borrow();
+            let tab_idx = tabs.iter().position(|tab| tab.contains(target))?;
+            let tab = &tabs[tab_idx];
+            // A minimized target has no viewport: size the newcomer on the
+            // whole pane area, the next layout pass corrects it.
+            let vp = tab
+                .viewport_for_pane(target, self.panes_viewport_for_tab(tab))
+                .unwrap_or_else(|| self.panes_viewport_for_tab(tab));
+            (tab_idx, vp, tab.pane(target).and_then(|p| p.cwd()))
+        };
+
+        let half_vp = match direction {
+            SplitDirection::Horizontal => PaneViewport { width: target_vp.width / 2.0, ..target_vp },
+            SplitDirection::Vertical => PaneViewport { height: target_vp.height / 2.0, ..target_vp },
+        };
+        let (cols, rows) = self.viewport_to_grid(&half_vp);
+
+        let cwd = cwd.map(String::from).or(target_cwd);
+        let new_pane = match Pane::spawn(cols, rows, config, cwd.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("IPC split: failed to spawn pane: {}", e);
+                return Some(None);
+            }
+        };
+        if let Some(cmd) = command {
+            new_pane.pending_command.set(Some(cmd));
+        }
+        let new_id = new_pane.id;
+        let open_timer = new_pane.open_timer.clone();
+
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let tab = &mut tabs[tab_idx];
+        match direction {
+            SplitDirection::Horizontal => {
+                // The column insert keys on the focused pane: point it at the
+                // target for the insert, then give the focus back.
+                let focused = tab.focused_pane;
+                tab.focused_pane = target;
+                tab.insert_column_after_focused(new_pane);
+                tab.focused_pane = focused;
+            }
+            SplitDirection::Vertical => tab.vsplit_at_pane(target, new_pane),
+        }
+        tab.mark_all_dirty();
+        drop(tabs);
+
+        open_timer.mark_inserted(new_id);
+        // Only the active tab is laid out here; a background tab is resized
+        // when it becomes active.
+        self.resize_all_panes();
+        log::info!("IPC: split created pane {} next to pane {} (no focus change)", new_id, target);
+        Some(Some(new_id))
+    }
+
     /// IPC: close a specific pane by ID. Returns true if found and closed.
     /// Try to close a pane by ID. Returns:
     /// - Some(true) = closed successfully
