@@ -1,14 +1,11 @@
-use parking_lot::RwLock;
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::config::Config;
 use crate::renderer::PaneViewport;
-use crate::terminal::pty::{ProcessInfo, Pty};
-use crate::terminal::TerminalState;
 
-pub type PaneId = u32;
+pub use crate::surface::PaneId;
+use crate::surface::{RunningState, Surface};
 
 /// Distribute `total` among entries by weight, giving minimized entries zero.
 /// Minimized panes take no layout space at all — they are reachable through
@@ -312,72 +309,6 @@ fn redistribute_loss(
     }
 }
 
-/// Per-pane open-latency instrumentation. Splits the new-pane critical path so
-/// "time to rectangle" (pane visible) and "time to prompt" (shell usable) can be
-/// attributed separately — see notes/pane-open-perf.md.
-///
-/// The reference instant `entry` is captured at the very start of `Pane::spawn`.
-/// The pre-spawn work in the split handlers (viewport float math, no syscalls)
-/// is sub-microsecond and folded in. `entry` is set once and only read after,
-/// so it is safe to share with the PTY reader thread, which records `shell-ready`.
-/// Each milestone logs at most once (atomic-guarded) under the `PANE-OPEN` prefix;
-/// grep the log for the full per-pane timeline.
-pub struct PaneOpenTimer {
-    entry: std::time::Instant,
-    inserted_logged: AtomicBool,
-    paint_logged: AtomicBool,
-    ready_logged: AtomicBool,
-}
-
-impl PaneOpenTimer {
-    pub fn new() -> Self {
-        PaneOpenTimer {
-            entry: std::time::Instant::now(),
-            inserted_logged: AtomicBool::new(false),
-            paint_logged: AtomicBool::new(false),
-            ready_logged: AtomicBool::new(false),
-        }
-    }
-
-    fn elapsed_ms(&self) -> f64 {
-        self.entry.elapsed().as_secs_f64() * 1e3
-    }
-
-    /// Tree mutation done: the new pane now exists in the layout (main thread).
-    /// Logged only for interactive splits (the split handlers call this);
-    /// restore/initial panes never reach it, so its absence flags a restore.
-    pub fn mark_inserted(&self, pane_id: PaneId) {
-        if self.inserted_logged.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        log::info!("PANE-OPEN id={} tree-inserted +{:.1}ms", pane_id, self.elapsed_ms());
-    }
-
-    /// First frame the pane is submitted to the renderer = pane becomes visible
-    /// (its loading overlay paints). This is the "time to rectangle".
-    pub fn mark_first_paint(&self, pane_id: PaneId) {
-        if self.paint_logged.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        log::info!("PANE-OPEN id={} first-paint +{:.1}ms (time-to-rectangle)", pane_id, self.elapsed_ms());
-    }
-
-    /// Shell emitted its first byte (first prompt) = shell is usable. This is
-    /// the "time to prompt". Called from the PTY reader thread.
-    pub fn mark_shell_ready(&self, pane_id: PaneId) {
-        if self.ready_logged.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        log::info!("PANE-OPEN id={} shell-ready +{:.1}ms (time-to-prompt)", pane_id, self.elapsed_ms());
-    }
-}
-
-impl Default for PaneOpenTimer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
     Horizontal, // side by side (left | right)
@@ -422,12 +353,7 @@ pub enum NavDirection {
 
 pub type TabId = u32;
 
-static NEXT_PANE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 static NEXT_TAB_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
-fn alloc_pane_id() -> PaneId {
-    NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
-}
 
 pub(crate) fn alloc_tab_id() -> TabId {
     NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed)
@@ -611,6 +537,40 @@ impl Tab {
         })
     }
 
+    /// Test-only: a tab laid out from the given columns of panes, focused on its
+    /// first pane.
+    #[cfg(test)]
+    pub fn with_columns(columns: Vec<Vec<Pane>>) -> Self {
+        let focused = columns[0][0].id;
+        let n = columns.len();
+        let columns = columns
+            .into_iter()
+            .map(|panes| {
+                let rows = panes.len();
+                Column { panes, row_weights: vec![1.0; rows], custom_row_weights: vec![false; rows] }
+            })
+            .collect();
+        Tab {
+            id: alloc_tab_id(),
+            collapsed: false,
+            columns,
+            column_weights: vec![1.0; n],
+            custom_weights: vec![false; n],
+            focused_pane: focused,
+            custom_title: None,
+            color: None,
+            has_bell: false,
+            has_completion: false,
+            has_running: false,
+            fg_running_cache: false,
+            minimized_stack: Vec::new(),
+            scroll_offset_x: 0.0,
+            virtual_width_override: 0.0,
+            geometry_scale: 0.0,
+            cell_h: Cell::new(0.0),
+        }
+    }
+
     /// Create a placeholder tab with a dummy pane (no shell process).
     /// Used for deferred tab restore to avoid shell contention at startup.
     pub fn placeholder(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
@@ -763,48 +723,21 @@ impl Tab {
         self.has_completion
     }
 
-    /// Check if any pane in the tab is running a command. Two sources, OR'd:
-    /// - OSC 133;C/D from shell integration (precise prompt cycles) — note
-    ///   that Claude Code emits a 133;D at the end of each of its turns, so
-    ///   this flag alone dies while claude is still open;
-    /// - a foreground process group other than the shell (tcgetpgrp) — covers
-    ///   claude, vim, any TUI, no shell integration needed. Only re-probed
-    ///   when `refresh_fg` is true (one ioctl per pane); the same probe caches
-    ///   the process name the status bar and the pane switcher display.
+    /// Check if any pane in the tab is running a command: each pane's
+    /// `check_running` (see `Surface::check_running` for the two sources,
+    /// OSC 133 and the foreground process group, and the stale-waiting reap
+    /// it piggybacks), OR'd over the tab.
     /// Unlike completion, the focused pane counts too: the indicator says
-    /// "something occupies this tab". Panes whose shell exited are skipped —
-    /// a shell killed mid-command never emits 133;D, which would strand the
-    /// OSC flag.
-    ///
-    /// This pass also reaps stale "waiting for the user" flags, because it is
-    /// already paying for the one probe that answers the question: a pane
-    /// marked waiting whose foreground process is gone (its Claude Code died
-    /// without ever retracting the flag) is dropped here. Piggybacking costs
-    /// nothing; a separate sweep would double the ioctls.
+    /// "something occupies this tab". Panes whose shell exited count as idle.
     pub fn check_running(&mut self, refresh_fg: bool) -> bool {
         let mut osc_any = false;
         let mut fg_any = false;
         self.for_each_pane(&mut |pane| {
-            if !pane.is_alive() {
-                pane.clear_awaiting();
-                pane.fg_process.replace(None);
-                pane.agent_session.replace(None);
-                return;
-            }
-            if pane.terminal.read().command_running.load(std::sync::atomic::Ordering::Relaxed) {
-                osc_any = true;
-            }
+            let state = pane.check_running(refresh_fg);
+            // Reads the screen at most once per settled turn, never per frame.
             pane.probe_prompt();
-            if refresh_fg {
-                pane.refresh_agent_session();
-                let fg = pane.refresh_fg_process();
-                if fg {
-                    fg_any = true;
-                } else {
-                    // Back to a bare shell prompt: whatever was waiting is gone.
-                    pane.clear_awaiting();
-                }
-            }
+            osc_any |= state.command_running;
+            fg_any |= state.fg_running;
         });
         if refresh_fg {
             self.fg_running_cache = fg_any;
@@ -1613,90 +1546,36 @@ impl Tab {
     }
 }
 
-/// The "waiting for the user" flag of a pane, with whether the reader has
-/// seen it since it was armed. The two live in one value because every
-/// transition that arms the flag must also re-arm the read state: keeping
-/// them apart is what let a pane the user had already read (or worse, one
-/// that asked a *second* question) fall out of step with Cmd+J.
-#[derive(Clone, Copy, Default, PartialEq, Debug)]
-pub struct AwaitingFlag {
-    since: Option<u64>,
-    read: bool,
-}
-
-impl AwaitingFlag {
-    /// The pane says it waits for the user. Idempotent on the timestamp — a
-    /// second `Stop` on the same unanswered turn keeps the original
-    /// waiting-since, so the status bar does not restart its clock — but never
-    /// on the read state: a fresh question is unread again.
-    fn armed(self, now: u64) -> Self {
-        Self { since: Some(self.since.unwrap_or(now)), read: false }
-    }
-
-    /// The user has had the pane under the eye. Only the jump cycle cares;
-    /// the pane keeps saying it waits.
-    fn read(self) -> Self {
-        Self { read: true, ..self }
-    }
-
-    /// Epoch seconds since which the pane has been waiting, if it is.
-    fn since(self) -> Option<u64> {
-        self.since
-    }
-
-    fn is_read(self) -> bool {
-        self.read
-    }
-}
-
-/// A single terminal pane: owns its PTY, terminal state, and per-pane flags.
+/// A terminal pane as a window lays it out: its [`Surface`] (PTY, terminal
+/// state, agent session, waiting flag) plus what only the window cares about.
+/// Derefs to the surface, so `pane.terminal`, `pane.is_awaiting()`… read
+/// through.
 pub struct Pane {
-    pub id: PaneId,
-    pub terminal: Arc<RwLock<TerminalState>>,
-    pub pty: Pty,
-    pub shell_exited: Arc<AtomicBool>,
-    pub shell_ready: Arc<AtomicBool>,
-    /// When the shell's first byte arrived and when it last wrote, both on the
-    /// monotonic clock of `monotonic_ms`. Read by `prompt_settled`.
-    pub ready_at_ms: Arc<AtomicU64>,
-    pub last_output_ms: Arc<AtomicU64>,
-    pub scroll_accumulator: Cell<f64>,
-    /// Command to inject into PTY once shell is ready (for session restore).
-    pub pending_command: Cell<Option<String>>,
+    pub surface: Surface,
     /// Custom pane title set by user (overrides OSC title). Sticky, so it sits
     /// below the name of the agent session running here — see
     /// `derive_display_title`.
     pub custom_title: Option<String>,
     /// Whether this pane is minimized (collapsed to a thin bar).
     pub minimized: bool,
-    /// Open-latency instrumentation (time-to-rectangle / time-to-prompt).
-    pub open_timer: Arc<PaneOpenTimer>,
-    /// The app in this pane told us it is waiting for the user (Claude Code
-    /// pushes this from its `Stop` / permission-prompt hooks over IPC), plus
-    /// whether the user has looked at it since. Never trusted blindly: see
-    /// `is_awaiting` and `Tab::check_running`.
-    pub awaiting: Cell<AwaitingFlag>,
-    /// The coding-agent conversation running in this pane — Claude Code or
-    /// Codex — with the id its `resume` takes and its conversation name.
-    /// Refreshed on the same throttle as the foreground
-    /// probe (`Tab::check_running`) rather than read per frame, because the
-    /// lookup scans a directory or the process table. `None` = no agent in this
-    /// pane; a conversation nobody named is `Some` with a `name` of `None`.
-    pub agent_session: RefCell<Option<crate::agent_session::AgentSession>>,
-    /// The user marked this pane unread by hand (Cmd+U, or the tile's Mark
-    /// unread): it counts as unread until it is marked read or gets focus
-    /// again (`Pane::is_unread`, `Pane::mark_read`).
+    /// Whether the idle agent session in this pane has been looked at since it
+    /// last did anything. Backs Cmd+J's third tier (see `is_idle_agent_unseen`):
+    /// an open session nobody is using is a candidate exactly once, then drops
+    /// out until it works again — the same drain rule as the waiting flag.
+    idle_agent_seen: Cell<bool>,
+    /// When the eye last landed on this pane, as a global visit sequence number
+    /// (0 = never looked at since Kova started). This — not the pane id — is
+    /// what orders every Cmd+J walk: the least recently seen pane comes first,
+    /// so a tour visits all of them before handing any of them back.
+    last_seen: Cell<u64>,
+    /// The user's own "I have not dealt with this" mark (Cmd+U), on top of what
+    /// Kova reads off the pane. Dropped by `mark_read`.
     manual_unread: Cell<bool>,
-    /// Name of the binary running in the foreground (`claude`, `nvim`, `ssh`…),
-    /// `None` at a bare shell prompt. Cached because the status bar reads it on
-    /// every frame while resolving it costs two syscalls: it is refreshed on the
-    /// same ~0.5s throttle as the running-state probe, in `Tab::check_running`.
-    fg_process: RefCell<Option<ProcessInfo>>,
-    /// What the Claude here asked or said when it last stopped working, read
-    /// off the screen (permission prompt) or the transcript (turn end) by
-    /// `probe_prompt`. Runtime state like the waiting flag: never saved.
+    /// The permission prompt read off this pane's screen, for the sidebar tile.
+    /// Refreshed by the throttled probe, never per frame.
     pub prompt_preview: RefCell<Option<crate::prompt_preview::PromptPreview>>,
-    /// The edge detector behind `probe_prompt`.
+    /// Where that probe stands, so a screen is read once a turn settles rather
+    /// than on every frame.
     prompt_probe: Cell<PromptProbe>,
 }
 
@@ -1709,387 +1588,90 @@ struct PromptProbe {
     due: Option<std::time::Instant>,
 }
 
-/// The TUI paints the prompt frame in the same frame `working` drops: one
-/// second is plenty, and a tool that hands back briefly is skipped.
-const PROMPT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// True if `title` begins with a Claude Code *working* marker immediately
-/// followed by a space: an animated Braille spinner glyph (U+2800–U+28FF), or a
-/// vertical half-circle spinner frame (`◐` U+25D0, `◑` U+25D1).
-/// Claude Code prepends a spinner ONLY while it is actively generating or
-/// running a tool; at the prompt it shows an asterisk-like idle marker
-/// (`✳ Claude Code`) or a plain title instead. So a spinner — and NOT the
-/// asterisk — is the reliable "the app is busy" signal.
-/// Wall-clock seconds since the epoch. Used to stamp when a pane started
-/// waiting; a jump in system time only skews a displayed age, never a decision.
-/// Milliseconds since this process started, on a monotonic clock. Used to time
-/// the gap between two PTY writes, where wall-clock time could jump.
-pub(crate) fn monotonic_ms() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
-}
+impl std::ops::Deref for Pane {
+    type Target = Surface;
 
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-fn is_working_marker(title: &str) -> bool {
-    let mut chars = title.chars();
-    matches!(
-        chars.next(),
-        Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c)
-            || matches!(c, '\u{25D0}' | '\u{25D1}')
-    ) && chars.next() == Some(' ')
-}
-
-/// True if `title` begins with any Claude Code status marker followed by a
-/// space: the Braille working spinner, an asterisk-like idle marker
-/// (`*`, `✳ ` U+2733, `∗` U+2217), or a vertical half-circle spinner frame
-/// (`◐` U+25D0, `◑` U+25D1). Used to strip the prefix for display so the
-/// title neither jitters with the spinner nor carries a bare idle marker.
-fn has_leading_marker(title: &str) -> bool {
-    let mut chars = title.chars();
-    matches!(
-        chars.next(),
-        Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c)
-            || matches!(c, '*' | '\u{2733}' | '\u{2217}' | '\u{25D0}' | '\u{25D1}')
-    ) && chars.next() == Some(' ')
-}
-
-/// Strip a leading status marker that Claude Code prepends to the terminal
-/// title (Braille working spinner or asterisk-like idle marker), plus its
-/// trailing space. Only trims a single such prefix; leaves the rest untouched.
-fn strip_activity_prefix(title: &str) -> &str {
-    if has_leading_marker(title) {
-        // Marker glyph (1–3 bytes) + one ASCII space (1 byte).
-        let marker_len = title.chars().next().map_or(0, char::len_utf8);
-        &title[marker_len + 1..]
-    } else {
-        title
+    fn deref(&self) -> &Surface {
+        &self.surface
     }
-}
-
-/// Clean up a raw foreground process name for display: drop surrounding
-/// whitespace, keep only the last path component (some processes report a full
-/// path), and drop the leading `-` a login shell carries (`-zsh`). Returns
-/// `None` when nothing displayable is left, so callers can treat "no name" and
-/// "empty name" the same way.
-fn normalize_process_name(raw: &str) -> Option<String> {
-    let name = raw.trim();
-    let name = name.rsplit('/').next().unwrap_or(name);
-    let name = name.strip_prefix('-').unwrap_or(name);
-    (!name.is_empty()).then(|| name.to_string())
-}
-
-/// Conversation name → custom pane title → non-empty OSC title → foreground
-/// process → cwd basename → fallback. Blank names/titles count as absent.
-fn derive_display_title(
-    custom_title: Option<&str>,
-    agent_name: Option<&str>,
-    osc_title: Option<&str>,
-    process: Option<&str>,
-    cwd: Option<&str>,
-    fallback: &str,
-) -> String {
-    // The current conversation name wins over a sticky pane title, which can
-    // outlive the conversation it originally described. Claude's derived names
-    // are filtered upstream; Codex's index does not distinguish name sources.
-    if let Some(name) = agent_name.map(str::trim).filter(|n| !n.is_empty()) {
-        return name.to_string();
-    }
-    if let Some(custom) = custom_title {
-        return custom.to_string();
-    }
-    if let Some(title) = osc_title.filter(|t| !t.trim().is_empty()) {
-        return strip_activity_prefix(title).to_string();
-    }
-    // Nothing named this pane: the binary running in it is still more telling
-    // than the directory it was started from.
-    if let Some(process) = process.map(str::trim).filter(|p| !p.is_empty()) {
-        return process.to_string();
-    }
-    if let Some(cwd) = cwd {
-        if let Some(base) = std::path::Path::new(cwd).file_name() {
-            return base.to_string_lossy().to_string();
-        }
-    }
-    fallback.to_string()
 }
 
 impl Pane {
     pub fn spawn(cols: u16, rows: u16, config: &Config, working_dir: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
-        // Reference instant for open-latency instrumentation — captured first so
-        // it covers the whole spawn (TerminalState alloc + fork/exec + dups).
-        let open_timer = Arc::new(PaneOpenTimer::new());
-        let id = alloc_pane_id();
-        let terminal = Arc::new(RwLock::new(TerminalState::new(
-            cols,
-            rows,
-            config.terminal.scrollback,
-            crate::terminal::color_to_u8(config.colors.foreground),
-            crate::terminal::color_to_u8(config.colors.background),
-        )));
-        let shell_exited = Arc::new(AtomicBool::new(false));
-        let shell_ready = Arc::new(AtomicBool::new(false));
-        let ready_at_ms = Arc::new(AtomicU64::new(0));
-        let last_output_ms = Arc::new(AtomicU64::new(0));
-        let pty = Pty::spawn(
-            cols,
-            rows,
-            terminal.clone(),
-            shell_exited.clone(),
-            shell_ready.clone(),
-            ready_at_ms.clone(),
-            last_output_ms.clone(),
-            working_dir,
-            id,
-            open_timer.clone(),
-        )?;
-        Ok(Pane {
-            id,
-            terminal,
-            pty,
-            shell_exited,
-            shell_ready,
-            ready_at_ms,
-            last_output_ms,
-            scroll_accumulator: Cell::new(0.0),
-            pending_command: Cell::new(None),
-            custom_title: None,
-            minimized: false,
-            open_timer,
-            awaiting: Cell::new(AwaitingFlag::default()),
-            agent_session: RefCell::new(None),
-            manual_unread: Cell::new(false),
-            fg_process: RefCell::new(None),
-            prompt_preview: RefCell::new(None),
-            prompt_probe: Cell::new(PromptProbe::default()),
-        })
+        Ok(Self::new(Surface::spawn(cols, rows, config, working_dir)?))
     }
 
     /// Create a lightweight placeholder pane with a dummy PTY (no shell process).
     /// Used for deferred tab restore — avoids spawning a shell that would
     /// compete with the active tab's shells for zshrc loading time.
     pub fn placeholder(cols: u16, rows: u16, config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let id = alloc_pane_id();
-        let terminal = Arc::new(RwLock::new(TerminalState::new(
-            cols,
-            rows,
-            config.terminal.scrollback,
-            crate::terminal::color_to_u8(config.colors.foreground),
-            crate::terminal::color_to_u8(config.colors.background),
-        )));
-        let pty = Pty::dummy()?;
-        Ok(Pane {
-            id,
-            terminal,
-            pty,
-            shell_exited: Arc::new(AtomicBool::new(false)),
-            shell_ready: Arc::new(AtomicBool::new(true)), // placeholder is immediately "ready"
-            ready_at_ms: Arc::new(AtomicU64::new(0)),
-            last_output_ms: Arc::new(AtomicU64::new(0)),
-            scroll_accumulator: Cell::new(0.0),
-            pending_command: Cell::new(None),
+        Ok(Self::new(Surface::placeholder(cols, rows, config)?))
+    }
+
+    /// Test-only: a pane without a shell whose PTY input is readable on the
+    /// returned fd (see [`Pty::capture`](crate::terminal::pty::Pty::capture)).
+    #[cfg(test)]
+    pub fn capture(cols: u16, rows: u16) -> (Self, std::os::fd::OwnedFd) {
+        let (surface, reader) = Surface::capture(cols, rows);
+        (Self::new(surface), reader)
+    }
+
+    /// A visible pane around `surface`, never looked at yet.
+    fn new(surface: Surface) -> Self {
+        Pane {
+            surface,
             custom_title: None,
             minimized: false,
-            open_timer: Arc::new(PaneOpenTimer::new()),
-            awaiting: Cell::new(AwaitingFlag::default()),
-            agent_session: RefCell::new(None),
+            idle_agent_seen: Cell::new(false),
+            last_seen: Cell::new(0),
             manual_unread: Cell::new(false),
-            fg_process: RefCell::new(None),
             prompt_preview: RefCell::new(None),
             prompt_probe: Cell::new(PromptProbe::default()),
-        })
-    }
-
-    pub fn cwd(&self) -> Option<String> {
-        self.pty.cwd()
-    }
-
-    pub fn foreground_process_name(&self) -> Option<String> {
-        self.pty.foreground_process_name()
-    }
-
-    /// Re-probe the foreground process and refresh the cached name. Returns
-    /// whether a process other than the shell owns the terminal — the answer
-    /// `Tab::check_running` needs, so both come out of a single probe.
-    /// An unresolvable name caches as `None` (nothing to display) without
-    /// changing the returned yes/no.
-    fn refresh_fg_process(&self) -> bool {
-        let probe = self.pty.foreground_process();
-        let running = probe.is_some();
-        self.fg_process.replace(probe.and_then(|info| {
-            normalize_process_name(&info.name).map(|name| ProcessInfo { name, ..info })
-        }));
-        running
-    }
-
-    /// Cached name and version of the foreground binary, `None` at a bare shell
-    /// prompt. Up to ~0.5s stale (see `Tab::check_running`), which is what makes
-    /// it free to read on every frame.
-    pub fn fg_process(&self) -> Option<ProcessInfo> {
-        self.fg_process.borrow().clone()
-    }
-
-    pub fn is_alive(&self) -> bool {
-        !self.shell_exited.load(Ordering::Relaxed)
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.shell_ready.load(Ordering::Relaxed)
-    }
-
-    pub fn last_command(&self) -> Option<String> {
-        self.terminal.read().last_command.clone()
-    }
-
-    /// Title set by the running app (OSC 0/2), without the activity marker
-    /// Claude Code prepends — so a saved title does not freeze a spinner frame.
-    pub fn osc_title(&self) -> Option<String> {
-        self.terminal
-            .read()
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| strip_activity_prefix(t).to_string())
-    }
-
-    /// Display title for this pane: agent session name > custom title > OSC
-    /// title > foreground process > CWD basename > fallback.
-    pub fn display_title(&self, fallback: &str) -> String {
-        let term = self.terminal.read();
-        let session = self.agent_session.borrow();
-        derive_display_title(
-            self.custom_title.as_deref(),
-            session.as_ref().and_then(|s| s.name.as_deref()),
-            term.title.as_deref(),
-            self.fg_process.borrow().as_ref().map(|p| p.name.as_str()),
-            term.cwd.as_deref(),
-            fallback,
-        )
-    }
-
-    /// Re-read the agent conversation running in this pane. Called from the
-    /// throttled probe pass, never per frame: the lookup is a cached scan of
-    /// `~/.claude/sessions/`, then of the process table for Codex.
-    pub fn refresh_agent_session(&self) {
-        *self.agent_session.borrow_mut() = crate::agent_session::for_shell(self.pty.pid());
-    }
-
-    /// Id of the agent conversation in this pane — the argument its `resume`
-    /// takes. It is the only identifier here that outlives the pane, so an
-    /// external client tying a pane to a subject must key on this, not on the
-    /// pane id: a closed tab reopened tomorrow is the same subject.
-    pub fn agent_session_id(&self) -> Option<String> {
-        self.agent_session.borrow().as_ref().map(|s| s.id.clone())
-    }
-
-    /// Current conversation name, regardless of which agent owns it.
-    pub fn agent_session_name(&self) -> Option<String> {
-        self.agent_session.borrow().as_ref().and_then(|s| s.name.clone())
-    }
-
-    /// Which agent holds the conversation in this pane, if any.
-    pub fn agent_kind(&self) -> Option<crate::agent_session::Agent> {
-        self.agent_session.borrow().as_ref().map(|s| s.agent)
-    }
-
-    /// Id of the conversation only when it is a Claude one. What an external
-    /// client hands to `claude --resume` or matches against a Claude session
-    /// name; a Codex pane answers `None` rather than an id Claude cannot open.
-    pub fn claude_session_id(&self) -> Option<String> {
-        let session = self.agent_session.borrow();
-        let session = session.as_ref()?;
-        (session.agent == crate::agent_session::Agent::Claude).then(|| session.id.clone())
-    }
-
-    /// Name that `/rename` gave a Claude conversation; `None` for other agents.
-    /// Exposed on its own rather than only through `display_title`, where it is
-    /// one candidate among five and indistinguishable from the others.
-    pub fn claude_session_name(&self) -> Option<String> {
-        self.agent_session.borrow().as_ref()
-            .filter(|s| s.agent == crate::agent_session::Agent::Claude)
-            .and_then(|s| s.name.clone())
-    }
-
-    /// True if the app in this pane is actively working: its live OSC 0/2 title
-    /// leads with one of Claude Code's animated spinners (see `is_working_marker`).
-    /// The asterisk idle marker (`✳ Claude Code`) does NOT count. Reads the live
-    /// OSC 0/2 title even when a sticky custom title shadows it in the display.
-    pub fn is_working(&self) -> bool {
-        self.terminal
-            .read()
-            .title
-            .as_deref()
-            .map_or(false, is_working_marker)
-    }
-
-    /// True if the app in this pane says it is waiting for the user, and
-    /// nothing observed since contradicts it.
-    ///
-    /// The flag is *pushed* by Claude Code's hooks, but a pushed flag can
-    /// outlive its truth (a session killed with -9 never gets to retract it),
-    /// so it is only ever reported through checks Kova makes itself. Here: a
-    /// pane whose Claude went back to work cannot be waiting, whatever the
-    /// last hook said. The slower liveness reap lives in `Tab::check_running`.
-    pub fn is_awaiting(&self) -> bool {
-        self.awaiting.get().since().is_some() && !self.is_working()
-    }
-
-    /// Epoch seconds since which this pane has been waiting, if it is.
-    pub fn awaiting_since(&self) -> Option<u64> {
-        self.is_awaiting().then(|| self.awaiting.get().since()).flatten()
-    }
-
-    /// Mark the pane as waiting for the user, starting now (idempotent: an
-    /// already-waiting pane keeps its original timestamp, so a second `Stop`
-    /// on the same unanswered turn does not reset how long it has waited).
-    pub fn set_awaiting(&self) {
-        self.awaiting.set(self.awaiting.get().armed(now_epoch_secs()));
-    }
-
-    /// Drop the waiting flag (the user engaged, or the session is gone). The
-    /// prompt preview goes with it: it described the question just answered.
-    pub fn clear_awaiting(&self) {
-        self.awaiting.set(AwaitingFlag::default());
-        self.prompt_preview.replace(None);
-    }
-
-    /// A permission prompt is on this pane's screen (`probe_prompt` read it)
-    /// and the agent has not gone back to work since.
-    pub fn has_permission_prompt(&self) -> bool {
-        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::Permission { .. }))
-            && !self.is_working()
-    }
-
-    /// The last turn ended with an answer nobody has looked at yet.
-    pub fn is_turn_end_unseen(&self) -> bool {
-        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::TurnEnd { seen: false, .. }))
-    }
-
-    /// A permission prompt sits on screen and nobody has looked at it since
-    /// it appeared.
-    pub fn is_prompt_unseen(&self) -> bool {
-        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::Permission { seen: false, .. }))
-    }
-
-    /// Record that what the preview shows (the prompt or the turn-end answer)
-    /// has been looked at (called by the frame loop on the focused pane,
-    /// alongside `mark_awaiting_seen`).
-    pub fn mark_preview_seen(&self) {
-        use crate::prompt_preview::PromptPreview;
-        match self.prompt_preview.borrow_mut().as_mut() {
-            Some(PromptPreview::TurnEnd { seen, .. }) | Some(PromptPreview::Permission { seen, .. }) => *seen = true,
-            None => {}
         }
     }
 
-    /// The user's own unread mark (Cmd+U, the tile's Mark unread).
-    pub fn is_manual_unread(&self) -> bool {
-        self.manual_unread.get()
+    /// A restore command still waits for the shell to be ready.
+    pub fn has_pending_command(&self) -> bool {
+        let cmd = self.pending_command.take();
+        let pending = cmd.is_some();
+        self.pending_command.set(cmd);
+        pending
+    }
+
+    /// What `Resume` runs in this pane: the agent, the conversation id and the
+    /// command line rebuilt by `resume_command` (which refuses an id that could
+    /// carry a second command). `None` when there is nothing to resume, or the
+    /// id is refused. The sidebar button and the IPC `resume-pane` share it, and
+    /// `list-panes` exposes it, so a client never types a line of its own.
+    pub fn resume_target(&self) -> Option<(crate::agent_session::Agent, String, String)> {
+        let (agent, id) = self.restored_session()?;
+        let command = crate::agent_session::resume_command(agent, &id, self.last_command().as_deref())?;
+        Some((agent, id, command))
+    }
+
+    /// Run the resume line (`resume_target`) in the shell: Ctrl+U first, since
+    /// the pre-typed line may still sit at the prompt or have been cleared, then
+    /// the line and Enter. Returns false when there is nothing to resume.
+    pub fn run_resume(&self) -> bool {
+        match self.resume_target() {
+            Some((_, _, command)) => {
+                self.pty.write(resume_keystrokes(&command).as_bytes());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The conversation waiting at this shell's prompt: a restored pane (or
+    /// one its agent has left) whose last command is a resume line, with
+    /// nothing running yet. Where the sidebar offers `Resume` instead of
+    /// `Start Claude`, and names the agent the pane belongs to.
+    pub fn restored_session(&self) -> Option<(crate::agent_session::Agent, String)> {
+        if !self.is_bare_shell() {
+            return None;
+        }
+        self.last_command().as_deref().and_then(crate::agent_session::resumed_session)
     }
 
     pub fn set_manual_unread(&self, unread: bool) {
@@ -2109,6 +1691,53 @@ impl Pane {
         self.mark_awaiting_seen();
         self.mark_preview_seen();
         self.manual_unread.set(false);
+    }
+
+    /// The user's own unread mark (Cmd+U, the tile's Mark unread).
+    pub fn is_manual_unread(&self) -> bool {
+        self.manual_unread.get()
+    }
+
+    /// Record that what the preview shows (the prompt or the turn-end answer)
+    /// has been looked at (called by the frame loop on the focused pane,
+    /// alongside `mark_awaiting_seen`).
+    pub fn mark_preview_seen(&self) {
+        use crate::prompt_preview::PromptPreview;
+        match self.prompt_preview.borrow_mut().as_mut() {
+            Some(PromptPreview::TurnEnd { seen, .. }) | Some(PromptPreview::Permission { seen, .. }) => *seen = true,
+            None => {}
+        }
+    }
+
+    /// A permission prompt sits on screen and nobody has looked at it since
+    /// it appeared.
+    pub fn is_prompt_unseen(&self) -> bool {
+        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::Permission { seen: false, .. }))
+    }
+
+    /// The last turn ended with an answer nobody has looked at yet.
+    pub fn is_turn_end_unseen(&self) -> bool {
+        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::TurnEnd { seen: false, .. }))
+    }
+
+    /// A permission prompt is on this pane's screen (`probe_prompt` read it)
+    /// and the agent has not gone back to work since.
+    pub fn has_permission_prompt(&self) -> bool {
+        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::Permission { .. }))
+            && !self.is_working()
+    }
+
+    /// Claude launched here but its session is not resolved yet: a restore
+    /// command pending, or a `claude` foreground process without a session.
+    pub fn is_starting_agent(&self) -> bool {
+        self.has_pending_command()
+            || (self.agent_kind().is_none() && self.fg_process().is_some_and(|p| p.name == "claude"))
+    }
+
+    /// Record that the idle Claude session here has been looked at (called by the
+    /// frame loop on the focused pane, alongside `mark_awaiting_seen`).
+    pub fn mark_idle_agent_seen(&self) {
+        self.idle_agent_seen.set(true);
     }
 
     /// Follow `is_working` from tick to tick and, one second after it drops
@@ -2145,7 +1774,7 @@ impl Pane {
                 header: p.header,
                 question: p.question,
                 detail: p.detail,
-                since: now_epoch_secs(),
+                since: crate::surface::now_epoch_secs(),
                 seen: false,
             }),
             None => self.transcript_summary().map(|summary| crate::prompt_preview::PromptPreview::TurnEnd { summary, seen: false }),
@@ -2168,33 +1797,35 @@ impl Pane {
         crate::prompt_preview::turn_end_summary(&tail)
     }
 
-    /// Record that the pane has been looked at while waiting (called by the
-    /// frame loop on the focused pane of the key window).
-    pub fn mark_awaiting_seen(&self) {
-        self.awaiting.set(self.awaiting.get().read());
+    /// Display title for this pane: agent session name > custom title > OSC
+    /// title > foreground process > CWD basename > fallback.
+    pub fn display_title(&self, fallback: &str) -> String {
+        self.surface.display_title(self.custom_title.as_deref(), fallback)
     }
 
-    /// True if the pane waits for the user AND has not been looked at since.
-    /// This — not `is_awaiting` — is what Cmd+J walks: a pane you have read
-    /// keeps its marker but stops pulling the jump back to itself.
-    pub fn is_awaiting_unseen(&self) -> bool {
-        self.is_awaiting() && !self.awaiting.get().is_read()
+    /// The surface's throttled probe pass ([`Surface::check_running`]), plus
+    /// the Cmd+J bookkeeping it feeds. `Tab::check_running` calls this on
+    /// every pane.
+    pub fn check_running(&self, refresh_fg: bool) -> RunningState {
+        let state = self.surface.check_running(refresh_fg);
+        // Cmd+J's idle-Claude tier re-arms as soon as the pane stops
+        // being a session sitting still: one that went back to work, or
+        // whose Claude is gone, is a new state — a "already looked at"
+        // flag kept from before would hide it for good. An exited shell
+        // has just dropped its session, so it always re-arms.
+        if (state.exited || refresh_fg) && (!self.has_agent_session() || self.is_working()) {
+            self.rearm_idle_agent();
+        }
+        state
     }
 
-    /// True if an agent session sits open in this pane and is not working.
-    /// "Idle" is the absence of the working spinner (`is_working`), so a session
-    /// chewing on something is never pulled up. The sidebar's `idle` chip and
-    /// summary count; never unread by itself.
-    pub fn is_idle_agent(&self) -> bool {
-        self.agent_session.borrow().is_some() && !self.is_working()
-    }
-
-    /// A restore command still waits for the shell to be ready.
-    pub fn has_pending_command(&self) -> bool {
-        let cmd = self.pending_command.take();
-        let pending = cmd.is_some();
-        self.pending_command.set(cmd);
-        pending
+    /// The same, minus the sessions already looked at since they fell idle —
+    /// Cmd+J's draining third tier. The flag is set when the pane gets focus and
+    /// re-armed in `check_running` as soon as the session works again or
+    /// goes away, so a walk that covered everything hands straight over to the
+    /// non-draining loop.
+    pub fn is_idle_agent_unseen(&self) -> bool {
+        !self.idle_agent_seen.get() && self.is_idle_agent()
     }
 
     /// A shell with nothing in it: no agent, no foreground process, no
@@ -2203,87 +1834,30 @@ impl Pane {
         self.agent_kind().is_none() && self.fg_process().is_none() && !self.has_pending_command()
     }
 
-    /// The conversation waiting at this shell's prompt: a restored pane (or
-    /// one its agent has left) whose last command is a resume line, with
-    /// nothing running yet. Where the sidebar offers `Resume` instead of
-    /// `Start Claude`, and names the agent the pane belongs to.
-    pub fn restored_session(&self) -> Option<(crate::agent_session::Agent, String)> {
-        if !self.is_bare_shell() {
-            return None;
-        }
-        self.last_command().as_deref().and_then(crate::agent_session::resumed_session)
+    /// Stamp the pane as just looked at, with a number no other pane will get
+    /// again. Called by the frame loop on the focused pane of the key window,
+    /// alongside `mark_awaiting_seen`.
+    pub fn mark_seen_now(&self) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.last_seen.set(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     }
 
-    /// What `Resume` runs in this pane: the agent, the conversation id and the
-    /// command line rebuilt by `resume_command` (which refuses an id that could
-    /// carry a second command). `None` when there is nothing to resume, or the
-    /// id is refused. The sidebar button and the IPC `resume-pane` share it, and
-    /// `list-panes` exposes it, so a client never types a line of its own.
-    pub fn resume_target(&self) -> Option<(crate::agent_session::Agent, String, String)> {
-        let (agent, id) = self.restored_session()?;
-        let command = crate::agent_session::resume_command(agent, &id, self.last_command().as_deref())?;
-        Some((agent, id, command))
+    /// Visit stamp of this pane: 0 for a pane the eye has never landed on, and
+    /// otherwise the higher the more recently it was looked at. What Cmd+J
+    /// sorts its candidates by.
+    pub fn last_seen(&self) -> u64 {
+        self.last_seen.get()
     }
 
-    /// Run the resume line (`resume_target`) in the shell: Ctrl+U first, since
-    /// the pre-typed line may still sit at the prompt or have been cleared, then
-    /// the line and Enter. Returns false when there is nothing to resume.
-    pub fn run_resume(&self) -> bool {
-        match self.resume_target() {
-            Some((_, _, command)) => {
-                self.pty.write(resume_keystrokes(&command).as_bytes());
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Claude launched here but its session is not resolved yet: a restore
-    /// command pending, or a `claude` foreground process without a session.
-    pub fn is_starting_agent(&self) -> bool {
-        self.has_pending_command()
-            || (self.agent_kind().is_none() && self.fg_process().is_some_and(|p| p.name == "claude"))
-    }
-
-    /// If the shell has settled at its prompt and there's a pending command,
-    /// write it to the PTY (without \r so the user can review before pressing
-    /// Enter).
-    pub fn inject_pending_command(&self) {
-        if !self.is_ready() {
-            return;
-        }
-        if !prompt_settled(
-            monotonic_ms(),
-            self.ready_at_ms.load(Ordering::Relaxed),
-            self.last_output_ms.load(Ordering::Relaxed),
-        ) {
-            return;
-        }
-        let cmd = self.pending_command.take();
-        if let Some(command) = cmd {
-            self.pty.write(command.as_bytes());
-        }
+    /// Put this pane back in the idle-Claude tier next time it falls idle.
+    pub fn rearm_idle_agent(&self) {
+        self.idle_agent_seen.set(false);
     }
 }
 
 /// How long the shell must stay silent, after its first byte, before Kova types
 /// the restored command into it.
-const PROMPT_QUIET_MS: u64 = 250;
-/// A shell that never falls silent still gets its command, this late at worst.
-const PROMPT_SETTLE_CAP_MS: u64 = 5_000;
-
-/// Whether the shell is done drawing its prompt.
-///
-/// The first byte out of the PTY is not the prompt: a theme that prints an
-/// instant prompt (powerlevel10k) draws a placeholder, finishes sourcing the
-/// rc file, then erases it and redraws the real one. Anything typed in between
-/// is echoed where it landed AND replayed in the redraw, so the restored
-/// command showed up twice. Waiting for the output to stop covers that without
-/// depending on shell integration: Kova gets no OSC 133;A from a plain shell.
-fn prompt_settled(now_ms: u64, ready_at_ms: u64, last_output_ms: u64) -> bool {
-    now_ms.saturating_sub(last_output_ms) >= PROMPT_QUIET_MS
-        || now_ms.saturating_sub(ready_at_ms) >= PROMPT_SETTLE_CAP_MS
-}
+const PROMPT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The bytes `Resume` writes: Ctrl+U clears whatever sits at the prompt, then
 /// the resume line and Enter.
@@ -2571,54 +2145,7 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjacent_visible_pairs, geometry_ratio, prompt_settled, PROMPT_QUIET_MS, PROMPT_SETTLE_CAP_MS, pinned_virtual_width, AwaitingFlag, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, derive_display_title, distribute_visible, grow_virtual_for_restored_column, is_working_marker, max_visible_fraction, new_entry_weight, normalize_process_name, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column, strip_activity_prefix};
-
-    #[test]
-    fn a_shell_still_redrawing_its_prompt_does_not_get_the_command_yet() {
-        // powerlevel10k: first byte at 0, instant prompt still being replaced.
-        let ready = 0;
-        let last_output = 100;
-        assert!(!prompt_settled(last_output + PROMPT_QUIET_MS - 1, ready, last_output));
-    }
-
-    #[test]
-    fn the_command_goes_in_once_the_shell_has_stopped_writing() {
-        let ready = 0;
-        let last_output = 100;
-        assert!(prompt_settled(last_output + PROMPT_QUIET_MS, ready, last_output));
-    }
-
-    #[test]
-    fn a_shell_that_never_falls_silent_still_gets_its_command() {
-        // Output every 10 ms forever: the quiet window never opens, the cap does.
-        let ready = 0;
-        let now = PROMPT_SETTLE_CAP_MS;
-        assert!(prompt_settled(now, ready, now - 10));
-    }
-
-    #[test]
-    fn a_read_waiting_pane_re_enters_the_jump_cycle_only_on_a_new_question() {
-        let quiet = AwaitingFlag::default();
-        assert_eq!(quiet.since(), None);
-        assert!(!quiet.is_read());
-
-        // Claude stops and asks: waiting, and unread.
-        let asked = quiet.armed(100);
-        assert_eq!(asked.since(), Some(100));
-        assert!(!asked.is_read());
-
-        // The eye lands on the pane: still waiting (reading is not answering),
-        // but read — Cmd+J must now walk past it.
-        let seen = asked.read();
-        assert!(seen.is_read());
-        assert_eq!(seen.since(), Some(100), "looking at a pane does not answer it");
-
-        // A second question on the same unanswered turn makes it unread again,
-        // without restarting the waiting clock.
-        let asked_again = seen.armed(160);
-        assert!(!asked_again.is_read(), "a fresh question must resurface the pane");
-        assert_eq!(asked_again.since(), Some(100), "the waiting clock keeps its origin");
-    }
+    use super::{adjacent_visible_pairs, geometry_ratio, pinned_virtual_width, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, distribute_visible, grow_virtual_for_restored_column, max_visible_fraction, new_entry_weight, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column};
 
     // ------------------------------------------------------------------
     // Minimized entries must not pollute the layout of the visible ones.
@@ -2832,81 +2359,6 @@ mod tests {
         assert_eq!(pinned_virtual_width(2560.0, 1728.0, 0.0), None, "unknown scale");
     }
 
-    #[test]
-    fn is_working_marker_only_on_a_spinner() {
-        // Working: an animated Braille spinner glyph (U+2800–U+28FF) + space.
-        assert!(is_working_marker("\u{2802} Revue de code")); // ⠂
-        // Working: the vertical half-circle spinner frames + space.
-        assert!(is_working_marker("\u{25D0} Configurer le suivi")); // ◐
-        assert!(is_working_marker("\u{25D1} Configurer le suivi")); // ◑
-        assert!(!is_working_marker("\u{25D0}glued"));
-        assert!(is_working_marker("\u{2810} Comprendre"));    // ⠐
-        assert!(is_working_marker("\u{28FF} x"));             // last frame of range
-        assert!(is_working_marker("\u{2800} ")); // spinner + trailing space only
-        // NOT working: the asterisk idle marker (this was the earlier bug).
-        assert!(!is_working_marker("* Claude Code"));
-        assert!(!is_working_marker("\u{2733} Claude Code"));
-        assert!(!is_working_marker("\u{2217} foo"));
-        // NOT working: plain titles, spinner without a space, empty.
-        assert!(!is_working_marker("plain title"));
-        assert!(!is_working_marker("\u{2802}glued"));
-        assert!(!is_working_marker("\u{2802}"));
-        assert!(!is_working_marker(""));
-    }
-
-    #[test]
-    fn process_name_kept_as_is_when_already_a_bare_binary() {
-        assert_eq!(normalize_process_name("claude").as_deref(), Some("claude"));
-        assert_eq!(normalize_process_name("nvim").as_deref(), Some("nvim"));
-    }
-
-    #[test]
-    fn process_name_keeps_only_the_last_path_component() {
-        assert_eq!(normalize_process_name("/usr/bin/ssh").as_deref(), Some("ssh"));
-    }
-
-    #[test]
-    fn process_name_drops_the_login_shell_dash() {
-        assert_eq!(normalize_process_name("-zsh").as_deref(), Some("zsh"));
-    }
-
-    #[test]
-    fn process_name_trims_surrounding_whitespace() {
-        assert_eq!(normalize_process_name("  cargo \n").as_deref(), Some("cargo"));
-    }
-
-    #[test]
-    fn unresolvable_process_name_yields_nothing_to_display() {
-        // proc_name failing gives an empty string — must not render a blank label.
-        assert_eq!(normalize_process_name(""), None);
-        assert_eq!(normalize_process_name("   "), None);
-        assert_eq!(normalize_process_name("-"), None);
-    }
-
-    #[test]
-    fn strip_activity_prefix_trims_spinner_and_idle_marker() {
-        // Braille working spinner stripped for a stable, non-jittering title.
-        assert_eq!(strip_activity_prefix("\u{2802} Revue de code"), "Revue de code");
-        assert_eq!(strip_activity_prefix("\u{2810} Comprendre"), "Comprendre");
-        // Asterisk-like idle markers still stripped too.
-        assert_eq!(strip_activity_prefix("* Add TimeComet.swift"), "Add TimeComet.swift");
-        assert_eq!(strip_activity_prefix("\u{2733} Claude Code"), "Claude Code");
-        assert_eq!(strip_activity_prefix("\u{2217} foo"), "foo");
-        // Vertical half-circle spinner frames stripped as well.
-        assert_eq!(strip_activity_prefix("\u{25D0} Configurer le suivi"), "Configurer le suivi");
-        assert_eq!(strip_activity_prefix("\u{25D1} Configurer le suivi"), "Configurer le suivi");
-        // No marker, or marker without a following space: left untouched.
-        assert_eq!(strip_activity_prefix("plain title"), "plain title");
-        assert_eq!(strip_activity_prefix("*already glued"), "*already glued");
-        assert_eq!(strip_activity_prefix("\u{2802}glued"), "\u{2802}glued");
-        // Only one prefix stripped; an inner asterisk stays.
-        assert_eq!(strip_activity_prefix("* a * b"), "a * b");
-        // Empty and marker-only edge cases don't panic.
-        assert_eq!(strip_activity_prefix(""), "");
-        assert_eq!(strip_activity_prefix("*"), "*");
-        assert_eq!(strip_activity_prefix("* "), "");
-    }
-
     // Emulate Tab::column_widths for the no-minimized fast path.
     fn col_widths(weights: &[f32], total: f32) -> Vec<f32> {
         let sum: f32 = weights.iter().sum();
@@ -2954,6 +2406,91 @@ mod tests {
         assert_eq!(weights, vec![1.0, 1.0]);
     }
 
+    fn claude_session() -> crate::agent_session::AgentSession {
+        crate::agent_session::AgentSession {
+            agent: crate::agent_session::Agent::Claude, id: "claude-id".into(), name: None,
+            peer_name: None,
+        }
+    }
+
+    #[test]
+    fn a_pane_remembers_its_last_claude_session_after_claude_exits() {
+        use crate::agent_session::{Agent, AgentSession};
+        let (pane, _fd) = super::Pane::capture(10, 2);
+        assert_eq!(pane.last_claude_session_id(), None);
+        pane.set_agent_session(Some(claude_session()));
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
+        // `/exit`: the probe finds nothing, the id stays.
+        pane.set_agent_session(None);
+        assert_eq!(pane.claude_session_id(), None);
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
+        // A Codex conversation is not a Claude one: the Claude id stays.
+        pane.set_agent_session(Some(AgentSession {
+            agent: Agent::Codex, id: "codex-id".into(), name: None, peer_name: None,
+        }));
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
+        // The next Claude conversation replaces it.
+        pane.set_agent_session(Some(AgentSession {
+            agent: Agent::Claude, id: "next-id".into(), name: None, peer_name: None,
+        }));
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("next-id"));
+        // A dead shell keeps it too.
+        pane.shell_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+        pane.check_running(false);
+        assert_eq!(pane.last_claude_session_id().as_deref(), Some("next-id"));
+    }
+
+    #[test]
+    fn a_pane_whose_shell_exited_forgets_its_program_and_rearms_cmd_j() {
+        let (pane, _fd) = super::Pane::capture(10, 2);
+        pane.agent_session.replace(Some(claude_session()));
+        pane.set_awaiting();
+        pane.mark_idle_agent_seen();
+        pane.terminal.read().command_running.store(true, std::sync::atomic::Ordering::Relaxed);
+        pane.shell_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Even without a foreground re-probe, a dead shell drops everything.
+        let state = pane.check_running(false);
+        assert_eq!(state, super::RunningState { exited: true, command_running: false, fg_running: false });
+        assert!(!pane.is_awaiting(), "a dead shell cannot be waiting");
+        assert!(!pane.has_agent_session());
+        assert_eq!(pane.fg_process(), None);
+        // Re-armed: a session that comes back later is a candidate again.
+        pane.agent_session.replace(Some(claude_session()));
+        assert!(pane.is_idle_agent_unseen());
+    }
+
+    #[test]
+    fn a_pass_without_a_foreground_probe_only_reads_the_osc_flag() {
+        let (pane, _fd) = super::Pane::capture(10, 2);
+        pane.agent_session.replace(Some(claude_session()));
+        pane.set_awaiting();
+        pane.mark_idle_agent_seen();
+
+        assert_eq!(pane.check_running(false), super::RunningState::default());
+        pane.terminal.read().command_running.store(true, std::sync::atomic::Ordering::Relaxed);
+        let state = pane.check_running(false);
+        assert!(state.command_running && !state.fg_running && !state.exited);
+        // Nothing re-probed, so nothing reaped or re-armed.
+        assert!(pane.is_awaiting());
+        assert!(pane.has_agent_session());
+        assert!(!pane.is_idle_agent_unseen(), "the Cmd+J read flag survives an unprobed pass");
+    }
+
+    #[test]
+    fn a_tab_runs_when_any_live_pane_runs() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        b.terminal.read().command_running.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut tab = super::Tab::with_columns(vec![vec![a], vec![b]]);
+        assert!(tab.check_running(false));
+
+        // The running pane's shell dies: its stranded OSC flag no longer counts.
+        let b_id = tab.columns[1].panes[0].id;
+        tab.pane(b_id).unwrap().shell_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!tab.check_running(false));
+    }
+
     #[test]
     fn a_restored_resume_line_is_the_resume_target_and_nothing_else_is() {
         use crate::agent_session::Agent;
@@ -2991,12 +2528,14 @@ mod tests {
         pane.terminal.write().title = Some("Codex".into());
         pane.agent_session.replace(Some(AgentSession {
             agent: Agent::Codex, id: "codex-id".into(), name: Some("premier nom".into()),
+            peer_name: Some("leak".into()),
         }));
         assert_eq!(pane.display_title("shell"), "premier nom");
         assert_eq!(pane.agent_session_name().as_deref(), Some("premier nom"));
         assert_eq!(pane.agent_session_id().as_deref(), Some("codex-id"));
         assert_eq!(pane.claude_session_name(), None);
         assert_eq!(pane.claude_session_id(), None);
+        assert_eq!(pane.claude_peer_name(), None);
 
         pane.agent_session.borrow_mut().as_mut().unwrap().name = Some("renommé 🦀".into());
         assert_eq!(pane.display_title("shell"), "renommé 🦀");
@@ -3007,117 +2546,23 @@ mod tests {
 
         pane.agent_session.replace(Some(AgentSession {
             agent: Agent::Claude, id: "claude-id".into(), name: Some("Claude nommé".into()),
+            peer_name: Some("Claude nommé".into()),
         }));
         assert_eq!(pane.display_title("shell"), "Claude nommé");
         assert_eq!(pane.agent_session_name(), pane.claude_session_name());
         assert_eq!(pane.claude_session_name().as_deref(), Some("Claude nommé"));
         assert_eq!(pane.agent_session_id(), pane.claude_session_id());
-    }
+        assert_eq!(pane.claude_peer_name().as_deref(), Some("Claude nommé"));
 
-    #[test]
-    fn claude_session_name_wins_over_everything() {
-        let t = derive_display_title(
-            Some("my pane"),
-            Some("session"),
-            Some("osc"),
-            Some("claude"),
-            Some("/home/x/proj"),
-            "shell",
-        );
-        assert_eq!(t, "session", "a /rename must beat the pane's sticky title");
-    }
-
-    #[test]
-    fn custom_title_wins_over_everything_below_the_claude_name() {
-        let t = derive_display_title(
-            Some("my pane"),
-            None,
-            Some("osc"),
-            Some("claude"),
-            Some("/home/x/proj"),
-            "shell",
-        );
-        assert_eq!(t, "my pane");
-    }
-
-    #[test]
-    fn claude_session_name_wins_over_osc_title() {
-        // The OSC title a Claude pane carries is the generic "✳ Claude Code";
-        // the name the user gave the session is what identifies the pane.
-        let t = derive_display_title(
-            None,
-            Some("pane switcher"),
-            Some("✳ Claude Code"),
-            Some("claude"),
-            Some("/home/x/proj"),
-            "shell",
-        );
-        assert_eq!(t, "pane switcher");
-    }
-
-    #[test]
-    fn blank_claude_session_name_falls_through_to_osc_title() {
-        let t = derive_display_title(None, Some("   "), Some("vim"), None, Some("/home/x/proj"), "shell");
-        assert_eq!(t, "vim");
-    }
-
-    #[test]
-    fn blank_claude_session_name_leaves_the_custom_title_alone() {
-        let t = derive_display_title(Some("my pane"), Some("   "), Some("vim"), None, None, "shell");
-        assert_eq!(t, "my pane");
-    }
-
-    #[test]
-    fn non_empty_osc_title_used() {
-        let t = derive_display_title(None, None, Some("vim"), None, Some("/home/x/proj"), "shell");
-        assert_eq!(t, "vim");
-    }
-
-    #[test]
-    fn osc_title_wins_over_the_foreground_process() {
-        // What the app calls itself says more than the name of its binary.
-        let t = derive_display_title(None, None, Some("README.md"), Some("nvim"), Some("/home/x/proj"), "shell");
-        assert_eq!(t, "README.md");
-    }
-
-    #[test]
-    fn foreground_process_used_when_nothing_named_the_pane() {
-        let t = derive_display_title(None, None, None, Some("nvim"), Some("/home/x/proj"), "shell");
-        assert_eq!(t, "nvim");
-        // A blank OSC title must not shadow the process either.
-        let t = derive_display_title(None, None, Some("  "), Some("nvim"), Some("/home/x/proj"), "shell");
-        assert_eq!(t, "nvim");
-    }
-
-    #[test]
-    fn empty_osc_title_falls_back_to_cwd_basename() {
-        let t = derive_display_title(None, None, Some(""), None, Some("/home/x/proj"), "shell");
-        assert_eq!(t, "proj");
-    }
-
-    #[test]
-    fn whitespace_osc_title_falls_back_to_cwd_basename() {
-        let t = derive_display_title(None, None, Some("   "), None, Some("/home/x/proj"), "shell");
-        assert_eq!(t, "proj");
-    }
-
-    #[test]
-    fn blank_process_falls_through_to_cwd_basename() {
-        let t = derive_display_title(None, None, None, Some("   "), Some("/home/x/proj"), "shell");
-        assert_eq!(t, "proj");
-    }
-
-    #[test]
-    fn claude_session_name_used_when_the_pane_has_no_other_title() {
-        let t = derive_display_title(None, Some("kova-bc"), None, None, None, "shell");
-        assert_eq!(t, "kova-bc");
-    }
-
-    #[test]
-    fn no_title_no_cwd_uses_fallback() {
-        assert_eq!(derive_display_title(None, None, None, None, None, "shell"), "shell");
-        // Empty OSC title with no cwd must also reach the fallback, never blank.
-        assert_eq!(derive_display_title(None, None, Some(""), None, None, "shell"), "shell");
+        // Never renamed: no session name, so the title falls back, but the
+        // derived peer name is still exposed for SendMessage.
+        pane.agent_session.replace(Some(AgentSession {
+            agent: Agent::Claude, id: "claude-id".into(), name: None,
+            peer_name: Some("lempire-f1".into()),
+        }));
+        assert_eq!(pane.claude_session_name(), None);
+        assert_eq!(pane.claude_peer_name().as_deref(), Some("lempire-f1"));
+        assert_eq!(pane.display_title("shell"), "Codex");
     }
 
     /// A tab moved from a 2x display to a 1x one must keep the same APPARENT

@@ -13,6 +13,8 @@ pub struct Config {
     pub splits: SplitsConfig,
     pub global_status_bar: GlobalStatusBarConfig,
     pub layout: LayoutConfig,
+    pub bookmarks: BookmarksConfig,
+    pub switcher: SwitcherConfig,
     pub keys: KeysConfig,
     pub agent: AgentConfig,
 }
@@ -88,6 +90,56 @@ pub struct GlobalStatusBarConfig {
     pub fg_color: [f32; 3],
     pub time_color: [f32; 3],
     pub scroll_indicator_color: [f32; 3],
+}
+
+/// Colors of a bookmarked conversation: the band its row wears in the pane
+/// switcher (Cmd+P), and the status bar of the pane that still holds it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BookmarksConfig {
+    /// Status-bar background of a pane holding a bookmarked conversation.
+    pub bar_bg: [f32; 3],
+    /// Switcher row background of a bookmarked pane that is not selected.
+    pub row_bg: [f32; 3],
+    /// Same row when the selection is on it.
+    pub row_selected_bg: [f32; 3],
+    /// Text drawn on that band — dark by default, since the band is light.
+    pub row_fg: [f32; 4],
+    /// Dimmer text on the same band (process name, minimized rows).
+    pub row_dim_fg: [f32; 4],
+}
+
+impl Default for BookmarksConfig {
+    fn default() -> Self {
+        BookmarksConfig {
+            // Deep enough to sit under the status bar's usual palette (cwd grey,
+            // branch green, scroll amber) without washing it out, and to read as
+            // a state rather than an alarm — the bell and completion bars own the
+            // loud end of the range.
+            bar_bg: [0.05, 0.09, 0.24],
+            // A light band, dark text on it. The selected variant is the same hue
+            // pushed harder, so selection still reads on a row that already has a
+            // background of its own.
+            row_bg: [0.69, 0.78, 0.86],
+            row_selected_bg: [0.51, 0.64, 0.79],
+            row_fg: [0.05, 0.07, 0.12, 1.0],
+            row_dim_fg: [0.22, 0.30, 0.42, 1.0],
+        }
+    }
+}
+
+/// The pane switcher (Cmd+P).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SwitcherConfig {
+    /// Band under the selected row — the cursor of the list.
+    pub selected_bg: [f32; 3],
+}
+
+impl Default for SwitcherConfig {
+    fn default() -> Self {
+        SwitcherConfig { selected_bg: [0.25, 0.35, 0.55] }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,6 +321,8 @@ impl Default for Config {
             splits: SplitsConfig::default(),
             global_status_bar: GlobalStatusBarConfig::default(),
             layout: LayoutConfig::default(),
+            bookmarks: BookmarksConfig::default(),
+            switcher: SwitcherConfig::default(),
             keys: KeysConfig::default(),
             agent: AgentConfig::default(),
         }
@@ -467,6 +521,8 @@ pub struct KeysConfig {
     pub open_pane_switcher: String,
     pub open_unread_switcher: String,
     pub toggle_bookmark: String,
+    pub toggle_anchor: String,
+    pub focus_anchor: String,
     pub equalize: String,
     pub repaint_pane: String,
     pub next_attention: String,
@@ -539,6 +595,8 @@ impl Default for KeysConfig {
             open_pane_switcher: "cmd+p".into(),
             open_unread_switcher: "cmd+shift+j".into(),
             toggle_bookmark: "cmd+b".into(),
+            toggle_anchor: "cmd+shift+a".into(),
+            focus_anchor: "cmd+a".into(),
             equalize: "cmd+shift++".into(),
             repaint_pane: "cmd+r".into(),
             next_attention: "cmd+j".into(),

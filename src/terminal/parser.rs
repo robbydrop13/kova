@@ -261,10 +261,7 @@ impl VteHandler {
                     TermOp::Tab => term.tab(),
                     TermOp::Newline => term.newline(),
                     TermOp::CarriageReturn => term.carriage_return(),
-                    TermOp::Bell => {
-                        term.bell.store(true, std::sync::atomic::Ordering::Relaxed);
-                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    TermOp::Bell => term.ring_bell(),
                     TermOp::CursorUp(n) => term.cursor_up(n),
                     TermOp::CursorDown(n) => term.cursor_down(n),
                     TermOp::CursorForward(n) => term.cursor_forward(n),
@@ -425,17 +422,14 @@ impl VteHandler {
                         log::debug!("OSC 133;D command completed (terminal {})", term.terminal_id);
                         // The first D with no prior C is the shell's startup
                         // precmd — swallow it (no command actually completed).
-                        // Later D-without-C (e.g. Claude Code's Stop hook)
+                        // Later D-without-C (a program printing 133;D itself)
                         // must still fire: the startup D already primed us.
                         if term.osc133_primed {
-                            term.command_completed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // Fresh completion — unread until the pane is looked at.
-                            term.completion_seen.store(false, std::sync::atomic::Ordering::Relaxed);
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                            term.mark_command_completed();
                         } else {
                             term.osc133_primed = true;
+                            term.command_running.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
-                        term.command_running.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                     TermOp::KittyKeyboardPush(flags) => {
                         term.kitty_keyboard_flags.push(flags);
@@ -490,12 +484,63 @@ impl VteHandler {
                     }
                 }
             }
+            // The renderer redraws a pane only when it is dirty (clean panes
+            // are drawn from their cached vertices), so any batch that touched
+            // the terminal marks it here rather than trusting every mutator to.
+            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         // Write lock released — now send PTY responses without holding any lock
         for response in &pty_responses {
             self.write_to_pty(response);
         }
     }
+}
+
+/// Decode standard base64 (padding optional, whitespace skipped). None on any other byte.
+fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &c in input {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Put text on the macOS clipboard from the parser thread. `pbcopy` rather than NSPasteboard,
+/// which wants the main thread; a background thread so the PTY reader never waits on it.
+fn copy_to_clipboard(text: String) {
+    // The parser fuzz test feeds OSC 52 on purpose; a test run must not clobber the clipboard.
+    if cfg!(test) { return; }
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let child = std::process::Command::new("/usr/bin/pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+            }
+            Err(e) => log::warn!("OSC 52: pbcopy failed: {}", e),
+        }
+    });
 }
 
 impl Perform for VteHandler {
@@ -557,8 +602,10 @@ impl Perform for VteHandler {
                     // Current working directory: file://hostname/path
                     if params[1].len() > MAX_OSC_PAYLOAD { return; }
                     let uri = String::from_utf8_lossy(params[1]);
+                    // The path is a URL path: a space arrives as %20 ("Application%20Support"),
+                    // and kept encoded it is a directory that does not exist.
                     let path = if let Some(rest) = uri.strip_prefix("file://") {
-                        rest.find('/').map(|i| rest[i..].to_string())
+                        rest.find('/').map(|i| percent_decode(&rest[i..]))
                     } else {
                         None
                     };
@@ -566,6 +613,19 @@ impl Perform for VteHandler {
                         // Filesystem I/O done during parsing — no lock held
                         let git_branch = resolve_git_branch(&path);
                         self.ops.push(TermOp::SetCwd(path, git_branch));
+                    }
+                }
+                b"52" => {
+                    // OSC 52 ; selection ; base64 — a program puts text on the clipboard.
+                    // Claude Code copies a mouse selection this way and then says "copied";
+                    // ignoring it left the old clipboard in place under that message.
+                    // A "?" payload asks to *read* the clipboard: never answered.
+                    const MAX_OSC52_PAYLOAD: usize = 8 * 1024 * 1024;
+                    let Some(data) = params.get(2) else { return };
+                    if *data == b"?" || data.len() > MAX_OSC52_PAYLOAD { return; }
+                    match decode_base64(data).map(String::from_utf8) {
+                        Some(Ok(text)) => copy_to_clipboard(text),
+                        _ => log::debug!("OSC 52: payload is not base64 UTF-8, ignored"),
                     }
                 }
                 b"133" => {
@@ -950,9 +1010,38 @@ impl AnsiColor {
     }
 }
 
+/// Decode %XX escapes of a URL path into UTF-8; a malformed escape is kept as is.
+fn percent_decode(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(b) = hex {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_osc52_base64() {
+        assert_eq!(decode_base64(b"Zm9v").unwrap(), b"foo");
+        assert_eq!(decode_base64(b"Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(decode_base64(b"Zm9vYmE").unwrap(), b"fooba");
+        assert!(decode_base64(b"Zm9v!").is_none());
+    }
+
     use crate::terminal::{DEFAULT_BG, DEFAULT_FG};
 
     /// Feed raw bytes through the real vte parser into a TerminalState.
@@ -1101,9 +1190,19 @@ mod tests {
         // it must not light the completion indicator.
         let t = drive(20, 5, &[b"\x1b]133;D\x07"]);
         assert!(!t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
-        // A later D without C (Claude Code Stop hook) must fire.
+        // A later D without C (any program printing 133;D itself) must fire.
         let t = drive(20, 5, &[b"\x1b]133;D\x07", b"\x1b]133;D\x07"]);
         assert!(t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn mark_started_clears_a_completion_like_osc133_c() {
+        // Claude's Stop hook marks each turn done; the next prompt's
+        // mark-started must reset it, or wait-for-completion answers at once.
+        let t = drive(20, 5, &[]);
+        t.read().mark_command_completed();
+        t.read().mark_command_started();
+        assert!(!t.read().command_completed.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -1399,5 +1498,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn osc7_cwd_is_percent_decoded() {
+        let term = drive(20, 5, &[b"\x1b]7;file://mac/Users/me/Library/Application%20Support/X\x07"]);
+        assert_eq!(term.read().cwd.as_deref(), Some("/Users/me/Library/Application Support/X"));
+        // UTF-8 escapes, and a plain path is left alone.
+        let term = drive(20, 5, &[b"\x1b]7;file://mac/tmp/caf%C3%A9\x07"]);
+        assert_eq!(term.read().cwd.as_deref(), Some("/tmp/caf\u{e9}"));
+        let term = drive(20, 5, &[b"\x1b]7;file://mac/tmp/plain\x07"]);
+        assert_eq!(term.read().cwd.as_deref(), Some("/tmp/plain"));
+    }
+
+    #[test]
+    fn percent_decode_keeps_malformed_escapes() {
+        assert_eq!(percent_decode("/a%2"), "/a%2");
+        assert_eq!(percent_decode("/a%zz/b"), "/a%zz/b");
+        assert_eq!(percent_decode("/100%25"), "/100%");
     }
 }

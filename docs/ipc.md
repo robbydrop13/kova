@@ -141,7 +141,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "claude_session_name": "subscribe côté Kova",
   "resume_agent": null,
   "resume_session_id": null,
-  "resume_command": null
+  "resume_command": null,
+  "peer_name": "subscribe côté Kova"
 }
 ```
 
@@ -152,6 +153,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 `child_processes[].name` is the program's name as it was invoked (argv[0], what `ps` shows), not the kernel's `p_comm`. The difference matters for anything installed under a versioned filename: Claude Code's binary is `~/.local/share/claude/versions/2.1.226`, so `p_comm` there is `2.1.226` and the name would say nothing about which program is running. `version` carries that number when the executable's own filename is one, and is `null` otherwise — so a Claude Code pane reads `{"name": "claude", "version": "2.1.226"}`.
 
 `claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab, and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
+
+`peer_name` is the name other Claude Code sessions use to reach this one with `SendMessage` / `ListAgents` (e.g. `"lempire-f1"`). It is the session file's `name` field as Claude Code wrote it, **including a name it derived on its own** (`nameSource: "derived"`), which `claude_session_name` deliberately drops so that it never shadows the pane title. After a `/rename` the two fields carry the same value. It is `null` in a pane with no Claude session, for Codex, and while Claude Code has not yet written a name. It comes from the same cached scan of `~/.claude/sessions/` as `claude_session_id`, with no extra filesystem pass.
 
 `agent` is `"claude"`, `"codex"`, or `null`. `agent_session_id` and `agent_session_name` expose the detected conversation's id and name for either agent; the name is `null` when absent. The `claude_*` fields remain `null` for Codex, including named Codex sessions. Codex resumes with `codex resume <id>`.
 
@@ -197,6 +200,44 @@ There is intentionally **no time-based expiry**. A question left unanswered for 
 
 ---
 
+### `mark-completed` — light a pane's "finished" indicator
+
+```json
+{ "cmd": "mark-completed", "pane_id": 42 }
+```
+
+Does what OSC 133;D does: the pane gets the unread "finished command" dot that `Cmd+P`'s `Tab`, the `●N` counter and `Cmd+J` walk, and a pending `wait-for-completion` on the pane returns. Unlike the shell's own 133;D, it is never swallowed as a startup marker, so it works on a pane with no shell integration.
+
+It exists for hooks of an app that owns the tty. Claude Code's `Stop` hook used to print `ESC ] 133;D BEL` straight to the pane's tty; those bytes interleave with Claude Code's output at any point, and landing inside one of its CSI sequences (`ESC [ 10 G`) aborts it, so the parameters are printed as text — `Les 1410Gmide` for `Les 14 min de`. Claude Code's differential renderer never repaints the line, so the garbage stays until something makes it redraw (a mouse selection does). Captures from one day held 30 such splits. Over the socket, nothing reaches the tty.
+
+Response: `{ "ok": true }`.
+
+---
+
+### `mark-started` — clear a pane's "finished" flag
+
+```json
+{ "cmd": "mark-started", "pane_id": 42 }
+```
+
+Does to the flag what OSC 133;C does: the last completion no longer answers `wait-for-completion`. Claude Code's `UserPromptSubmit` hook sends it, so a Claude pane marked done by one turn's `Stop` does not look done for the whole next turn. It leaves the running indicator alone: a turn interrupted with Esc fires no `Stop`, and the foreground-process probe already tracks it.
+
+Response: `{ "ok": true }`.
+
+---
+
+### `bell` — raise a pane's bell flag
+
+```json
+{ "cmd": "bell", "pane_id": 42 }
+```
+
+Same effect as a BEL in the pane's output (the unread bell marker), for the same reason as `mark-completed`: a BEL printed on the tty by a hook can land inside one of the app's OSC sequences (a title, a hyperlink) and terminate it early, spilling the rest as text. Claude Code's `Notification` and `Stop` hooks use it.
+
+Response: `{ "ok": true }`.
+
+---
+
 ### `focus-pane` — bring a pane into focus
 
 ```json
@@ -235,6 +276,119 @@ when Kova runs outside its app bundle (notifications need a bundle identifier).
 The first notification of a fresh install triggers the system permission prompt;
 if the user declines, `notify` still answers `{ "ok": true }` and macOS silently
 drops the banner.
+
+---
+
+### `ask` — put an agent's question on the user's screen and wait for the answer
+
+```json
+{ "cmd": "ask", "question": {
+    "id": "6f1c…-uuid", "message": "Send the reply to Robin?",
+    "actions": ["OK", "KO"], "input": true, "asked_at": 1792000000,
+    "from": { "name": "routine", "session_id": "…", "pane_id": 12,
+              "kova_socket": "/tmp/kova-123.sock", "cwd": "/Users/…/project" } } }
+```
+
+Not meant to be spoken by hand: `kova ask "<message>" [--actions OK,KO]` builds it
+from its environment (`CLAUDE_CODE_SESSION_ID`, `KOVA_PANE_ID`, `KOVA_SOCKET`) and
+`kova ask --help` documents the client. `id` must be a UUID (it names files on
+disk), `session_id` must be a plain `[A-Za-z0-9_-]` id (it reaches a command line).
+
+Kova shows the question on a card in the top-right corner of the screen (one
+card, oldest question first, a Dock badge counting them) and answers only when
+the user does — there is no server-side timeout. The response is
+`{"ok":true,"data":{"id":…,"action":"OK","text":"…"}}`, after which the client must
+write the line `ack` within 2 s: without it, the answer is considered lost on
+the way and Kova delivers it to the conversation itself:
+
+1. typed into the asker's pane, if that pane still runs the asker's Claude
+   conversation (same `claude_session_id`, or the conversation's process
+   descends from the pane's shell);
+2. if the conversation is open in another process, Kova waits for it to end;
+3. then reopens it in a new tab: `claude --dangerously-skip-permissions --resume
+   <session_id> '<the answer>'`, in the directory the conversation ran in (read
+   from its transcript, which `claude --resume` needs; not the asker's `cwd`).
+   No transcript, or `claude` no longer running in the new pane 10 s after
+   Enter (it exits at once on "No conversation found"), and the answer stays
+   on disk, retried at the next launch.
+
+A pane of a library host (Kana) names that host's socket, which answers `ask`
+with `command not supported by this host` (or `unknown command: ask` for a
+build older than `ask`): `kova ask` then asks Kova.app.
+
+Questions and undelivered answers survive a restart (`~/.config/kova/ask/`,
+`KOVA_ASK_DIR` overrides it). Only the Kova holding that directory's lock
+(`owner.lock`, taken at launch) writes there and replays it: another Kova
+running at the same time keeps its own questions in memory only, since
+anything it wrote would be shown and delivered a second time by the holder. Kova.app only: a library host answers `command not
+supported by this host`, which sends `kova ask` on to Kova.app.
+
+---
+
+### `set-anchor` — put a conversation at the head of the anchors
+
+```json
+{ "cmd": "set-anchor", "pane_id": 42 }
+{ "cmd": "set-anchor", "cwd": "/Users/x/projects/prez", "session_id": "abc123", "agent": "claude", "label": "Prez steerco" }
+```
+
+The anchors are the few conversations today is for: they open `Cmd+P` in their
+own section and `Cmd+A` goes to the first of them. This command puts one at the
+head, which is how an outside tool that knows the day's work (a task manager, a
+calendar) says "today is this one". Kova never calls out: it holds the list and
+answers this.
+
+Either name a pane of this Kova with `pane_id` — its conversation, directory and
+title are read from the pane — or name the conversation outright with `cwd`,
+plus `session_id` and `agent` (`"claude"` or `"codex"`) for Kova to be able to
+reopen it, and `label` for the row (the directory's name otherwise). A
+`session_id` without an `agent` is dropped: nothing could resume it. A
+conversation already anchored moves to the head rather than gaining a second
+row, so pushing the same anchor twice is harmless. The list is capped at 8; past
+that the last anchor of the list falls off and its label comes back in `dropped` — a push
+from outside always lands, where `Cmd+Shift+A` on a full list refuses instead
+(you are there to drop one). An anchored conversation stops appearing among
+the bookmarks below, even when it is bookmarked too.
+
+Response: `{ "ok": true, "data": { "label": "Prez steerco", "anchors": 3, "dropped": null } }`.
+
+Errors rather than a surprise: a request naming neither `pane_id` nor `cwd`, a
+`pane_id` that is not open (or holds neither a conversation nor a directory), and
+a `session_id` the agent could not resume.
+
+---
+
+### `clear-anchors` — empty the anchor list
+
+```json
+{ "cmd": "clear-anchors" }
+```
+
+Kova has no notion of a day and never clears the anchors on its own: this is how
+the outside says the day is over. Bookmarks are untouched — a conversation that
+was in both lists is simply a bookmark again.
+
+Response: `{ "ok": true, "data": { "removed": 3 } }`.
+
+---
+
+### `reload-config` — re-read the config file without restarting
+
+```json
+{ "cmd": "reload-config" }
+```
+
+Reads `~/.config/kova/config.toml` again and pushes its appearance half into
+every open window: `[colors]`, `[status_bar]`, `[global_status_bar]`, `[tab_bar]`,
+`[bookmarks]`, and the fade / focus outline of `[splits]`. The next frame draws
+with the new values — around 16 ms later, no restart, no session reload.
+
+What it does not touch, because they are read once at startup and would mean
+rebuilding the glyph atlas or resizing every PTY: `[font]`, `[terminal]`,
+`[window]`, `[keys]`. An invalid TOML file leaves every window as it was (the
+loader falls back to defaults and logs the parse error).
+
+Response: `{ "ok": true, "data": { "windows": 2, "needs_restart": ["font", "keys", "terminal", "window"] } }`.
 
 ---
 
@@ -399,6 +553,8 @@ detach-tab  break-pane  merge-tab  merge-window
 rename-tab  rename-pane            (open the inline rename editor)
 open-recent-project  open-search  open-pane-switcher   (open an overlay)
 open-unread-switcher               (the pane switcher, listing only panes with a bell, an unread completion or a question)
+toggle-bookmark                    (bookmark the focused pane's conversation)
+toggle-anchor  focus-anchor         (anchor the focused pane; jump to the first anchor)
 copy  copy-raw  paste  toggle-filter
 toggle-help  mem-report
 toggle-sidebar                     (switch the layout between the tab bar and the sidebar, see sidebar-spec.md)
@@ -531,7 +687,7 @@ Use this **before** `get-pane-content` to decide whether the payload is worth fe
 | `pane_id` | required | — | pane to watch |
 | `timeout_ms` | `30000` | `300000` | give up after this many ms |
 
-Returns when the shell emits **OSC 133;D** (command-completed marker) for that pane, or when the deadline passes.
+Returns when the pane is marked completed — by the shell's **OSC 133;D** or by the IPC `mark-completed` command (Claude Code's `Stop` hook) — or when the deadline passes.
 
 Response:
 
@@ -541,9 +697,9 @@ Response:
 { "ok": false, "error": "pane 42 closed during wait" }
 ```
 
-**Requires shell integration.** The shell must emit OSC 133 sequences. Most modern prompt frameworks (Starship, Powerlevel10k, fig/atuin, vscode-shell-integration) do this automatically. Without it, this command always times out.
+**Requires something to mark completion.** For a shell, that is shell integration emitting OSC 133 sequences; most modern prompt frameworks (Starship, Powerlevel10k, fig/atuin, vscode-shell-integration) do this automatically. For a Claude Code session, the `Stop` hook's `mark-completed`. With neither, this command always times out.
 
-**Semantics — sticky flag.** Kova's `command_completed` flag is set on OSC 133;D and stays set until the shell starts the next command (OSC 133;A). Implications:
+**Semantics — sticky flag.** Kova's `command_completed` flag is set on OSC 133;D or `mark-completed`, and stays set until the next command or turn starts: OSC 133;C, `mark-started`, or a `send-keys` whose text contains a newline or carriage return. Implications:
 
 - If the wait arrives **after** the command already finished, it returns `completed: true` immediately.
 - Calling `wait-for-completion` twice in a row without sending a new command in between returns `completed: true` both times. The flag isn't consumed by observation. The intended pattern is `send-keys` → `wait-for-completion`, never two waits without a send in between.

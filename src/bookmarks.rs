@@ -1,5 +1,5 @@
-//! Conversations the user wants back — the list Cmd+P offers under
-//! "Bookmarks", kept apart from the session file on purpose.
+//! Conversations the user wants back — the list Cmd+P offers, grouped by
+//! directory, kept apart from the session file on purpose.
 //!
 //! The session file answers "what was open when Kova quit"; it is a safety net
 //! and it forgets a tab as soon as it is closed. A bookmark answers a different
@@ -15,10 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::agent_session::Agent;
-
-/// Cap on the list. Past this it stops being a shortlist and becomes a second
-/// history, which the search palette already is.
-pub const MAX_BOOKMARKS: usize = 32;
 
 /// One saved conversation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,37 +64,13 @@ fn path() -> PathBuf {
 /// Read the list from disk. A missing or unreadable file is an empty list —
 /// never a reason to refuse to open the switcher.
 pub fn load() -> Bookmarks {
-    let path = path();
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return Bookmarks::default();
-    };
-    match serde_json::from_str(&data) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("Failed to parse {} ({}); starting from an empty list", path.display(), e);
-            Bookmarks::default()
-        }
-    }
+    crate::session::load_owner_only(&path(), "bookmark list")
 }
 
 /// Write the list back, owner-readable only: it holds working directories and
 /// conversation ids, same as the session file.
 pub fn save(bookmarks: &Bookmarks) {
-    let path = path();
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            log::warn!("Failed to create {}: {}", parent.display(), e);
-            return;
-        }
-    }
-    match serde_json::to_string_pretty(bookmarks) {
-        Ok(json) => {
-            if let Err(e) = crate::session::write_owner_only(&path, &json) {
-                log::warn!("Failed to write {}: {}", path.display(), e);
-            }
-        }
-        Err(e) => log::warn!("Failed to serialize bookmarks: {}", e),
-    }
+    crate::session::save_owner_only(&path(), "bookmarks", bookmarks);
 }
 
 /// The keys of every saved bookmark, for the per-frame "is this pane
@@ -108,25 +80,28 @@ pub fn keys(items: &[Bookmark]) -> std::collections::HashSet<String> {
     items.iter().map(|b| b.key().to_string()).collect()
 }
 
-/// Whether `items` already holds this conversation.
-pub fn contains(items: &[Bookmark], candidate: &Bookmark) -> bool {
-    items.iter().any(|b| b.key() == candidate.key())
-}
-
 /// Add `candidate`, or drop it if it is already there. Returns true when the
 /// list ends up holding it — what the caller says out loud.
 ///
 /// A new bookmark goes on top: the list is read top-down and the freshest
 /// decision is the one most likely to be wanted again.
 pub fn toggle(items: &mut Vec<Bookmark>, candidate: Bookmark) -> bool {
-    if contains(items, &candidate) {
-        let key = candidate.key().to_string();
-        items.retain(|b| b.key() != key);
+    if remove(items, candidate.key()) {
         return false;
     }
     items.insert(0, candidate);
-    items.truncate(MAX_BOOKMARKS);
     true
+}
+
+/// Drop the bookmark with this key. Returns true when there was one.
+///
+/// Cmd+B can only drop the conversation running in the focused pane; this is
+/// what the switcher uses to drop one that no pane holds any more — including
+/// a conversation whose transcript the agent has since deleted.
+pub fn remove(items: &mut Vec<Bookmark>, key: &str) -> bool {
+    let before = items.len();
+    items.retain(|b| b.key() != key);
+    items.len() != before
 }
 
 #[cfg(test)]
@@ -177,7 +152,7 @@ mod tests {
             label: "a".into(),
         };
         let mut items = vec![shell.clone()];
-        assert!(contains(&items, &shell));
+        assert!(keys(&items).contains(shell.key()));
         // A conversation that happens to run in the same directory is a
         // different thing, and does not collide with it.
         assert!(toggle(&mut items, claude("abc", "/a")));
@@ -206,13 +181,24 @@ mod tests {
     }
 
     #[test]
-    fn the_list_never_grows_past_its_cap() {
+    fn removing_by_key_drops_only_that_bookmark() {
+        let mut items = vec![claude("a", "/a"), claude("b", "/b")];
+        assert!(remove(&mut items, "a"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].session_id.as_deref(), Some("b"));
+        // A key that is not there changes nothing, and says so.
+        assert!(!remove(&mut items, "a"));
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn the_list_has_no_cap_and_never_drops_a_bookmark() {
         let mut items = Vec::new();
-        for i in 0..MAX_BOOKMARKS + 5 {
+        for i in 0..50 {
             toggle(&mut items, claude(&format!("id-{}", i), "/a"));
         }
-        assert_eq!(items.len(), MAX_BOOKMARKS);
-        // The cap drops the oldest, not the newest.
-        assert_eq!(items[0].session_id.as_deref(), Some(format!("id-{}", MAX_BOOKMARKS + 4).as_str()));
+        assert_eq!(items.len(), 50, "nothing is evicted to make room");
+        assert_eq!(items[0].session_id.as_deref(), Some("id-49"), "the newest is on top");
+        assert_eq!(items[49].session_id.as_deref(), Some("id-0"), "the oldest is still there");
     }
 }

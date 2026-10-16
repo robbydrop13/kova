@@ -670,23 +670,6 @@ impl NextPill {
     }
 }
 
-/// The pane Cmd+J and the pill land on. `order` is every pane in the
-/// sidebar's display order with whether it is unread: the answer is the
-/// first unread pane after `current`'s place in that order, wrapping to the
-/// first; `current` itself never, so a lone unread pane under the eye gives
-/// nothing. A `current` not in the order (another window's) starts at the
-/// head.
-pub fn next_unread(order: &[(PaneId, bool)], current: Option<PaneId>) -> Option<PaneId> {
-    let at = current.and_then(|c| order.iter().position(|&(id, _)| id == c));
-    let start = at.map_or(0, |i| i + 1);
-    order[start..]
-        .iter()
-        .chain(order[..start.min(order.len())].iter())
-        .filter(|&&(id, unread)| unread && Some(id) != current)
-        .map(|&(id, _)| id)
-        .next()
-}
-
 /// How many panes of `order` are unread: the pill's count.
 pub fn unread_count(order: &[(PaneId, bool)]) -> usize {
     order.iter().filter(|&&(_, unread)| unread).count()
@@ -899,26 +882,6 @@ mod tests {
     }
 
     #[test]
-    fn next_unread_walks_the_order_after_the_focused_pane_and_wraps() {
-        // Display order 7, 3, 2, 5; unread: 7, 2, 5.
-        let order = [(7, true), (3, false), (2, true), (5, true)];
-        assert_eq!(unread_count(&order), 3);
-        assert_eq!(next_unread(&order, Some(2)), Some(5));
-        assert_eq!(next_unread(&order, Some(5)), Some(7));
-        assert_eq!(next_unread(&order, Some(7)), Some(2));
-        // A read pane under the eye: the next unread one after its place.
-        assert_eq!(next_unread(&order, Some(3)), Some(2));
-        // A pane from elsewhere (another window), or none: the head.
-        assert_eq!(next_unread(&order, Some(9)), Some(7));
-        assert_eq!(next_unread(&order, None), Some(7));
-        // A lone unread pane that is the one under the eye: nowhere to go.
-        assert_eq!(next_unread(&[(4, true)], Some(4)), None);
-        assert_eq!(next_unread(&[(4, true), (6, false)], Some(6)), Some(4));
-        assert_eq!(next_unread(&[(4, false)], Some(9)), None);
-        assert_eq!(next_unread(&[], Some(4)), None);
-        assert_eq!(unread_count(&[]), 0);
-    }
-
     #[test]
     fn chips_keep_their_colour_and_neutral_ones_follow_the_group() {
         use TileState::*;

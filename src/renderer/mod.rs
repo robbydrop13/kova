@@ -1,9 +1,13 @@
+mod blink;
+pub mod context;
 pub mod glyph_atlas;
+pub mod layer;
+pub mod pane_renderer;
 pub mod pipeline;
 pub mod vertex;
 
 /// Horizontal padding inside a pane, in LOGICAL points. Always go through
-/// `Renderer::h_padding()` (or `KovaView::h_padding()`), which scales it to
+/// `RenderContext::h_padding()` (or `KovaView::h_padding()`), which scales it to
 /// pixels — using the constant raw makes the pane's apparent padding, and
 /// therefore its column count, depend on the display's scale factor.
 pub const PANE_H_PADDING: f32 = 10.0;
@@ -17,6 +21,7 @@ const TOOLTIP_ANIM_FRAMES: u8 = 10; // ~166ms at 60fps
 const ITALIC_SHEAR: f32 = 0.213;
 
 /// A hoverable zone in a status bar, with associated tooltip text.
+#[derive(Clone)]
 struct TooltipZone {
     x: f32,
     y: f32,
@@ -39,28 +44,9 @@ pub struct ActiveTooltip {
     pub anchor_y: f32,
 }
 
-/// Predefined tab color palette (macOS Finder-style tags).
-/// Each entry is [R, G, B] in 0.0..1.0. The first six are the original
-/// palette and keep their indices: saved sessions store the index.
-pub const TAB_COLORS: [[f32; 3]; 12] = [
-    [0.82, 0.22, 0.22], // Red
-    [0.90, 0.55, 0.15], // Orange
-    [0.85, 0.75, 0.15], // Yellow
-    [0.30, 0.70, 0.30], // Green
-    [0.25, 0.50, 0.85], // Blue
-    [0.60, 0.35, 0.75], // Violet
-    [0.88, 0.32, 0.60], // Pink
-    [0.93, 0.42, 0.36], // Coral
-    [0.62, 0.78, 0.25], // Lime
-    [0.15, 0.68, 0.62], // Teal
-    [0.20, 0.72, 0.85], // Cyan
-    [0.42, 0.45, 0.85], // Indigo
-];
-
-/// The colours' names, in `TAB_COLORS` order, for the colour menus.
-pub const TAB_COLOR_NAMES: [&str; 12] = [
-    "Red", "Orange", "Yellow", "Green", "Blue", "Violet", "Pink", "Coral", "Lime", "Teal", "Cyan", "Indigo",
-];
+// The tab palette lives in `crate::tab_colors`, outside the renderer, so the
+// IPC transport can validate `set-tab-color` indices without depending on it.
+pub use crate::tab_colors::{TAB_COLORS, TAB_COLOR_NAMES};
 
 /// Saturation kept on an inactive colored tab (CSS `saturate(0.7)`).
 const DIM_SATURATION: f32 = 0.7;
@@ -104,7 +90,11 @@ fn format_count(n: u64) -> String {
     }
 }
 
-use glyph_atlas::GlyphAtlas;
+use blink::CursorBlink;
+use context::RenderContext;
+use pane_renderer::{PaneDrawKey, PaneRenderer, PaneStyle};
+#[cfg(test)]
+use pane_renderer::{can_reuse_pane_cache, PaneBuild};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
@@ -115,23 +105,28 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use vertex::Vertex;
 
-use crate::config::{Config, DimMode, KeysConfig};
-use crate::terminal::paste_block::RowPaint;
+use crate::config::{Config, KeysConfig};
+#[cfg(test)]
+use crate::config::DimMode;
 use crate::pane::PaneId;
 
 /// Color of the minimized-pane marker (status-bar counter and switcher ⊟ icon).
 /// Violet: distinct from the bell (orange) and completion (green) dots.
 const MINIMIZED_FG: [f32; 4] = [0.75, 0.55, 0.95, 1.0];
 
-/// Status-bar background of a pane holding a bookmarked conversation. Deep
-/// enough to sit under the bar's usual palette (cwd grey, branch green, scroll
-/// amber) without washing it out, and to read as a state rather than an alarm —
-/// the bell and completion bars own the loud end of the range.
-const BOOKMARKED_BAR_BG: [f32; 3] = [0.05, 0.09, 0.24];
+/// Color of the anchor mark drawn on a pane row whose conversation is one of
+/// today's anchors. Gold, the colour the overlay's own title wears: an anchor
+/// is a claim about the day, not another kind of attention.
+const ANCHOR_FG: [f32; 4] = [1.0, 0.8, 0.25, 1.0];
 
 /// Color of the "Claude Code is working" marker (status-bar ✳ counter and
 /// switcher ✳ icon). Green: something is happening, nothing is owed.
 const WORKING_FG: [f32; 4] = [0.6, 0.85, 0.6, 1.0];
+/// Open todos at the end of a pane switcher row: warm, so a conversation with
+/// work left in it is spotted without reading the dim tail of every row.
+const RAF_TODO_FG: [f32; 4] = [0.95, 0.6, 0.3, 1.0];
+/// Between the todo and idea counts of a switcher row.
+const RAF_SEPARATOR: &str = " \u{b7} ";
 
 /// Color of the status-bar unread counter. Same amber as the per-pane bell dot:
 /// the counter and the dots it sums must read as one signal.
@@ -166,7 +161,9 @@ impl PaneAttention {
         }
     }
 }
-use crate::terminal::{CellAttrs, CursorShape, FilterMatch, TerminalState};
+use crate::terminal::{Cell, FilterMatch, TerminalState};
+#[cfg(test)]
+use crate::terminal::CursorShape;
 
 /// Data passed to the renderer for drawing filter overlay.
 pub struct FilterRenderData {
@@ -252,6 +249,16 @@ pub struct PaneSwitcherRowRender<'a> {
     /// This pane holds a bookmarked conversation — the row is painted light
     /// blue on black text so a tracked project is spotted without reading.
     pub bookmarked: bool,
+    /// This pane holds one of today's anchors — the row wears an \u{2693} in the
+    /// anchor colour, and the anchors section leaves it out: one row per
+    /// conversation, where the conversation actually is.
+    pub anchored: bool,
+    /// Open todos of the pane's Claude conversation (`"3 todo"`), drawn in
+    /// colour at the very end of the row, after the binary.
+    pub raf_todo: Option<&'a str>,
+    /// Open ideas of the same conversation (`"1 idea"`), drawn dim after the
+    /// todos (` · ` between them), or alone when there are no todos.
+    pub raf_idea: Option<&'a str>,
 }
 
 /// One column of the pane-switcher overlay: a vertical run of rows holding
@@ -273,6 +280,9 @@ pub struct PaneSwitcherRenderData<'a> {
     /// the panes that are not have been left out. Changes the title and the
     /// hint, so the list never looks like a truncated version of the full one.
     pub filtered: bool,
+    /// The bookmark half is up: the saved conversations in place of the open
+    /// panes (`b`). Changes the title and the hint line, for the same reason.
+    pub show_bookmarks: bool,
 }
 
 /// Vertical geometry of a list overlay (title + subtitle + scrolling rows),
@@ -293,6 +303,9 @@ struct FlashLabelLayout {
     parent_scale: f32,
     parent_x: f32,
     parent_y: f32,
+    session_scale: f32,
+    session_x: f32,
+    session_y: f32,
     box_x: f32,
     box_y: f32,
     box_w: f32,
@@ -302,18 +315,22 @@ struct FlashLabelLayout {
 /// Lay out the flash label inside a pane rectangle: the directory name is
 /// blown up as far as it fits (never past `FLASH_NAME_MAX_SCALE`, where the
 /// upscaled atlas bitmap starts to smear), the path above it sits underneath
-/// at a fixed small scale, and the whole block is centered behind a padded
-/// backdrop. Pure geometry, so it can be checked without a GPU.
+/// at a fixed small scale, the conversation name under that, and the whole
+/// block is centered behind a padded backdrop. `session_chars` is 0 when the
+/// pane holds no agent conversation, and that line then takes no space. Pure
+/// geometry, so it can be checked without a GPU.
 fn flash_label_layout(
     pane: (f32, f32, f32, f32),
     name_chars: usize,
     parent_chars: usize,
+    session_chars: usize,
     cell_w: f32,
     cell_h: f32,
 ) -> FlashLabelLayout {
     const FLASH_NAME_MAX_SCALE: f32 = 3.0;
     const FLASH_NAME_MIN_SCALE: f32 = 1.0;
     const FLASH_PARENT_SCALE: f32 = 1.1;
+    const FLASH_SESSION_SCALE: f32 = 1.4;
     /// Fraction of the pane width the name is allowed to span.
     const FLASH_WIDTH_RATIO: f32 = 0.8;
 
@@ -335,11 +352,21 @@ fn flash_label_layout(
     let parent_h = if parent_chars == 0 { 0.0 } else { cell_h * parent_scale };
     let gap = if parent_chars == 0 { 0.0 } else { name_h * 0.15 };
 
-    let block_h = name_h + gap + parent_h;
+    // Same shrink-rather-than-clip rule as the path line.
+    let session_scale = if session_chars == 0 {
+        FLASH_SESSION_SCALE
+    } else {
+        FLASH_SESSION_SCALE.min((pw * FLASH_WIDTH_RATIO) / (session_chars as f32 * cell_w)).max(0.6)
+    };
+    let session_w = session_chars as f32 * cell_w * session_scale;
+    let session_h = if session_chars == 0 { 0.0 } else { cell_h * session_scale };
+    let session_gap = if session_chars == 0 { 0.0 } else { name_h * 0.15 };
+
+    let block_h = name_h + gap + parent_h + session_gap + session_h;
     let top = py + (ph - block_h) / 2.0;
     let pad_x = cell_w * name_scale;
     let pad_y = name_h * 0.35;
-    let box_w = (name_w.max(parent_w) + pad_x * 2.0).min(pw);
+    let box_w = (name_w.max(parent_w).max(session_w) + pad_x * 2.0).min(pw);
 
     FlashLabelLayout {
         name_scale,
@@ -348,6 +375,9 @@ fn flash_label_layout(
         parent_scale,
         parent_x: px + (pw - parent_w) / 2.0,
         parent_y: top + name_h + gap,
+        session_scale,
+        session_x: px + (pw - session_w) / 2.0,
+        session_y: top + name_h + gap + parent_h + session_gap,
         box_x: px + (pw - box_w) / 2.0,
         box_y: top - pad_y,
         box_w,
@@ -366,6 +396,21 @@ fn flash_label_layout(
 /// rounding and is invisible on screen.
 const GLYPH_FIT_EPSILON: f32 = 0.25;
 
+/// First char of a single-line input to draw when only `visible` chars fit:
+/// zero until the caret would leave the box, then just enough to keep it on
+/// the last visible column.
+fn input_scroll(cursor: usize, visible: usize) -> usize {
+    (cursor + 1).saturating_sub(visible.max(1))
+}
+
+/// Where the session name starts in the attention banner: flush right, unless
+/// that would run into the tier label, in which case it starts two cells after
+/// the label and gets clipped at the right edge instead.
+fn banner_title_x(title_chars: usize, label_end: f32, right_edge: f32, cell_w: f32) -> f32 {
+    let flush_right = right_edge - title_chars as f32 * cell_w;
+    flush_right.max(label_end + cell_w * 2.0)
+}
+
 /// Whether a glyph cell starting at `x` still fits before `max_x`.
 fn glyph_fits(x: f32, cell_w: f32, max_x: f32) -> bool {
     x + cell_w <= max_x + GLYPH_FIT_EPSILON
@@ -379,6 +424,19 @@ struct SwitcherRowSplit {
     /// Where the binary starts, or `None` when the column is too narrow to
     /// carry both — a half-written program name is worse than none.
     process_x: Option<f32>,
+}
+
+/// Width, in cells, of what a pane switcher row parks flush right: the binary,
+/// then two cells, then the todo count, ` · `, the idea count. Each part is
+/// optional and the gaps only appear between parts that exist.
+fn switcher_row_tail_chars(process: Option<&str>, raf_todo: Option<&str>, raf_idea: Option<&str>) -> usize {
+    let n = |s: Option<&str>| s.map_or(0, |s| s.chars().count());
+    let raf = match (raf_todo, raf_idea) {
+        (Some(_), Some(_)) => n(raf_todo) + RAF_SEPARATOR.chars().count() + n(raf_idea),
+        _ => n(raf_todo) + n(raf_idea),
+    };
+    let gap = if process.is_some() && raf > 0 { 2 } else { 0 };
+    n(process) + gap + raf
 }
 
 /// Lay out one pane switcher row. Pure geometry, so it can be checked without
@@ -424,18 +482,6 @@ pub struct PaneRenderData {
     pub bookmarked: bool,
 }
 
-/// Cached vertex list for one pane, with the conditions it was built under.
-/// Reused as the pane's "previous coherent frame" while the pane defers
-/// rendering inside a DEC-2026 sync burst — but only when the viewport is
-/// unchanged (vertices are absolute pixels), the build wasn't itself torn
-/// (mid_sync) and it wasn't the loading placeholder (ready).
-struct PaneVertexEntry {
-    vp: PaneViewport,
-    verts: Vec<Vertex>,
-    mid_sync: bool,
-    ready: bool,
-}
-
 /// Sub-region of the drawable where a pane is rendered (in pixels).
 #[derive(Clone, Copy)]
 pub struct PaneViewport {
@@ -447,13 +493,18 @@ pub struct PaneViewport {
 
 const INITIAL_VERTEX_BYTES: usize = 8 * 1024 * 1024; // 8MB
 
+/// Kova's window renderer: one per window, the host of that window's panes.
+/// Owns the shared `RenderContext`, one `PaneRenderer` per pane, the drawable
+/// side (vertex buffers, one `nextDrawable` / `presentDrawable` per frame), the
+/// clock (cursor blink) and everything that is window chrome: tab bar, global
+/// status bar, separators, banners, flashes, overlays, tooltips.
 pub struct Renderer {
-    command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    atlas: GlyphAtlas,
+    /// Command queue, pipeline and glyph atlas, shared by every pane.
+    ctx: RenderContext,
+    /// How panes are drawn (colors, dim, focus outline, status bar).
+    style: PaneStyle,
     // Pre-allocated buffers
     viewport_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    atlas_size_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     vertex_bufs: [Retained<ProtocolObject<dyn MTLBuffer>>; 2],
     /// Capacity of each vertex buffer; per-Renderer because each window has
     /// its own buffers (a process-global value would skip reallocation when
@@ -461,32 +512,14 @@ pub struct Renderer {
     vertex_buf_capacity: usize,
     vertex_buf_idx: usize,
     last_viewport: [f32; 2],
-    last_atlas_size: [f32; 2],
-    blink_counter: u32,
-    last_cursor_epoch: u32,
-    bg_color: [f32; 3],
-    /// Compact version of bg_color for comparing with Cell.bg ([u8; 3]).
-    bg_color_u8: [u8; 3],
-    cursor_color: [f32; 3],
-    /// Colour of a block tagged to be copied out (see `terminal::paste_block`).
-    paste_block_color: [f32; 3],
-    font_size: f64,
-    font_name: String,
-    /// Backing scale factor of the display the renderer currently draws on.
-    scale: f32,
+    /// Phase of the focused pane's cursor blink, in real time.
+    blink: CursorBlink,
     cursor_blink_frames: u32,
-    status_bar_enabled: bool,
-    /// How much an unfocused pane is faded (see `DimMode`).
-    dim_opacity: f32,
-    dim_mode: DimMode,
-    /// Outline drawn around the focused pane; width 0.0 disables it.
-    focus_border_width: f32,
-    focus_border_color: [f32; 3],
-    status_bar_bg: [f32; 3],
-    status_bar_fg: [f32; 3],
-    status_bar_cwd_color: [f32; 3],
-    status_bar_branch_color: [f32; 3],
-    status_bar_scroll_color: [f32; 3],
+    /// Rate of the run-loop timer that calls `render_panes` (ticks per
+    /// second). `cursor_blink_frames` counts in these ticks. Taken from the
+    /// config this window was built with and never reloaded: the timer is
+    /// started once, at launch, and keeps its rate.
+    frame_rate: u32,
     global_bar_bg: [f32; 3],
     global_bar_time_color: [f32; 3],
     global_bar_scroll_color: [f32; 3],
@@ -499,10 +532,10 @@ pub struct Renderer {
     cached_io_str: String,
     /// Cached memory report lines for overlay (set by window on Cmd+Shift+I).
     cached_mem_report: Vec<String>,
-    selection_color: [f32; 3],
     tab_bar_bg: [f32; 3],
     tab_bar_fg: [f32; 3],
     tab_bar_active_bg: [f32; 3],
+    switcher_selected_bg: [f32; 3],
     /// Hovered URL: per-row segments [(visible_row, col_start, col_end)]
     pub hovered_url: Option<Vec<(usize, u16, u16)>>,
     /// Hovered URL text (for status bar display)
@@ -527,7 +560,7 @@ pub struct Renderer {
     pub pane_flash: Option<(f32, f32, f32, f32, f32)>,
     /// Big label drawn inside the flashing pane: (directory name, path above
     /// it). Set on Cmd+J jumps so a landing far from the eye names itself.
-    pub pane_flash_label: Option<(String, String)>,
+    pub pane_flash_label: Option<(String, String, String)>,
     /// Loading progress: (ready_panes, total_panes). None when all loaded.
     pub loading_progress: Option<(u32, u32)>,
     /// Pane ID of the hovered URL (to show URL only in that pane's status bar)
@@ -544,17 +577,44 @@ pub struct Renderer {
     /// Clickable rect of the minimized-panes counter in the global status bar
     /// (x, y, w, h); None when the counter is hidden. Click opens the switcher.
     pub minimized_counter_zone: Option<(f32, f32, f32, f32)>,
-    /// Last built vertices per pane. While a pane defers rendering inside a
-    /// synchronized-output burst (DEC 2026), its previous frame is drawn from
-    /// this cache instead of rebuilding from the mid-update grid — rebuilding
-    /// would present exactly the torn frames mode 2026 exists to hide.
-    pane_vertex_cache: std::collections::HashMap<u32, PaneVertexEntry>,
+    /// One renderer per drawn pane, holding its last built vertices. While a
+    /// pane defers rendering inside a synchronized-output burst (DEC 2026), its
+    /// previous frame is drawn from this cache instead of rebuilding from the
+    /// mid-update grid — rebuilding would present exactly the torn frames mode
+    /// 2026 exists to hide. A pane absent from the map has no cached build.
+    pane_renderers: std::collections::HashMap<u32, PaneRenderer>,
     /// Active tooltip to render. Set by window on mouse hover.
     pub active_tooltip: Option<ActiveTooltip>,
     /// Tooltip being animated (kept for fade-out after active_tooltip becomes None).
     tooltip_visible: Option<ActiveTooltip>,
     /// Animation progress: 0 = hidden, TOOLTIP_ANIM_FRAMES = fully visible.
     tooltip_anim: u8,
+}
+
+/// Runs of consecutive cells sharing a background other than `default_bg`,
+/// as (first column, one past the last column, colour).
+fn bg_runs(line: &[Cell], default_bg: [u8; 3]) -> Vec<(usize, usize, [u8; 3])> {
+    let mut runs: Vec<(usize, usize, [u8; 3])> = Vec::new();
+    for (col, cell) in line.iter().enumerate() {
+        if cell.bg == default_bg {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((_, end, bg)) if *end == col && *bg == cell.bg => *end = col + 1,
+            _ => runs.push((col, col + 1, cell.bg)),
+        }
+    }
+    runs
+}
+
+/// Width, in cells, of the switcher's hint line: each pair is drawn as
+/// "<key> <what>" with two spaces before the next one, and the trailing gap
+/// after the last pair is not part of the line. Kept apart from the drawing so
+/// the centring can be checked without a GPU.
+fn hint_line_width(hints: &[(&str, &str)]) -> usize {
+    let total: usize =
+        hints.iter().map(|(k, w)| k.chars().count() + 1 + w.chars().count() + 2).sum();
+    total.saturating_sub(2)
 }
 
 impl Renderer {
@@ -565,13 +625,7 @@ impl Renderer {
         scale: f64,
         config: &Config,
     ) -> Self {
-        let command_queue = device
-            .newCommandQueue()
-            .expect("failed to create command queue");
-
-        let pixel_format = layer.pixelFormat();
-        let pipeline = pipeline::create_pipeline(device, pixel_format);
-        let atlas = GlyphAtlas::new(device, config.font.size * scale, scale, &config.font.family);
+        let ctx = RenderContext::new(device, layer.pixelFormat(), scale, config);
 
         let make_vertex_buf = || {
             device.newBufferWithLength_options(
@@ -592,46 +646,17 @@ impl Renderer {
             )
         }.unwrap();
 
-        let atlas_size = [atlas.atlas_width as f32, atlas.atlas_height as f32];
-        let atlas_size_buf = unsafe {
-            device.newBufferWithBytes_length_options(
-                NonNull::new(atlas_size.as_ptr() as *mut _).unwrap(),
-                std::mem::size_of_val(&atlas_size),
-                MTLResourceOptions::CPUCacheModeDefaultCache,
-            )
-        }.unwrap();
-
         Renderer {
-            command_queue,
-            pipeline,
-            atlas,
+            ctx,
+            style: PaneStyle::from_config(config),
             viewport_buf,
-            atlas_size_buf,
             vertex_bufs: [make_vertex_buf(), make_vertex_buf()],
             vertex_buf_capacity: INITIAL_VERTEX_BYTES,
             vertex_buf_idx: 0,
             last_viewport: [0.0; 2],
-            last_atlas_size: atlas_size,
-            blink_counter: 0,
-            last_cursor_epoch: 0,
-            bg_color: config.colors.background,
-            bg_color_u8: crate::terminal::color_to_u8(config.colors.background),
-            cursor_color: config.colors.cursor,
-            paste_block_color: config.colors.paste_block,
-            font_size: config.font.size,
-            font_name: config.font.family.clone(),
-            scale: scale as f32,
+            blink: CursorBlink::new(),
             cursor_blink_frames: config.terminal.cursor_blink_frames,
-            status_bar_enabled: config.status_bar.enabled,
-            dim_opacity: config.splits.dim_opacity,
-            dim_mode: config.splits.dim_mode,
-            focus_border_width: config.splits.focus_border_width,
-            focus_border_color: config.splits.focus_border_color,
-            status_bar_bg: config.status_bar.bg_color,
-            status_bar_fg: config.status_bar.fg_color,
-            status_bar_cwd_color: config.status_bar.cwd_color,
-            status_bar_branch_color: config.status_bar.branch_color,
-            status_bar_scroll_color: config.status_bar.scroll_color,
+            frame_rate: config.terminal.fps,
             global_bar_bg: config.global_status_bar.bg_color,
             global_bar_time_color: config.global_status_bar.time_color,
             global_bar_scroll_color: config.global_status_bar.scroll_indicator_color,
@@ -643,10 +668,10 @@ impl Renderer {
             cached_proc_str: String::from("▶0"),
             cached_io_str: String::new(),
             cached_mem_report: Vec::new(),
-            selection_color: [0.45, 0.42, 0.20],
             tab_bar_bg: config.tab_bar.bg_color,
             tab_bar_fg: config.tab_bar.fg_color,
             tab_bar_active_bg: config.tab_bar.active_bg,
+            switcher_selected_bg: config.switcher.selected_bg,
             hovered_url: None,
             hovered_url_text: None,
             resize_feedback_text: None,
@@ -663,24 +688,74 @@ impl Renderer {
             cached_help_columns: [Vec::new(), Vec::new()],
             tooltip_zones: Vec::new(),
             minimized_counter_zone: None,
-            pane_vertex_cache: std::collections::HashMap::new(),
+            pane_renderers: std::collections::HashMap::new(),
             active_tooltip: None,
             tooltip_visible: None,
             tooltip_anim: 0,
         }
     }
 
+    /// Re-read the appearance half of a freshly loaded config into this
+    /// renderer. Only what can change between two frames: colors, the fade of
+    /// unfocused panes, the focus outline. Font, keybindings and terminal
+    /// geometry are not touched — they are read once at startup and need a
+    /// restart (the atlas and every PTY are sized from them).
+    pub fn apply_config(&mut self, config: &Config) {
+        self.style = PaneStyle::from_config(config);
+        self.cursor_blink_frames = config.terminal.cursor_blink_frames;
+        self.global_bar_bg = config.global_status_bar.bg_color;
+        self.global_bar_time_color = config.global_status_bar.time_color;
+        self.global_bar_scroll_color = config.global_status_bar.scroll_indicator_color;
+        self.tab_bar_bg = config.tab_bar.bg_color;
+        self.tab_bar_fg = config.tab_bar.fg_color;
+        self.tab_bar_active_bg = config.tab_bar.active_bg;
+        self.switcher_selected_bg = config.switcher.selected_bg;
+        // Every pane's vertices carry the old colors; drop the cache so the
+        // next frame rebuilds them.
+        self.pane_renderers.clear();
+    }
 
-    /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused, pane_id, custom_title, has_completion, has_bell, minimized).
-    /// `separators` are line segments (x1, y1, x2, y2) drawn between splits.
-    /// True while a pane is inside a synchronized-output burst (DEC 2026)
-    /// and should be drawn from its cached previous frame. Capped so a lost
-    /// ?2026l can't freeze the pane; a full TUI repaint spanning several PTY
-    /// chunks fits comfortably within the window.
-    fn in_sync_window(pane: &PaneRenderData) -> bool {
-        let t = pane.terminal.read();
-        t.synchronized_output
-            && t.sync_output_since.is_some_and(|s| s.elapsed().as_millis() < 150)
+    /// The hovered URL as `pane` sees it: its segments and text when the URL
+    /// is in that pane, nothing otherwise.
+    fn pane_hover(&self, pane_id: PaneId) -> (Option<&[(usize, u16, u16)]>, Option<&str>) {
+        if self.hovered_url_pane_id == Some(pane_id) {
+            (self.hovered_url.as_deref(), self.hovered_url_text.as_deref())
+        } else {
+            (None, None)
+        }
+    }
+
+    /// Everything `pane`'s build reads besides its grid (see `PaneDrawKey`).
+    fn pane_draw_key(&self, pane: &PaneRenderData, blink_on: bool) -> PaneDrawKey {
+        let (hovered_url, hovered_url_text) = self.pane_hover(pane.pane_id);
+        PaneRenderer::draw_key(pane, hovered_url, hovered_url_text, blink_on, self.ctx.atlas.generation)
+    }
+
+    /// Build one pane outside of a frame, the way `rebuild_pane_draws` does,
+    /// with the renderer's hover as is. Lets the vertex snapshots pin the
+    /// output of a pane build without a drawable.
+    #[cfg(test)]
+    fn build_vertices(
+        &mut self,
+        term: &TerminalState,
+        vp: &PaneViewport,
+        blink_on: bool,
+        is_focused: bool,
+        custom_title: Option<&str>,
+        attention: PaneAttention,
+        pane_input_chars: u64,
+        pane_id: PaneId,
+        fg_process: Option<&str>,
+        bookmarked: bool,
+    ) -> Vec<Vertex> {
+        PaneBuild {
+            ctx: &mut self.ctx,
+            style: &self.style,
+            hovered_url: self.hovered_url.as_deref(),
+            hovered_url_text: self.hovered_url_text.as_deref(),
+            zones: &mut self.tooltip_zones,
+        }
+        .build_vertices(term, vp, blink_on, is_focused, custom_title, attention, pane_input_chars, pane_id, fg_process, bookmarked)
     }
 
     /// Build per-pane vertex lists into the cache and return the draw list
@@ -694,80 +769,51 @@ impl Renderer {
         viewport_h: f32,
         has_filter: bool,
         blink_on: bool,
+        dirty_panes: &[u32],
+        sync_panes: &[u32],
     ) -> Vec<(u32, MTLScissorRect)> {
         let mut pane_draws: Vec<(u32, MTLScissorRect)> = Vec::new();
-        let (cell_w, cell_h) = self.cell_size();
-        let saved_hover_text = self.hovered_url_text.clone();
-        let saved_hover_segments = self.hovered_url.clone();
         for _pass in 0..3 {
-            let atlas_gen = self.atlas.generation;
+            let atlas_gen = self.ctx.atlas.generation;
             pane_draws.clear();
             self.tooltip_zones.clear();
             for pane in panes {
                 let vp = &pane.viewport;
-                // Scope hovered URL to the pane that owns it
-                let is_hover_pane = self.hovered_url_pane_id == Some(pane.pane_id);
-                self.hovered_url_text = if is_hover_pane { saved_hover_text.clone() } else { None };
-                self.hovered_url = if is_hover_pane { saved_hover_segments.clone() } else { None };
                 // Minimized panes take no layout space and are never drawn;
                 // they surface via the status-bar counter and the pane switcher.
                 if pane.minimized {
-                    self.pane_vertex_cache.remove(&pane.pane_id);
+                    self.pane_renderers.remove(&pane.pane_id);
                     continue;
                 }
-                // Skip panes entirely off-screen (hidden by horizontal scroll)
+                // Skip panes entirely off-screen (hidden by horizontal scroll).
+                // Their dirty flag was consumed this frame without a rebuild:
+                // drop the cache entry so they are rebuilt when they come back.
                 if vp.x + vp.width <= 0.0 || vp.x >= viewport_w {
+                    self.pane_renderers.remove(&pane.pane_id);
                     continue;
                 }
                 if pane.is_focused && has_filter {
-                    continue; // Skip: filter overlay covers focused pane
+                    // Filter overlay covers the focused pane; same as above.
+                    self.pane_renderers.remove(&pane.pane_id);
+                    continue;
                 }
-                let in_sync = Self::in_sync_window(pane);
-                // Sync-deferred pane: draw its previous coherent frame from
-                // the cache instead of rebuilding from the mid-update grid.
-                // Only valid while the viewport is unchanged (vertices are
-                // absolute pixels), the cached build itself wasn't torn
-                // (mid_sync) and it isn't the loading placeholder (ready).
-                let reuse_cached = pane.shell_ready
-                    && in_sync
-                    && self.pane_vertex_cache.get(&pane.pane_id).is_some_and(|e| {
-                        e.ready
-                            && !e.mid_sync
-                            && e.vp.x == vp.x
-                            && e.vp.y == vp.y
-                            && e.vp.width == vp.width
-                            && e.vp.height == vp.height
-                    });
-                if !reuse_cached {
-                    let pane_verts = {
-                        let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
-                        let mut verts = if pane.shell_ready {
-                            let t = pane.terminal.read();
-                            let show_blink = if pane.is_focused { blink_on } else { true };
-                            let pin = pane.input_chars.load(std::sync::atomic::Ordering::Relaxed);
-                            self.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref(), pane.bookmarked)
-                        } else {
-                            self.build_loading_vertices(vp)
-                        };
-                        // Attention indicator dot on non-focused panes
-                        if let Some(color) = pane_attention.dot_color() {
-                            let dot_x = vp.x + vp.width - cell_w * 2.5;
-                            let dot_y = vp.y + cell_h * 0.5;
-                            let no_bg = [0.0_f32, 0.0, 0.0, 0.0];
-                            self.render_status_text(&mut verts, "●", dot_x, dot_y, vp.x + vp.width, color, no_bg);
-                        }
-                        verts
-                    };
-                    self.pane_vertex_cache.insert(pane.pane_id, PaneVertexEntry {
-                        vp: *vp,
-                        verts: pane_verts,
-                        // A cache-miss build during a sync burst is possibly
-                        // torn: never reuse it as a "coherent previous frame";
-                        // it refreshes every tick until a clean build replaces it.
-                        mid_sync: in_sync,
-                        ready: pane.shell_ready,
-                    });
-                }
+                let in_sync = sync_panes.contains(&pane.pane_id);
+                let key = self.pane_draw_key(pane, blink_on);
+                // Scope hovered URL to the pane that owns it
+                let is_hover_pane = self.hovered_url_pane_id == Some(pane.pane_id);
+                let hovered_url = if is_hover_pane { self.hovered_url.as_deref() } else { None };
+                let hovered_url_text = if is_hover_pane { self.hovered_url_text.as_deref() } else { None };
+                self.pane_renderers.entry(pane.pane_id).or_default().prepare(
+                    &mut self.ctx,
+                    &self.style,
+                    pane,
+                    hovered_url,
+                    hovered_url_text,
+                    key,
+                    in_sync,
+                    dirty_panes.contains(&pane.pane_id),
+                    &mut self.tooltip_zones,
+                );
                 // Compute scissor rect clamped to drawable bounds. Ceil the
                 // extent: truncation shaves up to 1px off the right/bottom
                 // painted edge at fractional split boundaries.
@@ -775,26 +821,26 @@ impl Renderer {
                 let sy = (vp.y.max(0.0)) as usize;
                 let sw = ((vp.width).min(viewport_w - sx as f32).max(0.0)).ceil() as usize;
                 let sh = ((vp.height).min(viewport_h - sy as f32).max(0.0)).ceil() as usize;
-                let has_verts = self.pane_vertex_cache.get(&pane.pane_id).is_some_and(|e| !e.verts.is_empty());
+                let has_verts = self.pane_renderers.get(&pane.pane_id).is_some_and(|p| !p.vertices().is_empty());
                 if has_verts && sw > 0 && sh > 0 {
                     pane_draws.push((pane.pane_id, MTLScissorRect { x: sx, y: sy, width: sw, height: sh }));
                 }
             }
-            if self.atlas.generation == atlas_gen {
+            if self.ctx.atlas.generation == atlas_gen {
                 break;
             }
             // Atlas grew or was repacked while building: every cached vertex
             // list has stale UVs — drop them all and rebuild (the needed
             // glyphs are rasterized now, so the next pass is stable).
-            self.pane_vertex_cache.clear();
+            self.pane_renderers.clear();
         }
         // Drop cache entries of panes that no longer exist
-        self.pane_vertex_cache.retain(|id, _| panes.iter().any(|p| p.pane_id == *id));
-        self.hovered_url_text = saved_hover_text;
-        self.hovered_url = saved_hover_segments;
+        self.pane_renderers.retain(|id, _| panes.iter().any(|p| p.pane_id == *id));
         pane_draws
     }
 
+    /// Render multiple panes. Each entry: (terminal, viewport, shell_ready, is_focused, pane_id, custom_title, has_completion, has_bell, minimized).
+    /// `separators` are line segments (x1, y1, x2, y2) drawn between splits.
     pub fn render_panes(
         &mut self,
         layer: &CAMetalLayer,
@@ -837,25 +883,17 @@ impl Renderer {
             return;
         }
 
-        // Reset blink on cursor movement of focused pane
-        if let Some(focused_pane) = panes.iter().find(|p| p.is_focused) {
-            let epoch = focused_pane.terminal.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed);
-            if epoch != self.last_cursor_epoch {
-                self.last_cursor_epoch = epoch;
-                self.blink_counter = 0;
-            }
-        }
-
-        self.blink_counter = self.blink_counter.wrapping_add(1);
-        let (blink_on, blink_changed) = if self.cursor_blink_frames >= 2 {
-            let half = self.cursor_blink_frames / 2;
-            (
-                self.blink_counter % self.cursor_blink_frames < half,
-                (self.blink_counter % half) == 0,
-            )
-        } else {
-            (true, false)
-        };
+        // Reset blink on cursor movement of focused pane (see `CursorBlink`).
+        let focused_epoch = panes
+            .iter()
+            .find(|p| p.is_focused)
+            .map(|p| p.terminal.read().cursor_move_epoch.load(std::sync::atomic::Ordering::Relaxed));
+        let (blink_on, blink_changed) = self.blink.sample(
+            std::time::Instant::now(),
+            focused_epoch,
+            self.cursor_blink_frames,
+            self.frame_rate,
+        );
 
         // Shared timestamp for time + RSS checks
         let now_secs = SystemTime::now()
@@ -897,7 +935,9 @@ impl Renderer {
             }
         };
 
-        // Check if any pane is dirty (consume ALL flags, no short-circuit)
+        // Check if any pane is dirty. Only peeked here: the flags are
+        // consumed once a drawable is in hand, so a frame dropped for lack of
+        // one cannot lose them (a clean pane is now drawn from its cache).
         // Sync-deferred panes keep their dirty flag and are drawn from the
         // vertex cache below (their previous, coherent frame).
         let mut any_dirty = false;
@@ -905,14 +945,23 @@ impl Renderer {
         let mut any_sync_deferred = false;
         for pane in panes {
             if !pane.shell_ready { any_not_ready = true; }
-            if Self::in_sync_window(pane) {
+            if PaneRenderer::in_sync_window(pane) {
                 any_sync_deferred = true;
                 continue; // Don't consume dirty flag — pane will render later
             }
-            if pane.terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if pane.terminal.read().dirty.load(std::sync::atomic::Ordering::Relaxed) {
                 any_dirty = true;
             }
         }
+        // A clean pane whose status-bar inputs moved (input counter, fg
+        // process, bookmark…) must be redrawn too: those never mark it dirty.
+        let any_key_changed = panes.iter().any(|p| {
+            !p.minimized
+                && self
+                    .pane_renderers
+                    .get(&p.pane_id)
+                    .is_some_and(|r| r.key_changed(&self.pane_draw_key(p, blink_on)))
+        });
         // If only sync-deferred panes were dirty, still need to render the others
         let all_ready = !any_not_ready;
         let has_filter = filter.is_some();
@@ -922,7 +971,7 @@ impl Renderer {
         let has_loading = self.loading_progress.is_some();
         let has_pane_flash = self.pane_flash.is_some();
         let has_status_text = self.resize_feedback_text.is_some();
-        if all_ready && !any_dirty && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading && !self.force_redraw {
+        if all_ready && !any_dirty && !any_key_changed && !any_sync_deferred && !blink_changed && !minute_changed && !rss_changed && !has_filter && !show_help && !show_mem_report && !has_recent_projects && !has_search_palette && !has_pane_flash && !has_status_text && help_hint_remaining == 0 && !tooltip_animating && !has_loading && !self.force_redraw {
             return;
         }
         // Past the gate: this frame is being drawn, so the debt is settled.
@@ -943,11 +992,27 @@ impl Renderer {
         let viewport_w = drawable_size.width as f32;
         let viewport_h = drawable_size.height as f32;
 
+        // Sync state is read once per frame: evaluated twice, a burst ending
+        // in between would leave a pane neither consumed nor sync-deferred.
+        let sync_panes: Vec<u32> = panes
+            .iter()
+            .filter(|p| PaneRenderer::in_sync_window(p))
+            .map(|p| p.pane_id)
+            .collect();
+        // Consume the dirty flags now that this frame will be drawn; the
+        // panes that had one are rebuilt, the others may reuse their cache.
+        let dirty_panes: Vec<u32> = panes
+            .iter()
+            .filter(|p| !sync_panes.contains(&p.pane_id))
+            .filter(|p| p.terminal.read().dirty.swap(false, std::sync::atomic::Ordering::Relaxed))
+            .map(|p| p.pane_id)
+            .collect();
+
         // Build vertices for each pane with its own scissor rect for clipping.
         // pane_draws references the vertex cache by pane id (vertices live in
-        // self.pane_vertex_cache).
-        let mut pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on);
-        let atlas_gen_after_panes = self.atlas.generation;
+        // self.pane_renderers).
+        let mut pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on, &dirty_panes, &sync_panes);
+        let atlas_gen_after_panes = self.ctx.atlas.generation;
         let pane_zone_count = self.tooltip_zones.len();
         let mut overlay_vertices = Vec::new();
 
@@ -1026,7 +1091,10 @@ impl Renderer {
         if let (Some((text, color)), Some(focused)) =
             (self.pane_banner.clone(), panes.iter().find(|p| p.is_focused))
         {
-            self.build_pane_banner_vertices(&mut overlay_vertices, &focused.viewport, &text, color);
+            // The banner hides the bar's right-hand title, which is the only
+            // place an unrenamed session shows its name: carry it over.
+            let title = focused.custom_title.clone().or_else(|| focused.terminal.read().title.clone());
+            self.build_pane_banner_vertices(&mut overlay_vertices, &focused.viewport, &text, title.as_deref(), color);
         }
 
         // Draw filter overlay on focused pane
@@ -1087,13 +1155,14 @@ impl Renderer {
 
             // The directory name in big over the pane, when the jump asked for
             // it (Cmd+J): the border alone does not say where the eye landed.
-            if let Some((name, parent)) = self.pane_flash_label.clone() {
+            if let Some((name, parent, session)) = self.pane_flash_label.clone() {
                 self.build_flash_label_vertices(
                     &mut overlay_vertices,
                     (x, y, w, h),
                     alpha,
                     &name,
                     &parent,
+                    &session,
                 );
             }
         }
@@ -1115,9 +1184,11 @@ impl Renderer {
         }
         self.build_tooltip_vertices(&mut overlay_vertices, viewport_w);
 
-        // Flatten all pane vertices + overlay into a single buffer, tracking draw ranges
-        let mut all_vertices: Vec<Vertex> = Vec::new();
-        let mut draw_calls: Vec<(usize, usize, MTLScissorRect)> = Vec::new(); // (start, count, scissor)
+        // Lay every pane's vertices + the overlay end to end in the GPU
+        // buffer, tracking draw ranges. Copied straight from the cache into the
+        // buffer below: no intermediate Vec holding a second copy of the frame.
+        // (start, count, scissor, source pane — None for the overlay)
+        let mut draw_calls: Vec<(usize, usize, MTLScissorRect, Option<u32>)> = Vec::new();
         let global_scissor = MTLScissorRect {
             x: 0,
             y: 0,
@@ -1129,27 +1200,23 @@ impl Renderer {
         // glyphs and grown/repacked the atlas AFTER the pane build — pane UVs
         // would point into the wrong texture. Rebuild the panes once; the
         // overlay vertices themselves are at worst stale for this one frame.
-        if self.atlas.generation != atlas_gen_after_panes {
+        if self.ctx.atlas.generation != atlas_gen_after_panes {
             let overlay_zones: Vec<TooltipZone> = self.tooltip_zones.split_off(pane_zone_count);
-            self.pane_vertex_cache.clear();
-            pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on);
+            self.pane_renderers.clear();
+            pane_draws = self.rebuild_pane_draws(panes, viewport_w, viewport_h, filter.is_some(), blink_on, &dirty_panes, &sync_panes);
             self.tooltip_zones.extend(overlay_zones);
         }
 
+        let mut total_vertices = 0usize;
         for (pane_id, scissor) in &pane_draws {
-            let verts = match self.pane_vertex_cache.get(pane_id) {
-                Some(entry) => &entry.verts,
-                None => continue,
-            };
-            let start = all_vertices.len();
-            all_vertices.extend_from_slice(verts);
-            draw_calls.push((start, verts.len(), *scissor));
+            let Some(pane) = self.pane_renderers.get(pane_id) else { continue };
+            let verts = pane.vertices();
+            draw_calls.push((total_vertices, verts.len(), *scissor, Some(*pane_id)));
+            total_vertices += verts.len();
         }
         if !overlay_vertices.is_empty() {
-            let start = all_vertices.len();
-            let count = overlay_vertices.len();
-            all_vertices.extend(overlay_vertices);
-            draw_calls.push((start, count, global_scissor));
+            draw_calls.push((total_vertices, overlay_vertices.len(), global_scissor, None));
+            total_vertices += overlay_vertices.len();
         }
 
         // Update viewport buffer if changed
@@ -1163,14 +1230,7 @@ impl Renderer {
         }
 
         // Update atlas size buffer if atlas grew
-        let atlas_size = [self.atlas.atlas_width as f32, self.atlas.atlas_height as f32];
-        if atlas_size != self.last_atlas_size {
-            self.last_atlas_size = atlas_size;
-            unsafe {
-                let ptr = self.atlas_size_buf.contents().as_ptr() as *mut [f32; 2];
-                *ptr = atlas_size;
-            }
-        }
+        self.ctx.sync_atlas_size();
 
         let pass_desc = {
             let desc = MTLRenderPassDescriptor::new();
@@ -1181,16 +1241,16 @@ impl Renderer {
             color.setTexture(Some(&tex));
             color.setLoadAction(MTLLoadAction::Clear);
             color.setClearColor(MTLClearColor {
-                red: self.bg_color[0] as f64,
-                green: self.bg_color[1] as f64,
-                blue: self.bg_color[2] as f64,
+                red: self.style.bg_color[0] as f64,
+                green: self.style.bg_color[1] as f64,
+                blue: self.style.bg_color[2] as f64,
                 alpha: 1.0,
             });
             color.setStoreAction(MTLStoreAction::Store);
             desc
         };
 
-        let cmd_buf = match self.command_queue.commandBuffer() {
+        let cmd_buf = match self.ctx.command_queue.commandBuffer() {
             Some(buf) => buf,
             None => { log::error!("Metal: failed to create command buffer, skipping frame"); return; }
         };
@@ -1199,23 +1259,18 @@ impl Renderer {
             None => { log::error!("Metal: failed to create render encoder, skipping frame"); return; }
         };
 
-        if !all_vertices.is_empty() {
-            let vertex_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    all_vertices.as_ptr() as *const u8,
-                    std::mem::size_of_val(all_vertices.as_slice()),
-                )
-            };
+        if total_vertices > 0 {
+            let total_bytes = total_vertices * std::mem::size_of::<Vertex>();
 
             let buf_idx = self.vertex_buf_idx;
             self.vertex_buf_idx = 1 - buf_idx;
 
             let current_capacity = self.vertex_buf_capacity;
-            if vertex_bytes.len() > current_capacity {
+            if total_bytes > current_capacity {
                 // Grow to next power-of-two that fits
-                let new_capacity = vertex_bytes.len().next_power_of_two();
+                let new_capacity = total_bytes.next_power_of_two();
                 log::warn!("Vertex data ({} bytes) exceeds buffer ({} bytes), growing to {} bytes",
-                    vertex_bytes.len(), current_capacity, new_capacity);
+                    total_bytes, current_capacity, new_capacity);
                 let device = layer.device().expect("no Metal device on layer");
                 for i in 0..2 {
                     self.vertex_bufs[i] = device.newBufferWithLength_options(
@@ -1230,21 +1285,31 @@ impl Renderer {
             }
 
             let vertex_buf = &self.vertex_bufs[buf_idx];
-            unsafe {
-                let ptr = vertex_buf.contents().as_ptr() as *mut u8;
-                std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), ptr, vertex_bytes.len());
+            let dst = vertex_buf.contents().as_ptr() as *mut Vertex;
+            for &(start, count, _, source) in &draw_calls {
+                let src: &[Vertex] = match source {
+                    Some(pane_id) => match self.pane_renderers.get(&pane_id) {
+                        Some(pane) => pane.vertices(),
+                        None => continue,
+                    },
+                    None => &overlay_vertices,
+                };
+                debug_assert_eq!(src.len(), count);
+                // SAFETY: the buffer holds at least total_vertices vertices
+                // (grown above) and the ranges in draw_calls are disjoint.
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(start), count) };
             }
 
-            encoder.setRenderPipelineState(&self.pipeline);
+            encoder.setRenderPipelineState(&self.ctx.pipeline);
             unsafe {
                 encoder.setVertexBuffer_offset_atIndex(Some(vertex_buf), 0, 0);
                 encoder.setVertexBuffer_offset_atIndex(Some(&self.viewport_buf), 0, 1);
-                encoder.setVertexBuffer_offset_atIndex(Some(&self.atlas_size_buf), 0, 2);
-                encoder.setFragmentTexture_atIndex(Some(&*self.atlas.texture), 0);
+                encoder.setVertexBuffer_offset_atIndex(Some(&self.ctx.atlas_size_buf), 0, 2);
+                encoder.setFragmentTexture_atIndex(Some(&*self.ctx.atlas.texture), 0);
             }
 
             // Draw each group with its own scissor rect
-            for &(start, count, ref scissor) in &draw_calls {
+            for &(start, count, ref scissor, _) in &draw_calls {
                 encoder.setScissorRect(MTLScissorRect {
                     x: scissor.x,
                     y: scissor.y,
@@ -1268,505 +1333,36 @@ impl Renderer {
         cmd_buf.commit();
     }
 
-    fn build_vertices(
-        &mut self,
-        term: &TerminalState,
-        vp: &PaneViewport,
-        blink_on: bool,
-        is_focused: bool,
-        custom_title: Option<&str>,
-        attention: PaneAttention,
-        pane_input_chars: u64,
-        pane_id: PaneId,
-        fg_process: Option<&str>,
-        bookmarked: bool,
-    ) -> Vec<Vertex> {
-        // Pass 1: collect unknown chars/clusters for dynamic rasterization
-        let display = term.visible_lines();
-        let mut unknown_chars: Vec<char> = Vec::new();
-        let mut unknown_italic_chars: Vec<char> = Vec::new();
-        let mut unknown_clusters: Vec<Box<str>> = Vec::new();
-        let has_italic = self.atlas.has_italic();
-        {
-            let mut seen_chars = std::collections::HashSet::new();
-            let mut seen_italic = std::collections::HashSet::new();
-            let mut seen_clusters = std::collections::HashSet::new();
-            for line in display.iter() {
-                for cell in line.iter() {
-                    if let Some(ref cluster) = cell.cluster {
-                        if self.atlas.cluster_glyph(cluster).is_none() && seen_clusters.insert(cluster.clone()) {
-                            unknown_clusters.push(cluster.clone());
-                        }
-                    } else {
-                        let c = cell.c;
-                        if c == ' ' || c == '\0' {
-                            continue;
-                        }
-                        // Regular glyph is always needed (non-italic cells, and the
-                        // synthetic-shear fallback for chars with no italic form).
-                        if self.atlas.glyph(c).is_none() && seen_chars.insert(c) {
-                            unknown_chars.push(c);
-                        }
-                        if has_italic
-                            && cell.attrs.contains(CellAttrs::ITALIC)
-                            && self.atlas.italic_glyph(c).is_none()
-                            && seen_italic.insert(c)
-                        {
-                            unknown_italic_chars.push(c);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Pass 2: rasterize unknowns
-        for c in unknown_chars {
-            self.atlas.rasterize_char(c);
-        }
-        for c in unknown_italic_chars {
-            self.atlas.rasterize_italic_char(c);
-        }
-        for cluster in unknown_clusters {
-            self.atlas.rasterize_cluster(&cluster);
-        }
-
-        // Pass 3: build vertices
-        // Amount by which this pane's text is faded. Non-zero only for an
-        // unfocused pane in `text` dim mode; `full` mode fades with a veil
-        // quad at the end instead.
-        let text_fade = if !is_focused && self.dim_mode == DimMode::Text {
-            self.dim_opacity
-        } else {
-            0.0
-        };
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
-        let baseline_from_top = self.atlas.baseline_from_top();
-        let atlas_w = self.atlas.atlas_width as f32;
-        let atlas_h = self.atlas.atlas_height as f32;
-        let ox = vp.x + self.h_padding();
-        let oy = vp.y;
-
-        // Push content to bottom when screen isn't full (single source of truth in Terminal)
-        let y_offset_rows = term.y_offset_rows() as f32;
-        let content_height = (term.rows as f32 - y_offset_rows) * cell_h;
-        let y_offset = (y_offset_rows * cell_h).min((vp.height - content_height).max(0.0));
-
-        let mut vertices = Vec::with_capacity(display.len() * term.cols as usize * 6);
-
-        // Precompute selection abs_line base if selection is active
-        let has_selection = term.selection.is_some();
-        let abs_line_base = if has_selection {
-            term.scrollback_len() as i64 - term.scroll_offset() as i64
-        } else {
-            0
-        };
-
-        // Pass 1: backgrounds + selection highlights (under text)
-        for (row_idx, line) in display.iter().enumerate() {
-            let abs_line = (abs_line_base + row_idx as i64) as usize;
-            let y = (oy + y_offset + row_idx as f32 * cell_h).round();
-
-            for col_idx in 0..term.cols as usize {
-                let x = (ox + col_idx as f32 * cell_w).round();
-
-                // Cell background
-                if col_idx < line.len() && line[col_idx].bg != self.bg_color_u8 {
-                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, crate::terminal::color_to_f32(line[col_idx].bg));
-                }
-
-                // Selection highlight (rendered on top of cell bg, under glyphs)
-                if has_selection && term.is_selected(abs_line, col_idx as u16) {
-                    Self::push_bg_quad(&mut vertices, x, y, cell_w, cell_h, self.selection_color);
-                }
-            }
-        }
-
-        // Rows holding a block Claude tagged as meant to be pasted elsewhere. Read from
-        // the cells rather than tracked as the bytes arrive: Claude Code redraws lines
-        // while it streams, and a state machine fed by those redraws would drift.
-        let paste_rows = {
-            let lines: Vec<&[crate::terminal::Cell]> = display.iter().map(|l| l.as_ref()).collect();
-            crate::terminal::paste_block::paste_block_rows(&lines, term.default_fg)
-        };
-
-        // Pass 2: glyphs (on top of backgrounds and selection)
-        for (row_idx, line) in display.iter().enumerate() {
-            // The line that closes a paste block: it delimited, it is done, and drawing it
-            // would put a marker on screen for every message.
-            if paste_rows[row_idx] == RowPaint::Hidden {
-                continue;
-            }
-            for col_idx in 0..term.cols as usize {
-                let cell = if col_idx < line.len() {
-                    &line[col_idx]
-                } else {
-                    continue;
-                };
-
-                // Underline / strikethrough: horizontal rules in the cell's fg
-                // color. Drawn before the blank skip so runs of underlined
-                // spaces (and wide-char continuation cells) stay continuous.
-                if cell.attrs.intersects(CellAttrs::UNDERLINE | CellAttrs::STRIKETHROUGH) {
-                    let lx = (ox + col_idx as f32 * cell_w).round();
-                    let ly = (oy + y_offset + row_idx as f32 * cell_h).round();
-                    let rule_fg = Self::fade_toward(crate::terminal::color_to_f32(cell.fg), self.bg_color, text_fade);
-                    let thickness = (cell_h * 0.07).max(1.0).round();
-                    if cell.attrs.contains(CellAttrs::UNDERLINE) {
-                        let uy = (ly + cell_h - thickness).round();
-                        Self::push_bg_quad(&mut vertices, lx, uy, cell_w, thickness, rule_fg);
-                    }
-                    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
-                        let sy = (ly + cell_h * 0.5 - thickness * 0.5).round();
-                        Self::push_bg_quad(&mut vertices, lx, sy, cell_w, thickness, rule_fg);
-                    }
-                }
-
-                if cell.is_blank() {
-                    continue;
-                }
-                let c = cell.c;
-
-                if c == '─' && row_idx == 2 && col_idx < 3 {
-                    log::trace!("render ─ at col={} row={} fg={:?} bg={:?}", col_idx, row_idx, cell.fg, cell.bg);
-                }
-
-                // Look up glyph: cluster first, then single char. Italic cells
-                // prefer the real italic glyph; when there is none (no italic
-                // face, or a char with no italic form like box-drawing) we fall
-                // back to the upright glyph and shear it synthetically below.
-                let mut real_italic = false;
-                let glyph = if let Some(ref cluster) = cell.cluster {
-                    match self.atlas.cluster_glyph(cluster) {
-                        Some(g) => *g,
-                        None => continue,
-                    }
-                } else if cell.attrs.contains(CellAttrs::ITALIC) {
-                    match self.atlas.italic_glyph(c) {
-                        Some(g) => {
-                            real_italic = true;
-                            *g
-                        }
-                        None => match self.atlas.glyph(c) {
-                            Some(g) => *g,
-                            None => continue,
-                        },
-                    }
-                } else {
-                    match self.atlas.glyph(c) {
-                        Some(g) => *g,
-                        None => continue,
-                    }
-                };
-
-                if glyph.width == 0 || glyph.height == 0 {
-                    continue;
-                }
-
-                let gx = (ox + col_idx as f32 * cell_w).round();
-                let gy = (oy + y_offset + row_idx as f32 * cell_h).round();
-                let gw = glyph.width as f32;
-                let gh = glyph.height as f32;
-
-                let tx = glyph.x as f32 / atlas_w;
-                let ty = glyph.y as f32 / atlas_h;
-                let tw = glyph.width as f32 / atlas_w;
-                let th = glyph.height as f32 / atlas_h;
-
-                let alpha = if glyph.is_color { 2.0 } else { 1.0 };
-                // Inside a tagged block, text that carries no colour of its own takes the
-                // paste colour; anything Claude coloured itself keeps what it was given.
-                let fg_f = if paste_rows[row_idx] == RowPaint::Body && cell.fg == term.default_fg {
-                    self.paste_block_color
-                } else {
-                    crate::terminal::color_to_f32(cell.fg)
-                };
-                let fg_f = Self::fade_toward(fg_f, self.bg_color, text_fade);
-                let fg = [fg_f[0], fg_f[1], fg_f[2], alpha];
-                let no_bg = [0.0, 0.0, 0.0, 0.0];
-
-                // Synthetic italic: shear the glyph quad around the baseline —
-                // the top edge leans right, the descender edge leans left. Emoji
-                // and box-drawing keep their shape only insofar as the quad is
-                // slanted; color glyphs are left as-is to avoid smearing.
-                let italic = cell.attrs.contains(CellAttrs::ITALIC) && !glyph.is_color && !real_italic;
-                let (shear_top, shear_bot) = if italic {
-                    (ITALIC_SHEAR * baseline_from_top, ITALIC_SHEAR * (baseline_from_top - gh))
-                } else {
-                    (0.0, 0.0)
-                };
-
-                // Faux-bold: draw the glyph a second time shifted +1px in x. A
-                // real bold font would need a (char, bold)-keyed atlas; the
-                // synthetic double-draw is cheap and reads clearly as bold.
-                // Color emoji are already color glyphs — don't embolden them.
-                let bold = cell.attrs.contains(CellAttrs::BOLD) && !glyph.is_color;
-                let x_offsets: &[f32] = if bold { &[0.0, 1.0] } else { &[0.0] };
-                for &dx in x_offsets {
-                    let xtl = gx + dx + shear_top;
-                    let xtr = gx + gw + dx + shear_top;
-                    let xbl = gx + dx + shear_bot;
-                    let xbr = gx + gw + dx + shear_bot;
-                    vertices.push(Vertex { position: [xtl, gy], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [xtr, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [xbl, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [xtr, gy], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [xbr, gy + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-                    vertices.push(Vertex { position: [xbl, gy + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-                }
-            }
-        }
-
-        // Draw URL underline for hovered URL (may span multiple wrapped rows)
-        if let Some(ref segments) = self.hovered_url {
-            let url_color = [0.4, 0.6, 1.0];
-            for &(hover_row, col_start, col_end) in segments {
-                let uy = (oy + y_offset + hover_row as f32 * cell_h + cell_h - 1.0).round();
-                let ux = (ox + col_start as f32 * cell_w).round();
-                let uw = (col_end - col_start) as f32 * cell_w;
-                Self::push_bg_quad(&mut vertices, ux, uy, uw, 1.0, url_color);
-            }
-        }
-
-        // Draw cursor (adjusted for scroll offset and y_offset)
-        if term.cursor_visible && blink_on {
-            let offset = term.scroll_offset();
-            let screen_y = offset + term.cursor_y as i32;
-            if screen_y >= 0 && screen_y < term.rows as i32 {
-                let cx = (ox + term.cursor_x as f32 * cell_w).round();
-                let cy = (oy + y_offset + screen_y as f32 * cell_h).round();
-                match term.cursor_shape {
-                    // Filled block only where the keystrokes go. Elsewhere the
-                    // cursor is drawn hollow, the way a text field marks that it
-                    // no longer has the caret.
-                    CursorShape::Block if is_focused => {
-                        Self::push_bg_quad(&mut vertices, cx, cy, cell_w, cell_h, self.cursor_color);
-                    }
-                    CursorShape::Block => {
-                        let t = (cell_h * 0.08).max(1.0).round();
-                        Self::push_bg_quad(&mut vertices, cx, cy, cell_w, t, self.cursor_color);
-                        Self::push_bg_quad(&mut vertices, cx, cy + cell_h - t, cell_w, t, self.cursor_color);
-                        Self::push_bg_quad(&mut vertices, cx, cy + t, t, cell_h - 2.0 * t, self.cursor_color);
-                        Self::push_bg_quad(&mut vertices, cx + cell_w - t, cy + t, t, cell_h - 2.0 * t, self.cursor_color);
-                    }
-                    CursorShape::Underline => {
-                        let thickness = (cell_h * 0.1).max(1.0);
-                        Self::push_bg_quad(&mut vertices, cx, cy + cell_h - thickness, cell_w, thickness, self.cursor_color);
-                    }
-                    CursorShape::Bar => {
-                        let thickness = (cell_w * 0.1).max(1.0);
-                        Self::push_bg_quad(&mut vertices, cx, cy, thickness, cell_h, self.cursor_color);
-                    }
-                }
-            }
-        }
-
-        // Status bar. Built before the veil so the veil covers it too: leaving
-        // it out made every unfocused bar as bright as the focused one, and with
-        // four splits nothing pointed at the pane that had the keyboard.
-        if self.status_bar_enabled {
-            self.build_status_bar_vertices(&mut vertices, vp, term, custom_title, attention, pane_input_chars, pane_id, fg_process, text_fade, bookmarked);
-        }
-
-        // Veil over an unfocused pane, status bar included.
-        if !is_focused && self.dim_mode == DimMode::Full && self.dim_opacity > 0.0 {
-            let dim4 = [0.0, 0.0, 0.0, self.dim_opacity]; // black overlay
-            let no_tex = [0.0, 0.0];
-            let white = [1.0, 1.0, 1.0, 0.0];
-            let dim_h = vp.height;
-            vertices.push(Vertex { position: [vp.x, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
-            vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
-            vertices.push(Vertex { position: [vp.x, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
-            vertices.push(Vertex { position: [vp.x + vp.width, vp.y], tex_coords: no_tex, color: white, bg_color: dim4 });
-            vertices.push(Vertex { position: [vp.x + vp.width, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
-            vertices.push(Vertex { position: [vp.x, vp.y + dim_h], tex_coords: no_tex, color: white, bg_color: dim4 });
-        }
-
-        // Outline around the focused pane, drawn last so nothing covers it.
-        if is_focused && self.focus_border_width > 0.0 {
-            let w = self.focus_border_width.min(vp.width * 0.5).min(vp.height * 0.5);
-            let c = self.focus_border_color;
-            Self::push_bg_quad(&mut vertices, vp.x, vp.y, vp.width, w, c);
-            Self::push_bg_quad(&mut vertices, vp.x, vp.y + vp.height - w, vp.width, w, c);
-            Self::push_bg_quad(&mut vertices, vp.x, vp.y + w, w, vp.height - 2.0 * w, c);
-            Self::push_bg_quad(&mut vertices, vp.x + vp.width - w, vp.y + w, w, vp.height - 2.0 * w, c);
-        }
-
-        vertices
-    }
-
-    fn build_status_bar_vertices(
-        &mut self,
-        vertices: &mut Vec<Vertex>,
-        vp: &PaneViewport,
-        term: &TerminalState,
-        custom_title: Option<&str>,
-        attention: PaneAttention,
-        pane_input_chars: u64,
-        pane_id: PaneId,
-        fg_process: Option<&str>,
-        text_fade: f32,
-        bookmarked: bool,
-    ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
-        let bar_y = vp.y + vp.height - cell_h;
-
-        // Background quad: orange for bell, green for completion, default otherwise.
-        // In `text` dim mode the veil never comes, so the bar of an unfocused
-        // pane fades here — bar included, or the brightest thing on screen ends
-        // up being a pane nobody is typing in.
-        // A bookmarked pane paints its whole bar very dark blue: the mark has to
-        // be readable at a glance across four splits, and a single glyph is not.
-        // Darker than the default bar, so the usual text colors keep their
-        // contrast — the bar changes hue, not its readability. Attention still
-        // wins: a bell or a finished run is news, a bookmark is a standing fact.
-        let base_bar_bg = if bookmarked { BOOKMARKED_BAR_BG } else { self.status_bar_bg };
-        let bar_bg = Self::fade_toward(attention.bar_bg(base_bar_bg), self.bg_color, text_fade);
-        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, bar_bg);
-
-        let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let cwd = Self::fade_toward(self.status_bar_cwd_color, bar_bg, text_fade);
-        let branch = Self::fade_toward(self.status_bar_branch_color, bar_bg, text_fade);
-        let scroll = Self::fade_toward(self.status_bar_scroll_color, bar_bg, text_fade);
-        let fg = Self::fade_toward(self.status_bar_fg, bar_bg, text_fade);
-        let cwd_fg = [cwd[0], cwd[1], cwd[2], 1.0];
-        let branch_fg = [branch[0], branch[1], branch[2], 1.0];
-        let scroll_fg = [scroll[0], scroll[1], scroll[2], 1.0];
-        let title_fg = [fg[0], fg[1], fg[2], 1.0];
-        let id_fg = [fg[0], fg[1], fg[2], 0.6];
-        let process_fg = [fg[0], fg[1], fg[2], 0.9];
-
-        // Pane ID first, always visible: it is the handle used to address the
-        // pane over IPC, so it never gets dropped when the bar runs out of room.
-        let mut cursor_x = vp.x + self.h_padding() + cell_w; // 1 cell padding from left
-        {
-            let id_str = format!("#{}", pane_id);
-            let id_w = id_str.chars().count() as f32 * cell_w;
-            let id_x = cursor_x;
-            cursor_x = self.render_status_text(vertices, &id_str, id_x, bar_y, vp.x + vp.width, id_fg, no_bg);
-            cursor_x += cell_w; // 1 cell gap before the CWD
-            self.push_tooltip_zone(id_x, bar_y, id_w, cell_h, "Pane ID (KOVA_PANE_ID — use it with the IPC socket)");
-        }
-
-        // Render CWD aligned to the left
-        if let Some(ref cwd) = term.cwd {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let display_path = if !home.is_empty() && cwd.starts_with(&home) {
-                format!("~{}", &cwd[home.len()..])
-            } else {
-                cwd.clone()
-            };
-            cursor_x = self.render_status_text(vertices, &display_path, cursor_x, bar_y, vp.x + vp.width * 0.4, cwd_fg, no_bg);
-        }
-
-        // Render git branch after CWD
-        cursor_x += cell_w * 2.0; // 2 cell gap
-        let branch_display = match term.git_branch {
-            Some(ref b) => format!(" {}", b),
-            None => " no git".to_string(),
-        };
-        let actual_branch_fg = match term.git_branch {
-            Some(_) => branch_fg,
-            None => [branch_fg[0] * 0.5, branch_fg[1] * 0.5, branch_fg[2] * 0.5, 0.5],
-        };
-        let mut left_end = self.render_status_text(vertices, &branch_display, cursor_x, bar_y, vp.x + vp.width * 0.6, actual_branch_fg, no_bg);
-
-        // Foreground process after the branch: what is actually running in the
-        // pane right now (claude, nvim, ssh…). Absent at a bare shell prompt,
-        // so the bar stays quiet when nothing runs.
-        if let Some(process) = fg_process {
-            let proc_x = left_end + cell_w * 2.0;
-            let proc_w = process.chars().count() as f32 * cell_w;
-            left_end = self.render_status_text(vertices, process, proc_x, bar_y, vp.x + vp.width * 0.75, process_fg, no_bg);
-            self.push_tooltip_zone(proc_x, bar_y, proc_w, cell_h, "Foreground process running in this pane");
-        }
-
-        // Right side: title (custom or hovered URL or OSC) + scroll indicator
-        let right_edge = vp.x + vp.width - cell_w; // 1 cell padding from right
-
-        // Scroll indicator (rightmost)
-        let scroll_off = term.scroll_offset();
-        let right_after_scroll = if scroll_off > 0 {
-            let scroll_str = format!("↑{}", scroll_off);
-            let scroll_w = scroll_str.chars().count() as f32 * cell_w;
-            let right_x = right_edge - scroll_w;
-            self.render_status_text(vertices, &scroll_str, right_x, bar_y, right_edge + cell_w, scroll_fg, no_bg);
-            self.push_tooltip_zone(right_x, bar_y, scroll_w, cell_h, "Scroll offset (lines above visible area)");
-            right_x - cell_w * 2.0 // gap before title
-        } else {
-            right_edge
-        };
-
-        // Title: hovered URL > custom_title > OSC title
-        let right_text: Option<(String, [f32; 4])> = if let Some(ref url) = self.hovered_url_text {
-            Some((url.clone(), [0.4, 0.6, 1.0, 1.0]))
-        } else if let Some(title) = custom_title {
-            Some((title.to_string(), title_fg))
-        } else {
-            term.title.as_ref().map(|t| (t.clone(), title_fg))
-        };
-        let right_content_start = if let Some((ref text, fg)) = right_text {
-            let char_count = text.chars().count();
-            let text_w = char_count as f32 * cell_w;
-            let title_x = right_after_scroll - text_w;
-            // Only render if it doesn't overlap with left content
-            if title_x >= left_end + cell_w * 2.0 {
-                self.render_status_text(vertices, text, title_x, bar_y, right_after_scroll, fg, no_bg);
-                title_x
-            } else {
-                right_after_scroll
-            }
-        } else {
-            right_after_scroll
-        };
-
-        // Per-pane I/O counters — only if enough space between left and right content
-        let pane_out = term.printable_chars.load(std::sync::atomic::Ordering::Relaxed);
-        let io_str = format!("↑{} ↓{}", format_count(pane_input_chars), format_count(pane_out));
-        let io_w = io_str.chars().count() as f32 * cell_w;
-        let io_x = right_content_start - io_w - cell_w * 2.0;
-        let io_rendered = io_x >= left_end + cell_w * 2.0;
-        let dim_fg = [self.status_bar_fg[0], self.status_bar_fg[1], self.status_bar_fg[2], 0.4];
-        if io_rendered {
-            self.render_status_text(vertices, &io_str, io_x, bar_y, right_content_start, dim_fg, no_bg);
-            self.push_tooltip_zone(io_x, bar_y, io_w, cell_h, "Pane I/O — ↑ chars sent  ↓ chars received");
-        }
-
-        // Last interaction timestamp (DD/MMM HH:mm) — shown to the left of the I/O counters.
-        let last_activity = term.last_activity_secs.load(std::sync::atomic::Ordering::Relaxed);
-        if last_activity > 0 {
-            let ts_str = format_last_activity(last_activity);
-            let ts_w = ts_str.chars().count() as f32 * cell_w;
-            let ts_right = if io_rendered { io_x - cell_w * 2.0 } else { right_content_start };
-            let ts_x = ts_right - ts_w;
-            if ts_x >= left_end + cell_w * 2.0 {
-                self.render_status_text(vertices, &ts_str, ts_x, bar_y, ts_right, dim_fg, no_bg);
-                self.push_tooltip_zone(ts_x, bar_y, ts_w, cell_h, "Last input or output on this pane");
-            }
-        }
-    }
-
     /// Paint `text` over the whole status-bar row of `vp`, on a solid `color`
     /// background — the pane's own bar is hidden underneath for as long as it
     /// lasts, so the message cannot be mistaken for one more field in the bar.
     /// The text sits one cell in from the left, and is clipped at the right edge
-    /// like every other status-bar string.
+    /// like every other status-bar string. `title` — the pane's session name —
+    /// goes at the right end in bold, where the bar it hides would show it.
     fn build_pane_banner_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
         vp: &PaneViewport,
         text: &str,
+        title: Option<&str>,
         color: [f32; 3],
     ) {
-        let cell_h = self.atlas.cell_height;
-        let cell_w = self.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
         let bar_y = vp.y + vp.height - cell_h;
-        Self::push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, color);
+        push_bg_quad(vertices, vp.x, bar_y, vp.width, cell_h, color);
         let fg = [1.0, 1.0, 1.0, 1.0];
         let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let text_x = vp.x + self.h_padding() + cell_w;
-        self.render_status_text(vertices, text, text_x, bar_y, vp.x + vp.width - cell_w, fg, no_bg);
+        let text_x = vp.x + self.ctx.h_padding() + cell_w;
+        let right_edge = vp.x + vp.width - cell_w;
+        let label_end = self.ctx.render_status_text(vertices, text, text_x, bar_y, right_edge, fg, no_bg);
+        if let Some(title) = title.filter(|t| !t.is_empty()) {
+            let title_x = banner_title_x(title.chars().count(), label_end, right_edge, cell_w);
+            // Faux-bold, as for terminal cells: the same glyphs again, 1px right.
+            for dx in [0.0, 1.0] {
+                self.ctx.render_status_text(vertices, title, title_x + dx, bar_y, right_edge + dx, fg, no_bg);
+            }
+        }
     }
 
     fn build_global_status_bar_vertices(
@@ -1788,13 +1384,13 @@ impl Renderer {
         help_hint_remaining: u32,
         keys_config: Option<&KeysConfig>,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
         let bar_y = viewport_h - cell_h;
         self.minimized_counter_zone = None;
 
         // Background quad
-        Self::push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.global_bar_bg);
+        push_bg_quad(vertices, 0.0, bar_y, viewport_w, cell_h, self.global_bar_bg);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let time_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 1.0];
@@ -1820,14 +1416,14 @@ impl Renderer {
             let mut x = center_start;
 
             if hidden_left > 0 {
-                x = self.render_status_text(vertices, &left_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
+                x = self.ctx.render_status_text(vertices, &left_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
             }
-            x = self.render_status_text(vertices, &tab_name_text, x, bar_y, viewport_w, tab_fg, no_bg);
-            x = self.render_status_text(vertices, &tab_text, x, bar_y, viewport_w, tab_fg, no_bg);
-            x = self.render_status_text(vertices, sep, x, bar_y, viewport_w, tab_fg, no_bg);
-            x = self.render_status_text(vertices, &col_text, x, bar_y, viewport_w, scroll_fg, no_bg);
+            x = self.ctx.render_status_text(vertices, &tab_name_text, x, bar_y, viewport_w, tab_fg, no_bg);
+            x = self.ctx.render_status_text(vertices, &tab_text, x, bar_y, viewport_w, tab_fg, no_bg);
+            x = self.ctx.render_status_text(vertices, sep, x, bar_y, viewport_w, tab_fg, no_bg);
+            x = self.ctx.render_status_text(vertices, &col_text, x, bar_y, viewport_w, scroll_fg, no_bg);
             if hidden_right > 0 {
-                x = self.render_status_text(vertices, &right_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
+                x = self.ctx.render_status_text(vertices, &right_arrow, x, bar_y, viewport_w, scroll_fg, no_bg);
             }
             self.push_tooltip_zone(center_start, bar_y, x - center_start, cell_h, "Tab / total — focused column / total columns");
         }
@@ -1836,12 +1432,12 @@ impl Renderer {
         if let Some((ready, total)) = self.loading_progress {
             let text = format!("Loading {}/{}...", ready, total);
             let loading_fg = [0.6, 0.85, 0.6, 1.0];
-            self.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, loading_fg, no_bg);
+            self.ctx.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, loading_fg, no_bg);
         }
         // Left: resize feedback (takes priority over help hint)
         else if let Some(text) = self.resize_feedback_text.clone() {
             let info_fg = [0.6, 0.85, 0.6, 1.0];
-            self.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, info_fg, no_bg);
+            self.ctx.render_status_text(vertices, &text, cell_w, bar_y, viewport_w, info_fg, no_bg);
         }
         // Left: permanent shortcuts reminder (help + overlays), unless loading
         // or resize feedback is shown. Brighter for the first few seconds after
@@ -1862,7 +1458,7 @@ impl Renderer {
                 let alpha = if help_hint_remaining > 0 { 0.85 } else { 0.4 };
                 let hint_fg = [0.6, 0.75, 1.0, alpha];
                 let hint = self.cached_shortcuts_hint.clone();
-                self.render_status_text(vertices, &hint, cell_w, bar_y, viewport_w, hint_fg, no_bg);
+                self.ctx.render_status_text(vertices, &hint, cell_w, bar_y, viewport_w, hint_fg, no_bg);
             }
         }
 
@@ -1872,7 +1468,7 @@ impl Renderer {
             let rss_str = self.cached_rss_str.clone();
             let time_w = time_str.chars().count() as f32 * cell_w;
             let right_x = viewport_w - time_w - cell_w;
-            self.render_status_text(vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg);
+            self.ctx.render_status_text(vertices, &time_str, right_x, bar_y, viewport_w, time_fg, no_bg);
 
             let mut left_edge = right_x;
             let gap = cell_w * 2.0;
@@ -1881,7 +1477,7 @@ impl Renderer {
                 let rss_fg = [self.global_bar_time_color[0], self.global_bar_time_color[1], self.global_bar_time_color[2], 0.6];
                 let rss_w = rss_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - rss_w - gap;
-                self.render_status_text(vertices, &rss_str, left_edge, bar_y, viewport_w, rss_fg, no_bg);
+                self.ctx.render_status_text(vertices, &rss_str, left_edge, bar_y, viewport_w, rss_fg, no_bg);
                 self.push_tooltip_zone(left_edge, bar_y, rss_w, cell_h, "Memory usage (RSS)");
             }
 
@@ -1890,7 +1486,7 @@ impl Renderer {
                 let io_w = self.cached_io_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - io_w - gap;
                 let io_str = self.cached_io_str.clone();
-                self.render_status_text(vertices, &io_str, left_edge, bar_y, viewport_w, io_fg, no_bg);
+                self.ctx.render_status_text(vertices, &io_str, left_edge, bar_y, viewport_w, io_fg, no_bg);
                 self.push_tooltip_zone(left_edge, bar_y, io_w, cell_h, "Total I/O — ↑ chars sent  ↓ chars received");
             }
 
@@ -1902,7 +1498,7 @@ impl Renderer {
             let proc_w = self.cached_proc_str.chars().count() as f32 * cell_w;
             left_edge = left_edge - proc_w - gap;
             let proc_str = self.cached_proc_str.clone();
-            self.render_status_text(vertices, &proc_str, left_edge, bar_y, viewport_w, proc_fg, no_bg);
+            self.ctx.render_status_text(vertices, &proc_str, left_edge, bar_y, viewport_w, proc_fg, no_bg);
             self.push_tooltip_zone(left_edge, bar_y, proc_w, cell_h, "Running child processes");
 
             // Number of panes whose Claude Code is actively working (OSC-title
@@ -1911,7 +1507,7 @@ impl Renderer {
                 let agents_str = format!("\u{2733}{}", working_agents);
                 let agents_w = agents_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - agents_w - gap;
-                self.render_status_text(vertices, &agents_str, left_edge, bar_y, viewport_w, WORKING_FG, no_bg);
+                self.ctx.render_status_text(vertices, &agents_str, left_edge, bar_y, viewport_w, WORKING_FG, no_bg);
                 self.push_tooltip_zone(left_edge, bar_y, agents_w, cell_h, "Claude Code panes currently working");
             }
 
@@ -1923,7 +1519,7 @@ impl Renderer {
                 let unread_str = format!("\u{25cf}{}", unread_panes);
                 let unread_w = unread_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - unread_w - gap;
-                self.render_status_text(vertices, &unread_str, left_edge, bar_y, viewport_w, UNREAD_FG, no_bg);
+                self.ctx.render_status_text(vertices, &unread_str, left_edge, bar_y, viewport_w, UNREAD_FG, no_bg);
                 self.push_tooltip_zone(left_edge, bar_y, unread_w, cell_h, "Panes with unread output (bell or finished command)");
             }
 
@@ -1939,7 +1535,7 @@ impl Renderer {
                 };
                 let min_w = min_str.chars().count() as f32 * cell_w;
                 left_edge = left_edge - min_w - gap;
-                self.render_status_text(vertices, &min_str, left_edge, bar_y, viewport_w, min_fg, no_bg);
+                self.ctx.render_status_text(vertices, &min_str, left_edge, bar_y, viewport_w, min_fg, no_bg);
                 self.push_tooltip_zone(left_edge, bar_y, min_w, cell_h, "Minimized panes — this tab / all windows (click: switcher)");
                 self.minimized_counter_zone = Some((left_edge, bar_y, min_w, cell_h));
             }
@@ -1953,13 +1549,13 @@ impl Renderer {
         tab_titles: &[(String, bool, Option<usize>, bool, bool, bool, bool)],
         left_inset: f32,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
         let bar_h = (cell_h * 2.0).round();
         let tab_count = tab_titles.len();
 
         // Full-width background
-        Self::push_bg_quad(vertices, 0.0, 0.0, viewport_w, bar_h, self.tab_bar_bg);
+        push_bg_quad(vertices, 0.0, 0.0, viewport_w, bar_h, self.tab_bar_bg);
 
         // Version label — always visible, doubles as window drag handle
         let version_label = format!("Kova v{}", env!("CARGO_PKG_VERSION"));
@@ -1989,13 +1585,13 @@ impl Renderer {
             };
 
             if let Some(bg) = tab_bg {
-                Self::push_bg_quad(vertices, x, 0.0, tab_width, bar_h, bg);
+                push_bg_quad(vertices, x, 0.0, tab_width, bar_h, bg);
             }
 
             // Active tab: white border at bottom, the same on every tab color
             if *is_active {
                 let border_h = 4.0_f32;
-                Self::push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, [1.0, 1.0, 1.0]);
+                push_bg_quad(vertices, x, bar_h - border_h, tab_width, border_h, [1.0, 1.0, 1.0]);
             }
 
             // Tab indicator: bell (orange ●) > completion (green ●) > running
@@ -2052,7 +1648,7 @@ impl Renderer {
             } else {
                 x + tab_width - cell_w
             };
-            self.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), text_y, max_x, fg, no_bg);
+            self.ctx.render_status_text(vertices, &label, text_x.max(x + cell_w * 0.5), text_y, max_x, fg, no_bg);
 
             if let Some((color, glyph)) = indicator {
                 let dot_x = x + tab_width - cell_w * 2.0;
@@ -2067,7 +1663,7 @@ impl Renderer {
                 } else {
                     [color[0], color[1], color[2], 1.0]
                 };
-                self.render_status_text(vertices, glyph, dot_x, dot_y, x + tab_width, dot_color, no_bg);
+                self.ctx.render_status_text(vertices, glyph, dot_x, dot_y, x + tab_width, dot_color, no_bg);
             }
         }
 
@@ -2078,129 +1674,9 @@ impl Renderer {
             let grip_x = viewport_w - right_inset + cell_w * 0.25;
             let version_x = grip_x + cell_w * 1.5;
             let version_y = (bar_h - cell_h) / 2.0;
-            self.render_status_text(vertices, "⠿", grip_x, version_y, viewport_w, grip_fg, no_bg);
-            self.render_status_text(vertices, &version_label, version_x, version_y, viewport_w - cell_w * 0.5, version_fg, no_bg);
+            self.ctx.render_status_text(vertices, "⠿", grip_x, version_y, viewport_w, grip_fg, no_bg);
+            self.ctx.render_status_text(vertices, &version_label, version_x, version_y, viewport_w - cell_w * 0.5, version_fg, no_bg);
         }
-    }
-
-    /// Render a string at the given position with optional scale factor.
-    /// Returns the x position after the last rendered character.
-    /// Stops rendering if x exceeds max_x.
-    fn render_text(
-        &mut self,
-        vertices: &mut Vec<Vertex>,
-        text: &str,
-        start_x: f32,
-        y: f32,
-        max_x: f32,
-        fg: [f32; 4],
-        no_bg: [f32; 4],
-        scale: f32,
-    ) -> f32 {
-        let cell_w = self.atlas.cell_width * scale;
-        let atlas_w = self.atlas.atlas_width as f32;
-        let atlas_h = self.atlas.atlas_height as f32;
-
-        for c in text.chars() {
-            if self.atlas.glyph(c).is_none() {
-                self.atlas.rasterize_char(c);
-            }
-        }
-
-        let mut x = start_x;
-        for c in text.chars() {
-            if !glyph_fits(x, cell_w, max_x) { break; }
-            let glyph = match self.atlas.glyph(c) {
-                Some(g) => *g,
-                None => { x += cell_w; continue; }
-            };
-            if glyph.width == 0 || glyph.height == 0 { x += cell_w; continue; }
-
-            let gw = glyph.width as f32 * scale;
-            let gh = glyph.height as f32 * scale;
-            let tx = glyph.x as f32 / atlas_w;
-            let ty = glyph.y as f32 / atlas_h;
-            let tw = glyph.width as f32 / atlas_w;
-            let th = glyph.height as f32 / atlas_h;
-
-            vertices.push(Vertex { position: [x, y], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-            x += cell_w;
-        }
-        x
-    }
-
-    fn render_status_text(
-        &mut self,
-        vertices: &mut Vec<Vertex>,
-        text: &str,
-        start_x: f32,
-        y: f32,
-        max_x: f32,
-        fg: [f32; 4],
-        no_bg: [f32; 4],
-    ) -> f32 {
-        self.render_text(vertices, text, start_x, y, max_x, fg, no_bg, 1.0)
-    }
-
-    /// Render text using the overlay font (rasterized at larger size, no bitmap stretching).
-    /// `scale` upscales the overlay glyphs (1.0 = native overlay size). Keep close to 1.0:
-    /// large factors reintroduce bilinear blur. Used >1.0 only for the help title.
-    fn render_overlay_text(
-        &mut self,
-        vertices: &mut Vec<Vertex>,
-        text: &str,
-        start_x: f32,
-        y: f32,
-        max_x: f32,
-        fg: [f32; 4],
-        no_bg: [f32; 4],
-        scale: f32,
-    ) -> f32 {
-        let cell_w = self.atlas.overlay_cell_width * scale;
-        let atlas_w = self.atlas.atlas_width as f32;
-        let atlas_h = self.atlas.atlas_height as f32;
-
-        for c in text.chars() {
-            if self.atlas.overlay_glyph(c).is_none() {
-                self.atlas.rasterize_overlay_char(c);
-            }
-        }
-
-        let mut x = start_x;
-        for c in text.chars() {
-            if !glyph_fits(x, cell_w, max_x) { break; }
-            let glyph = match self.atlas.overlay_glyph(c) {
-                Some(g) => *g,
-                None => { x += cell_w; continue; }
-            };
-            if glyph.width == 0 || glyph.height == 0 { x += cell_w; continue; }
-
-            let gw = glyph.width as f32 * scale;
-            let gh = glyph.height as f32 * scale;
-            let tx = glyph.x as f32 / atlas_w;
-            let ty = glyph.y as f32 / atlas_h;
-            let tw = glyph.width as f32 / atlas_w;
-            let th = glyph.height as f32 / atlas_h;
-
-            // Snap to integer pixels so the nearest-sampled glyph stays crisp
-            // (fractional positions smear the bitmap edges).
-            let px = x.round();
-            let py = y.round();
-
-            vertices.push(Vertex { position: [px, py], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [px + gw, py], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [px, py + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [px + gw, py], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [px + gw, py + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [px, py + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-            x += cell_w;
-        }
-        x
     }
 
     fn build_filter_overlay_vertices(
@@ -2209,22 +1685,22 @@ impl Renderer {
         vp: &PaneViewport,
         filter: &FilterRenderData,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
 
         // 1. Semi-transparent dark overlay covering the entire pane
-        Self::push_bg_quad_alpha(vertices, vp.x, vp.y, vp.width, vp.height, [0.0, 0.0, 0.0], 0.85);
+        push_bg_quad_alpha(vertices, vp.x, vp.y, vp.width, vp.height, [0.0, 0.0, 0.0], 0.85);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
 
         // 2. Search bar background
         let bar_bg = [0.2, 0.2, 0.25];
-        Self::push_bg_quad(vertices, vp.x, vp.y, vp.width, cell_h, bar_bg);
+        push_bg_quad(vertices, vp.x, vp.y, vp.width, cell_h, bar_bg);
 
         // 3. Search bar text: "/ query▏"
         let bar_text = format!("/ {}▏", &filter.query);
         let bar_fg = [1.0, 0.8, 0.2, 1.0]; // accent yellow
-        self.render_status_text(vertices, &bar_text, vp.x + self.h_padding(), vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
+        self.ctx.render_status_text(vertices, &bar_text, vp.x + self.ctx.h_padding(), vp.y, vp.x + vp.width - cell_w, bar_fg, no_bg);
 
         // Match count — or, on an empty query, how to recall an earlier one.
         let count_text = match &filter.hint {
@@ -2233,23 +1709,23 @@ impl Renderer {
         };
         let count_fg = [0.6, 0.6, 0.6, 1.0];
         let count_w = count_text.chars().count() as f32 * cell_w;
-        self.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - self.h_padding(), vp.y, vp.x + vp.width, count_fg, no_bg);
+        self.ctx.render_status_text(vertices, &count_text, vp.x + vp.width - count_w - self.ctx.h_padding(), vp.y, vp.x + vp.width, count_fg, no_bg);
 
         // 4. List matched lines — truncate text to visible columns to limit vertices
         let max_visible = ((vp.height / cell_h).floor() as usize).saturating_sub(1);
         let match_fg = [0.85, 0.85, 0.85, 1.0];
         let highlight_fg = [1.0, 0.8, 0.2, 1.0];
         let query_lower = filter.query.to_lowercase();
-        let max_chars = ((vp.width - 2.0 * self.h_padding()) / cell_w) as usize;
+        let max_chars = ((vp.width - 2.0 * self.ctx.h_padding()) / cell_w) as usize;
 
         for (i, m) in filter.matches.iter().take(max_visible).enumerate() {
             let y = vp.y + (i + 1) as f32 * cell_h;
-            let max_x = vp.x + vp.width - self.h_padding();
+            let max_x = vp.x + vp.width - self.ctx.h_padding();
 
             // Line number prefix
             let prefix = format!("{:>6}: ", m.abs_line);
             let prefix_fg = [0.5, 0.5, 0.5, 1.0];
-            let after_prefix = self.render_status_text(vertices, &prefix, vp.x + self.h_padding(), y, max_x, prefix_fg, no_bg);
+            let after_prefix = self.ctx.render_status_text(vertices, &prefix, vp.x + self.ctx.h_padding(), y, max_x, prefix_fg, no_bg);
 
             // Truncate line text to what fits on screen
             let prefix_chars = prefix.chars().count();
@@ -2257,7 +1733,7 @@ impl Renderer {
             let display_text: String = m.text.chars().take(text_limit).collect();
 
             if query_lower.is_empty() {
-                self.render_status_text(vertices, &display_text, after_prefix, y, max_x, match_fg, no_bg);
+                self.ctx.render_status_text(vertices, &display_text, after_prefix, y, max_x, match_fg, no_bg);
             } else {
                 // Split text into spans: alternating normal/highlighted.
                 // to_lowercase() is not byte-length-preserving ('İ' is 2
@@ -2298,72 +1774,24 @@ impl Renderer {
                 let mut x = after_prefix;
                 for (span, is_hl) in spans {
                     let fg = if is_hl { highlight_fg } else { match_fg };
-                    x = self.render_status_text(vertices, span, x, y, max_x, fg, no_bg);
+                    x = self.ctx.render_status_text(vertices, span, x, y, max_x, fg, no_bg);
                 }
             }
         }
     }
 
-    fn build_loading_vertices(&mut self, vp: &PaneViewport) -> Vec<Vertex> {
-        let text = "starting...";
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
-        let atlas_w = self.atlas.atlas_width as f32;
-        let atlas_h = self.atlas.atlas_height as f32;
-
-        let text_w = text.len() as f32 * cell_w;
-        let start_x = vp.x + (vp.width - text_w) / 2.0;
-        let start_y = vp.y + (vp.height - cell_h) / 2.0;
-
-        let fg = [0.4, 0.4, 0.45, 1.0];
-        let no_bg = [0.0, 0.0, 0.0, 0.0];
-        let mut vertices = Vec::new();
-
-        for (i, c) in text.chars().enumerate() {
-            let glyph = match self.atlas.glyph(c) {
-                Some(g) => *g,
-                None => continue,
-            };
-            if glyph.width == 0 || glyph.height == 0 { continue; }
-
-            let x = start_x + i as f32 * cell_w;
-            let y = start_y;
-            let gw = glyph.width as f32;
-            let gh = glyph.height as f32;
-            let tx = glyph.x as f32 / atlas_w;
-            let ty = glyph.y as f32 / atlas_h;
-            let tw = glyph.width as f32 / atlas_w;
-            let th = glyph.height as f32 / atlas_h;
-
-            vertices.push(Vertex { position: [x, y], tex_coords: [tx, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y], tex_coords: [tx + tw, ty], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x + gw, y + gh], tex_coords: [tx + tw, ty + th], color: fg, bg_color: no_bg });
-            vertices.push(Vertex { position: [x, y + gh], tex_coords: [tx, ty + th], color: fg, bg_color: no_bg });
-        }
-
-        vertices
-    }
-
     pub fn rebuild_atlas(&mut self, scale: f64) {
-        let device = self.atlas.device.clone();
-        self.scale = scale as f32;
-        self.atlas = GlyphAtlas::new(&device, self.font_size * scale, scale, &self.font_name);
-        // Update atlas size buffer
-        let atlas_size = [self.atlas.atlas_width as f32, self.atlas.atlas_height as f32];
-        self.last_atlas_size = atlas_size;
-        unsafe {
-            let ptr = self.atlas_size_buf.contents().as_ptr() as *mut [f32; 2];
-            *ptr = atlas_size;
-        }
+        self.ctx.rebuild_atlas(scale);
+        // A new atlas restarts its generation count: cached UVs would point
+        // into the old texture with a key that still matches.
+        self.pane_renderers.clear();
     }
 
     /// Memory report for the renderer (atlas + vertex buffers).
     pub fn mem_report(&self) -> (usize, (u32, u32), usize, usize) {
-        let atlas_bytes = self.atlas.mem_bytes();
-        let atlas_dims = self.atlas.texture_size();
-        let glyph_count = self.atlas.glyphs.len() + self.atlas.cluster_glyphs.len();
+        let atlas_bytes = self.ctx.atlas.mem_bytes();
+        let atlas_dims = self.ctx.atlas.texture_size();
+        let glyph_count = self.ctx.atlas.glyphs.len() + self.ctx.atlas.cluster_glyphs.len();
         let vertex_bytes = self.vertex_buf_capacity * 2; // double-buffered
         (atlas_bytes, atlas_dims, glyph_count, vertex_bytes)
     }
@@ -2377,12 +1805,12 @@ impl Renderer {
     ) {
         // Overlay atlas: glyphs rasterized natively at ~1.3x the terminal font,
         // so they render sharp instead of bilinearly upscaling the base atlas.
-        let ocw = self.atlas.overlay_cell_width;
-        let och = self.atlas.overlay_cell_height;
-        let base_ch = self.atlas.cell_height;
+        let ocw = self.ctx.atlas.overlay_cell_width;
+        let och = self.ctx.atlas.overlay_cell_height;
+        let base_ch = self.ctx.atlas.cell_height;
 
         // Semi-transparent dark overlay
-        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0]; // accent yellow
@@ -2398,7 +1826,7 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * ocw * title_scale) / 2.0;
         let mut y = och * 2.0;
-        self.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
         y += och * title_scale * 1.6;
 
         // Subtitle
@@ -2408,26 +1836,26 @@ impl Renderer {
         let subtitle = format!("Press {} or Esc to close", &self.cached_help_hint);
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * ocw) / 2.0;
-        self.render_overlay_text(vertices, &subtitle, sub_x, y, viewport_w, label_fg, no_bg, 1.0);
+        self.ctx.render_overlay_text(vertices, &subtitle, sub_x, y, viewport_w, label_fg, no_bg, 1.0);
         drop(subtitle);
         y += och * 1.4;
 
         // Actually-resolved font (CoreText may substitute / fall back silently).
         let font_line = {
-            let actual = self.atlas.actual_font_name.clone();
-            let configured = &self.font_name;
+            let actual = self.ctx.atlas.actual_font_name.clone();
+            let configured = &self.ctx.font_name;
             if actual.to_lowercase().contains(&configured.to_lowercase()) {
-                format!("Font: {} {:.1}pt", actual, self.font_size)
+                format!("Font: {} {:.1}pt", actual, self.ctx.font_size)
             } else {
                 format!(
                     "Font: {} {:.1}pt  (\"{}\" not found, using fallback)",
-                    actual, self.font_size, configured
+                    actual, self.ctx.font_size, configured
                 )
             }
         };
         let fl_chars = font_line.chars().count() as f32;
         let fl_x = (viewport_w - fl_chars * ocw) / 2.0;
-        self.render_overlay_text(vertices, &font_line, fl_x, y, viewport_w, dim_fg, no_bg, 1.0);
+        self.ctx.render_overlay_text(vertices, &font_line, fl_x, y, viewport_w, dim_fg, no_bg, 1.0);
         drop(font_line);
         y += och * 2.2;
 
@@ -2444,6 +1872,7 @@ impl Renderer {
                     ("Close Tab", kc.close_tab.as_str(), "whole tab at once"),
                     ("Previous Tab", kc.prev_tab.as_str(), ""),
                     ("Next Tab", kc.next_tab.as_str(), ""),
+                    ("Jump to Tab", "cmd+1-9", ""),
                     ("Rename Tab", kc.rename_tab.as_str(), ""),
                     ("New Window", kc.new_window.as_str(), ""),
                     ("Close Window", kc.close_window.as_str(), ""),
@@ -2466,18 +1895,23 @@ impl Renderer {
                     ("Swap Pane", kc.swap_up.as_str(), "trade two panes"),
                     ("Reparent Pane", kc.reparent_up.as_str(), "move across the split tree"),
                 ]),
+                ("MISC", vec![
+                    ("Memory Report", "cmd+shift+i", ""),
+                    ("Help", kc.toggle_help.as_str(), "this screen"),
+                ]),
             ];
             let right: Vec<Section> = vec![
                 ("PANES", vec![
                     ("Navigate", kc.navigate_up.as_str(), "move focus"),
                     ("Resize Pane", kc.resize_up.as_str(), "adjust split ratio"),
                     ("Edge Grow", kc.edge_grow_right.as_str(), "grow one edge"),
+                    ("Virtual Width", "ctrl+option+right", "widen / narrow the tab"),
                     ("Minimize Pane", kc.minimize_pane.as_str(), ""),
                     ("Restore Minimized", kc.restore_minimized.as_str(), ""),
                     ("Rename Pane", kc.rename_pane.as_str(), "sticky title"),
                     ("Mark Unread / Read", kc.toggle_unread.as_str(), "toggle the unread mark"),
                     ("Repaint Pane", kc.repaint_pane.as_str(), "redraw / fix winsize"),
-                    ("Next Unread", kc.next_attention.as_str(), "the next pane with something new"),
+                    ("Next Unread", kc.next_attention.as_str(), "unread, else idle agent session"),
                     ("Back / Forward", kc.history_back.as_str(), "panes you visited"),
                 ]),
                 ("EDIT & SEARCH", vec![
@@ -2488,11 +1922,17 @@ impl Renderer {
                     ("Global Search", kc.open_search.as_str(), "panes + closed Claude sessions"),
                     ("Switch Tab/Pane", kc.open_pane_switcher.as_str(), "quick switcher + bookmarks"),
                     ("Bookmark Pane", kc.toggle_bookmark.as_str(), "keep this conversation"),
+                    ("Anchor Pane", kc.toggle_anchor.as_str(), "what today is for"),
+                    ("Go To Anchor", kc.focus_anchor.as_str(), "back to the first anchor"),
                     ("Unread Panes", kc.open_unread_switcher.as_str(), "switcher, attention only"),
                 ]),
-                ("MISC", vec![
-                    ("Memory Report", "cmd+shift+i", ""),
-                    ("Help", kc.toggle_help.as_str(), "this screen"),
+                ("TERMINAL", vec![
+                    ("Line Start / End", kc.terminal.home.as_str(), "\u{2190} / \u{2192}"),
+                    ("Word Jump", kc.terminal.word_back.as_str(), "\u{2190} / \u{2192}"),
+                    ("Kill Line", kc.terminal.kill_line.as_str(), ""),
+                    ("Newline", kc.terminal.shift_enter.as_str(), "without running"),
+                    ("Clear Scrollback", "ctrl+l", "passed to the app too"),
+                    ("Open URL", "cmd+click", ""),
                 ]),
             ];
             let build = |sections: Vec<Section>| -> Vec<HelpRow> {
@@ -2530,7 +1970,15 @@ impl Renderer {
         let label_off = ocw * 2.0;
         let key_off = label_off + (max_label as f32 + 1.0) * ocw;
         let desc_off = key_off + (max_key as f32 + 2.0) * ocw;
-        let row_h = och * 1.4;
+        // Tighten the spacing when the tallest column would run past the
+        // status bar, so a short window still shows every row.
+        let avail = viewport_h - base_ch - y;
+        let scale = columns.iter().map(|col| {
+            let headers = col.iter().filter(|r| matches!(r, HelpRow::Header(_))).count();
+            help_row_scale(headers, col.len() - headers, avail, och)
+        }).fold(1.0_f32, f32::min);
+        let row_h = och * HELP_ROW_STEP * scale;
+        let header_gap = och * HELP_HEADER_GAP * scale;
 
         for (ci, col) in columns.iter().enumerate() {
             let base_x = ci as f32 * col_width;
@@ -2541,15 +1989,15 @@ impl Renderer {
                 }
                 match row {
                     HelpRow::Header(h) => {
-                        row_y += och * 0.5; // breathing room above each section
-                        self.render_overlay_text(vertices, h, base_x + label_off, row_y, base_x + col_width - ocw, title_fg, no_bg, 1.0);
+                        row_y += header_gap; // breathing room above each section
+                        self.ctx.render_overlay_text(vertices, h, base_x + label_off, row_y, base_x + col_width - ocw, title_fg, no_bg, 1.0);
                         row_y += row_h;
                     }
                     HelpRow::Item { label, key, desc } => {
-                        self.render_overlay_text(vertices, label, base_x + label_off, row_y, base_x + key_off - ocw, label_fg, no_bg, 1.0);
-                        self.render_overlay_text(vertices, key, base_x + key_off, row_y, base_x + desc_off - ocw, key_fg, no_bg, 1.0);
+                        self.ctx.render_overlay_text(vertices, label, base_x + label_off, row_y, base_x + key_off - ocw, label_fg, no_bg, 1.0);
+                        self.ctx.render_overlay_text(vertices, key, base_x + key_off, row_y, base_x + desc_off - ocw, key_fg, no_bg, 1.0);
                         if !desc.is_empty() {
-                            self.render_overlay_text(vertices, desc, base_x + desc_off, row_y, base_x + col_width - ocw, dim_fg, no_bg, 1.0);
+                            self.ctx.render_overlay_text(vertices, desc, base_x + desc_off, row_y, base_x + col_width - ocw, dim_fg, no_bg, 1.0);
                         }
                         row_y += row_h;
                     }
@@ -2567,11 +2015,11 @@ impl Renderer {
         viewport_w: f32,
         viewport_h: f32,
     ) {
-        let overlay_cw = self.atlas.overlay_cell_width;
-        let overlay_ch = self.atlas.overlay_cell_height;
+        let overlay_cw = self.ctx.atlas.overlay_cell_width;
+        let overlay_ch = self.ctx.atlas.overlay_cell_height;
 
         // Semi-transparent dark overlay
-        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
@@ -2584,14 +2032,14 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * overlay_cw) / 2.0;
         let mut y = overlay_ch * 2.0;
-        self.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, 1.0);
+        self.ctx.render_overlay_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, 1.0);
         y += overlay_ch * 2.0;
 
         // Subtitle
         let subtitle = "Press Esc to close";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * overlay_cw) / 2.0;
-        self.render_overlay_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, 1.0);
+        self.ctx.render_overlay_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, 1.0);
         y += overlay_ch * 2.5;
 
         // Report lines
@@ -2610,7 +2058,7 @@ impl Renderer {
             } else {
                 (line.as_str(), label_fg)
             };
-            self.render_overlay_text(vertices, text, left_margin, y, viewport_w - overlay_cw, fg, no_bg, 1.0);
+            self.ctx.render_overlay_text(vertices, text, left_margin, y, viewport_w - overlay_cw, fg, no_bg, 1.0);
             y += overlay_ch * 1.3;
         }
         self.cached_mem_report = report;
@@ -2621,7 +2069,7 @@ impl Renderer {
     /// rows the renderer drew. The constants below MUST match the layout used in
     /// `build_pane_switcher_overlay_vertices` / `build_recent_projects_overlay_vertices`.
     pub fn overlay_list_geometry(&self, viewport_h: f32) -> OverlayListGeometry {
-        let cell_h = self.atlas.cell_height;
+        let cell_h = self.ctx.atlas.cell_height;
         // title at y=3·cell_h, +title_scale(1.8)·2 lines, +body_scale(1.3)·2 lines.
         let content_top = cell_h * (3.0 + 1.8 * 2.0 + 1.3 * 2.0);
         let row_height = cell_h * 1.3 * 1.6;
@@ -2637,25 +2085,27 @@ impl Renderer {
         viewport_h: f32,
         data: &PaneSwitcherRenderData<'_>,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
 
         // Semi-transparent dark overlay
-        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
         let header_fg = [0.55, 0.75, 1.0, 1.0];
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
-        let selected_bg = [0.25, 0.35, 0.55];
-        // Bookmarked panes: a light band, dark text on it. The selected variant
-        // is the same hue pushed harder, so selection still reads on a row that
-        // already has a background of its own.
-        let bookmark_bg = [0.62, 0.79, 0.95];
-        let bookmark_selected_bg = [0.40, 0.66, 0.95];
-        let bookmark_fg = [0.05, 0.07, 0.12, 1.0];
-        let bookmark_dim_fg = [0.22, 0.30, 0.42, 1.0];
+        // The keys of the hint line, warmer than the words they go with.
+        let key_fg = [0.95, 0.7, 0.35, 1.0];
+        let selected_bg = self.switcher_selected_bg;
+        // Bookmarked panes wear a band of their own, from `[bookmarks]` in the
+        // config — the selected variant included, so selection still reads on a
+        // row that already has a background.
+        let bookmark_bg = self.style.bookmarks.row_bg;
+        let bookmark_selected_bg = self.style.bookmarks.row_selected_bg;
+        let bookmark_fg = self.style.bookmarks.row_fg;
+        let bookmark_dim_fg = self.style.bookmarks.row_dim_fg;
 
         let title_scale = 1.8_f32;
         let body_scale = 1.3_f32;
@@ -2684,6 +2134,17 @@ impl Renderer {
                 1 => "Unread Panes  —  1".to_string(),
                 n => format!("Unread Panes  —  {}", n),
             }
+        } else if data.show_bookmarks {
+            let saved = data
+                .columns
+                .iter()
+                .flat_map(|c| c.rows.iter())
+                .filter(|r| !r.is_header)
+                .count();
+            match saved {
+                0 => "Bookmarks  —  none saved".to_string(),
+                n => format!("Bookmarks  —  {}", n),
+            }
         } else {
             match unread {
                 0 => "Switch Tab / Pane".to_string(),
@@ -2694,18 +2155,51 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
-        self.render_text(vertices, &title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_text(vertices, &title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
         y += cell_h * title_scale * 2.0;
 
-        // Subtitle
-        let subtitle = if data.filtered {
-            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{23ce} Focus  click to focus  u All panes  esc Cancel"
+        // Subtitle: the keys the overlay answers, each one a (key, what it does)
+        // pair. The key is drawn in its own colour — read as a line of grey the
+        // hints ran together, and the eye had to parse where each one started.
+        let hints: &[(&str, &str)] = if data.filtered {
+            &[
+                ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
+                ("\u{23ce}", "Focus"),
+                ("u", "All panes"),
+                ("esc", "Cancel"),
+            ]
+        } else if data.show_bookmarks {
+            &[
+                ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
+                ("\u{23ce}", "Open"),
+                ("b", "Open panes"),
+                ("\u{2318}\u{21e7}A", "Anchor"),
+                ("\u{2318}\u{232b}", "Remove bookmark"),
+                ("esc", "Cancel"),
+            ]
         } else {
-            "\u{2191}\u{2193}\u{2190}\u{2192} Navigate  \u{21e5} Next unread  \u{23ce} Focus  \u{2318}\u{2191}\u{2193} Move  u Unread only  esc Cancel"
+            &[
+                ("\u{2191}\u{2193}\u{2190}\u{2192}", "Navigate"),
+                ("\u{21e5}", "Next unread"),
+                ("\u{23ce}", "Focus"),
+                ("\u{2318}\u{2191}\u{2193}", "Move"),
+                ("b", "Bookmarks"),
+                ("\u{2318}B", "Bookmark"),
+                ("\u{2318}\u{21e7}A", "Anchor"),
+                ("u", "Unread only"),
+                ("esc", "Cancel"),
+            ]
         };
-        let sub_chars = subtitle.chars().count() as f32;
-        let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
-        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        let sub_chars = hint_line_width(hints) as f32;
+        // Clamped: this hint line grew with each key added to the overlay, and a
+        // centred line wider than the window would start off its left edge.
+        let mut sub_x = ((viewport_w - sub_chars * scaled_cell_w) / 2.0).max(0.0);
+        for (key, what) in hints {
+            self.ctx.render_text(vertices, key, sub_x, y, viewport_w, key_fg, no_bg, body_scale);
+            sub_x += (key.chars().count() + 1) as f32 * scaled_cell_w;
+            self.ctx.render_text(vertices, what, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+            sub_x += (what.chars().count() + 2) as f32 * scaled_cell_w;
+        }
 
         let geom = self.overlay_list_geometry(viewport_h);
         let content_top = geom.content_top;
@@ -2739,11 +2233,11 @@ impl Renderer {
                     (false, false) => None,
                 };
                 if let Some(color) = band {
-                    Self::push_bg_quad_alpha(vertices, left_margin - pad * 0.5, row_y, right_margin - left_margin + pad, row_height, color, 0.8);
+                    push_bg_quad_alpha(vertices, left_margin - pad * 0.5, row_y, right_margin - left_margin + pad, row_height, color, 0.8);
                 }
 
                 if row.is_header {
-                    self.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
+                    self.ctx.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
                 } else {
                     // No current-pane marker: the focused pane renders like any
                     // other row (the blue selection highlight is the only cursor).
@@ -2751,7 +2245,10 @@ impl Renderer {
                     // per-pane status-bar dot (bell > completion). is_current panes
                     // are already suppressed upstream (has_bell/has_completion = false).
                     let attention = PaneAttention::from_flags(row.has_bell, row.has_completion);
-                    let text = format!("    {}", row.text);
+                    // The anchor mark is a wide glyph: on a row that wears one
+                    // the title starts a cell further right, or the two touch.
+                    let text =
+                        if row.anchored { format!("     {}", row.text) } else { format!("    {}", row.text) };
                     let (row_fg, row_dim_fg) = if row.bookmarked {
                         (if row.minimized { bookmark_dim_fg } else { bookmark_fg }, bookmark_dim_fg)
                     } else {
@@ -2761,31 +2258,55 @@ impl Renderer {
                     // dim: it says what the pane *is* without competing with the
                     // title, which is what the eye scans. The title is clipped
                     // before it rather than drawn under it.
+                    // The conversation's open todos and ideas follow it, same
+                    // tail: todos in colour, ideas dim.
                     let split = switcher_row_split(
                         left_margin,
                         right_margin,
-                        row.process.map_or(0, |p| p.chars().count()),
+                        switcher_row_tail_chars(row.process, row.raf_todo, row.raf_idea),
                         scaled_cell_w,
                     );
-                    self.render_text(vertices, &text, left_margin, text_y, split.title_limit, row_fg, no_bg, body_scale);
-                    if let (Some(process), Some(proc_x)) = (row.process, split.process_x) {
-                        self.render_text(vertices, process, proc_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                    self.ctx.render_text(vertices, &text, left_margin, text_y, split.title_limit, row_fg, no_bg, body_scale);
+                    if let Some(mut tail_x) = split.process_x {
+                        if let Some(process) = row.process {
+                            self.ctx.render_text(vertices, process, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                            tail_x += (process.chars().count() + 2) as f32 * scaled_cell_w;
+                        }
+                        if let Some(todo) = row.raf_todo {
+                            let todo_fg = if row.bookmarked { row_fg } else { RAF_TODO_FG };
+                            self.ctx.render_text(vertices, todo, tail_x, text_y, right_margin, todo_fg, no_bg, body_scale);
+                            tail_x += todo.chars().count() as f32 * scaled_cell_w;
+                            if row.raf_idea.is_some() {
+                                self.ctx.render_text(vertices, RAF_SEPARATOR, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                                tail_x += RAF_SEPARATOR.chars().count() as f32 * scaled_cell_w;
+                            }
+                        }
+                        if let Some(idea) = row.raf_idea {
+                            self.ctx.render_text(vertices, idea, tail_x, text_y, right_margin, row_dim_fg, no_bg, body_scale);
+                        }
+                    }
+                    if row.anchored {
+                        // Anchor mark in the 4th char slot, right before the
+                        // title: the three slots before it are taken by the
+                        // minimized, working and attention markers.
+                        let anchor_x = left_margin + 3.0 * scaled_cell_w;
+                        self.ctx.render_text(vertices, "\u{2693}", anchor_x, text_y, right_margin, ANCHOR_FG, no_bg, body_scale);
                     }
                     if row.minimized {
                         // Minimized marker in the 1st char slot, in a color of
                         // its own so hidden panes stand out in the list.
-                        self.render_text(vertices, "\u{229f}", left_margin, text_y, right_margin, MINIMIZED_FG, no_bg, body_scale);
+                        self.ctx.render_text(vertices, "\u{229f}", left_margin, text_y, right_margin, MINIMIZED_FG, no_bg, body_scale);
                     }
                     if let Some(color) = attention.dot_color() {
                         // Dot occupies the 3rd char slot (after the "    " lead-in).
                         let dot_x = left_margin + 2.0 * scaled_cell_w;
-                        self.render_text(vertices, "\u{25cf}", dot_x, text_y, right_margin, color, no_bg, body_scale);
+                        self.ctx.render_text(vertices, "\u{25cf}", dot_x, text_y, right_margin, color, no_bg, body_scale);
                     }
                     // Claude Code state in the 2nd char slot: "✳" while the
                     // session works.
                     if row.working {
                         let state_x = left_margin + scaled_cell_w;
-                        self.render_text(vertices, "\u{2733}", state_x, text_y, right_margin, WORKING_FG, no_bg, body_scale);
+                        self.ctx.render_text(vertices, "\u{2733}", state_x, text_y, right_margin, WORKING_FG, no_bg, body_scale);
                     }
                 }
             }
@@ -2793,10 +2314,10 @@ impl Renderer {
             // Per-column scroll indicators (centered in the column)
             let ind_x = col_x + col_w / 2.0;
             if scroll > 0 {
-                self.render_text(vertices, "\u{25b2}", ind_x, content_top - scaled_cell_h, right_margin, dim_fg, no_bg, body_scale);
+                self.ctx.render_text(vertices, "\u{25b2}", ind_x, content_top - scaled_cell_h, right_margin, dim_fg, no_bg, body_scale);
             }
             if end < column.rows.len() {
-                self.render_text(vertices, "\u{25bc}", ind_x, content_top + max_visible as f32 * row_height, right_margin, dim_fg, no_bg, body_scale);
+                self.ctx.render_text(vertices, "\u{25bc}", ind_x, content_top + max_visible as f32 * row_height, right_margin, dim_fg, no_bg, body_scale);
             }
         }
     }
@@ -2808,17 +2329,17 @@ impl Renderer {
         viewport_h: f32,
         data: &SendToWindowRenderData<'_>,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
 
         // Semi-transparent dark overlay
-        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
-        let selected_bg = [0.25, 0.35, 0.55];
+        let selected_bg = self.switcher_selected_bg;
         let new_window_fg = [0.5, 0.8, 0.5, 1.0];
 
         let title_scale = 1.8_f32;
@@ -2832,14 +2353,14 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
-        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
         y += cell_h * title_scale * 2.0;
 
         // Subtitle
         let subtitle = "\u{2191}\u{2193} Navigate  \u{23ce} Send  esc Cancel";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
-        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
         y += scaled_cell_h * 2.0;
 
         let left_margin = scaled_cell_w * 3.0;
@@ -2851,7 +2372,7 @@ impl Renderer {
 
             // Selected row background
             if i == data.selected {
-                Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+                push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
             }
 
             // "New Window" gets a distinct color (only if flagged)
@@ -2859,7 +2380,7 @@ impl Renderer {
             let fg = if is_new_window { new_window_fg } else { label_fg };
             let prefix = if is_new_window { "+ " } else { "" };
             let text = format!("{}{}", prefix, label);
-            self.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
+            self.ctx.render_text(vertices, &text, left_margin, text_y, right_margin, fg, no_bg, body_scale);
         }
     }
 
@@ -2870,18 +2391,18 @@ impl Renderer {
         viewport_h: f32,
         data: &RecentProjectsRenderData<'_>,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
 
         // Semi-transparent dark overlay
-        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
+        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.9);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.45, 0.45, 0.5, 1.0];
         let time_fg = [0.5, 0.5, 0.55, 1.0];
-        let selected_bg = [0.25, 0.35, 0.55];
+        let selected_bg = self.switcher_selected_bg;
         let invalid_fg = [0.4, 0.4, 0.42, 1.0];
 
         let title_scale = 1.8_f32;
@@ -2895,14 +2416,14 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
-        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
         y += cell_h * title_scale * 2.0;
 
         // Subtitle
         let subtitle = "↑↓ Navigate  ⏎ Open  ⌘⌫ Remove  esc Cancel";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
-        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
         y += scaled_cell_h * 2.0;
 
         let content_top = y;
@@ -2923,7 +2444,7 @@ impl Renderer {
             let msg = "No closed tabs to reopen";
             let msg_w = msg.chars().count() as f32 * scaled_cell_w;
             let msg_x = (viewport_w - msg_w) / 2.0;
-            self.render_text(vertices, msg, msg_x, content_top + row_height, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(vertices, msg, msg_x, content_top + row_height, viewport_w, dim_fg, no_bg, body_scale);
             return;
         }
 
@@ -2941,17 +2462,17 @@ impl Renderer {
             match tab_color {
                 Some(c) => {
                     let bg = if is_selected { c } else { dim_inactive_tab(c) };
-                    Self::push_bg_quad(vertices, row_x, row_y, row_w, row_height, bg);
+                    push_bg_quad(vertices, row_x, row_y, row_w, row_height, bg);
                 }
                 None if is_selected => {
-                    Self::push_bg_quad_alpha(vertices, row_x, row_y, row_w, row_height, selected_bg, 0.8);
+                    push_bg_quad_alpha(vertices, row_x, row_y, row_w, row_height, selected_bg, 0.8);
                 }
                 None => {}
             }
             // Selection marker: on a colored list the background alone does not
             // say which row is picked (a dimmed blue reads like the selection).
             if is_selected {
-                Self::push_bg_quad(vertices, row_x, row_y, scaled_cell_w * 0.3, row_height, [1.0, 1.0, 1.0]);
+                push_bg_quad(vertices, row_x, row_y, scaled_cell_w * 0.3, row_height, [1.0, 1.0, 1.0]);
             }
 
             // Text on a colored row follows the tab bar: white when selected,
@@ -2971,12 +2492,12 @@ impl Renderer {
             let text_max_x = right_margin - scaled_cell_w * 12.0;
             match entry.title {
                 Some(ref title) => {
-                    self.render_text(vertices, title, left_margin, text_y, text_max_x, fg, no_bg, body_scale);
+                    self.ctx.render_text(vertices, title, left_margin, text_y, text_max_x, fg, no_bg, body_scale);
                     let path_x = left_margin + (title.chars().count() as f32 + 3.0) * scaled_cell_w;
-                    self.render_text(vertices, &entry.path, path_x, text_y, text_max_x, dim_fg, no_bg, body_scale);
+                    self.ctx.render_text(vertices, &entry.path, path_x, text_y, text_max_x, dim_fg, no_bg, body_scale);
                 }
                 None => {
-                    self.render_text(vertices, &entry.path, left_margin, text_y, text_max_x, fg, no_bg, body_scale);
+                    self.ctx.render_text(vertices, &entry.path, left_margin, text_y, text_max_x, fg, no_bg, body_scale);
                 }
             }
 
@@ -2988,19 +2509,19 @@ impl Renderer {
             };
             let info_w = info.chars().count() as f32 * scaled_cell_w;
             let info_x = right_margin - info_w;
-            self.render_text(vertices, &info, info_x, text_y, right_margin, time_fg, no_bg, body_scale);
+            self.ctx.render_text(vertices, &info, info_x, text_y, right_margin, time_fg, no_bg, body_scale);
         }
 
         // Scroll indicators
         if scroll > 0 {
             let arrow = "▲";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
-            self.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
         }
         if scroll + max_visible < data.entries.len() {
             let arrow = "▼";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
-            self.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
         }
     }
 
@@ -3011,18 +2532,18 @@ impl Renderer {
         viewport_h: f32,
         data: &SearchPaletteRenderData<'_>,
     ) {
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
 
         // Dim the world behind the palette.
-        Self::push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.85);
+        push_bg_quad_alpha(vertices, 0.0, 0.0, viewport_w, viewport_h, [0.0, 0.0, 0.0], 0.85);
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
         let title_fg = [1.0, 0.85, 0.3, 1.0];
         let label_fg = [0.85, 0.85, 0.9, 1.0];
         let dim_fg = [0.55, 0.55, 0.6, 1.0];
         let input_bg = [0.18, 0.18, 0.22];
-        let selected_bg = [0.25, 0.35, 0.55];
+        let selected_bg = self.switcher_selected_bg;
         let caret_fg = [1.0, 1.0, 1.0];
 
         let title_scale = 1.8_f32;
@@ -3036,31 +2557,35 @@ impl Renderer {
         let title_chars = title.chars().count() as f32;
         let title_x = (viewport_w - title_chars * cell_w * title_scale) / 2.0;
         let mut y = cell_h * 3.0;
-        self.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
+        self.ctx.render_text(vertices, title, title_x, y, viewport_w, title_fg, no_bg, title_scale);
         y += cell_h * title_scale * 1.5;
 
         // Subtitle
         let subtitle = "↑↓ Navigate  ⏎ Open  esc Cancel";
         let sub_chars = subtitle.chars().count() as f32;
         let sub_x = (viewport_w - sub_chars * scaled_cell_w) / 2.0;
-        self.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(vertices, subtitle, sub_x, y, viewport_w, dim_fg, no_bg, body_scale);
         y += scaled_cell_h * 2.0;
 
         // Input box: a single full-width row with the query and caret.
         let left_margin = scaled_cell_w * 3.0;
         let right_margin = viewport_w - scaled_cell_w * 3.0;
         let input_h = row_height;
-        Self::push_bg_quad(vertices, left_margin - scaled_cell_w, y, right_margin - left_margin + scaled_cell_w * 2.0, input_h, input_bg);
+        push_bg_quad(vertices, left_margin - scaled_cell_w, y, right_margin - left_margin + scaled_cell_w * 2.0, input_h, input_bg);
 
         let prompt = "› ";
         let text_y = y + (input_h - scaled_cell_h) / 2.0;
-        self.render_text(vertices, prompt, left_margin, text_y, right_margin, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(vertices, prompt, left_margin, text_y, right_margin, dim_fg, no_bg, body_scale);
         let prompt_w = prompt.chars().count() as f32 * scaled_cell_w;
-        self.render_text(vertices, data.query, left_margin + prompt_w, text_y, right_margin, label_fg, no_bg, body_scale);
+        // A query wider than the box scrolls so the caret stays in view.
+        let visible_chars = ((right_margin - left_margin - prompt_w) / scaled_cell_w).floor().max(1.0) as usize;
+        let scroll = input_scroll(data.cursor, visible_chars);
+        let shown: String = data.query.chars().skip(scroll).collect();
+        self.ctx.render_text(vertices, &shown, left_margin + prompt_w, text_y, right_margin, label_fg, no_bg, body_scale);
 
         // Caret as a thin vertical bar at the cursor position.
-        let caret_x = left_margin + prompt_w + (data.cursor as f32) * scaled_cell_w;
-        Self::push_bg_quad(vertices, caret_x, text_y, 1.5, scaled_cell_h, caret_fg);
+        let caret_x = left_margin + prompt_w + ((data.cursor - scroll) as f32) * scaled_cell_w;
+        push_bg_quad(vertices, caret_x, text_y, 1.5, scaled_cell_h, caret_fg);
 
         y += input_h + scaled_cell_h * 0.75;
 
@@ -3075,7 +2600,7 @@ impl Renderer {
         } else {
             format!("{} match{} for \"{}\"", hit_count, if hit_count == 1 { "" } else { "es" }, data.submitted_query)
         };
-        self.render_text(vertices, &status, left_margin, y, right_margin, dim_fg, no_bg, body_scale);
+        self.ctx.render_text(vertices, &status, left_margin, y, right_margin, dim_fg, no_bg, body_scale);
         y += scaled_cell_h * 1.5;
 
         if data.rows.is_empty() {
@@ -3104,34 +2629,29 @@ impl Renderer {
 
             if row.is_header {
                 // Group header: tab name (section 1) or the "Tabs" divider.
-                self.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
+                self.ctx.render_text(vertices, row.text, left_margin, text_y, right_margin, header_fg, no_bg, body_scale);
             } else {
                 if i == data.selected {
-                    Self::push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
+                    push_bg_quad_alpha(vertices, left_margin - scaled_cell_w, row_y, right_margin - left_margin + scaled_cell_w * 2.0, row_height, selected_bg, 0.8);
                 }
-                self.render_text(vertices, row.text, left_margin + hit_indent, text_y, right_margin, label_fg, no_bg, body_scale);
+                self.ctx.render_text(vertices, row.text, left_margin + hit_indent, text_y, right_margin, label_fg, no_bg, body_scale);
             }
         }
 
         if scroll > 0 {
             let arrow = "▲";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
-            self.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(vertices, arrow, ax, content_top - scaled_cell_h, viewport_w, dim_fg, no_bg, body_scale);
         }
         if scroll + max_visible < data.rows.len() {
             let arrow = "▼";
             let ax = (viewport_w - scaled_cell_w) / 2.0;
-            self.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
+            self.ctx.render_text(vertices, arrow, ax, content_bottom, viewport_w, dim_fg, no_bg, body_scale);
         }
     }
 
-    /// Horizontal pane padding in pixels for the current display scale.
-    pub fn h_padding(&self) -> f32 {
-        PANE_H_PADDING * self.scale
-    }
-
     pub fn cell_size(&self) -> (f32, f32) {
-        (self.atlas.cell_width, self.atlas.cell_height)
+        self.ctx.cell_size()
     }
 
     pub fn set_mem_report(&mut self, report: Vec<String>) {
@@ -3139,7 +2659,7 @@ impl Renderer {
     }
 
     pub fn status_bar_enabled(&self) -> bool {
-        self.status_bar_enabled
+        self.style.status_bar_enabled
     }
 
     /// Hit-test mouse position against tooltip zones. Returns an ActiveTooltip if hovering.
@@ -3164,8 +2684,8 @@ impl Renderer {
         let t = self.tooltip_anim as f32 / TOOLTIP_ANIM_FRAMES as f32;
         let alpha = t * t * (3.0 - 2.0 * t);
 
-        let cell_w = self.atlas.cell_width;
-        let cell_h = self.atlas.cell_height;
+        let cell_w = self.ctx.atlas.cell_width;
+        let cell_h = self.ctx.atlas.cell_height;
         let padding_x = cell_w;
         let padding_y = cell_h * 0.25;
         let text_w = tt.text.chars().count() as f32 * cell_w;
@@ -3180,19 +2700,21 @@ impl Renderer {
         let box_y = tt.anchor_y - box_h - 2.0 + slide;
 
         let bg = [0.15, 0.15, 0.18];
-        Self::push_bg_quad_alpha(vertices, box_x, box_y, box_w, box_h, bg, 0.95 * alpha);
+        push_bg_quad_alpha(vertices, box_x, box_y, box_w, box_h, bg, 0.95 * alpha);
 
         let text_str = tt.text;
         let text_x = box_x + padding_x;
         let text_y = box_y + padding_y;
         let fg = [0.85, 0.85, 0.85, alpha];
         let no_bg = [0.0, 0.0, 0.0, 0.0];
-        self.render_status_text(vertices, text_str, text_x, text_y, text_x + text_w + cell_w, fg, no_bg);
+        self.ctx.render_status_text(vertices, text_str, text_x, text_y, text_x + text_w + cell_w, fg, no_bg);
     }
 
     /// Draw the big directory label of a pane flash: the directory name, the
-    /// path above it, and a padded backdrop so the terminal content underneath
-    /// does not fight the text. Both lines fade with `alpha`.
+    /// path above it, the name of the agent conversation living in the pane
+    /// (empty when there is none), and a padded backdrop so the terminal
+    /// content underneath does not fight the text. Every line fades with
+    /// `alpha`.
     fn build_flash_label_vertices(
         &mut self,
         vertices: &mut Vec<Vertex>,
@@ -3200,31 +2722,33 @@ impl Renderer {
         alpha: f32,
         name: &str,
         parent: &str,
+        session: &str,
     ) {
-        let cell_w = self.atlas.overlay_cell_width;
-        let cell_h = self.atlas.overlay_cell_height;
+        let cell_w = self.ctx.atlas.overlay_cell_width;
+        let cell_h = self.ctx.atlas.overlay_cell_height;
         let layout = flash_label_layout(
             pane,
             name.chars().count(),
             parent.chars().count(),
+            session.chars().count(),
             cell_w,
             cell_h,
         );
 
         let no_bg = [0.0, 0.0, 0.0, 0.0];
-        Self::push_bg_quad_alpha(
+        push_bg_quad_alpha(
             vertices,
             layout.box_x,
             layout.box_y,
             layout.box_w,
             layout.box_h,
-            self.bg_color,
+            self.style.bg_color,
             alpha * 0.92,
         );
         let name_fg = [1.0, 0.85, 0.3, alpha];
         let parent_fg = [0.75, 0.75, 0.75, alpha * 0.8];
         let right = pane.0 + pane.2;
-        self.render_overlay_text(
+        self.ctx.render_overlay_text(
             vertices,
             name,
             layout.name_x,
@@ -3235,7 +2759,7 @@ impl Renderer {
             layout.name_scale,
         );
         if !parent.is_empty() {
-            self.render_overlay_text(
+            self.ctx.render_overlay_text(
                 vertices,
                 parent,
                 layout.parent_x,
@@ -3246,60 +2770,97 @@ impl Renderer {
                 layout.parent_scale,
             );
         }
-    }
-
-    /// Fade a colour toward `bg`. `t` is the dim amount: 0.0 leaves the colour
-    /// alone, 1.0 makes it the background. Used by `text` dim mode, which fades
-    /// glyphs instead of laying a veil over the pane.
-    fn fade_toward(c: [f32; 3], bg: [f32; 3], t: f32) -> [f32; 3] {
-        if t <= 0.0 {
-            return c;
+        if !session.is_empty() {
+            // Blue, so the conversation name never reads as part of the path.
+            let session_fg = [0.55, 0.78, 1.0, alpha];
+            self.ctx.render_overlay_text(
+                vertices,
+                session,
+                layout.session_x,
+                layout.session_y,
+                right,
+                session_fg,
+                no_bg,
+                layout.session_scale,
+            );
         }
-        let t = t.min(1.0);
-        [
-            c[0] + (bg[0] - c[0]) * t,
-            c[1] + (bg[1] - c[1]) * t,
-            c[2] + (bg[2] - c[2]) * t,
-        ]
     }
+}
 
-    fn push_bg_quad(
-        vertices: &mut Vec<Vertex>,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        bg: [f32; 3],
-    ) {
-        Self::push_bg_quad_alpha(vertices, x, y, w, h, bg, 1.0);
+/// Fade a colour toward `bg`. `t` is the dim amount: 0.0 leaves the colour
+/// alone, 1.0 makes it the background. Used by `text` dim mode, which fades
+/// glyphs instead of laying a veil over the pane.
+pub(super) fn fade_toward(c: [f32; 3], bg: [f32; 3], t: f32) -> [f32; 3] {
+    if t <= 0.0 {
+        return c;
     }
+    let t = t.min(1.0);
+    [
+        c[0] + (bg[0] - c[0]) * t,
+        c[1] + (bg[1] - c[1]) * t,
+        c[2] + (bg[2] - c[2]) * t,
+    ]
+}
 
-    fn push_bg_quad_alpha(
-        vertices: &mut Vec<Vertex>,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        bg: [f32; 3],
-        alpha: f32,
-    ) {
-        let bg4 = [bg[0], bg[1], bg[2], alpha];
-        let no_tex = [0.0, 0.0];
-        let white = [1.0, 1.0, 1.0, 0.0];
+pub(super) fn push_bg_quad(
+    vertices: &mut Vec<Vertex>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    bg: [f32; 3],
+) {
+    push_bg_quad_alpha(vertices, x, y, w, h, bg, 1.0);
+}
 
-        vertices.push(Vertex { position: [x, y], tex_coords: no_tex, color: white, bg_color: bg4 });
-        vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: bg4 });
-        vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
-        vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: bg4 });
-        vertices.push(Vertex { position: [x + w, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
-        vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
-    }
+pub(super) fn push_bg_quad_alpha(
+    vertices: &mut Vec<Vertex>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    bg: [f32; 3],
+    alpha: f32,
+) {
+    let bg4 = [bg[0], bg[1], bg[2], alpha];
+    let no_tex = [0.0, 0.0];
+    let white = [1.0, 1.0, 1.0, 0.0];
+
+    vertices.push(Vertex { position: [x, y], tex_coords: no_tex, color: white, bg_color: bg4 });
+    vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: bg4 });
+    vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
+    vertices.push(Vertex { position: [x + w, y], tex_coords: no_tex, color: white, bg_color: bg4 });
+    vertices.push(Vertex { position: [x + w, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
+    vertices.push(Vertex { position: [x, y + h], tex_coords: no_tex, color: white, bg_color: bg4 });
 }
 
 /// One row of the help overlay: either a section header or a shortcut entry.
 enum HelpRow {
     Header(String),
     Item { label: String, key: String, desc: String },
+}
+
+/// Help overlay spacing, in overlay cell heights: the step from one row to the
+/// next, and the extra gap above each section header.
+const HELP_ROW_STEP: f32 = 1.4;
+const HELP_HEADER_GAP: f32 = 0.5;
+
+/// Factor applied to the help overlay spacing so a column of `headers` +
+/// `items` rows fits in `avail` pixels: 1.0 when it already fits, less when it
+/// would run past the status bar, never so tight that rows touch — past that
+/// point the overflow is still cut.
+fn help_row_scale(headers: usize, items: usize, avail: f32, och: f32) -> f32 {
+    let rows = headers + items;
+    if rows < 2 {
+        return 1.0;
+    }
+    // From the first row's top to the last row's bottom: a gap per header,
+    // a step per row but the last, and the last row's own height.
+    let spacing = headers as f32 * HELP_HEADER_GAP + (rows - 1) as f32 * HELP_ROW_STEP;
+    // One pixel of slack keeps f32 rounding from cutting the last row at an
+    // exact fit.
+    let scale = (avail - och - 1.0) / (spacing * och);
+    scale.clamp(1.0 / HELP_ROW_STEP, 1.0)
 }
 
 /// Format a key combo string like "cmd+shift+d" into "⌘⇧D" for display.
@@ -3366,18 +2927,169 @@ fn format_key_combo(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn draw_key() -> PaneDrawKey {
+        PaneDrawKey {
+            vp: [0.0, 0.0, 800.0, 600.0],
+            is_focused: false,
+            show_blink: true,
+            hover: None,
+            custom_title: None,
+            has_bell: false,
+            has_completion: false,
+            input_chars: 0,
+            printable_chars: 0,
+            last_activity: 0,
+            fg_process: None,
+            bookmarked: false,
+            atlas_generation: 0,
+        }
+    }
+
+    fn bg_line(bgs: &[[u8; 3]]) -> Vec<Cell> {
+        bgs.iter().map(|&bg| Cell { bg, ..Cell::default() }).collect()
+    }
+
+    #[test]
+    fn bg_runs_merge_neighbours_and_skip_the_default() {
+        let d = [0, 0, 0];
+        let (r, g) = ([255, 0, 0], [0, 255, 0]);
+        let line = bg_line(&[d, r, r, r, g, d, d, r]);
+        assert_eq!(bg_runs(&line, d), vec![(1, 4, r), (4, 5, g), (7, 8, r)]);
+    }
+
+    #[test]
+    fn bg_runs_of_a_default_line_is_empty() {
+        let d = [1, 2, 3];
+        assert!(bg_runs(&bg_line(&[d, d, d]), d).is_empty());
+    }
+
+    #[test]
+    fn a_clean_unchanged_pane_is_drawn_from_its_cache() {
+        let k = draw_key();
+        assert!(can_reuse_pane_cache(Some((&k, false, true)), &k, true, false, false));
+    }
+
+    #[test]
+    fn a_dirty_pane_is_rebuilt() {
+        let k = draw_key();
+        assert!(!can_reuse_pane_cache(Some((&k, false, true)), &k, true, false, true));
+    }
+
+    #[test]
+    fn a_pane_with_no_cache_is_built() {
+        assert!(!can_reuse_pane_cache(None, &draw_key(), true, false, false));
+    }
+
+    #[test]
+    fn anything_shown_outside_the_grid_forces_a_rebuild() {
+        // Each of these changes without the pane being marked dirty.
+        let cached = draw_key();
+        let changes: Vec<fn(&mut PaneDrawKey)> = vec![
+            |k| k.show_blink = false,
+            |k| k.is_focused = true,
+            |k| k.hover = Some((vec![(0, 1, 5)], Some("https://x".into()))),
+            |k| k.custom_title = Some("t".into()),
+            |k| k.has_bell = true,
+            |k| k.has_completion = true,
+            |k| k.input_chars = 1,
+            |k| k.printable_chars = 1,
+            |k| k.last_activity = 1,
+            |k| k.fg_process = Some("claude".into()),
+            |k| k.bookmarked = true,
+            |k| k.atlas_generation = 1,
+            |k| k.vp[2] = 801.0,
+        ];
+        for change in changes {
+            let mut now = cached.clone();
+            change(&mut now);
+            assert!(!can_reuse_pane_cache(Some((&cached, false, true)), &now, true, false, false));
+        }
+    }
+
+    #[test]
+    fn inside_a_sync_burst_only_the_viewport_matters() {
+        let cached = draw_key();
+        let mut now = cached.clone();
+        now.input_chars = 42;
+        assert!(can_reuse_pane_cache(Some((&cached, false, true)), &now, true, true, true));
+        now.vp[3] = 500.0;
+        assert!(!can_reuse_pane_cache(Some((&cached, false, true)), &now, true, true, true));
+    }
+
+    #[test]
+    fn a_torn_or_placeholder_build_is_never_reused() {
+        let k = draw_key();
+        assert!(!can_reuse_pane_cache(Some((&k, true, true)), &k, true, false, false));
+        assert!(!can_reuse_pane_cache(Some((&k, false, false)), &k, true, false, false));
+        assert!(!can_reuse_pane_cache(Some((&k, false, true)), &k, false, false, false));
+    }
+
+    #[test]
+    fn banner_title_sits_flush_right_unless_it_would_hit_the_label() {
+        use super::banner_title_x;
+        // Room to spare: ends exactly on the right edge.
+        assert_eq!(banner_title_x(5, 100.0, 500.0, 10.0), 450.0);
+        // Too long: starts two cells after the label, clipped later.
+        assert_eq!(banner_title_x(50, 100.0, 500.0, 10.0), 120.0);
+    }
+
+    #[test]
+    fn input_scroll_keeps_the_caret_in_the_box() {
+        use super::input_scroll;
+        assert_eq!(input_scroll(0, 10), 0);
+        assert_eq!(input_scroll(9, 10), 0); // caret on the last column
+        assert_eq!(input_scroll(10, 10), 1);
+        assert_eq!(input_scroll(150, 10), 141);
+        assert_eq!(input_scroll(3, 0), 3);
+    }
+
+    #[test]
+    fn the_hint_line_measures_what_it_draws() {
+        // "\u{23ce} Focus  esc Cancel" — 7 + 2 + 10, no trailing gap.
+        assert_eq!(super::hint_line_width(&[("\u{23ce}", "Focus"), ("esc", "Cancel")]), 19);
+        assert_eq!(super::hint_line_width(&[]), 0);
+    }
     use super::*;
+
+    /// Bottom of the last row of a help column laid out at `scale`, walking
+    /// the rows the way `build_help_overlay_vertices` does.
+    fn help_column_bottom(headers: usize, items: usize, och: f32, scale: f32) -> f32 {
+        let rows = headers + items;
+        headers as f32 * HELP_HEADER_GAP * och * scale
+            + (rows - 1) as f32 * HELP_ROW_STEP * och * scale
+            + och
+    }
+
+    #[test]
+    fn help_spacing_is_untouched_when_the_column_fits() {
+        assert_eq!(help_row_scale(4, 24, 5000.0, 40.0), 1.0);
+    }
+
+    #[test]
+    fn help_spacing_tightens_until_the_column_fits() {
+        let (headers, items, och, avail) = (4, 24, 40.0, 1500.0);
+        let scale = help_row_scale(headers, items, avail, och);
+        assert!(scale < 1.0);
+        assert!(help_column_bottom(headers, items, och, scale) <= avail);
+    }
+
+    #[test]
+    fn help_rows_never_overlap_however_short_the_window() {
+        let scale = help_row_scale(4, 24, 200.0, 40.0);
+        assert!(HELP_ROW_STEP * scale >= 1.0 - f32::EPSILON);
+    }
 
     #[test]
     fn text_dim_fades_toward_the_background_and_never_past_it() {
         let bg = [0.1, 0.1, 0.12];
         let fg = [1.0, 0.5, 0.0];
-        assert_eq!(Renderer::fade_toward(fg, bg, 0.0), fg);
-        assert_eq!(Renderer::fade_toward(fg, bg, -1.0), fg, "a negative amount is a no-op");
+        assert_eq!(fade_toward(fg, bg, 0.0), fg);
+        assert_eq!(fade_toward(fg, bg, -1.0), fg, "a negative amount is a no-op");
         let close = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-6);
-        assert!(close(Renderer::fade_toward(fg, bg, 1.0), bg));
-        assert!(close(Renderer::fade_toward(fg, bg, 2.0), bg), "clamped, never past the background");
-        let half = Renderer::fade_toward(fg, bg, 0.5);
+        assert!(close(fade_toward(fg, bg, 1.0), bg));
+        assert!(close(fade_toward(fg, bg, 2.0), bg), "clamped, never past the background");
+        let half = fade_toward(fg, bg, 0.5);
         for i in 0..3 {
             assert!((half[i] - (fg[i] + bg[i]) * 0.5).abs() < 1e-6);
         }
@@ -3435,7 +3147,7 @@ mod tests {
     fn flash_label_fills_the_pane_without_overflowing_it() {
         // Wide pane, short name: capped at the max scale, centered, and the
         // backdrop stays inside the pane.
-        let l = flash_label_layout((100.0, 200.0, 800.0, 400.0), 4, 16, 10.0, 20.0);
+        let l = flash_label_layout((100.0, 200.0, 800.0, 400.0), 4, 16, 0, 10.0, 20.0);
         assert_eq!(l.name_scale, 3.0);
         let name_w = 4.0 * 10.0 * l.name_scale;
         assert!((l.name_x - (100.0 + (800.0 - name_w) / 2.0)).abs() < 0.01);
@@ -3445,17 +3157,33 @@ mod tests {
     }
 
     #[test]
+    fn flash_label_stacks_the_session_name_under_the_path() {
+        let l = flash_label_layout((0.0, 0.0, 800.0, 400.0), 4, 16, 12, 10.0, 20.0);
+        assert!(l.session_y > l.parent_y + 20.0 * l.parent_scale - 0.01);
+        // The block stays centered: session line included, it fits the pane.
+        assert!(l.box_y >= 0.0 && l.box_y + l.box_h <= 400.0 + 0.01);
+    }
+
+    #[test]
+    fn flash_label_without_a_session_takes_no_room_for_it() {
+        let with_session = flash_label_layout((0.0, 0.0, 800.0, 400.0), 4, 16, 12, 10.0, 20.0);
+        let without = flash_label_layout((0.0, 0.0, 800.0, 400.0), 4, 16, 0, 10.0, 20.0);
+        assert!(without.box_h < with_session.box_h);
+        assert_eq!(without.session_y, without.parent_y + 20.0 * without.parent_scale);
+    }
+
+    #[test]
     fn flash_label_shrinks_a_long_name_to_the_pane_width() {
-        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 40, 0, 10.0, 20.0);
+        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 40, 0, 0, 10.0, 20.0);
         assert_eq!(l.name_scale, 1.0, "never shrinks below the overlay size");
-        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 12, 0, 10.0, 20.0);
+        let l = flash_label_layout((0.0, 0.0, 300.0, 200.0), 12, 0, 0, 10.0, 20.0);
         assert!(l.name_scale < 3.0 && l.name_scale > 1.0);
         assert!(12.0 * 10.0 * l.name_scale <= 300.0, "name must fit the pane");
     }
 
     #[test]
     fn flash_label_without_a_path_line_centers_the_name_alone() {
-        let l = flash_label_layout((0.0, 0.0, 400.0, 100.0), 1, 0, 10.0, 20.0);
+        let l = flash_label_layout((0.0, 0.0, 400.0, 100.0), 1, 0, 0, 10.0, 20.0);
         let name_h = 20.0 * l.name_scale;
         assert!((l.name_y - (100.0 - name_h) / 2.0).abs() < 0.01);
     }
@@ -3474,6 +3202,21 @@ mod tests {
         let split = switcher_row_split(0.0, 300.0, 14, 10.0);
         assert_eq!(split.process_x, Some(160.0));
         assert_eq!(split.title_limit, 140.0);
+    }
+
+    #[test]
+    fn switcher_row_tail_is_the_binary_alone_without_a_raf() {
+        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), None, None), 14);
+        assert_eq!(switcher_row_tail_chars(None, None, None), 0);
+    }
+
+    #[test]
+    fn switcher_row_tail_adds_the_raf_after_a_two_cell_gap() {
+        // "claude 2.1.226" + 2 + "3 todo" + " · " + "1 idea"
+        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), Some("3 todo"), Some("1 idea")), 14 + 2 + 6 + 3 + 6);
+        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), Some("3 todo"), None), 14 + 2 + 6);
+        assert_eq!(switcher_row_tail_chars(Some("claude 2.1.226"), None, Some("2 ideas")), 14 + 2 + 7);
+        assert_eq!(switcher_row_tail_chars(None, Some("3 todo"), None), 6);
     }
 
     #[test]
@@ -3592,5 +3335,282 @@ mod tests {
             assert!(spread(d) > spread(c) * 0.4, "{c:?} -> {d:?} lost its hue");
             assert!(d.iter().all(|v| (0.0..=1.0).contains(v)), "{d:?} out of range");
         }
+    }
+}
+
+/// Characterization of `build_vertices` as of 13/10/2026, before the embedding
+/// refactor (docs/embedding.md). The renderer is the real one on the real Metal
+/// device, but its atlas carries fixed metrics and synthetic glyphs, so the
+/// snapshots depend on neither the installed font nor the macOS version.
+///
+/// A snapshot that moves means the pixels a pane draws moved. To accept a change
+/// on purpose: `KOVA_UPDATE_SNAPSHOTS=1 cargo test vertex_snapshots`, then read the
+/// diff of `src/renderer/snapshots/`.
+#[cfg(test)]
+mod vertex_snapshots {
+    use super::*;
+    use crate::terminal::{GridPos, Selection, SelectionMode};
+    use glyph_atlas::GlyphInfo;
+
+    const CELL_W: f32 = 10.0;
+    const CELL_H: f32 = 20.0;
+
+    fn renderer() -> Renderer {
+        let device = MTLCreateSystemDefaultDevice().expect("no Metal device");
+        let layer = CAMetalLayer::new();
+        layer.setDevice(Some(&device));
+        layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        let mut config = Config::default();
+        config.status_bar.enabled = false;
+        let term = Arc::new(RwLock::new(TerminalState::new(4, 2, 10, [255; 3], [0; 3])));
+        let mut r = Renderer::new(&device, &layer, term, 2.0, &config);
+        r.ctx.atlas.fake_metrics(CELL_W, CELL_H, 4.0, 1024, 512);
+        r
+    }
+
+    /// A deterministic atlas slot per char: a 16-px grid indexed by code point.
+    fn slot(code: u32, wide: bool) -> GlyphInfo {
+        GlyphInfo {
+            x: (code % 32) * 32,
+            y: (code / 32 % 16) * 32,
+            width: if wide { 2 * CELL_W as u32 } else { CELL_W as u32 - 2 },
+            height: CELL_H as u32 - 4,
+            is_color: false,
+        }
+    }
+
+    /// Register every glyph the visible cells need, so nothing is rasterized.
+    fn fill_atlas(r: &mut Renderer, t: &TerminalState) {
+        for line in t.visible_lines() {
+            for cell in line.iter() {
+                if let Some(ref cl) = cell.cluster {
+                    let code: u32 = cl.chars().map(|c| c as u32).sum();
+                    r.ctx.atlas.fake_cluster_glyph(cl, slot(code, false));
+                } else if !cell.is_blank() {
+                    let wide = unicode_width::UnicodeWidthChar::width(cell.c) == Some(2);
+                    r.ctx.atlas.fake_glyph(cell.c, slot(cell.c as u32, wide));
+                }
+            }
+        }
+    }
+
+    /// A terminal with the default config colors, as Kova builds them.
+    fn term(cols: u16, rows: u16) -> TerminalState {
+        let c = Config::default();
+        TerminalState::new(
+            cols,
+            rows,
+            10,
+            crate::terminal::color_to_u8(c.colors.foreground),
+            crate::terminal::color_to_u8(c.colors.background),
+        )
+    }
+
+    fn type_lines(t: &mut TerminalState, lines: &[&str]) {
+        for (i, l) in lines.iter().enumerate() {
+            if i > 0 {
+                t.newline();
+                t.carriage_return();
+            }
+            for c in l.chars() {
+                t.put_char(c);
+            }
+        }
+    }
+
+    fn vp() -> PaneViewport {
+        PaneViewport { x: 100.0, y: 50.0, width: 140.0, height: 90.0 }
+    }
+
+    fn build(r: &mut Renderer, t: &TerminalState, focused: bool) -> Vec<Vertex> {
+        fill_atlas(r, t);
+        r.build_vertices(t, &vp(), true, focused, None, PaneAttention::None, 0, 1, None, false)
+    }
+
+    fn dump(vs: &[Vertex]) -> String {
+        let f = |x: f32| format!("{:.4}", x);
+        let mut out = String::new();
+        for (i, v) in vs.iter().enumerate() {
+            if i % 6 == 0 {
+                out.push_str(&format!("# quad {}\n", i / 6));
+            }
+            out.push_str(&format!(
+                "pos {} {} | uv {} {} | fg {} {} {} {} | bg {} {} {} {}\n",
+                f(v.position[0]), f(v.position[1]),
+                f(v.tex_coords[0]), f(v.tex_coords[1]),
+                f(v.color[0]), f(v.color[1]), f(v.color[2]), f(v.color[3]),
+                f(v.bg_color[0]), f(v.bg_color[1]), f(v.bg_color[2]), f(v.bg_color[3]),
+            ));
+        }
+        out
+    }
+
+    fn check(name: &str, vs: &[Vertex]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/renderer/snapshots")
+            .join(format!("{name}.snap"));
+        let got = dump(vs);
+        let update = std::env::var_os("KOVA_UPDATE_SNAPSHOTS").is_some();
+        match std::fs::read_to_string(&path) {
+            Ok(want) if !update => {
+                if want != got {
+                    let first = want.lines().zip(got.lines()).position(|(a, b)| a != b);
+                    panic!(
+                        "vertex snapshot {name} moved ({} lines expected, {} got); first difference at line {:?}:\n  want: {:?}\n  got:  {:?}",
+                        want.lines().count(), got.lines().count(), first.map(|i| i + 1),
+                        first.and_then(|i| want.lines().nth(i)), first.and_then(|i| got.lines().nth(i)),
+                    );
+                }
+            }
+            _ => std::fs::write(&path, got).expect("write snapshot"),
+        }
+    }
+
+    #[test]
+    fn plain_text_with_a_focused_block_cursor() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab", "cd"]);
+        check("plain_focused", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn unfocused_pane_full_dim_and_hollow_cursor() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        check("unfocused_full_dim", &build(&mut r, &t, false));
+    }
+
+    #[test]
+    fn unfocused_pane_text_dim() {
+        let mut r = renderer();
+        r.style.dim_mode = DimMode::Text;
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        check("unfocused_text_dim", &build(&mut r, &t, false));
+    }
+
+    #[test]
+    fn colors_and_background_runs() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        t.set_sgr(&[31]);
+        t.put_char('R');
+        t.set_sgr(&[0, 44]);
+        t.put_char('B');
+        t.put_char(' ');
+        t.put_char('B');
+        t.set_sgr(&[0, 38, 2, 10, 200, 30]);
+        t.put_char('g');
+        t.set_sgr(&[0]);
+        check("colors_bg_runs", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn bold_italic_underline_strikethrough() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        for (sgr, c) in [(1u16, 'b'), (3, 'i'), (4, 'u'), (9, 's')] {
+            t.set_sgr(&[sgr]);
+            t.put_char(c);
+            t.set_sgr(&[0]);
+        }
+        t.set_sgr(&[4]);
+        t.put_char(' ');
+        t.set_sgr(&[0]);
+        check("attributes", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn selection_highlight() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["hello", "world"]);
+        t.selection = Some(Selection {
+            anchor: GridPos { line: 0, col: 3 },
+            end: GridPos { line: 1, col: 1 },
+            mode: SelectionMode::Normal,
+        });
+        check("selection", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn wide_chars_and_clusters() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["前x", "e\u{301}!"]);
+        check("wide_and_cluster", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn paste_block_rows() {
+        let mut r = renderer();
+        let mut t = term(12, 5);
+        type_lines(&mut t, &["say:", "```slack", "body", "```", "```/slack"]);
+        check("paste_block", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn scrolled_back_hides_the_cursor_and_shows_scrollback() {
+        let mut r = renderer();
+        let mut t = term(12, 2);
+        type_lines(&mut t, &["one", "two", "three", "four"]);
+        t.scroll(2);
+        check("scrolled_back", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn bottom_gravity_on_a_short_screen() {
+        let mut r = renderer();
+        let mut t = term(12, 4);
+        type_lines(&mut t, &["$ ls"]);
+        assert!(t.y_offset_rows() > 0);
+        check("bottom_gravity", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn hovered_url_underline() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["http://a.b/c"]);
+        r.hovered_url = Some(vec![(0, 0, 12), (1, 0, 3)]);
+        check("hovered_url", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn underline_and_bar_cursors() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        t.cursor_shape = CursorShape::Underline;
+        check("cursor_underline", &build(&mut r, &t, true));
+        t.cursor_shape = CursorShape::Bar;
+        check("cursor_bar", &build(&mut r, &t, true));
+    }
+
+    #[test]
+    fn hidden_cursor_and_blink_off_draw_no_cursor() {
+        let mut r = renderer();
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["ab"]);
+        fill_atlas(&mut r, &t);
+        let on = r.build_vertices(&t, &vp(), true, true, None, PaneAttention::None, 0, 1, None, false);
+        let off = r.build_vertices(&t, &vp(), false, true, None, PaneAttention::None, 0, 1, None, false);
+        assert_eq!(on.len() - off.len(), 6, "blink off drops exactly the cursor quad");
+        t.cursor_visible = false;
+        let hidden = r.build_vertices(&t, &vp(), true, true, None, PaneAttention::None, 0, 1, None, false);
+        assert_eq!(hidden.len(), off.len());
+    }
+
+    #[test]
+    fn snapshots_ignore_the_installed_font() {
+        // Two renderers built independently produce the same bytes: nothing in
+        // the output comes from the atlas the font would have filled.
+        let mut t = term(12, 3);
+        type_lines(&mut t, &["Wy!", "前"]);
+        let a = dump(&build(&mut renderer(), &t, true));
+        let b = dump(&build(&mut renderer(), &t, true));
+        assert_eq!(a, b);
     }
 }

@@ -2,6 +2,28 @@
 
 ## En cours
 
+### Kova en bibliothèque pour Kana : les manques du pane intégré
+
+**Statut** : 🔄 étapes 1 à 3 de `docs/embedding.md` faites et publiées en v2.0.0 (14/10/2026) ; l'étape 4 (Kana) vit dans `kana/track.md`.
+
+**D'où ça part** : Kova sert aussi de terminal à Kana (un pane par note), via `libkova.a` et l'API C de `include/kova.h`. Kova.app n'a pas changé de comportement (tests figés d'abord, audits). Mais le pane fourni par la bibliothèque (`src/embed.rs`, `KovaPaneView`) n'a pas tout ce que Kova.app sait faire, et seul le texte avait été porté pour Cmd+V : le coller d'image manquait (une autre session le porte, 14/10).
+
+**Ce qui manque encore au pane intégré**, d'après le rapport de l'étape 3 : survol et Cmd+clic d'URL, filtre Ctrl+F (la touche est avalée), notifications et `subscribe` (répondent une erreur), les retouches de redimensionnement de Kova.app (relance de dessin de Claude Code, réparation des bandes vides), la fenêtre des accents mal placée dans une sous-vue (au coin de la fenêtre, prouvé par `KovaEmbedTests` de Kana) et le signal de focus. Le pane tourne dans Kana depuis le 14/10.
+
+**Correctif prêt, seule copie** : la fenêtre des accents, la réparation au redimensionnement (`src/resize_repair.rs`) et le signal de focus sont corrigés dans le worktree `~/projects/perso/kova-embed-fixes`, en modifications non commitées sur un HEAD détaché en 690cba8. Aucune branche, aucun stash ni aucun commit ne les porte (vérifié le 15/10 : `git log --all -- src/resize_repair.rs` vide). Ne pas retirer ce worktree avant de les avoir reportées sur `main` ; son `target/` se supprime sans perte (il se recompile), mais la commande de test de Kana `KOVA_TARGET_DIR=…/kova-embed-fixes/target` (`kana/CLAUDE.md`) en dépend tant que le correctif n'est pas sur `main`.
+
+**Prochaine action** : reporter ce correctif sur `main` (d'après la note Kana du 14/10, il ne s'applique plus proprement : conflit dans `src/lib.rs`, non revérifié), puis porter les autres manques un par un dans `src/embed.rs` quand Mickael les rencontre dans Kana, en commençant par le survol et le Cmd+clic d'URL.
+
+### Revue UX/UI du 10/10/2026 — rien n'a été fait
+
+**Statut** : ⏸️ propositions seulement, **aucune n'a été implémentée**. Vérifié le 13/10/2026 dans le code : le switcher ignore toujours les lettres tapées (`src/window/switcher.rs:927`), les titres d'onglet sont toujours coupés à 25 caractères sans `…` (`src/renderer/mod.rs:2212`), le picker de fusion de fenêtre s'appelle toujours « Send Tab to Window » (`src/window/tick.rs:357`), et le menu de couleur dit toujours « Aucune » (`src/window/tabs.rs:100`).
+
+**Le détail** : `notes/ux-review-2026-10-10.md` (8 sections, chacune avec ce que c'est, pourquoi ça compte et la proposition).
+
+**Les quatre qui enlèvent le plus de gestes** : taper dans Cmd+P filtre la liste ; vider les barres de statut de ce qui ne sert pas à agir (`▶N`, I/O, RSS, heure en triple) et rendre `●N`/`✳N` cliquables ; un seul composant pour les cinq overlays en liste (souris, Esc, fermeture par leur propre raccourci) ; remonter le contraste du bleu et du gris ANSI (≈3:1 sur le fond par défaut).
+
+**Prochaine action** : que Mickael choisisse par où commencer.
+
 ### Les bookmarks lus comme une liste de projets en cours
 
 **Statut** : 🔧 codé, 316 tests verts, binaire reconstruit et signé. **Il faut redémarrer Kova** pour voir le bleu.
@@ -49,6 +71,16 @@
 **Documenté** : `docs/ipc.md` (section `notify`), le skill `kova` (21 commandes), et `CLAUDE.md` § Pièges récurrents — « une notif qui s'affiche ne prouve pas que son clic marche ».
 
 **Prochaine action** : redémarrer Kova, accepter le prompt de notifications, puis vérifier qu'un clic sur la notif de fin de session ramène bien au bon pane.
+
+### Recherche globale : Entrée menait sur un pane minimisé, sans focus
+
+**Statut** : 🔧 corrigé le 13/10/2026, build et 401 tests verts. **Reste à redémarrer Kova** pour le voir, et à refaire le scénario (chercher un mot présent dans un pane minimisé, Entrée).
+
+**Symptôme** : Cmd+Shift+F, recherche « steerco », Entrée sur un pane de l'onglet CTO : aucun pane focusé, barre de statut « 26/25 » et « ⊟ 1/1 ».
+
+**Cause** : `jump_to_search_hit` donnait le focus par `focus_pane_in_active_tab`, qui ne restaure pas un pane minimisé. Le focus tombait sur une colonne entièrement minimisée, que `visible_column_index` (`src/pane.rs`) ne compte pas, d'où la colonne 26 sur 25.
+
+**Fix** : la recherche passe par `ipc_focus_pane`, comme le switcher, qui restaure le pane avant de le focuser. `focus_pane_in_active_tab` est supprimée, il n'y a plus de chemin de focus qui saute la restauration.
 
 ### Crash sur Cmd+J : cast de fenêtre non vérifié
 
@@ -231,6 +263,16 @@
 **Prochaine action** : choisir la direction de fix (calcul de grille en espace logique vs cellule arrondie en logique puis scalée pour l'atlas ; + scaler le padding), montrer le diff, builder.
 
 ## En attente
+
+### Cmd+P : ranger les panes en catégories ? — réflexion à reprendre
+
+**Statut** : ⏸️ réflexion (`/brain` du 12-13/10/2026), rien de décidé ni de codé. Le détail : `notes/cmd-p-categories.md`.
+
+**D'où ça part** : 53 panes ouverts, dont 26 dans l'onglet `CTO` et 13 dans `self`, et Mickael s'y perd. Il a précisé que « perdu » veut dire « je ne sais plus lesquels comptent encore », pas « je ne trouve pas un pane ». Les onglets sont des projets pour lui, pas des états.
+
+**Son idée** : ranger un pane dans une catégorie avec Cmd+↑↓ dans Cmd+P. Ce geste déplace déjà le pane dans son onglet (`move_pane_in_order`, `src/pane.rs:1516`). Objection posée : ranger à la main ne dit pas ce qui est mort ; Kova connaît déjà la dernière activité de chaque terminal et pourrait reléguer les panes dormants tout seul.
+
+**Prochaine action** : trancher si le besoin est de fermer (combien des 26 panes `CTO` sont finis ?) ou de sous-grouper à l'intérieur d'un projet.
 
 ### Bug: resultats de recherche perimes si du texte arrive overlay ouvert
 

@@ -1,16 +1,17 @@
 mod attention;
 mod feather;
 use attention::{do_history_step, pane_history_state};
+mod duplicates;
 mod geometry;
 mod ipc_handlers;
 mod overlays;
 use overlays::{FilterState, RenamePaneState, RenameTabState};
-pub use ipc_handlers::{IpcCloseTabResult, IpcMergeTabResult, IpcMoveTabResult, IpcSwapPaneResult};
+pub use ipc_handlers::{IpcMergeTabResult, IpcMoveTabResult, IpcSwapPaneResult};
 mod recent_projects_overlay;
 use recent_projects_overlay::RecentProjectsState;
 mod resize;
 mod search_palette;
-use search_palette::{is_typed_char, SearchPaletteState, SearchRow};
+use search_palette::{is_shortcut, is_typed_char, typed_text, SearchPaletteState, SearchRow};
 pub mod sidebar;
 mod sidebar_model;
 mod sidebar_ui;
@@ -23,8 +24,8 @@ use tabs::{MergeTabState, SendToWindowState};
 use switcher::{PaneSwitcherState, SwitcherRow};
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSPasteboard, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSArray, NSObjectProtocol, NSString};
 use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -32,13 +33,14 @@ use objc2_quartz_core::CAMetalLayer;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::Arc;
 
+use crate::appkit_input::{self, copy_to_pasteboard, AppKitInput, PaneOrigin, ScrollAxisLock};
 use crate::config::{Config, TerminalConfig};
-use crate::input;
+use crate::input::{self, MouseAction, MouseResult};
 use crate::keybindings::{Action, Keybindings, KeyCombo};
 use crate::pane::{alloc_tab_id, NavDirection, Pane, PaneId, SplitDirection, Tab, TabId};
 use crate::renderer::{FilterRenderData, PaneViewport, Renderer};
 use crate::terminal::pty::ProcessInfo;
-use crate::terminal::{FilterMatch, GridPos, Selection, SelectionMode};
+use crate::terminal::FilterMatch;
 
 #[derive(Clone, Copy)]
 struct SeparatorDrag {
@@ -55,13 +57,6 @@ struct DragTabState {
     start_x: f32,
     current_x: f32,
     dragging: bool,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ScrollAxisLock {
-    None,
-    Vertical,
-    Horizontal,
 }
 
 pub struct KovaViewIvars {
@@ -92,14 +87,9 @@ pub struct KovaViewIvars {
     hovered_url: RefCell<Option<(PaneId, Vec<(usize, u16, u16)>, String)>>,
     /// Whether Cmd key is currently held (for URL hover detection)
     cmd_held: Cell<bool>,
-    /// Auto-scroll speed during drag selection (lines/tick, positive = down, negative = up, 0 = inactive)
-    auto_scroll_speed: Cell<i32>,
-    /// Marked text from IME composition (dead keys, etc.)
-    marked_text: RefCell<Option<String>>,
-    /// Current NSEvent being processed by interpretKeyEvents, so doCommandBySelector can access it.
-    /// SAFETY: pointer is only live during the synchronous keyDown → interpretKeyEvents → doCommandBySelector
-    /// call chain, and cleared immediately after. Never accessed outside that stack frame.
-    current_event: Cell<Option<*const NSEvent>>,
+    /// Terminal input from AppKit events, for the focused pane (or the pane
+    /// under the pointer): composition, drag auto-scroll, scroll axis lock.
+    input: AppKitInput,
     /// Window is closing — tick() should return false immediately.
     closing: Cell<bool>,
     /// Skip session save for this window (Cmd+Shift+Q kill).
@@ -121,8 +111,6 @@ pub struct KovaViewIvars {
     recent_projects: RefCell<Option<RecentProjectsState>>,
     /// Countdown frames for "⌘? for help" hint in global status bar (fps * 3).
     help_hint_frames: Cell<u32>,
-    /// Axis lock for trackpad scroll gestures (prevents cross-axis drift).
-    scroll_axis_lock: Cell<ScrollAxisLock>,
     /// "Send Tab to Window" overlay state.
     send_to_window: RefCell<Option<SendToWindowState>>,
     /// "Merge Tab" overlay state.
@@ -136,11 +124,27 @@ pub struct KovaViewIvars {
     /// pane apart without reading `bookmarks.json` on every frame. Refreshed
     /// when the list changes (Cmd+B) — the file is only written from here.
     bookmark_keys: RefCell<std::collections::HashSet<String>>,
+    /// Keys of the saved anchors, read by the same per-frame test as
+    /// `bookmark_keys`. Kept apart because the two lists mean different things
+    /// and are written by different gestures — an anchor also arrives from
+    /// outside, through the `set-anchor` IPC command.
+    anchor_keys: RefCell<std::collections::HashSet<String>>,
+    /// Two panes found running the same agent conversation, newest first:
+    /// (duplicate, original). Raised by the session poll, answered by an alert
+    /// at the top of the next tick — the poll runs with the tabs borrowed, and
+    /// a modal there would re-enter them.
+    duplicate_session: Cell<Option<(PaneId, PaneId)>>,
+    /// Duplicates the user chose to keep, by the pane that carries them. Without
+    /// it the poll would ask again every half-second, forever.
+    accepted_duplicates: RefCell<std::collections::HashSet<PaneId>>,
     /// Banner painted across the focused pane's status bar (text, colour,
     /// remaining frames): says which attention tier the last Cmd+J landed in.
     /// The focused pane the manual unread mark was last checked against:
     /// a change means the pane just became focused (see `tick.rs`).
     unread_focus: Cell<Option<PaneId>>,
+    /// Banner across the focused pane's status bar after a Cmd+J jump:
+    /// its text, its colour and the frames it has left.
+    attention_banner: RefCell<Option<(String, [f32; 3], u32)>>,
     /// Deferred tabs to restore progressively (tab_index, saved_tab_data).
     /// Deferred tabs keyed by their placeholder's TabId (not by index: the
     /// window is interactive during progressive restore, so indices shift
@@ -239,12 +243,14 @@ struct PaneFlash {
     label: Option<PaneFlashLabel>,
 }
 
-/// The two lines of a flash label: the directory the pane sits in, and the
-/// path above it.
+/// The three lines of a flash label: the directory the pane sits in, the path
+/// above it, and the name of the agent conversation it holds (empty when the
+/// pane has none).
 #[derive(Clone)]
 struct PaneFlashLabel {
     name: String,
     parent: String,
+    session: String,
 }
 
 /// Split a working directory into the big line (the directory's own name) and
@@ -346,34 +352,12 @@ define_class!(
     unsafe impl NSTextInputClient for KovaView {
         #[unsafe(method(insertText:replacementRange:))]
         unsafe fn insert_text_replacement_range(&self, string: &objc2::runtime::AnyObject, _replacement_range: objc2_foundation::NSRange) {
-            let text = unsafe { nsstring_from_input(string) };
-            // Clear marked text
-            *self.ivars().marked_text.borrow_mut() = None;
-            // Write to PTY
-            if let Some(pane) = self.focused_pane() {
-                pane.terminal.write().reset_scroll();
-                // Typing into a pane answers it: it is no longer waiting on us.
-                pane.clear_awaiting();
-                input::write_text(&text, &pane.pty);
-            }
+            unsafe { self.ivars().input.insert_text(string, self.focused_pane().map(|p| &**p)) }
         }
 
         #[unsafe(method(doCommandBySelector:))]
         unsafe fn do_command_by_selector(&self, _selector: objc2::runtime::Sel) {
-            if let Some(event_ptr) = self.ivars().current_event.get() {
-                let event = unsafe { &*event_ptr };
-                if let Some(pane) = self.focused_pane() {
-                    let (cursor_keys_app, kitty_flags) = {
-                        let term = pane.terminal.read();
-                        (term.cursor_keys_application, term.kitty_flags())
-                    };
-                    pane.terminal.write().reset_scroll();
-                    pane.clear_awaiting();
-                    if let Some(kb) = self.ivars().keybindings.get() {
-                        input::handle_key_event(event, &pane.pty, cursor_keys_app, kb, kitty_flags);
-                    }
-                }
-            }
+            self.ivars().input.do_command_by_selector(|| self.focused_pane().map(|p| &**p), self.ivars().keybindings.get());
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
@@ -383,32 +367,27 @@ define_class!(
             _selected_range: objc2_foundation::NSRange,
             _replacement_range: objc2_foundation::NSRange,
         ) {
-            let text = unsafe { nsstring_from_input(string) };
-            *self.ivars().marked_text.borrow_mut() = if text.is_empty() { None } else { Some(text) };
+            unsafe { self.ivars().input.set_marked_text(string) }
         }
 
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
-            *self.ivars().marked_text.borrow_mut() = None;
+            self.ivars().input.unmark_text();
         }
 
         #[unsafe(method(hasMarkedText))]
         fn has_marked_text(&self) -> bool {
-            self.ivars().marked_text.borrow().is_some()
+            self.ivars().input.has_marked_text()
         }
 
         #[unsafe(method(markedRange))]
         fn marked_range(&self) -> objc2_foundation::NSRange {
-            if self.ivars().marked_text.borrow().is_some() {
-                objc2_foundation::NSRange { location: 0, length: 1 }
-            } else {
-                objc2_foundation::NSRange { location: objc2_foundation::NSNotFound as usize, length: 0 }
-            }
+            self.ivars().input.marked_range()
         }
 
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> objc2_foundation::NSRange {
-            objc2_foundation::NSRange { location: objc2_foundation::NSNotFound as usize, length: 0 }
+            self.ivars().input.selected_range()
         }
 
         #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
@@ -433,24 +412,12 @@ define_class!(
             _range: objc2_foundation::NSRange,
             _actual_range: objc2_foundation::NSRangePointer,
         ) -> objc2_core_foundation::CGRect {
-            let frame = self.frame();
-            let window_frame = if let Some(window) = self.window() {
-                window.frame()
-            } else {
-                return objc2_core_foundation::CGRect::ZERO;
-            };
-            objc2_core_foundation::CGRect {
-                origin: objc2_core_foundation::CGPoint {
-                    x: window_frame.origin.x + frame.origin.x,
-                    y: window_frame.origin.y + frame.origin.y,
-                },
-                size: objc2_core_foundation::CGSize { width: 0.0, height: 0.0 },
-            }
+            self.ivars().input.first_rect_for_character_range(self)
         }
 
         #[unsafe(method(characterIndexForPoint:))]
         fn character_index_for_point(&self, _point: objc2_core_foundation::CGPoint) -> usize {
-            objc2_foundation::NSNotFound as usize
+            self.ivars().input.character_index_for_point()
         }
     }
 
@@ -560,93 +527,22 @@ define_class!(
                 return;
             }
 
-            // Ctrl+F → toggle filter (in addition to Cmd+F via performKeyEquivalent)
-            {
-                let modifiers = event.modifierFlags();
-                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-                if has_ctrl && !has_cmd {
-                    if let Some(chars) = event.charactersIgnoringModifiers() {
-                        if chars.to_string() == "f" {
-                            self.toggle_filter();
-                            return;
-                        }
-                    }
+            // Window keys first, even with no pane under focus
+            let key = appkit_input::key_event(event);
+            match input::host_key(&key) {
+                Some(input::HostKey::ToggleFilter) => {
+                    self.toggle_filter();
+                    return;
                 }
+                Some(input::HostKey::AdjustVirtualWidth(dir)) => {
+                    self.adjust_virtual_width(dir);
+                    return;
+                }
+                None => {}
             }
 
-            // Ctrl+L → wipe Kova's scrollback, then let the key through so the app
-            // redraws. The app's own answer to Ctrl+L is `ESC[H ESC[2J` (terminfo
-            // `clear`), which only erases the visible screen — the scrollback needs
-            // `ESC[3J`, which nothing sends here. Skipped in alt-screen, where Ctrl+L
-            // means "repaint" and the scrollback holds whatever ran before the
-            // full-screen app.
-            {
-                let modifiers = event.modifierFlags();
-                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-                let has_option = modifiers.contains(NSEventModifierFlags::Option);
-                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-                if has_ctrl && !has_option && !has_cmd {
-                    if let Some(chars) = event.charactersIgnoringModifiers() {
-                        if chars.to_string() == "l" {
-                            if let Some(pane) = self.focused_pane() {
-                                let mut term = pane.terminal.write();
-                                if !term.in_alt_screen {
-                                    term.clear_scrollback_and_screen();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Ctrl+Option+arrows → adjust virtual width
-            {
-                let modifiers = event.modifierFlags();
-                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-                let has_option = modifiers.contains(NSEventModifierFlags::Option);
-                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-                if has_ctrl && has_option && !has_cmd {
-                    if let Some(chars) = event.charactersIgnoringModifiers() {
-                        let dir = match chars.to_string().as_str() {
-                            "\u{f703}" => Some(1.0_f32),
-                            "\u{f702}" => Some(-1.0_f32),
-                            _ => None,
-                        };
-                        if let Some(dir) = dir {
-                            self.adjust_virtual_width(dir);
-                            return;
-                        }
-                    }
-                }
-            }
-
-            if let Some(pane) = self.focused_pane() {
-                let (kitty_flags, cursor_keys_app) = {
-                    let term = pane.terminal.read();
-                    (term.kitty_flags(), term.cursor_keys_application)
-                };
-
-                let modifiers = event.modifierFlags();
-                let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
-                let has_alt = modifiers.contains(NSEventModifierFlags::Option);
-                let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
-
-                if kitty_flags > 0 && (has_ctrl || has_alt) && !has_cmd {
-                    // Kitty mode: bypass macOS text input for modified keys
-                    pane.terminal.write().reset_scroll();
-                    pane.clear_awaiting();
-                    if let Some(kb) = self.ivars().keybindings.get() {
-                        input::handle_key_event(event, &pane.pty, cursor_keys_app, kb, kitty_flags);
-                    }
-                } else {
-                    // Normal path: macOS text input (dead keys, IME)
-                    self.ivars().current_event.set(Some(event as *const NSEvent));
-                    let event_retained: Retained<NSEvent> = event.retain();
-                    let events = NSArray::from_retained_slice(&[event_retained]);
-                    self.interpretKeyEvents(&events);
-                    self.ivars().current_event.set(None);
-                }
+            if let (Some(pane), Some(kb)) = (self.focused_pane(), self.ivars().keybindings.get()) {
+                self.ivars().input.key_down(self, event, &key, pane, kb);
             }
         }
 
@@ -659,6 +555,19 @@ define_class!(
                 None => return objc2::runtime::Bool::NO,
             };
 
+            // Same routing as the three overlays below, and for the same reason:
+            // these two pick a target tab and read `active_tab` at Enter, so a
+            // shortcut falling through to the global map (Cmd+A, a tab switch)
+            // would act on one tab while the overlay names another.
+            if self.ivars().send_to_window.borrow().is_some() {
+                self.handle_send_to_window_key(event);
+                return objc2::runtime::Bool::YES;
+            }
+            if self.ivars().merge_tab.borrow().is_some() {
+                self.handle_merge_tab_key(event);
+                return objc2::runtime::Bool::YES;
+            }
+
             // When recent projects overlay is shown, route keys through the overlay handler
             if self.ivars().recent_projects.borrow().is_some() {
                 self.handle_recent_projects_key(event);
@@ -668,7 +577,14 @@ define_class!(
             // When the search palette is open, route keys through its handler so
             // shortcuts like Cmd+V/Cmd+P don't fall through to the global map.
             if self.ivars().search_palette.borrow().is_some() {
-                self.handle_search_palette_key(event);
+                if matches!(keybindings.window_map.get(&combo), Some(Action::Paste)) {
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                        self.paste_into_search_palette(&text.to_string());
+                    }
+                } else {
+                    self.handle_search_palette_key(event);
+                }
                 return objc2::runtime::Bool::YES;
             }
 
@@ -704,23 +620,7 @@ define_class!(
                 if matches!(keybindings.window_map.get(&combo), Some(Action::Paste)) {
                     let pasteboard = NSPasteboard::generalPasteboard();
                     if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
-                        let text = text.to_string();
-                        if !text.is_empty() {
-                            if let Some(state) = self.ivars().rename_tab.borrow_mut().as_mut() {
-                                let byte_idx = state.input.char_indices()
-                                    .nth(state.cursor).map(|(i, _)| i)
-                                    .unwrap_or(state.input.len());
-                                state.input.insert_str(byte_idx, &text);
-                                state.cursor += text.chars().count();
-                            } else if let Some(state) = self.ivars().rename_pane.borrow_mut().as_mut() {
-                                let byte_idx = state.input.char_indices()
-                                    .nth(state.cursor).map(|(i, _)| i)
-                                    .unwrap_or(state.input.len());
-                                state.input.insert_str(byte_idx, &text);
-                                state.cursor += text.chars().count();
-                            }
-                            self.mark_dirty();
-                        }
+                        self.paste_into_rename(&text.to_string());
                     }
                     return objc2::runtime::Bool::YES;
                 }
@@ -789,78 +689,16 @@ define_class!(
                 return;
             }
 
-            // Phase-based axis lock (trackpad only)
-            if is_trackpad {
-                let phase = event.phase();
-                let momentum = event.momentumPhase();
-
-                if phase == NSEventPhase::Began {
-                    let dy = event.scrollingDeltaY().abs();
-                    let dx = event.scrollingDeltaX().abs();
-                    ivars.scroll_axis_lock.set(if dy >= dx {
-                        ScrollAxisLock::Vertical
-                    } else {
-                        ScrollAxisLock::Horizontal
-                    });
-                } else if phase.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled)
-                    && momentum == NSEventPhase::None
-                {
-                    ivars.scroll_axis_lock.set(ScrollAxisLock::None);
-                } else if momentum.intersects(NSEventPhase::Ended | NSEventPhase::Cancelled) {
-                    ivars.scroll_axis_lock.set(ScrollAxisLock::None);
-                }
-            }
-
-            let lock = ivars.scroll_axis_lock.get();
+            let lock = ivars.input.scroll_axis_lock(event);
 
             // Vertical scroll (pane under cursor)
             if lock != ScrollAxisLock::Horizontal {
                 if let Some((pane, vp)) = self.pane_at_event(event) {
-                    let dy = event.scrollingDeltaY();
-                    let lines = if is_trackpad {
-                        let sensitivity = ivars.config.get()
-                            .map(|c| c.terminal.scroll_sensitivity)
-                            .unwrap_or(TerminalConfig::default().scroll_sensitivity);
-                        let acc = pane.scroll_accumulator.get() + dy / sensitivity;
-                        let discrete = acc as i32;
-                        pane.scroll_accumulator.set(acc - discrete as f64);
-                        discrete
-                    } else {
-                        dy as i32
-                    };
-                    if lines != 0 {
-                        // Forward scroll to PTY if mouse reporting is active
-                        let mouse_mode = pane.terminal.read().mouse_mode;
-                        let sgr = pane.terminal.read().sgr_mouse;
-                        if mouse_mode >= 1000 && sgr {
-                            if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                                // Each discrete line = one scroll event
-                                let count = lines.unsigned_abs() as usize;
-                                let button = if lines > 0 { 64u8 } else { 65u8 }; // 64=up, 65=down
-                                for _ in 0..count {
-                                    self.send_sgr_mouse(pane, button, col, row, true, false, event);
-                                }
-                            }
-                        } else {
-                            let mut term = pane.terminal.write();
-                            let active_tab_idx = ivars.active_tab.get();
-                            log::debug!("SCROLL-EVENT tab={} pane={} term_id={} lines={} offset_before={}",
-                                active_tab_idx, pane.id, term.terminal_id, lines, term.scroll_offset());
-                            // One info line per scroll session (offset 0 → >0), to pair
-                            // tab/pane with the SCROLL-START line for the cross-tab
-                            // scrollback bug — without needing RUST_LOG=debug.
-                            if term.scroll_offset() == 0 && lines > 0 {
-                                log::info!("SCROLL-BEGIN tab={} pane={} term_id={}",
-                                    active_tab_idx, pane.id, term.terminal_id);
-                            }
-                            term.scroll(lines);
-                            // Reset accumulator when hitting bounds to avoid residual drift
-                            let at_bound = term.scroll_offset() == 0
-                                || term.scroll_offset() == term.scrollback_len() as i32;
-                            if at_bound {
-                                pane.scroll_accumulator.set(0.0);
-                            }
-                        }
+                    let sensitivity = ivars.config.get()
+                        .map(|c| c.terminal.scroll_sensitivity)
+                        .unwrap_or(TerminalConfig::default().scroll_sensitivity);
+                    if let Some(cell) = self.cell_size() {
+                        ivars.input.scroll(self, event, pane, self.pane_origin(&vp), cell, sensitivity, ivars.active_tab.get());
                     }
                 }
             }
@@ -910,7 +748,7 @@ define_class!(
             if let Some(renderer) = self.ivars().renderer.get() {
                 if let Some((zx, zy, zw, zh)) = renderer.read().minimized_counter_zone {
                     if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
-                        self.open_pane_switcher(false);
+                        self.open_pane_switcher(false, false);
                         return;
                     }
                 }
@@ -984,45 +822,9 @@ define_class!(
                         }
                     }
                 }
-                // Forward to PTY if mouse reporting is active
-                {
-                    let term = pane.terminal.read();
-                    if term.mouse_mode >= 1000 && term.sgr_mouse {
-                        drop(term);
-                        if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                            // button 0=left, 1=middle, 2=right
-                            let button_number = event.buttonNumber() as u8;
-                            let button_code = button_number.min(2);
-                            self.send_sgr_mouse(pane, button_code, col, row, true, false, event);
-                        }
-                        return;
-                    }
-                }
-                if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
-                    let click_count = event.clickCount();
-                    let mut term = pane.terminal.write();
-                    if click_count == 2 {
-                        // Double-click: select word
-                        let (wstart, wend) = term.word_bounds_at(pos);
-                        term.selection = Some(Selection {
-                            anchor: GridPos { line: pos.line, col: wstart },
-                            end: GridPos { line: pos.line, col: wend },
-                            mode: SelectionMode::Word,
-                        });
-                    } else if click_count >= 3 {
-                        // Triple-click: select entire line
-                        let row_len = term.row_at(pos.line)
-                            .map(|r| r.cells.len().saturating_sub(1) as u16)
-                            .unwrap_or(0);
-                        term.selection = Some(Selection {
-                            anchor: GridPos { line: pos.line, col: 0 },
-                            end: GridPos { line: pos.line, col: row_len },
-                            mode: SelectionMode::Line,
-                        });
-                    } else {
-                        term.selection = Some(Selection { anchor: pos, end: pos, mode: SelectionMode::Normal });
-                    }
-                    term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Reported to the app, or starts a selection
+                if let Some(cell) = self.cell_size() {
+                    self.ivars().input.mouse(self, event, MouseAction::Press, pane, self.pane_origin(&vp), cell);
                 }
             }
         }
@@ -1088,118 +890,23 @@ define_class!(
                 return;
             }
 
-            // Forward drag to PTY if mouse reporting mode 1002+ is active
-            if let Some(pane) = self.focused_pane() {
-                let term = pane.terminal.read();
-                if term.mouse_mode >= 1002 && term.sgr_mouse {
-                    drop(term);
-                    let vp = {
-                        let tabs = self.ivars().tabs.borrow();
-                        let idx = self.ivars().active_tab.get();
-                        tabs.get(idx).and_then(|t| t.viewport_for_pane(pane.id, self.panes_viewport_for_tab(t)))
-                    };
-                    if let Some(vp) = vp {
-                        if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                            let button_number = event.buttonNumber() as u8;
-                            let button_code = button_number.min(2);
-                            self.send_sgr_mouse(pane, button_code, col, row, true, true, event);
-                        }
-                    }
-                    return;
-                }
-                drop(term);
-            }
-
-            // Drag continues on the focused pane (set by mouseDown)
+            // Drag continues on the focused pane (set by mouseDown): reported
+            // to the app, or extends the selection
             if let Some(pane) = self.focused_pane() {
                 let vp = {
                     let tabs = self.ivars().tabs.borrow();
                     let idx = self.ivars().active_tab.get();
                     tabs.get(idx).and_then(|t| t.viewport_for_pane(pane.id, self.panes_viewport_for_tab(t)))
                 };
-                if let Some(vp) = vp {
-                    if let Some(pos) = self.pixel_to_grid_in(event, pane, &vp) {
-                        // Mouse is inside viewport — normal drag
-                        self.ivars().auto_scroll_speed.set(0);
-                        let mut term = pane.terminal.write();
-                        // Read mode and anchor before mutating selection
-                        let sel_info = term.selection.as_ref().map(|s| (s.mode, s.anchor));
-                        if let Some((mode, anchor)) = sel_info {
-                            match mode {
-                                SelectionMode::Word => {
-                                    let (wstart, wend) = term.word_bounds_at(pos);
-                                    let anchor_before = (anchor.line, anchor.col) <= (pos.line, wstart);
-                                    if let Some(sel) = term.selection.as_mut() {
-                                        if anchor_before {
-                                            sel.end = GridPos { line: pos.line, col: wend };
-                                        } else {
-                                            sel.end = GridPos { line: pos.line, col: wstart };
-                                        }
-                                    }
-                                }
-                                SelectionMode::Line => {
-                                    let row_len = term.row_at(pos.line)
-                                        .map(|r| r.cells.len().saturating_sub(1) as u16)
-                                        .unwrap_or(0);
-                                    let anchor_row_len = term.row_at(anchor.line)
-                                        .map(|r| r.cells.len().saturating_sub(1) as u16)
-                                        .unwrap_or(0);
-                                    if let Some(sel) = term.selection.as_mut() {
-                                        if pos.line >= anchor.line {
-                                            sel.anchor.col = 0;
-                                            sel.end = GridPos { line: pos.line, col: row_len };
-                                        } else {
-                                            sel.anchor.col = anchor_row_len;
-                                            sel.end = GridPos { line: pos.line, col: 0 };
-                                        }
-                                    }
-                                }
-                                SelectionMode::Normal => {
-                                    if let Some(sel) = term.selection.as_mut() {
-                                        sel.end = pos;
-                                    }
-                                }
-                            }
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    } else {
-                        // Mouse is outside viewport — compute auto-scroll speed
-                        let renderer = self.ivars().renderer.get();
-                        if let Some(renderer) = renderer {
-                            let (_, pixel_y) = self.event_to_pixel(event);
-                            let renderer_r = renderer.read();
-                            let cell_h = renderer_r.cell_size().1;
-                            drop(renderer_r);
-
-                            let rel_y = pixel_y - vp.y;
-                            let term = pane.terminal.read();
-                            let y_offset = term.y_offset_rows() as f32 * cell_h;
-                            let bottom = y_offset + (term.rows as f32 * cell_h);
-
-                            if rel_y < y_offset {
-                                // Above viewport — scroll up
-                                let dist = y_offset - rel_y;
-                                let speed = -((dist / cell_h).ceil() as i32).clamp(1, 10);
-                                self.ivars().auto_scroll_speed.set(speed);
-                            } else if rel_y > bottom {
-                                // Below viewport — scroll down
-                                let dist = rel_y - bottom;
-                                let speed = ((dist / cell_h).ceil() as i32).clamp(1, 10);
-                                self.ivars().auto_scroll_speed.set(speed);
-                            } else {
-                                // Mouse is vertically inside viewport but pixel_to_grid_in
-                                // returned None (e.g. mouse to the left of the grid) — no scroll
-                                self.ivars().auto_scroll_speed.set(0);
-                            }
-                        }
-                    }
+                if let (Some(vp), Some(cell)) = (vp, self.cell_size()) {
+                    self.ivars().input.mouse(self, event, MouseAction::Drag, pane, self.pane_origin(&vp), cell);
                 }
             }
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
-            self.ivars().auto_scroll_speed.set(0);
+            self.ivars().input.end_drag();
             if self.ivars().drag_tab.get().is_some() {
                 self.ivars().drag_tab.set(None);
                 return;
@@ -1208,33 +915,18 @@ define_class!(
                 self.ivars().drag_separator.set(None);
                 return;
             }
-            // Forward to PTY if mouse reporting is active
+            // Reported to the app under the pointer, if it asked
             if let Some((pane, vp)) = self.pane_at_event(event) {
-                let term = pane.terminal.read();
-                if term.mouse_mode >= 1000 && term.sgr_mouse {
-                    drop(term);
-                    if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                        let button_number = event.buttonNumber() as u8;
-                        let button_code = button_number.min(2);
-                        self.send_sgr_mouse(pane, button_code, col, row, false, false, event);
-                    }
-                    return;
-                }
-            }
-            if let Some(pane) = self.focused_pane() {
-                let mut term = pane.terminal.write();
-                // Single click (no drag) — clear selection
-                if let Some(ref sel) = term.selection {
-                    if sel.anchor == sel.end && sel.mode == SelectionMode::Normal {
-                        term.selection = None;
-                        term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(cell) = self.cell_size() {
+                    let result = self.ivars().input.mouse(self, event, MouseAction::Release, pane, self.pane_origin(&vp), cell);
+                    if result == MouseResult::Reported {
                         return;
                     }
                 }
-                let text = term.selected_text();
-                if !text.is_empty() {
-                    copy_to_pasteboard(&text);
-                }
+            }
+            // Otherwise the focused pane's selection ends and is copied
+            if let Some(pane) = self.focused_pane() {
+                self.ivars().input.finish_selection(pane);
             }
         }
 
@@ -1329,16 +1021,13 @@ define_class!(
 
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
-            // Forward move to PTY if all-motion tracking (mode 1003) is active
+            // Reported to the app if it tracks all motion (mode 1003)
             if let Some((pane, vp)) = self.pane_at_event(event) {
-                let term = pane.terminal.read();
-                if term.mouse_mode >= 1003 && term.sgr_mouse {
-                    drop(term);
-                    if let Some((col, row)) = self.pixel_to_cell_in(event, pane, &vp) {
-                        // No button pressed during move → button code 3 (no button) + motion flag
-                        self.send_sgr_mouse(pane, 3, col, row, true, true, event);
+                if let Some(cell) = self.cell_size() {
+                    let result = self.ivars().input.mouse(self, event, MouseAction::Move, pane, self.pane_origin(&vp), cell);
+                    if result == MouseResult::Reported {
+                        return;
                     }
-                    return;
                 }
             }
             self.update_separator_cursor(event);
@@ -1373,18 +1062,6 @@ define_class!(
     }
 );
 
-/// Extract a String from an NSTextInputClient input object (NSString or NSAttributedString).
-unsafe fn nsstring_from_input(obj: &objc2::runtime::AnyObject) -> String {
-    let responds: bool = unsafe { msg_send![obj, respondsToSelector: objc2::sel!(string)] };
-    if responds {
-        let ns_str: *const NSString = unsafe { msg_send![obj, string] };
-        unsafe { &*ns_str }.to_string()
-    } else {
-        let ns_str: &NSString = unsafe { &*(obj as *const objc2::runtime::AnyObject as *const NSString) };
-        ns_str.to_string()
-    }
-}
-
 /// Shell-quote a filesystem path for insertion on the command line.
 /// Leaves paths made of safe characters untouched; otherwise wraps them in
 /// single quotes (escaping embedded single quotes).
@@ -1398,22 +1075,6 @@ fn shell_quote(path: &str) -> String {
     } else {
         format!("'{}'", path.replace('\'', "'\\''"))
     }
-}
-
-/// Copy text to the system pasteboard.
-fn copy_to_pasteboard(text: &str) {
-    use objc2::runtime::ProtocolObject;
-    let pasteboard = NSPasteboard::generalPasteboard();
-    pasteboard.clearContents();
-    let ns_str = NSString::from_str(text);
-    // Write the NSString as an object (not raw bytes under a fixed type) so the
-    // pasteboard can hand any requested text encoding to the receiving app.
-    // setString:forType: only registers literal UTF-8 bytes, which some legacy
-    // apps mis-decode as Mac Roman (turning "é" into "√©").
-    let writing: &ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting> =
-        ProtocolObject::from_ref(&*ns_str);
-    let objects = NSArray::from_slice(&[writing]);
-    pasteboard.writeObjects(&objects);
 }
 
 impl KovaView {
@@ -1436,9 +1097,7 @@ impl KovaView {
             drag_tab: Cell::new(None),
             hovered_url: RefCell::new(None),
             cmd_held: Cell::new(false),
-            auto_scroll_speed: Cell::new(0),
-            marked_text: RefCell::new(None),
-            current_event: Cell::new(None),
+            input: AppKitInput::new(),
             closing: Cell::new(false),
             skip_session_save: Cell::new(false),
             last_title: RefCell::new(None),
@@ -1452,11 +1111,14 @@ impl KovaView {
             send_to_window: RefCell::new(None),
             merge_tab: RefCell::new(None),
             help_hint_frames: Cell::new(180), // updated in setup_metal
-            scroll_axis_lock: Cell::new(ScrollAxisLock::None),
             resize_feedback: Cell::new(None),
             transient_status: RefCell::new(None),
             bookmark_keys: RefCell::new(crate::bookmarks::keys(&crate::bookmarks::load().items)),
             unread_focus: Cell::new(None),
+            anchor_keys: RefCell::new(crate::anchors::keys(&crate::anchors::load().items)),
+            duplicate_session: Cell::new(None),
+            accepted_duplicates: RefCell::new(std::collections::HashSet::new()),
+            attention_banner: RefCell::new(None),
             deferred_tabs: RefCell::new(Vec::new()),
             loading_total_panes: Cell::new(0),
             boundary_hit: Cell::new(None),
@@ -1824,26 +1486,6 @@ impl KovaView {
 
 
 
-    /// Encode modifier flags for SGR mouse reporting.
-    fn mouse_modifiers(event: &NSEvent) -> u8 {
-        let flags = event.modifierFlags();
-        let mut m: u8 = 0;
-        if flags.contains(NSEventModifierFlags::Shift) { m |= 4; }
-        if flags.contains(NSEventModifierFlags::Option) { m |= 8; }
-        if flags.contains(NSEventModifierFlags::Control) { m |= 16; }
-        m
-    }
-
-    /// Send an SGR mouse event to the PTY. `button_code` is the base button (0=left, 1=middle, 2=right, 64/65=scroll).
-    /// `press` = true for press/motion ('M'), false for release ('m').
-    /// `motion` = true adds +32 to the button code for motion events.
-    fn send_sgr_mouse(&self, pane: &Pane, button_code: u8, col: u16, row: u16, press: bool, motion: bool, event: &NSEvent) {
-        let mods = Self::mouse_modifiers(event);
-        let cb = button_code | mods | if motion { 32 } else { 0 };
-        let suffix = if press { 'M' } else { 'm' };
-        let seq = format!("\x1b[<{};{};{}{}", cb, col, row, suffix);
-        pane.pty.write(seq.as_bytes());
-    }
 
 
 
@@ -1881,30 +1523,113 @@ impl KovaView {
         cwd
     }
 
+    /// The name of the agent conversation held by a pane of this window, if it
+    /// holds one and it has been named.
+    fn pane_session_name(&self, pane_id: PaneId) -> Option<String> {
+        let tabs = self.ivars().tabs.borrow();
+        let tab = tabs.iter().find(|t| t.contains(pane_id))?;
+        tab.pane(pane_id)?.agent_session_name()
+    }
+
     /// Keep the focused pane's conversation in the bookmark list, or drop it if
-    /// it is already there. The list is what Cmd+P offers under "Bookmarks".
+    /// it is already there. The list is what Cmd+P offers, grouped by directory.
     ///
     /// Unlike the session file, this survives closing the pane: it is the answer
     /// to "I want this conversation back tomorrow", not to "put back what was
     /// open when Kova quit".
     fn do_toggle_bookmark(&self) {
-        let candidate = {
+        let focused = {
             let tabs = self.ivars().tabs.borrow();
-            let idx = self.ivars().active_tab.get();
-            let Some(tab) = tabs.get(idx) else { return };
-            let Some(pane) = tab.pane(tab.focused_pane) else { return };
-            let session = pane.agent_session.borrow().clone();
-            crate::bookmarks::Bookmark {
-                agent: session.as_ref().map(|s| s.agent),
-                session_id: session.as_ref().map(|s| s.id.clone()),
-                cwd: pane.cwd().unwrap_or_default(),
-                label: pane.display_title("shell"),
-            }
+            let Some(tab) = tabs.get(self.ivars().active_tab.get()) else { return };
+            tab.focused_pane
         };
-        if candidate.cwd.is_empty() && candidate.session_id.is_none() {
-            self.set_transient_status("Nothing to bookmark in this pane");
+        self.toggle_pane_bookmark(focused);
+    }
+
+    /// What a pane would be saved as, in either list: the conversation it runs,
+    /// or its directory alone at a bare shell. `None` when the pane holds
+    /// neither — there would be nothing to bring back.
+    pub(super) fn pane_as_saved(&self, pane_id: PaneId) -> Option<crate::bookmarks::Bookmark> {
+        let tabs = self.ivars().tabs.borrow();
+        let pane = tabs.iter().find_map(|t| t.pane(pane_id))?;
+        let session = pane.agent_session.borrow().clone();
+        let saved = crate::bookmarks::Bookmark {
+            agent: session.as_ref().map(|s| s.agent),
+            session_id: session.as_ref().map(|s| s.id.clone()),
+            cwd: pane.cwd().unwrap_or_default(),
+            label: pane.display_title("shell"),
+        };
+        (!saved.cwd.is_empty() || saved.session_id.is_some()).then_some(saved)
+    }
+
+    /// Keep the focused pane's conversation among today's anchors, or drop it.
+    /// Cmd+Shift+A — the deliberate gesture, next to Cmd+B, one modifier apart
+    /// because the two lists are neighbours.
+    fn do_toggle_anchor(&self) {
+        let focused = {
+            let tabs = self.ivars().tabs.borrow();
+            let Some(tab) = tabs.get(self.ivars().active_tab.get()) else { return };
+            tab.focused_pane
+        };
+        self.toggle_pane_anchor(focused);
+    }
+
+    /// Anchor or un-anchor the conversation of `pane_id`. Cmd+Shift+A on the
+    /// focused pane, and on a pane row of Cmd+P.
+    pub(super) fn toggle_pane_anchor(&self, pane_id: PaneId) {
+        let Some(candidate) = self.pane_as_saved(pane_id) else {
+            self.set_transient_status("Nothing to anchor in this pane");
+            return;
+        };
+        let label = candidate.label.clone();
+        let mut anchors = crate::anchors::load();
+        let outcome = crate::anchors::toggle(&mut anchors.items, candidate);
+        if outcome == crate::anchors::Toggled::Full {
+            self.set_transient_status(&format!(
+                "Already {} anchors — drop one first",
+                crate::anchors::MAX_ANCHORS
+            ));
             return;
         }
+        crate::anchors::save(&anchors);
+        self.refresh_anchor_keys(&anchors);
+        self.set_transient_status(&if outcome == crate::anchors::Toggled::Added {
+            format!("Anchored {}", label)
+        } else {
+            format!("Removed anchor {}", label)
+        });
+    }
+
+    /// Cmd+A: back to the first anchor — the pane still running it, or the
+    /// conversation reopened where it belongs when none does. One key, one
+    /// target, nothing to pick: that is the whole point of an ordered list.
+    fn do_focus_anchor(&self) {
+        // Cmd+A is "select all" everywhere else on this Mac, so while a text
+        // field of Kova's own is up it must not jump the window somewhere else.
+        if self.ivars().filter.borrow().is_some() {
+            return;
+        }
+        let anchors = crate::anchors::load();
+        let Some(first) = anchors.items.first() else {
+            self.set_transient_status("No anchor yet — Cmd+Shift+A anchors this pane");
+            return;
+        };
+        self.open_saved_conversation(first);
+    }
+
+    /// Re-read the anchor cache the status bars paint from, and repaint.
+    pub(super) fn refresh_anchor_keys(&self, anchors: &crate::anchors::Anchors) {
+        *self.ivars().anchor_keys.borrow_mut() = crate::anchors::keys(&anchors.items);
+        self.mark_dirty();
+    }
+
+    /// Bookmark or un-bookmark the conversation of `pane_id`, whichever tab of
+    /// this window holds it. Cmd+B on the focused pane, and on a pane row of Cmd+P.
+    pub(super) fn toggle_pane_bookmark(&self, pane_id: PaneId) {
+        let Some(candidate) = self.pane_as_saved(pane_id) else {
+            self.set_transient_status("Nothing to bookmark in this pane");
+            return;
+        };
         let mut bookmarks = crate::bookmarks::load();
         let label = candidate.label.clone();
         let kept = crate::bookmarks::toggle(&mut bookmarks.items, candidate);
@@ -1944,33 +1669,6 @@ impl KovaView {
         }
         false
     }
-
-    /// Focus a specific pane within the active tab. Returns true if found.
-    fn focus_pane_in_active_tab(&self, pane_id: PaneId) -> bool {
-        let mut tabs = self.ivars().tabs.borrow_mut();
-        let idx = self.ivars().active_tab.get();
-        if let Some(tab) = tabs.get_mut(idx) {
-            // Walk panes to confirm the id exists in this tab before assigning.
-            let mut found = false;
-            tab.for_each_pane(&mut |p| {
-                if p.id == pane_id { found = true; }
-            });
-            if found {
-                tab.focused_pane = pane_id;
-                // Scroll the virtual viewport so the pane is on-screen if it
-                // sits outside the visible horizontal span (e.g. jumped to from
-                // global search).
-                let screen_w = self.drawable_viewport().width;
-                let min_w = self.min_split_width_px();
-                tab.clamp_scroll(screen_w, min_w);
-                self.scroll_to_reveal_pane(tab, pane_id, screen_w);
-                drop(tabs);
-                self.mark_dirty();
-                return true;
-            }
-        }
-        false
-    }
 }
 
 
@@ -2001,8 +1699,18 @@ impl KovaView {
     fn do_close_window(&self) {
         // Check for running processes and confirm
         let procs = self.running_processes();
+        // The open todos of every conversation the window's panes hold or held.
+        let sessions = {
+            let tabs = self.ivars().tabs.borrow();
+            let mut sessions: Vec<String> = Vec::new();
+            for tab in tabs.iter() {
+                tab.for_each_pane(&mut |pane| push_raf_session(&mut sessions, pane));
+            }
+            sessions
+        };
+        let (todos, conversations) = open_todos_of(&sessions);
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        if !confirm_running_processes(mtm, &procs, "Close this window?", "Close") {
+        if !confirm_close(mtm, &procs, &todos, conversations, "Close this window?", "Close") {
             return;
         }
         // Save all tabs to recent projects before closing (single I/O cycle)
@@ -2062,9 +1770,11 @@ impl KovaView {
             Action::CloseTab => self.do_close_tab(),
             Action::OpenRecentProject => self.do_open_recent_projects(),
             Action::OpenSearchPalette => self.do_open_search_palette(),
-            Action::OpenPaneSwitcher => self.open_pane_switcher(false),
-            Action::OpenUnreadSwitcher => self.open_pane_switcher(true),
+            Action::OpenPaneSwitcher => self.open_pane_switcher(false, false),
+            Action::OpenUnreadSwitcher => self.open_pane_switcher(true, false),
             Action::ToggleBookmark => self.do_toggle_bookmark(),
+            Action::ToggleAnchor => self.do_toggle_anchor(),
+            Action::FocusAnchor => self.do_focus_anchor(),
             Action::Equalize => {
                 let mut tabs = self.ivars().tabs.borrow_mut();
                 let idx = self.ivars().active_tab.get();
@@ -2184,41 +1894,32 @@ impl KovaView {
                 }
             }
             Action::Paste => {
-                if let Some(pane) = self.focused_pane() {
+                // Every overlay that owns the keyboard owns the paste too, so
+                // IPC `dispatch-action paste` lands where Cmd+V would, never in
+                // the PTY hidden behind it.
+                let palette_open = self.ivars().search_palette.borrow().is_some();
+                let rename_open = self.ivars().rename_tab.borrow().is_some()
+                    || self.ivars().rename_pane.borrow().is_some();
+                let filter_open = self.ivars().filter.borrow().is_some();
+                if palette_open || rename_open || filter_open {
                     let pasteboard = NSPasteboard::generalPasteboard();
-                    let pasted_image = unsafe { pasteboard.dataForType(objc2_app_kit::NSPasteboardTypePNG) }
-                        .and_then(|data| {
-                            if data.is_empty() { return None; }
-                            let bytes = data.to_vec();
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis();
-                            let path = format!("/tmp/kova-paste-{timestamp}.png");
-                            std::fs::write(&path, bytes).ok().map(|_| path)
-                        });
-
-                    if let Some(path) = pasted_image {
-                        let bracketed = pane.terminal.read().bracketed_paste;
-                        if bracketed { pane.pty.write(b"\x1b[200~"); }
-                        pane.pty.write(path.as_bytes());
-                        if bracketed { pane.pty.write(b"\x1b[201~"); }
-                    } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
-                        let mut text = text.to_string();
-                        let bracketed = pane.terminal.read().bracketed_paste;
-                        if bracketed {
-                            // A paste containing the bracketed-paste
-                            // terminator would break out of the paste
-                            // and inject keystrokes into the app.
-                            // Loop to a fixpoint: a single replace can
-                            // re-form the terminator from its halves.
-                            while text.contains("\x1b[201~") {
-                                text = text.replace("\x1b[201~", "");
-                            }
-                            pane.pty.write(b"\x1b[200~");
+                    if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                        let text = text.to_string();
+                        if palette_open {
+                            self.paste_into_search_palette(&text);
+                        } else if rename_open {
+                            self.paste_into_rename(&text);
+                        } else {
+                            self.paste_into_filter(&text);
                         }
-                        pane.pty.write(text.as_bytes());
-                        if bracketed { pane.pty.write(b"\x1b[201~"); }
+                    }
+                } else if let Some(pane) = self.focused_pane() {
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    if let Some(path) = appkit_input::pasted_image_path(&pasteboard) {
+                        // The path Kova just built holds no paste terminator.
+                        pane.paste(&path);
+                    } else if let Some(text) = unsafe { pasteboard.stringForType(objc2_app_kit::NSPasteboardTypeString) } {
+                        pane.paste(&text.to_string());
                     }
                 }
             }
@@ -2429,9 +2130,32 @@ impl KovaView {
 
 
 
+    /// Paste into whichever rename editor is open, as one sanitized line.
+    fn paste_into_rename(&self, text: &str) {
+        // A title is one line: no newline, tab or escape may reach the tab bar
+        // or session.json.
+        let text = overlays::line_paste_text(text);
+        if text.is_empty() {
+            return;
+        }
+        let insert = |input: &mut String, cursor: &mut usize| {
+            let byte_idx = input.char_indices().nth(*cursor).map(|(i, _)| i).unwrap_or(input.len());
+            input.insert_str(byte_idx, &text);
+            *cursor += text.chars().count();
+        };
+        if let Some(state) = self.ivars().rename_tab.borrow_mut().as_mut() {
+            insert(&mut state.input, &mut state.cursor);
+        } else if let Some(state) = self.ivars().rename_pane.borrow_mut().as_mut() {
+            insert(&mut state.input, &mut state.cursor);
+        }
+        self.mark_dirty();
+    }
+
     fn mark_dirty(&self) {
         if let Some(pane) = self.focused_pane() {
-            pane.terminal.read().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            // read_recursive: callers may already hold a read guard on this terminal,
+            // and a plain read() queued behind a waiting writer would deadlock.
+            pane.terminal.read_recursive().dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -2494,19 +2218,101 @@ static WINDOW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// Show a confirmation alert listing running processes.
 /// Returns `true` if the user confirmed (or no processes are running).
 pub fn confirm_running_processes(mtm: MainThreadMarker, procs: &[(String, String)], message: &str, confirm_button: &str) -> bool {
-    if procs.is_empty() {
+    confirm_close(mtm, procs, &[], 0, message, confirm_button)
+}
+
+/// `confirm_running_processes`, plus what the closing conversations still have
+/// to do: `todos` are their open todo texts (`crate::raf`), `conversations` how
+/// many conversations those come from. The dialog appears when a process runs
+/// or when there are open todos — the latter covers a pane whose `claude` has
+/// exited but whose conversation still has work left. With neither, nothing is
+/// asked, as before.
+pub fn confirm_close(
+    mtm: MainThreadMarker,
+    procs: &[(String, String)],
+    todos: &[String],
+    conversations: usize,
+    message: &str,
+    confirm_button: &str,
+) -> bool {
+    if procs.is_empty() && todos.is_empty() {
         return true;
     }
+    confirm_action(mtm, message, &close_dialog_text(procs, todos, conversations), confirm_button)
+}
+
+/// Informative text of the close / quit confirmation: the running processes,
+/// then, when there are open todos, a blank line and their list. Without a
+/// running process, the todo list alone.
+fn close_dialog_text(procs: &[(String, String)], todos: &[String], conversations: usize) -> String {
+    let mut lines = String::new();
+    if !procs.is_empty() {
+        lines.push_str("The following processes are running:");
+        for (tab, name) in procs {
+            lines.push_str(&format!("\n\u{2022} Tab \u{ab}{}\u{bb}: {}", tab, name));
+        }
+    }
+    let warning = crate::raf::close_warning(todos, conversations);
+    if !warning.is_empty() {
+        if !lines.is_empty() {
+            lines.push_str("\n\n");
+        }
+        lines.push_str(&warning);
+    }
+    lines
+}
+
+/// Add the Claude conversation `pane` holds or held — live, left behind by an
+/// exited `claude`, or waiting in a restored resume line — to `sessions`,
+/// once. That is the conversation whose open todos a close warns about.
+pub(super) fn push_raf_session(sessions: &mut Vec<String>, pane: &Pane) {
+    let id = pane.last_claude_session_id().or_else(|| {
+        let last = pane.last_command();
+        switcher::pending_session_id(last.as_deref()).map(str::to_string)
+    });
+    if let Some(id) = id {
+        if !sessions.contains(&id) {
+            sessions.push(id);
+        }
+    }
+}
+
+/// Open todos of every distinct Claude conversation in `sessions`, flattened,
+/// and how many conversations they came from. Reads `~/.claude/raf/` — only
+/// call it when a close is under way, never per frame.
+pub(super) fn open_todos_of(sessions: &[String]) -> (Vec<String>, usize) {
+    let lists: Vec<Vec<String>> = sessions
+        .iter()
+        .filter_map(|id| crate::raf::load(id))
+        .map(|r| r.todos)
+        .filter(|t| !t.is_empty())
+        .collect();
+    let n = lists.len();
+    (lists.into_iter().flatten().collect(), n)
+}
+
+/// Ask a yes/no question in a warning alert. Returns `true` if the user picked
+/// `confirm_button`. The caller must hold no `RefCell` borrow on the view:
+/// `runModal` spins a run loop that dispatches events, which borrow again.
+pub fn confirm_action(mtm: MainThreadMarker, message: &str, informative: &str, confirm_button: &str) -> bool {
+    confirm_choice(mtm, message, informative, confirm_button, "Cancel")
+}
+
+/// Same alert with both buttons named: for a question whose second answer is a
+/// choice of its own ("Keep both") rather than backing out.
+pub fn confirm_choice(
+    mtm: MainThreadMarker,
+    message: &str,
+    informative: &str,
+    first_button: &str,
+    second_button: &str,
+) -> bool {
     let alert = NSAlert::new(mtm);
     alert.setAlertStyle(NSAlertStyle::Warning);
     alert.setMessageText(&NSString::from_str(message));
-    let mut lines = String::from("The following processes are running:");
-    for (tab, name) in procs {
-        lines.push_str(&format!("\n\u{2022} Tab \u{ab}{}\u{bb}: {}", tab, name));
-    }
-    alert.setInformativeText(&NSString::from_str(&lines));
-    alert.addButtonWithTitle(&NSString::from_str(confirm_button));
-    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.setInformativeText(&NSString::from_str(informative));
+    alert.addButtonWithTitle(&NSString::from_str(first_button));
+    alert.addButtonWithTitle(&NSString::from_str(second_button));
     alert.runModal() == 1000 // NSAlertFirstButtonReturn
 }
 
@@ -2646,6 +2452,36 @@ const MAX_BAND_REPAIRS: u32 = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_dialog_text_lists_the_running_processes_as_before() {
+        // Frozen: the text the dialog showed before todos were added to it.
+        let procs = vec![("kova".to_string(), "claude".to_string()), ("logs".to_string(), "tail".to_string())];
+        assert_eq!(
+            close_dialog_text(&procs, &[], 0),
+            "The following processes are running:\n\u{2022} Tab \u{ab}kova\u{bb}: claude\n\u{2022} Tab \u{ab}logs\u{bb}: tail"
+        );
+    }
+
+    #[test]
+    fn close_dialog_text_without_a_process_is_the_todo_list_alone() {
+        let todos = vec!["ship it".to_string()];
+        assert_eq!(
+            close_dialog_text(&[], &todos, 1),
+            "1 thing left to do in this conversation:\n\u{2022} ship it"
+        );
+    }
+
+    #[test]
+    fn close_dialog_text_adds_the_open_todos_after_a_blank_line() {
+        let procs = vec![("kova".to_string(), "claude".to_string())];
+        let todos = vec!["ship it".to_string()];
+        assert_eq!(
+            close_dialog_text(&procs, &todos, 1),
+            "The following processes are running:\n\u{2022} Tab \u{ab}kova\u{bb}: claude\n\n\
+             1 thing left to do in this conversation:\n\u{2022} ship it"
+        );
+    }
 
 
 

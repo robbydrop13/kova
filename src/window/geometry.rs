@@ -231,13 +231,7 @@ impl KovaView {
 
     /// Convert an NSEvent location to Metal pixel coordinates (origin top-left).
     pub(super) fn event_to_pixel(&self, event: &NSEvent) -> (f32, f32) {
-        let location = event.locationInWindow();
-        let local: CGPoint = unsafe { msg_send![self, convertPoint: location, fromView: std::ptr::null::<objc2::runtime::AnyObject>()] };
-        let frame = self.frame();
-        let scale = self.backing_scale();
-        let pixel_x = local.x as f32 * scale;
-        let pixel_y = (frame.size.height as f32 - local.y as f32) * scale;
-        (pixel_x, pixel_y)
+        appkit_input::event_to_pixel(self, event)
     }
 
     /// Hit-test: find which pane is under the mouse event (in active tab).
@@ -268,60 +262,17 @@ impl KovaView {
         Some((unsafe { &*(pane as *const Pane) }, vp))
     }
 
-    /// Convert an NSEvent to a grid position within the given pane/viewport.
-    pub(super) fn pixel_to_grid_in(&self, event: &NSEvent, pane: &Pane, vp: &PaneViewport) -> Option<GridPos> {
-        let renderer = self.ivars().renderer.get()?;
-        let (pixel_x, pixel_y) = self.event_to_pixel(event);
-
-        let renderer_r = renderer.read();
-        let (cell_w, cell_h) = renderer_r.cell_size();
-        drop(renderer_r);
-
-        let rel_x = pixel_x - vp.x - self.h_padding();
-        let rel_y = pixel_y - vp.y;
-
-        let term = pane.terminal.read();
-        let y_offset = term.y_offset_rows();
-        let col = (rel_x / cell_w).floor() as i32;
-        let visible_row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
-
-        if visible_row < 0 || col < 0 {
-            return None;
-        }
-        let col = (col as u16).min(term.cols.saturating_sub(1));
-        let visible_row = visible_row as usize;
-        if visible_row >= term.rows as usize {
-            return None;
-        }
-
-        let abs_line = (term.scrollback_len() as i64 - term.scroll_offset() as i64 + visible_row as i64) as usize;
-        Some(GridPos { line: abs_line, col })
+    /// Where a pane's text starts in this view: its viewport's corner and the
+    /// horizontal padding, for the input component's point → cell mapping.
+    pub(super) fn pane_origin(&self, vp: &PaneViewport) -> PaneOrigin {
+        PaneOrigin { x: vp.x, y: vp.y, pad_x: self.h_padding() }
     }
 
-    /// Convert pixel coords to 1-based (col, row) within a pane viewport.
-    /// Returns None if the pixel is outside the grid area.
-    pub(super) fn pixel_to_cell_in(&self, event: &NSEvent, pane: &Pane, vp: &PaneViewport) -> Option<(u16, u16)> {
+    /// Cell size in pixels, `None` before the renderer exists.
+    pub(super) fn cell_size(&self) -> Option<(f32, f32)> {
         let renderer = self.ivars().renderer.get()?;
-        let (pixel_x, pixel_y) = self.event_to_pixel(event);
-        let renderer_r = renderer.read();
-        let (cell_w, cell_h) = renderer_r.cell_size();
-        drop(renderer_r);
-
-        let rel_x = pixel_x - vp.x - self.h_padding();
-        let rel_y = pixel_y - vp.y;
-
-        let term = pane.terminal.read();
-        let y_offset = term.y_offset_rows();
-        let col = (rel_x / cell_w).floor() as i32;
-        let row = (rel_y / cell_h).floor() as i32 - y_offset as i32;
-
-        if row < 0 || col < 0 {
-            return None;
-        }
-        let col = (col as u16).min(term.cols.saturating_sub(1));
-        let row = (row as u16).min(term.rows.saturating_sub(1));
-        // SGR uses 1-based coordinates
-        Some((col + 1, row + 1))
+        let size = renderer.read().cell_size();
+        Some(size)
     }
 
     /// Compute cols/rows for a pane viewport.

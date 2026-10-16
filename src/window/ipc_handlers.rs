@@ -1,16 +1,13 @@
 //! What a pane, tab or window looks like to an IPC client, and every command
 //! the socket can run against this window. The parsing and the socket itself
-//! live in `crate::ipc`; this is the half that touches the view.
+//! live in `crate::ipc`, the pane commands' replies in `crate::ipc::host`;
+//! this is the half that touches the view.
 
 use super::*;
-
-/// Outcome of `KovaView::ipc_close_tab`. Lets the caller distinguish "not in this window"
-/// (keep scanning) from "last tab — refuse" (final answer).
-pub enum IpcCloseTabResult {
-    Closed,
-    WouldTerminate,
-    NotFound,
-}
+use crate::ipc::host::PaneSignal;
+// Re-exported through `window` for the callers that match on it.
+pub use crate::ipc::host::IpcCloseTabResult;
+use crate::ipc::host::TabInfo;
 
 /// Outcome of `KovaView::ipc_merge_tab`. `SourceMissing` lets the caller keep scanning
 /// across windows; `TargetMissing` is a final answer because we found the source here.
@@ -37,7 +34,9 @@ pub enum IpcSwapPaneResult {
 }
 
 /// The JSON shape of one pane, shared by `list-panes`, the `subscribe` snapshot
-/// and the event payloads — a client parses the same object everywhere.
+/// and the event payloads — a client parses the same object everywhere. The
+/// shape itself is `crate::ipc::host::surface_json`, which a library host
+/// shares.
 ///
 /// Costs a `proc_pidinfo` (the CWD) and a process-table walk (the children), so
 /// callers on a polling path must build it only for panes they actually report.
@@ -47,56 +46,134 @@ pub fn pane_json(
     tab_idx: usize,
     focused: bool,
 ) -> serde_json::Value {
-    let pid = pane.pty.pid();
-    let children = pane.pty.child_processes();
-    let is_idle = children.is_empty();
-    let child_json: Vec<serde_json::Value> = children
-        .into_iter()
-        .map(|(cpid, info)| {
-            serde_json::json!({
-                "pid": cpid,
-                "name": info.name,
-                "version": info.version,
-            })
-        })
-        .collect();
-    let resume = pane.resume_target();
-    serde_json::json!({
-        "id": pane.id,
-        "window": win_idx,
-        "tab": tab_idx,
-        "cwd": pane.cwd().unwrap_or_default(),
-        "title": pane.display_title("shell"),
-        "focused": focused,
-        "pid": pid,
-        "child_processes": child_json,
-        "is_idle": is_idle,
-        "working": pane.is_working(),
-        "awaiting": pane.is_awaiting(),
-        "awaiting_since": pane.awaiting_since(),
-        // Whether the waiting pane has been looked at here since it started waiting. A remote
-        // client walking waiting panes needs that halt, or it hands back panes already read on
-        // this Mac. False on a pane that is not waiting at all, where the bit means nothing.
-        "awaiting_seen": pane.is_awaiting() && !pane.is_awaiting_unseen(),
+    let mut json =
+        crate::ipc::host::surface_json(pane, &pane.display_title("shell"), pane.minimized, win_idx, tab_idx, focused);
+    // Two fields the library's `surface_json` cannot fill: `unread` is the
+    // sidebar's own reading of the pane, and the resume line belongs to Kova.app.
+    if let Some(obj) = json.as_object_mut() {
         // Something new since the pane was last looked at (a prompt, a finished
         // turn, a bell, or the user's own mark): what the Next pill counts.
-        "unread": super::sidebar_ui::pane_flags(pane, focused).is_unread(),
-        "minimized": pane.minimized,
-        // Which agent holds the pane's conversation ("claude", "codex"), absent
-        // at a bare shell. `claude_session_id` stays Claude-only so a client
-        // that resumes with it never gets an id Claude cannot open; the
-        // agent-agnostic id is next to it.
-        "agent": pane.agent_kind().map(|a| a.as_str()),
-        "agent_session_id": pane.agent_session_id(),
-        "agent_session_name": pane.agent_session_name(),
-        "claude_session_id": pane.claude_session_id(),
-        "claude_session_name": pane.claude_session_name(),
-        // The conversation the sidebar's `Resume` would reopen here (`Pane::resume_target`),
-        // all three null when it offers none. `resume-pane` runs exactly this line.
-        "resume_agent": resume.as_ref().map(|r| r.0.as_str()),
-        "resume_session_id": resume.as_ref().map(|r| r.1.clone()),
-        "resume_command": resume.as_ref().map(|r| r.2.clone()),
-    })
+        obj.insert(
+            "unread".to_string(),
+            serde_json::json!(super::sidebar_ui::pane_flags(pane, focused).is_unread()),
+        );
+        // The conversation the sidebar's `Resume` would reopen here
+        // (`Pane::resume_target`), all three null when it offers none.
+        // `resume-pane` runs exactly this line.
+        let resume = pane.resume_target();
+        obj.insert("resume_agent".to_string(), serde_json::json!(resume.as_ref().map(|r| r.0.as_str())));
+        obj.insert("resume_session_id".to_string(), serde_json::json!(resume.as_ref().map(|r| r.1.clone())));
+        obj.insert("resume_command".to_string(), serde_json::json!(resume.as_ref().map(|r| r.2.clone())));
+    }
+    json
+}
+
+/// `list-panes` for one window's tabs: every pane in tab then column then row
+/// order. A pane is `focused` only if it is its tab's focused pane, in the active
+/// tab, in the key window.
+pub fn collect_panes_in(
+    tabs: &[Tab],
+    active_tab: usize,
+    win_idx: usize,
+    is_key_window: bool,
+    out: &mut Vec<serde_json::Value>,
+) {
+    for (tab_idx, tab) in tabs.iter().enumerate() {
+        let focused_id = tab.focused_pane;
+        let is_active_tab = tab_idx == active_tab;
+        tab.for_each_pane(&mut |pane| {
+            let is_focused = pane.id == focused_id && is_active_tab && is_key_window;
+            out.push(pane_json(pane, win_idx, tab_idx, is_focused));
+        });
+    }
+}
+
+/// `send-keys`: write `text` to the pane's PTY as is. Returns false when no tab
+/// holds the pane.
+pub fn send_keys_in(tabs: &[Tab], pane_id: PaneId, text: &str) -> bool {
+    for tab in tabs.iter() {
+        if let Some(pane) = tab.pane(pane_id) {
+            crate::ipc::host::send_keys_to(pane, text);
+            return true;
+        }
+    }
+    false
+}
+
+/// `list-tabs` for one window's tabs, in tab order. A tab is `active` only if it
+/// is the active tab of the key window.
+pub fn collect_tabs_in(
+    tabs: &[Tab],
+    active_tab: usize,
+    win_idx: usize,
+    is_key_window: bool,
+    out: &mut Vec<TabInfo>,
+) {
+    for (tab_idx, tab) in tabs.iter().enumerate() {
+        let mut pane_count = 0;
+        tab.for_each_pane(&mut |_| { pane_count += 1; });
+        let is_active = tab_idx == active_tab && is_key_window;
+        out.push(TabInfo {
+            id: tab.id,
+            window: win_idx,
+            tab_index: tab_idx,
+            title: tab.title(),
+            pane_count,
+            focused_pane_id: tab.focused_pane,
+            active: is_active,
+            has_bell: tab.has_bell,
+            has_completion: tab.has_completion,
+            has_running: tab.has_running,
+        });
+    }
+}
+
+/// Every pane id of these tabs, in `list-panes` order (expands `panes: "all"`).
+pub fn collect_pane_ids_in(tabs: &[Tab], out: &mut Vec<PaneId>) {
+    for tab in tabs.iter() {
+        tab.for_each_pane(&mut |p| out.push(p.id));
+    }
+}
+
+/// One `get-pane-content` entry, or None when no tab holds the pane.
+pub fn dump_pane_text_in(
+    tabs: &[Tab],
+    pane_id: PaneId,
+    mode: crate::terminal::DumpMode,
+    trim: bool,
+) -> Option<serde_json::Value> {
+    for tab in tabs.iter() {
+        if let Some(pane) = tab.pane(pane_id) {
+            return Some(crate::ipc::host::pane_text_entry(pane_id, pane, mode, trim));
+        }
+    }
+    None
+}
+
+/// The OSC 133;D flag of a pane, or None when no tab holds it.
+pub fn check_completion_in(tabs: &[Tab], pane_id: PaneId) -> Option<bool> {
+    for tab in tabs.iter() {
+        if let Some(pane) = tab.pane(pane_id) {
+            return Some(crate::ipc::host::completion_flag(pane));
+        }
+    }
+    None
+}
+
+/// `(chars, bytes)` of what `get-pane-content` would return for a pane, or None
+/// when no tab holds it.
+pub fn measure_pane_text_in(
+    tabs: &[Tab],
+    pane_id: PaneId,
+    mode: crate::terminal::DumpMode,
+    trim: bool,
+) -> Option<(usize, usize)> {
+    for tab in tabs.iter() {
+        if let Some(pane) = tab.pane(pane_id) {
+            return Some(crate::ipc::host::measure_pane_text(pane, mode, trim));
+        }
+    }
+    None
 }
 
 impl KovaView {
@@ -331,15 +408,7 @@ impl KovaView {
     /// IPC: collect pane info as JSON values for the list-panes command.
     pub fn ipc_collect_panes(&self, win_idx: usize, is_key_window: bool, out: &mut Vec<serde_json::Value>) {
         let tabs = self.ivars().tabs.borrow();
-        let active_tab = self.ivars().active_tab.get();
-        for (tab_idx, tab) in tabs.iter().enumerate() {
-            let focused_id = tab.focused_pane;
-            let is_active_tab = tab_idx == active_tab;
-            tab.for_each_pane(&mut |pane| {
-                let is_focused = pane.id == focused_id && is_active_tab && is_key_window;
-                out.push(pane_json(pane, win_idx, tab_idx, is_focused));
-            });
-        }
+        collect_panes_in(&tabs, self.ivars().active_tab.get(), win_idx, is_key_window, out);
     }
 
     /// The pane this window would hand the keyboard to: the focused pane of the
@@ -414,16 +483,31 @@ impl KovaView {
 
     /// IPC: write text to a pane's PTY. Returns true if the pane was found.
     pub fn ipc_send_keys(&self, pane_id: PaneId, text: &str) -> bool {
-        let tabs = self.ivars().tabs.borrow();
-        for tab in tabs.iter() {
-            if let Some(pane) = tab.pane(pane_id) {
-                // Same rule as a keystroke: someone answered this pane.
-                pane.clear_awaiting();
-                pane.pty.write(text.as_bytes());
-                return true;
-            }
+        send_keys_in(&self.ivars().tabs.borrow(), pane_id, text)
+    }
+
+    /// IPC: take a new anchor list into this window. The status bars repaint,
+    /// and an open Cmd+P is rebuilt around it: the overlay is a snapshot, so a
+    /// list pushed while it is up would otherwise stay on screen out of date.
+    pub fn ipc_refresh_anchors(&self, anchors: &crate::anchors::Anchors) {
+        self.refresh_anchor_keys(anchors);
+        self.refresh_open_pane_switcher();
+    }
+
+
+    /// IPC: what `pane_id` would be saved as, if this window holds it. Lets
+    /// `set-anchor` name a live pane instead of repeating what Kova knows.
+    pub fn ipc_pane_as_saved(&self, pane_id: PaneId) -> Option<crate::bookmarks::Bookmark> {
+        self.pane_as_saved(pane_id)
+    }
+
+    /// IPC: apply a freshly read config to this window's renderer. Only the
+    /// appearance half travels (see `Renderer::apply_config`); the config this
+    /// window was built with keeps driving font, keys and geometry.
+    pub fn ipc_apply_config(&self, config: &Config) {
+        if let Some(renderer) = self.ivars().renderer.get() {
+            renderer.write().apply_config(config);
         }
-        false
     }
 
     /// IPC: focus a pane by ID (switch tab if needed). Returns true if found.
@@ -466,10 +550,7 @@ impl KovaView {
 
     /// IPC: collect all pane IDs in this window (used to expand `panes: "all"`).
     pub fn ipc_collect_pane_ids(&self, out: &mut Vec<PaneId>) {
-        let tabs = self.ivars().tabs.borrow();
-        for tab in tabs.iter() {
-            tab.for_each_pane(&mut |p| out.push(p.id));
-        }
+        collect_pane_ids_in(&self.ivars().tabs.borrow(), out);
     }
 
     /// IPC: build a JSON entry with the rendered text of a pane.
@@ -480,38 +561,13 @@ impl KovaView {
         mode: crate::terminal::DumpMode,
         trim: bool,
     ) -> Option<serde_json::Value> {
-        let tabs = self.ivars().tabs.borrow();
-        for tab in tabs.iter() {
-            if let Some(pane) = tab.pane(pane_id) {
-                let term = pane.terminal.read();
-                let dump = term.dump_text(mode, trim);
-                return Some(serde_json::json!({
-                    "id": pane_id,
-                    "text": dump.text,
-                    "cols": dump.cols,
-                    "rows": dump.rows,
-                    "cursor": { "row": dump.cursor_row, "col": dump.cursor_col },
-                }));
-            }
-        }
-        None
+        dump_pane_text_in(&self.ivars().tabs.borrow(), pane_id, mode, trim)
     }
 
     /// IPC: report whether the OSC 133;D flag is set for a pane.
     /// `None` means the pane is not in this window; `Some(b)` is the flag's value.
     pub fn ipc_check_completion(&self, pane_id: PaneId) -> Option<bool> {
-        let tabs = self.ivars().tabs.borrow();
-        for tab in tabs.iter() {
-            if let Some(pane) = tab.pane(pane_id) {
-                let flag = pane
-                    .terminal
-                    .read()
-                    .command_completed
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                return Some(flag);
-            }
-        }
-        None
+        check_completion_in(&self.ivars().tabs.borrow(), pane_id)
     }
 
     /// IPC: measure how big the rendered text of a pane would be.
@@ -522,14 +578,7 @@ impl KovaView {
         mode: crate::terminal::DumpMode,
         trim: bool,
     ) -> Option<(usize, usize)> {
-        let tabs = self.ivars().tabs.borrow();
-        for tab in tabs.iter() {
-            if let Some(pane) = tab.pane(pane_id) {
-                let term = pane.terminal.read();
-                return Some(term.measure_text(mode, trim));
-            }
-        }
-        None
+        measure_pane_text_in(&self.ivars().tabs.borrow(), pane_id, mode, trim)
     }
 
     /// IPC: set the custom title of the tab containing `pane_id`.
@@ -600,27 +649,10 @@ impl KovaView {
         Some((tab_id, pane_id))
     }
 
-    /// IPC: collect this window's tabs as JSON entries.
-    pub fn ipc_collect_tabs(&self, win_idx: usize, is_key_window: bool, out: &mut Vec<serde_json::Value>) {
+    /// IPC: collect this window's tabs as `list-tabs` entries.
+    pub fn ipc_collect_tabs(&self, win_idx: usize, is_key_window: bool, out: &mut Vec<TabInfo>) {
         let tabs = self.ivars().tabs.borrow();
-        let active_tab = self.ivars().active_tab.get();
-        for (tab_idx, tab) in tabs.iter().enumerate() {
-            let mut pane_count = 0;
-            tab.for_each_pane(&mut |_| { pane_count += 1; });
-            let is_active = tab_idx == active_tab && is_key_window;
-            out.push(serde_json::json!({
-                "id": tab.id,
-                "window": win_idx,
-                "tab_index": tab_idx,
-                "title": tab.title(),
-                "pane_count": pane_count,
-                "focused_pane_id": tab.focused_pane,
-                "active": is_active,
-                "has_bell": tab.has_bell,
-                "has_completion": tab.has_completion,
-                "has_running": tab.has_running,
-            }));
-        }
+        collect_tabs_in(&tabs, self.ivars().active_tab.get(), win_idx, is_key_window, out);
     }
 
     /// IPC: close a tab by ID. Refuses to close the very last tab — that would
@@ -881,4 +913,364 @@ impl KovaView {
         log::info!("IPC: pane {} unread={}", pane_id, unread);
         true
     }
+    pub fn ipc_pane_signal(&self, pane_id: PaneId, signal: PaneSignal) -> bool {
+        let found = {
+            let tabs = self.ivars().tabs.borrow();
+            let pane = tabs.iter().find_map(|tab| tab.pane(pane_id));
+            if let Some(pane) = pane {
+                signal.apply(pane);
+                log::info!("IPC: pane {} {:?}", pane_id, signal);
+            }
+            pane.is_some()
+        };
+        if found {
+            self.mark_dirty();
+            // An open switcher would otherwise keep this pane's row as it was.
+            self.refresh_open_pane_switcher();
+        }
+        found
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Characterization of the pane-level IPC commands as of 13/10/2026, before the
+    //! embedding refactor (docs/embedding.md), on panes whose PTY input is captured.
+    use super::*;
+    use crate::input::tests::drain;
+    use crate::terminal::DumpMode;
+    use std::os::fd::OwnedFd;
+
+    fn pane(text: &str) -> (Pane, OwnedFd) {
+        let (p, fd) = Pane::capture(20, 4);
+        {
+            let mut t = p.terminal.write();
+            for c in text.chars() {
+                t.put_char(c);
+            }
+        }
+        (p, fd)
+    }
+
+    #[test]
+    fn send_keys_writes_the_text_verbatim_to_the_pane() {
+        let (a, _fa) = pane("");
+        let (b, fb) = pane("");
+        let b_id = b.id;
+        let tabs = vec![Tab::with_columns(vec![vec![a]]), Tab::with_columns(vec![vec![b]])];
+        assert!(send_keys_in(&tabs, b_id, "ls -la\r"));
+        assert_eq!(drain(&fb), b"ls -la\r");
+        assert!(send_keys_in(&tabs, b_id, "\x1b[A\u{e9}"));
+        assert_eq!(drain(&fb), "\x1b[A\u{e9}".as_bytes(), "escapes and UTF-8 untouched");
+    }
+
+    #[test]
+    fn send_keys_to_an_unknown_pane_is_false_and_writes_nothing() {
+        let (a, fa) = pane("");
+        let tabs = vec![Tab::with_columns(vec![vec![a]])];
+        assert!(!send_keys_in(&tabs, 999_999, "x"));
+        assert_eq!(drain(&fa), b"");
+    }
+
+    #[test]
+    fn send_keys_answers_a_waiting_pane() {
+        let (a, _fa) = pane("");
+        let id = a.id;
+        a.set_awaiting();
+        assert!(a.is_awaiting());
+        let tabs = vec![Tab::with_columns(vec![vec![a]])];
+        send_keys_in(&tabs, id, "y");
+        assert!(!tabs[0].pane(id).unwrap().is_awaiting());
+    }
+
+    #[test]
+    fn only_a_submitted_line_resets_the_completion_flag() {
+        let (a, _fa) = pane("");
+        let id = a.id;
+        let tabs = vec![Tab::with_columns(vec![vec![a]])];
+        let term = || tabs[0].pane(id).unwrap().terminal.clone();
+        term().read().mark_command_completed();
+        send_keys_in(&tabs, id, "partial");
+        assert_eq!(check_completion_in(&tabs, id), Some(true), "no newline: still finished");
+        send_keys_in(&tabs, id, "go\n");
+        assert_eq!(check_completion_in(&tabs, id), Some(false));
+        term().read().mark_command_completed();
+        send_keys_in(&tabs, id, "\r");
+        assert_eq!(check_completion_in(&tabs, id), Some(false));
+    }
+
+    #[test]
+    fn check_completion_of_an_unknown_pane_is_none() {
+        let (a, _fa) = pane("");
+        let tabs = vec![Tab::with_columns(vec![vec![a]])];
+        assert_eq!(check_completion_in(&tabs, 999_999), None);
+    }
+
+    #[test]
+    fn pane_ids_come_in_tab_column_row_order() {
+        let (a, _1) = pane("");
+        let (b, _2) = pane("");
+        let (c, _3) = pane("");
+        let (d, _4) = pane("");
+        let ids = [a.id, b.id, c.id, d.id];
+        let tabs = vec![
+            Tab::with_columns(vec![vec![a, b], vec![c]]),
+            Tab::with_columns(vec![vec![d]]),
+        ];
+        let mut out = Vec::new();
+        collect_pane_ids_in(&tabs, &mut out);
+        assert_eq!(out, ids);
+    }
+
+    #[test]
+    fn dump_pane_text_reports_text_size_and_cursor() {
+        let (a, _fa) = pane("hello");
+        let id = a.id;
+        let tabs = vec![Tab::with_columns(vec![vec![a]])];
+        let v = dump_pane_text_in(&tabs, id, DumpMode::Visible, true).unwrap();
+        assert_eq!(v["id"], id);
+        assert_eq!(v["text"], "hello\n", "each line ends with a newline");
+        assert_eq!(v["cols"], 20);
+        assert_eq!(v["rows"], 4);
+        assert_eq!(v["cursor"]["row"], 0);
+        assert_eq!(v["cursor"]["col"], 5);
+        assert!(dump_pane_text_in(&tabs, 999_999, DumpMode::Visible, true).is_none());
+    }
+
+    #[test]
+    fn dump_and_measure_agree_on_every_mode() {
+        let (a, _fa) = Pane::capture(10, 2);
+        let id = a.id;
+        {
+            let mut t = a.terminal.write();
+            for (i, line) in ["one", "two", "thré", "four"].iter().enumerate() {
+                if i > 0 {
+                    t.newline();
+                    t.carriage_return();
+                }
+                for c in line.chars() {
+                    t.put_char(c);
+                }
+            }
+        }
+        let tabs = vec![Tab::with_columns(vec![vec![a]])];
+        for mode in [DumpMode::Visible, DumpMode::Scrollback, DumpMode::All] {
+            for trim in [true, false] {
+                let text = dump_pane_text_in(&tabs, id, mode, trim).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let (chars, bytes) = measure_pane_text_in(&tabs, id, mode, trim).unwrap();
+                assert_eq!((chars, bytes), (text.chars().count(), text.len()), "{mode:?} trim={trim}");
+            }
+        }
+        let all = dump_pane_text_in(&tabs, id, DumpMode::All, true).unwrap();
+        assert_eq!(all["text"], "one\ntwo\nthré\nfour\n");
+        let sb = dump_pane_text_in(&tabs, id, DumpMode::Scrollback, true).unwrap();
+        assert_eq!(sb["text"], "one\ntwo\n");
+        assert!(measure_pane_text_in(&tabs, 999_999, DumpMode::All, true).is_none());
+    }
+
+    #[test]
+    fn list_panes_marks_only_the_focused_pane_of_the_active_tab_of_the_key_window() {
+        let (a, _1) = pane("");
+        let (b, _2) = pane("");
+        let (c, _3) = pane("");
+        let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+        let mut t0 = Tab::with_columns(vec![vec![a, b]]);
+        t0.focused_pane = b_id;
+        let tabs = vec![t0, Tab::with_columns(vec![vec![c]])];
+
+        let mut out = Vec::new();
+        collect_panes_in(&tabs, 0, 3, true, &mut out);
+        let row = |id: u32| out.iter().find(|v| v["id"] == id).unwrap().clone();
+        assert_eq!(out.len(), 3);
+        assert_eq!(row(a_id)["focused"], false);
+        assert_eq!(row(b_id)["focused"], true);
+        assert_eq!(row(c_id)["focused"], false, "focused in its tab, but the tab is not active");
+        assert_eq!(row(c_id)["tab"], 1);
+        assert_eq!(row(a_id)["window"], 3);
+
+        let mut out = Vec::new();
+        collect_panes_in(&tabs, 0, 0, false, &mut out);
+        assert!(out.iter().all(|v| v["focused"] == false), "not the key window");
+    }
+
+    #[test]
+    fn pane_json_shape() {
+        let (a, _fa) = pane("");
+        a.set_awaiting();
+        let v = pane_json(&a, 1, 2, true);
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut keys = keys;
+        keys.sort();
+        // The four last ones are Kova.app's own, added on top of the library's
+        // `surface_json`: what the sidebar reads off the pane, and the line its
+        // `Resume` button would run.
+        assert_eq!(keys, [
+            "agent", "agent_session_id", "agent_session_name", "awaiting", "awaiting_seen",
+            "awaiting_since", "child_processes", "claude_session_id", "claude_session_name",
+            "cwd", "focused", "id", "is_idle", "minimized", "peer_name", "pid",
+            "resume_agent", "resume_command", "resume_session_id", "tab", "title", "unread",
+            "window", "working",
+        ]);
+        assert_eq!(v["id"], a.id);
+        assert_eq!(v["window"], 1);
+        assert_eq!(v["tab"], 2);
+        assert_eq!(v["focused"], true);
+        assert_eq!(v["awaiting"], true);
+        assert_eq!(v["awaiting_seen"], false);
+        assert!(v["awaiting_since"].is_u64());
+        assert_eq!(v["working"], false);
+        assert_eq!(v["minimized"], false);
+        assert!(v["agent"].is_null(), "a bare shell has no agent");
+        assert!(v["claude_session_id"].is_null());
+        a.mark_awaiting_seen();
+        assert_eq!(pane_json(&a, 1, 2, true)["awaiting_seen"], true);
+    }
+
+    // --- The same per-window functions behind `crate::ipc::host::dispatch` ---
+
+    /// One key window of real panes, answering the host interface with the very
+    /// functions `KovaView`'s `ipc_*` methods call, as `KovaAppHost` does per window.
+    struct TabsHost {
+        tabs: Vec<Tab>,
+    }
+
+    impl crate::ipc::host::IpcHost for TabsHost {
+        fn collect_panes(&self, out: &mut Vec<serde_json::Value>) {
+            collect_panes_in(&self.tabs, 0, 0, true, out);
+        }
+        fn collect_pane_ids(&self, out: &mut Vec<PaneId>) {
+            collect_pane_ids_in(&self.tabs, out);
+        }
+        fn send_keys(&self, pane_id: PaneId, text: &str) -> bool {
+            send_keys_in(&self.tabs, pane_id, text)
+        }
+        fn dump_pane_text(&self, pane_id: PaneId, mode: DumpMode, trim: bool) -> Option<serde_json::Value> {
+            dump_pane_text_in(&self.tabs, pane_id, mode, trim)
+        }
+        fn measure_pane_text(&self, pane_id: PaneId, mode: DumpMode, trim: bool) -> Option<(usize, usize)> {
+            measure_pane_text_in(&self.tabs, pane_id, mode, trim)
+        }
+        fn check_completion(&self, pane_id: PaneId) -> Option<bool> {
+            check_completion_in(&self.tabs, pane_id)
+        }
+        fn focus_pane(&self, _: PaneId) -> bool {
+            unimplemented!("needs a KovaView")
+        }
+        fn close_pane(&self, _: PaneId) -> Option<bool> {
+            unimplemented!("needs a KovaView")
+        }
+        fn set_pane_status(&self, _: PaneId, _: bool) -> bool {
+            unimplemented!("needs a KovaView")
+        }
+        fn pane_signal(&self, _: PaneId, _: PaneSignal) -> bool {
+            unimplemented!("needs a KovaView")
+        }
+        fn notify(&self, _: Option<PaneId>, _: &str, _: &str, _: bool) -> Result<(), String> {
+            unimplemented!("posts a real notification")
+        }
+        fn collect_tabs(&self, out: &mut Vec<TabInfo>) {
+            collect_tabs_in(&self.tabs, 0, 0, true, out);
+        }
+        fn close_tab(&self, _: u32) -> IpcCloseTabResult {
+            unimplemented!("needs a KovaView")
+        }
+    }
+
+    fn reply(host: &TabsHost, request: &str) -> serde_json::Value {
+        use crate::ipc::host::{dispatch, Disposition};
+        let cmd = crate::ipc::parse_command(request).unwrap();
+        match dispatch(host, cmd) {
+            Ok(Disposition::Reply(r)) => r.to_json(),
+            _ => panic!("{request}: expected an immediate reply"),
+        }
+    }
+
+    #[test]
+    fn list_panes_through_the_host_is_the_window_listing() {
+        let (a, _1) = pane("");
+        let (b, _2) = pane("");
+        let (c, _3) = pane("");
+        let mut t0 = Tab::with_columns(vec![vec![a, b]]);
+        t0.focused_pane = t0.first_pane().id;
+        let host = TabsHost { tabs: vec![t0, Tab::with_columns(vec![vec![c]])] };
+        let mut direct = Vec::new();
+        collect_panes_in(&host.tabs, 0, 0, true, &mut direct);
+        let r = reply(&host, r#"{"cmd":"list-panes"}"#);
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["data"], serde_json::Value::Array(direct));
+        assert_eq!(r["data"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn send_keys_and_content_through_the_host() {
+        let (a, fa) = pane("hello");
+        let (b, _fb) = pane("bye");
+        let (a_id, b_id) = (a.id, b.id);
+        let host = TabsHost { tabs: vec![Tab::with_columns(vec![vec![a], vec![b]])] };
+
+        let r = reply(&host, &format!(r#"{{"cmd":"send-keys","pane_id":{a_id},"text":"ls\r"}}"#));
+        assert_eq!(r.to_string(), r#"{"ok":true}"#);
+        assert_eq!(drain(&fa), b"ls\r");
+
+        let r = reply(&host, r#"{"cmd":"get-pane-content"}"#);
+        let entry = |id: PaneId| dump_pane_text_in(&host.tabs, id, DumpMode::Visible, true).unwrap();
+        assert_eq!(r["data"], serde_json::json!({"panes": [entry(a_id), entry(b_id)]}));
+        assert_eq!(r["data"]["panes"][0]["text"], "hello\n");
+
+        let r = reply(&host, &format!(r#"{{"cmd":"count-pane-content","panes":[{b_id},999999]}}"#));
+        assert_eq!(
+            r.to_string(),
+            format!(r#"{{"data":{{"panes":[{{"bytes":4,"chars":4,"id":{b_id}}},{{"error":"not found","id":999999}}],"total_bytes":4,"total_chars":4}},"ok":true}}"#)
+        );
+    }
+
+    #[test]
+    fn wait_for_completion_through_the_host_reads_the_pane_flag() {
+        use crate::ipc::host::{dispatch, Disposition};
+        let (a, _fa) = pane("");
+        let id = a.id;
+        let host = TabsHost { tabs: vec![Tab::with_columns(vec![vec![a]])] };
+        let wait = |host: &TabsHost| {
+            dispatch(host, crate::ipc::parse_command(&format!(r#"{{"cmd":"wait-for-completion","pane_id":{id}}}"#)).unwrap())
+        };
+        assert!(matches!(wait(&host), Ok(Disposition::Pending(_))));
+        host.tabs[0].pane(id).unwrap().terminal.read().mark_command_completed();
+        match wait(&host) {
+            Ok(Disposition::Reply(r)) => assert_eq!(
+                r.to_json().to_string(),
+                format!(r#"{{"data":{{"completed":true,"pane_id":{id},"timed_out":false}},"ok":true}}"#)
+            ),
+            _ => panic!("a finished pane answers at once"),
+        }
+    }
+
+    #[test]
+    fn list_tabs_through_the_host() {
+        let (a, _1) = pane("");
+        let (b, _2) = pane("");
+        let (c, _3) = pane("");
+        let c_id = c.id;
+        let mut t1 = Tab::with_columns(vec![vec![c]]);
+        t1.has_bell = true;
+        let t0 = Tab::with_columns(vec![vec![a], vec![b]]);
+        let (t0_id, t1_id, t0_focus) = (t0.id, t1.id, t0.focused_pane);
+        let (t0_title, t1_title) = (t0.title(), t1.title());
+        let host = TabsHost { tabs: vec![t0, t1] };
+        let r = reply(&host, r#"{"cmd":"list-tabs"}"#);
+        assert_eq!(
+            r,
+            serde_json::json!({"ok": true, "data": [
+                {"id": t0_id, "window": 0, "tab_index": 0, "title": t0_title, "pane_count": 2,
+                 "focused_pane_id": t0_focus, "active": true, "has_bell": false,
+                 "has_completion": false, "has_running": false},
+                {"id": t1_id, "window": 0, "tab_index": 1, "title": t1_title, "pane_count": 1,
+                 "focused_pane_id": c_id, "active": false, "has_bell": true,
+                 "has_completion": false, "has_running": false},
+            ]})
+        );
+    }
+
 }

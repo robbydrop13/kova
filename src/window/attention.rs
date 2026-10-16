@@ -1,10 +1,160 @@
-//! Where `Cmd+J` sends the eye next: the unread panes, walked in the
-//! sidebar's order after the focused pane (`sidebar::next_unread`). The
-//! visit history walked by `Cmd+Shift+Option+arrows` shares the same jump.
+//! Where `Cmd+J` sends the eye next: unread panes first, then idle agent
+//! sessions, then a loop over every open session. The visit history walked by
+//! `Cmd+Shift+Option+arrows` shares the same jump.
 
-use super::sidebar::{next_unread, SidebarSort};
+use super::sidebar::SidebarSort;
 use super::sidebar_model::pane_order;
 use super::*;
+
+/// Show the tier banner in whichever window owns `pane_id` — the jump may have
+/// crossed windows, and the banner belongs on the pane it landed on.
+fn show_attention_banner(pane_id: PaneId, tier: AttentionTier) {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    for i in 0..ns_windows.count() {
+        let win = ns_windows.objectAtIndex(i);
+        let Some(view) = crate::app::kova_view(&win) else { continue };
+        let owns = view.ivars().tabs.borrow().iter().any(|t| t.contains(pane_id));
+        if owns {
+            view.set_attention_banner(tier);
+            return;
+        }
+    }
+}
+
+
+/// How far a candidate pane sits from the pane in focus. Ordering matters:
+/// the variants are ranked nearest-first, and `Ord` is what sorts them.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum PaneLocality {
+    /// Same tab as the focused pane — already on screen, no jump at all.
+    CurrentTab,
+    /// Another tab of the same window.
+    CurrentWindow,
+    /// Another window entirely.
+    OtherWindow,
+}
+
+/// A pane Cmd+J could land on: how far it sits from the eye, when the eye last
+/// landed on it (0 = never), and which pane it is. Tuple order *is* the walk
+/// order — nearest locality first, then least recently seen, then lowest id.
+pub(super) type Candidate = (PaneLocality, u64, PaneId);
+
+/// Next pane to land on among `candidates`, all of the same attention tier.
+///
+/// The nearest locality present wins outright: the tab under the eye is walked
+/// dry before the key crosses a tab boundary, and that window before it hops to
+/// another one. Nothing is stranded by this — a pane leaves the candidate set
+/// the moment it has been read, so the near group drains and the far ones come
+/// up next.
+///
+/// Within the chosen locality the walk goes to the pane the eye has been away
+/// from the longest, never-visited panes first. Ordering by pane id instead is
+/// what used to strand 40 panes: the walk restarted from the id of whatever
+/// pane pulled the eye back, so a single noisy pane made the key hand back its
+/// id-neighbour over and over while the rest of the panes never came up.
+///
+/// `candidates` arrives in any order and is sorted, deduped and stripped of
+/// `current` in place first, so the pane being looked at is never the answer.
+fn next_pane_in_cycle(candidates: &mut Vec<Candidate>, current: Option<PaneId>) -> Option<PaneId> {
+    candidates.sort_unstable();
+    candidates.dedup_by_key(|&mut (_, _, id)| id);
+    if let Some(c) = current {
+        candidates.retain(|&(_, _, id)| id != c);
+    }
+    candidates.first().map(|&(_, _, id)| id)
+}
+
+/// Next pane in the non-draining loop over every open session.
+///
+/// Locality is deliberately ignored here, unlike in the draining tiers: nothing
+/// leaves this set by being looked at, so favouring the nearest group would pin
+/// the walk to it for good — two sessions in the focused tab would hand each
+/// other back and forth, and the sessions sitting in other tabs or other windows
+/// would never come up at all. One global ring, least recently seen first, which
+/// is what makes it a real tour: every session comes up once before any of them
+/// comes up twice.
+///
+/// `candidates` arrives in any order and is sorted, deduped and stripped of
+/// `current` in place first, so the pane being looked at is never the answer.
+fn next_pane_in_loop(candidates: &mut Vec<(u64, PaneId)>, current: Option<PaneId>) -> Option<PaneId> {
+    candidates.sort_unstable();
+    candidates.dedup_by_key(|&mut (_, id)| id);
+    if let Some(c) = current {
+        candidates.retain(|&(_, id)| id != c);
+    }
+    candidates.first().map(|&(_, id)| id)
+}
+
+/// Which of Cmd+J's tiers a jump landed in — what the banner across the focused
+/// pane's status bar names, and what colours it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum AttentionTier {
+    /// A bell, or a command that finished while the eye was elsewhere.
+    Unread,
+    /// A Claude session sitting open and idle, first time round.
+    IdleAgent,
+    /// Every open session, walked round and round once the draining tiers are
+    /// empty — working ones included, since a session left chewing is an open
+    /// loop too. This tier no longer drains: the key keeps handing them back
+    /// until they are closed or picked up.
+    AgentLoop,
+}
+
+impl AttentionTier {
+    /// Label painted across the focused pane's status bar.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unread => "Tier 1 — unread output",
+            Self::IdleAgent => "Tier 2 — idle agent session",
+            Self::AgentLoop => "Tier 2 — open agent session (loop)",
+        }
+    }
+
+    /// Banner background. Orange is what waits on an answer, green the idle-session
+    /// walk; unread output sits between the two and takes blue so the three never
+    /// read as the same event.
+    fn color(self) -> [f32; 3] {
+        match self {
+            Self::Unread => [0.15, 0.33, 0.68],
+            Self::IdleAgent | Self::AgentLoop => [0.15, 0.50, 0.24],
+        }
+    }
+}
+
+/// Pick the pane to jump to, in two tiers: unread panes first (a bell, or a
+/// command that finished while you were elsewhere), then Claude sessions left
+/// open and idle, which nobody is waiting on but which still have to be closed
+/// or picked back up. Locality never crosses that line — an idle session sitting
+/// right next door still loses to unread output in another window — it only
+/// orders the walk *within* a tier. Returns the tier alongside the pane, since
+/// the banner has to name it.
+fn next_attention_pane(
+    unread: &mut Vec<Candidate>,
+    idle_agent: &mut Vec<Candidate>,
+    current: Option<PaneId>,
+) -> Option<(AttentionTier, PaneId)> {
+    next_pane_in_cycle(unread, current)
+        .map(|id| (AttentionTier::Unread, id))
+        .or_else(|| {
+            next_pane_in_cycle(idle_agent, current).map(|id| (AttentionTier::IdleAgent, id))
+        })
+}
+
+/// Status line for a Cmd+J press that has nowhere to send the eye. Reaching it
+/// means not one open session is left to walk, the pane under the eye aside, so
+/// the count of sessions still working can only come from that pane itself or
+/// from a minimized one — the two places the ring never goes. It says whether
+/// the quiet means "everything is dealt with" or "wait, something is still
+/// chewing behind a collapsed pane".
+fn nothing_to_show_status(thinking: usize) -> String {
+    if thinking == 0 {
+        "Nothing to show, no thinking".to_string()
+    } else {
+        format!("Nothing to show ({thinking} thinking)")
+    }
+}
 
 /// Focus a pane wherever it lives: find the window holding it, bring that
 /// window front and let it switch to the right tab. Also flashes the pane
@@ -27,7 +177,8 @@ fn focus_pane_in_any_window(pane_id: PaneId) {
             let label = view.pane_cwd(pane_id).map(|cwd| {
                 let home = std::env::var("HOME").unwrap_or_default();
                 let (name, parent) = flash_label_parts(&cwd, &home);
-                PaneFlashLabel { name, parent }
+                let session = view.pane_session_name(pane_id).unwrap_or_default();
+                PaneFlashLabel { name, parent, session }
             });
             view.set_pane_flash(pane_id, 54, label);
             return;
@@ -78,6 +229,15 @@ pub(super) fn pane_history_state(pane_id: PaneId) -> crate::pane_history::PaneSt
 }
 
 impl KovaView {
+    /// Paint the attention banner across this window's focused pane status bar
+    /// for ~2 seconds. Same lifetime as `set_transient_status`, different slot:
+    /// this one sits on the pane the jump landed on, not in the global bar.
+    fn set_attention_banner(&self, tier: AttentionTier) {
+        let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
+        *self.ivars().attention_banner.borrow_mut() =
+            Some((tier.label().to_string(), tier.color(), fps * 2));
+        self.mark_dirty();
+    }
     /// Every pane Cmd+J and the pill can land on, with whether it is unread,
     /// across every window: this window's in the sidebar's display order,
     /// then the other windows' in their tab order. Minimized panes never
@@ -109,10 +269,236 @@ impl KovaView {
             let tabs = self.ivars().tabs.borrow();
             tabs.get(active_tab).map(|t| t.focused_pane)
         };
-        let order = self.collect_unread();
-        match next_unread(&order, current) {
-            Some(target) => focus_pane_in_any_window(target),
-            None => self.set_transient_status("Nothing to read"),
+
+        let mut unread: Vec<Candidate> = Vec::new();
+        let mut idle_agent: Vec<Candidate> = Vec::new();
+        // Every open session — idle or working, looked at or not: what the
+        // post-message loop walks once the draining tiers are empty. No locality
+        // here, that ring never drains and a nearest-first rule would trap it in
+        // one tab.
+        let mut session_ring: Vec<(u64, PaneId)> = Vec::new();
+        // Claude sessions actively working: what the dead-end message counts,
+        // for the two spots the ring never reaches (the focused pane and the
+        // minimized ones).
+        let mut thinking = 0usize;
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let app = NSApplication::sharedApplication(mtm);
+        let ns_windows = app.windows();
+        for i in 0..ns_windows.count() {
+            let win = ns_windows.objectAtIndex(i);
+            let view = match crate::app::kova_view(&win) {
+                Some(v) => v,
+                None => continue,
+            };
+            let is_current_window = std::ptr::eq(view as *const KovaView, self as *const KovaView);
+            let tabs = view.ivars().tabs.borrow();
+            for (tab_idx, tab) in tabs.iter().enumerate() {
+                let locality = match (is_current_window, tab_idx == active_tab) {
+                    (true, true) => PaneLocality::CurrentTab,
+                    (true, false) => PaneLocality::CurrentWindow,
+                    (false, _) => PaneLocality::OtherWindow,
+                };
+                tab.for_each_pane(&mut |pane| {
+                    // Counted before every early return, minimized included: a
+                    // session chewing away behind a collapsed pane is exactly
+                    // what the user wants to hear about when nothing else waits.
+                    if pane.is_working_agent() {
+                        thinking += 1;
+                    }
+                    // A minimized pane is never a landing spot: jumping to it
+                    // would have to give it its space back, and the user
+                    // collapsed it on purpose. It keeps running and keeps its
+                    // marker — Cmd+J simply walks past it. Restoring one is
+                    // `restore-minimized`, or the IPC `focus-pane` command.
+                    if pane.minimized {
+                        return;
+                    }
+                    // Scoped: `is_idle_agent_unseen` reads the terminal too,
+                    // and holding two read guards on the same lock deadlocks
+                    // the moment a writer queues between them.
+                    let has_unread = {
+                        let term = pane.terminal.read();
+                        term.bell.load(std::sync::atomic::Ordering::Relaxed)
+                            || term.unread_completion()
+                    };
+                    if has_unread {
+                        unread.push((locality, pane.last_seen(), pane.id));
+                        return;
+                    }
+                    if pane.has_agent_session() {
+                        // Working sessions ride the ring too: one still chewing
+                        // is as much an open loop as an idle one, and landing on
+                        // it is how the eye gets back to the answer it will
+                        // print. Only the draining tier stays idle-only, so a
+                        // working session is never announced as something to
+                        // deal with now.
+                        session_ring.push((pane.last_seen(), pane.id));
+                        if pane.is_idle_agent_unseen() {
+                            idle_agent.push((locality, pane.last_seen(), pane.id));
+                        }
+                    }
+                });
+            }
         }
+
+        // Why the key landed where it landed: the sets are drained in place by
+        // the walk, so they are counted first. Without this, a jump back onto a
+        // pane read seconds ago is indistinguishable from a stale unread flag.
+        let (n_unread, n_idle, n_ring) = (unread.len(), idle_agent.len(), session_ring.len());
+        let hit = next_attention_pane(&mut unread, &mut idle_agent, current);
+        let (tier, target) = match hit {
+            Some(hit) => hit,
+            None => match next_pane_in_loop(&mut session_ring, current) {
+                Some(id) => (AttentionTier::AgentLoop, id),
+                // Not one open session left: nothing to hand over at all.
+                None => {
+                    self.set_transient_status(&nothing_to_show_status(thinking));
+                    return;
+                }
+            },
+        };
+        log::info!(
+            "Cmd+J: {:?} from pane {:?} to pane {} (unread {}, idle {}, ring {}, thinking {})",
+            tier, current, target, n_unread, n_idle, n_ring, thinking
+        );
+        focus_pane_in_any_window(target);
+        show_attention_banner(target, tier);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_to_show_names_the_sessions_still_working() {
+        // Nothing left to jump to and nothing running: say both.
+        assert_eq!(nothing_to_show_status(0), "Nothing to show, no thinking");
+        // Sessions still chewing are the reason the screen looks quiet.
+        assert_eq!(nothing_to_show_status(1), "Nothing to show (1 thinking)");
+        assert_eq!(nothing_to_show_status(4), "Nothing to show (4 thinking)");
+    }
+
+    /// Candidate panes all sitting in the tab under the eye, given as
+    /// `(last_seen, id)` — the shape most of these cases care about, where only
+    /// the visit order is under test. `last_seen` is 0 for a pane never looked
+    /// at, and grows with how recently the eye landed on it.
+    fn here(panes: &[(u64, PaneId)]) -> Vec<Candidate> {
+        panes.iter().map(|&(seen, id)| (PaneLocality::CurrentTab, seen, id)).collect()
+    }
+
+    /// An empty tier. A fresh Vec per call, since each one is borrowed mutably.
+    fn nothing() -> Vec<Candidate> {
+        Vec::new()
+    }
+
+    /// The landing pane alone: the walk-order cases below do not care which
+    /// tier answered, only where the key lands.
+    fn jump_to(
+        unread: &mut Vec<Candidate>,
+        idle_agent: &mut Vec<Candidate>,
+        current: Option<PaneId>,
+    ) -> Option<PaneId> {
+        next_attention_pane(unread, idle_agent, current).map(|(_, id)| id)
+    }
+
+    #[test]
+    fn next_attention_goes_to_the_pane_left_alone_the_longest() {
+        // Pane 5 was read ages ago, 2 a moment ago, 7 never: 7 first, then 5.
+        let unread = || here(&[(90, 2), (10, 5), (0, 7)]);
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(2)), Some(7));
+        // Standing on the never-seen one, the next oldest comes up — not the id
+        // above it, and never the pane just read.
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), Some(7)), Some(5));
+        // Unfocused window: same order, nothing to exclude.
+        assert_eq!(jump_to(&mut unread(), &mut nothing(), None), Some(7));
+    }
+
+    #[test]
+    fn a_noisy_pane_no_longer_pins_the_walk_to_its_id_neighbour() {
+        // The shape that stranded 40 panes: pane 150 keeps pulling the eye back
+        // with fresh output, and every trip out of it used to restart at its id,
+        // so 161 came up again and again. Ordered by visit, the walk moves on.
+        let quiet = || here(&[(0, 3), (0, 23), (99, 161)]);
+        assert_eq!(jump_to(&mut nothing(), &mut quiet(), Some(150)), Some(3));
+        // Once 3 has been seen, the next untouched pane comes up, not 3 again.
+        let after_3 = || here(&[(100, 3), (0, 23), (99, 161)]);
+        assert_eq!(jump_to(&mut nothing(), &mut after_3(), Some(150)), Some(23));
+    }
+
+    #[test]
+    fn next_attention_visits_idle_agent_sessions_last() {
+        // An idle session loses to unread output, however long ago it was read...
+        assert_eq!(jump_to(&mut here(&[(99, 9)]), &mut here(&[(0, 3)]), Some(1)), Some(9));
+        // ...and comes up only once the unread tier is dry, oldest visit first.
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[(5, 3), (0, 8)]), Some(4)), Some(8));
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[(0, 3), (5, 8)]), Some(4)), Some(3));
+        // The focused pane being the only unread one: fall through to the idle
+        // tier rather than re-focusing where the cursor already is.
+        assert_eq!(jump_to(&mut here(&[(9, 4)]), &mut here(&[(9, 6)]), Some(4)), Some(6));
+        // The last idle session being the focused one: the tour is over.
+        assert_eq!(jump_to(&mut nothing(), &mut here(&[(9, 4)]), Some(4)), None);
+    }
+
+    #[test]
+    fn the_session_loop_walks_every_session_before_repeating_one() {
+        // The ring drains nothing, so only the visit order keeps it moving: each
+        // jump takes the session left alone the longest, which is what makes a
+        // full tour of 39 sessions before any of them comes up twice.
+        let ring = || vec![(30u64, 4), (10, 6), (0, 8), (20, 2)];
+        assert_eq!(next_pane_in_loop(&mut ring(), Some(4)), Some(8));
+        assert_eq!(next_pane_in_loop(&mut ring(), Some(8)), Some(6));
+        // Landing back on a noisy pane does not restart the tour where it was:
+        // the sessions already seen stay behind the ones that were not.
+        let seen_8 = || vec![(30u64, 4), (10, 6), (40, 8), (20, 2)];
+        assert_eq!(next_pane_in_loop(&mut seen_8(), Some(8)), Some(6));
+        // Unfocused window: same order, nothing to exclude.
+        assert_eq!(next_pane_in_loop(&mut ring(), None), Some(8));
+        // The only session is the one under the eye: nothing to hand over.
+        assert_eq!(next_pane_in_loop(&mut vec![(0, 4)], Some(4)), None);
+        assert_eq!(next_pane_in_loop(&mut Vec::new(), Some(4)), None);
+    }
+
+    #[test]
+    fn next_attention_names_the_tier_it_answered_from() {
+        use AttentionTier::{IdleAgent, Unread};
+        assert_eq!(
+            next_attention_pane(&mut here(&[(0, 3)]), &mut here(&[(0, 4)]), Some(1)),
+            Some((Unread, 3))
+        );
+        assert_eq!(
+            next_attention_pane(&mut nothing(), &mut here(&[(0, 4)]), Some(1)),
+            Some((IdleAgent, 4))
+        );
+    }
+
+    #[test]
+    fn next_attention_walks_the_current_tab_before_leaving_it() {
+        use PaneLocality::{CurrentTab, CurrentWindow, OtherWindow};
+        // A pane nobody has seen in another window loses to the tab under the
+        // eye, even one read a second ago...
+        let mut spread = vec![(OtherWindow, 0, 2), (CurrentWindow, 0, 3), (CurrentTab, 99, 9)];
+        assert_eq!(jump_to(&mut spread, &mut Vec::new(), Some(1)), Some(9));
+        // ...and the current tab is walked by visit order rather than crossing
+        // over, since a pane leaves the set once read and the group drains.
+        let mut two_here = vec![(CurrentWindow, 0, 8), (CurrentTab, 50, 4), (CurrentTab, 20, 6)];
+        assert_eq!(jump_to(&mut two_here, &mut Vec::new(), Some(4)), Some(6));
+        // Nothing left in the current tab: the rest of the window comes next,
+        // and only then another window.
+        let mut away = vec![(OtherWindow, 0, 2), (CurrentWindow, 80, 8)];
+        assert_eq!(jump_to(&mut away, &mut Vec::new(), Some(6)), Some(8));
+        // Locality never outranks the tier: an idle session in the current tab
+        // still waits behind unread output in another window.
+        let mut far_unread = vec![(OtherWindow, 90, 2)];
+        assert_eq!(jump_to(&mut far_unread, &mut here(&[(0, 7)]), Some(1)), Some(2));
+    }
+
+    #[test]
+    fn next_attention_handles_empty_and_lone_candidates() {
+        assert_eq!(jump_to(&mut vec![], &mut nothing(), Some(4)), None);
+        // Nothing else unread or idle: no jump at all.
+        assert_eq!(jump_to(&mut here(&[(0, 4)]), &mut nothing(), Some(4)), None);
+        // Duplicates (same pane seen twice) collapse instead of stalling.
+        assert_eq!(jump_to(&mut here(&[(0, 4), (0, 4), (0, 9)]), &mut nothing(), Some(4)), Some(9));
     }
 }

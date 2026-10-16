@@ -68,6 +68,10 @@ pub enum Action {
     /// Save the focused pane's conversation to the bookmark list, or drop it if
     /// it is already there.
     ToggleBookmark,
+    /// Anchor or un-anchor the focused pane's conversation.
+    ToggleAnchor,
+    /// Jump to the first anchor, reopening it when no pane holds it.
+    FocusAnchor,
     Equalize,
     RepaintPane,
     NextAttention,
@@ -102,19 +106,32 @@ impl KeyCombo {
         let ctrl = modifiers.contains(NSEventModifierFlags::Control);
         let option = modifiers.contains(NSEventModifierFlags::Option);
         let shift = modifiers.contains(NSEventModifierFlags::Shift);
+        Self::from_parts(cmd, ctrl, option, shift, event.keyCode(), || {
+            event.charactersIgnoringModifiers().map(|s| s.to_string())
+        })
+    }
 
-        // Use keycodes for special keys (arrows, enter, backspace) where
-        // charactersIgnoringModifiers returns private-use Unicode characters,
-        // and for the number row so cmd+1..9 works on layouts where the digits
-        // require Shift (AZERTY: the "1" key types "&", "2" types "é", etc.).
+    /// The combo of a key event given as its parts: the modifiers, the macOS
+    /// virtual keycode, and `charactersIgnoringModifiers` (asked for only
+    /// when the keycode does not decide). What `from_event` reads off an
+    /// `NSEvent`, and what a host that hands over plain values (the C API)
+    /// provides itself.
+    pub fn from_parts(
+        cmd: bool,
+        ctrl: bool,
+        option: bool,
+        shift: bool,
+        keycode: u16,
+        chars_ignoring_modifiers: impl FnOnce() -> Option<String>,
+    ) -> Self {
+        // Use keycodes only for special keys (arrows, enter, backspace) where
+        // charactersIgnoringModifiers returns private-use Unicode characters.
         // For all other keys, use charactersIgnoringModifiers which respects the
         // active keyboard layout (AZERTY, QWERTZ, etc.).
-        let code = event.keyCode();
-        let key = keycode_to_special(code)
-            .or_else(|| keycode_to_digit(code).map(Key::Char))
+        let key = keycode_to_special(keycode)
+            .or_else(|| keycode_to_digit(keycode))
             .unwrap_or_else(|| {
-                let chars = event.charactersIgnoringModifiers();
-                let ch_str = chars.map(|s| s.to_string()).unwrap_or_default();
+                let ch_str = chars_ignoring_modifiers().unwrap_or_default();
                 let c = ch_str.chars().next().unwrap_or('\0');
                 Key::Char(c.to_ascii_lowercase())
             });
@@ -138,23 +155,25 @@ fn keycode_to_special(code: u16) -> Option<Key> {
     }
 }
 
-/// Map number-row physical keycodes to their digit characters, so bindings like
-/// `cmd+1` match by physical key position regardless of keyboard layout. On
-/// AZERTY the top-row keys type symbols (`&`, `é`, `"`, …) without Shift, so
-/// resolving via characters would never match the digit bindings.
-fn keycode_to_digit(code: u16) -> Option<char> {
-    match code {
-        0x12 => Some('1'),
-        0x13 => Some('2'),
-        0x14 => Some('3'),
-        0x15 => Some('4'),
-        0x17 => Some('5'),
-        0x16 => Some('6'),
-        0x1A => Some('7'),
-        0x1C => Some('8'),
-        0x19 => Some('9'),
-        _ => None,
-    }
+/// Map the number-row keycodes to their digit. On AZERTY the unshifted
+/// characters of that row are `&é"'(§è!çà`, so charactersIgnoringModifiers
+/// would turn Cmd+1 into Cmd+& and the `cmd+1` binding would never match.
+/// Keycodes are physical positions, identical on every layout.
+fn keycode_to_digit(code: u16) -> Option<Key> {
+    let digit = match code {
+        0x12 => '1',
+        0x13 => '2',
+        0x14 => '3',
+        0x15 => '4',
+        0x17 => '5',
+        0x16 => '6',
+        0x1A => '7',
+        0x1C => '8',
+        0x19 => '9',
+        0x1D => '0',
+        _ => return None,
+    };
+    Some(Key::Char(digit))
 }
 
 /// Parse a string like "cmd+shift+d" into a KeyCombo.
@@ -293,6 +312,8 @@ impl Keybindings {
         bind(&keys.open_pane_switcher, Action::OpenPaneSwitcher);
         bind(&keys.open_unread_switcher, Action::OpenUnreadSwitcher);
         bind(&keys.toggle_bookmark, Action::ToggleBookmark);
+        bind(&keys.toggle_anchor, Action::ToggleAnchor);
+        bind(&keys.focus_anchor, Action::FocusAnchor);
         bind(&keys.equalize, Action::Equalize);
         bind(&keys.repaint_pane, Action::RepaintPane);
         bind(&keys.next_attention, Action::NextAttention);
@@ -395,6 +416,8 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "open-pane-switcher" => Action::OpenPaneSwitcher,
         "open-unread-switcher" => Action::OpenUnreadSwitcher,
         "toggle-bookmark" => Action::ToggleBookmark,
+        "toggle-anchor" => Action::ToggleAnchor,
+        "focus-anchor" => Action::FocusAnchor,
         "equalize" => Action::Equalize,
         "repaint-pane" => Action::RepaintPane,
         "next-attention" => Action::NextAttention,
@@ -411,6 +434,28 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn number_row_keycodes_map_to_digits() {
+        let expected = [
+            (0x12, '1'), (0x13, '2'), (0x14, '3'), (0x15, '4'), (0x17, '5'),
+            (0x16, '6'), (0x1A, '7'), (0x1C, '8'), (0x19, '9'), (0x1D, '0'),
+        ];
+        for (code, digit) in expected {
+            assert_eq!(keycode_to_digit(code), Some(Key::Char(digit)));
+        }
+        // 'A' on QWERTY / 'Q' on AZERTY: not a digit key.
+        assert_eq!(keycode_to_digit(0x00), None);
+    }
+
+    #[test]
+    fn cmd_digit_binding_matches_number_row_combo() {
+        let combo = KeyCombo {
+            cmd: true, ctrl: false, option: false, shift: false,
+            key: keycode_to_digit(0x12).unwrap(),
+        };
+        assert_eq!(parse_key_combo("cmd+1"), combo);
+    }
 
     #[test]
     fn cmd_u_toggles_the_unread_mark_by_default_and_by_name() {

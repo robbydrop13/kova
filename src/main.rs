@@ -1,26 +1,8 @@
-mod app;
-mod agent_session;
-mod bookmarks;
-mod claude_history;
-mod claude_session;
-mod codex_session;
-mod config;
-mod events;
-mod input;
-mod ipc;
-mod keybindings;
-mod notification;
-mod pane;
-mod pane_history;
-mod prompt_preview;
-mod recent_projects;
-mod routines;
-mod renderer;
-mod search_history;
-mod session;
-mod terminal;
-mod update_check;
-mod window;
+//! Kova.app: the macOS app around the terminal library (`kova`, `src/lib.rs`).
+//! Process-wide concerns live here — logging, crash handlers, the fd limit,
+//! command-line flags — and everything else is the library's.
+
+use kova::{app, config, session};
 
 use objc2::{AnyThread, runtime::ProtocolObject};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSImage};
@@ -90,23 +72,6 @@ fn install_crash_signal_handlers() {
 }
 
 static ICON_DATA: &[u8] = include_bytes!("../assets/kova.icns");
-
-/// Process RSS (Resident Set Size) in MB via mach API.
-pub(crate) fn get_rss_mb() -> f64 {
-    unsafe {
-        let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();
-        let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
-            / std::mem::size_of::<libc::natural_t>()) as u32;
-        let kr = libc::task_info(
-            #[allow(deprecated)]
-            libc::mach_task_self_,
-            libc::MACH_TASK_BASIC_INFO,
-            &mut info as *mut _ as *mut i32,
-            &mut count,
-        );
-        if kr == 0 { info.resident_size as f64 / (1024.0 * 1024.0) } else { -1.0 }
-    }
-}
 
 const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
 const LOG_ARCHIVE_COUNT: usize = 3; // keep kova.log.1, .2, .3
@@ -229,8 +194,28 @@ fn raise_fd_limit() {
     }
 }
 
+/// First positional word on the command line (not a flag, not the value of
+/// `--session`). The app takes no subcommand, so any such word is a mistake.
+/// Flags such as macOS's `-psn_…` start with a dash and pass through.
+fn stray_subcommand(args: &[String]) -> Option<&str> {
+    let mut prev: Option<&str> = None;
+    for a in args.iter().skip(1) {
+        if !a.starts_with('-') && prev != Some("--session") {
+            return Some(a.as_str());
+        }
+        prev = Some(a.as_str());
+    }
+    None
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // `kova ask "<question>"`: the one subcommand. A client of a running Kova
+    // (it asks the user something through the question card), never the app.
+    if args.get(1).map(String::as_str) == Some("ask") {
+        std::process::exit(kova::ask_cli(&args[2..]));
+    }
 
     // Informational flags must exit BEFORE any app machinery runs: launching
     // the full app here restores (and deletes) session.json and truncates the
@@ -247,7 +232,19 @@ fn main() {
         println!("  --help, -h         print this help and exit");
         println!("  --list-sessions    list session backups and exit");
         println!("  --session N        restore session.N.json instead of session.json");
+        println!();
+        println!("  kova ask \"<question>\"  ask the user through the running Kova (kova ask --help)");
         return;
+    }
+
+    // `kova list-panes`, `kova rename-pane …`: agents keep mistaking this binary
+    // for an IPC CLI, and each call opened a second Kova window over the user's
+    // work. Refuse any positional word instead of launching the app.
+    if let Some(word) = stray_subcommand(&args) {
+        eprintln!("kova: '{}' is not a command. This binary is the Kova app; its only subcommand is `kova ask`.", word);
+        eprintln!("Talk to a running Kova through its socket:");
+        eprintln!("  printf '%s' '{{\"cmd\":\"list-panes\"}}' | nc -U \"$KOVA_SOCKET\"");
+        std::process::exit(2);
     }
 
     if args.iter().any(|a| a == "--list-sessions") {
@@ -295,7 +292,6 @@ fn main() {
     }));
 
     let config = config::Config::load();
-    claude_session::set_skip_permissions(config.agent.claude_skip_permissions);
 
     let mtm = MainThreadMarker::new().expect("must run on main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -316,7 +312,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_capture_file;
+    use super::{is_capture_file, stray_subcommand};
 
     #[test]
     fn capture_file_matching() {
@@ -327,5 +323,24 @@ mod tests {
         assert!(!is_capture_file("kova.log.1"));
         assert!(!is_capture_file("pty-capture-7.txt"));
         assert!(!is_capture_file("capture-7.raw"));
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        std::iter::once("kova").chain(words.iter().copied()).map(String::from).collect()
+    }
+
+    #[test]
+    fn stray_subcommand_catches_cli_style_calls() {
+        assert_eq!(stray_subcommand(&argv(&["list-panes"])), Some("list-panes"));
+        assert_eq!(stray_subcommand(&argv(&["rename-pane", "Quoi"])), Some("rename-pane"));
+        assert_eq!(stray_subcommand(&argv(&["help"])), Some("help"));
+    }
+
+    #[test]
+    fn stray_subcommand_lets_app_launches_through() {
+        assert_eq!(stray_subcommand(&argv(&[])), None);
+        assert_eq!(stray_subcommand(&argv(&["--session", "2"])), None);
+        assert_eq!(stray_subcommand(&argv(&["-psn_0_12345"])), None);
+        assert_eq!(stray_subcommand(&argv(&["--session", "2", "oops"])), Some("oops"));
     }
 }

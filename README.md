@@ -31,7 +31,7 @@ Cmd+hover highlights URLs with an underline and pointer cursor. Cmd+click opens 
 
 Cmd+F opens an inline search overlay with match highlighting. Click a match to jump to it.
 
-Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code sessions that are no longer open: closed transcripts are indexed by the prompts you typed in them, and picking one reopens it with `claude --resume` in its own project directory. An empty input offers what you searched earlier in the run.
+Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code sessions that are no longer open: closed transcripts are indexed by the prompts you typed in them, and picking one reopens it with `claude --resume` in its own project directory. Bookmarks (Cmd+B) are listed too, matched on their name, directory and prompts. An empty input offers what you searched earlier in the run.
 
 ### Attention routing
 
@@ -39,7 +39,10 @@ Kova tracks which panes have something you have not seen — a bell, or a comman
 
 - Cmd+J jumps to the next unread pane, across tabs and windows: a pane with a prompt, a finished turn, a bell or a manual mark (Cmd+U) nobody has looked at since. The sidebar's Next pill counts them.
 - Cmd+P opens the tab/pane switcher: every tab with its panes, arrows or click to pick, Enter to focus. `u` flips it to the panes asking for something; Cmd+Shift+J opens that filtered list directly.
-- Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order.
+- A pane whose Claude conversation has open items in `~/.claude/raf/<session-id>.json` ends its Cmd+P row with them: `3 todo` in orange, `· 1 idea` dim (ideas alone show dim). Closing such a pane, tab or window (Cmd+W, Cmd+Shift+W, window close) lists up to five of its todos in the close confirmation — even after `claude` has exited in the pane, since Kova remembers the last Claude conversation each pane held. Ideas never warn; a pane with no running process and no open todos still closes without a dialog. Quitting Kova does not list todos (the sessions reopen at relaunch).
+- Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order, and Cmd+Backspace on a bookmark row removes that bookmark after a confirmation.
+- Cmd+B bookmarks the conversation in the focused pane (press again to drop it); bookmarks no pane holds are listed in Cmd+P, and picking one reopens the conversation and runs its resume line.
+- Cmd+Shift+A anchors the focused pane's conversation — the few things today is for. Anchors open Cmd+P in their own section, listed whether or not a pane still holds them, and Cmd+A goes straight to the first one, reopening it when nothing does. A conversation that is both only shows up under the anchors. The list is Kova's own; an outside tool can push into it with the `set-anchor` IPC command.
 - The status bar counts working Claude sessions (`✳N`) and unread panes (`●N`).
 - Cmd+Shift+Option+Left/Right walks the panes you visited, back then forward.
 - Desktop notifications are posted by Kova itself, so clicking one focuses the pane it came from.
@@ -119,6 +122,8 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+Shift+T | Detach tab to new window |
 | Cmd+Ctrl+T | Break pane out to new tab |
 | Cmd+Ctrl+M | Merge tab into another tab (as split) |
+| Cmd+Ctrl+Shift+M | Merge this window into another window |
+| Ctrl+Option+Left/Right | Narrow/widen the tab's virtual width |
 | Cmd+N | New window |
 | Cmd+M | Minimize pane |
 | Cmd+Option+M | Restore last minimized pane |
@@ -126,9 +131,12 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+R | Repaint focused pane (force redraw via SIGWINCH) |
 | Cmd+F | Search scrollback |
 | Ctrl+L | Passed to the app as usual, and clears Kova's scrollback with it (not in alt-screen) |
-| Cmd+Shift+F | Global search (all tabs and panes, plus closed Claude sessions) |
+| Cmd+Shift+F | Global search (all tabs and panes, bookmarks, plus closed Claude sessions) |
 | Cmd+P | Tab/pane switcher |
 | Cmd+Shift+J | Pane switcher, unread panes only |
+| Cmd+B | Bookmark the focused pane's conversation (toggle) |
+| Cmd+Shift+A | Anchor the focused pane's conversation (toggle) |
+| Cmd+A | Go to the first anchor |
 | Cmd+J | Jump to the next unread pane |
 | Cmd+U | Mark the focused pane as unread, or as read when it is unread |
 | Cmd+Shift+Option+Left/Right | Walk the panes you visited, back and forward |

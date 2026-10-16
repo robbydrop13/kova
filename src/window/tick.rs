@@ -12,20 +12,7 @@ fn active_tab_after_removals(active: usize, removed: &[usize], remaining: usize)
     active.saturating_sub(removed_before).min(remaining.saturating_sub(1))
 }
 
-/// Rendering a background window does not mean its selected pane was read.
-/// Keep the completion flag itself sticky for IPC wait-for-completion.
-fn pane_attention(term: &crate::terminal::TerminalState, seen: bool) -> (bool, bool) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if seen {
-        let had_bell = term.bell.swap(false, Relaxed);
-        let had_completion = term.unread_completion();
-        term.ack_completion();
-        if had_bell || had_completion {
-            term.dirty.store(true, Relaxed);
-        }
-    }
-    (term.unread_completion(), term.bell.load(Relaxed))
-}
+use crate::surface::pane_attention;
 
 /// How many panes sit entirely off-screen, left and right of the visible strip.
 ///
@@ -167,6 +154,8 @@ impl KovaView {
             Some(l) => l.clone(),
             None => return true,
         };
+
+        self.ask_about_duplicate_session();
 
         self.inject_pending_commands();
 
@@ -343,7 +332,7 @@ impl KovaView {
                     r.pane_flash_label = flash
                         .label
                         .as_ref()
-                        .map(|l| (l.name.clone(), l.parent.clone()));
+                        .map(|l| (l.name.clone(), l.parent.clone(), l.session.clone()));
                 } else {
                     // Pane disappeared (e.g. closed) — drop the flash.
                     *flash_slot = None;
@@ -386,11 +375,15 @@ impl KovaView {
         let ps_guard = ivars.pane_switcher.borrow();
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None },
+                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored, raf_todo: raf_todo.as_deref(), raf_idea: raf_idea.as_deref() },
                 // A bookmark row borrows the pane row's shape: its title on the
                 // left, the project and agent dim on the right.
-                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false },
+                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false, raf_todo: None, raf_idea: None },
+                // An anchor row is the same shape, painted like a saved
+                // conversation: it is one, and its section header is what says
+                // it is today's.
+                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true, raf_todo: None, raf_idea: None },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -404,6 +397,7 @@ impl KovaView {
             selected_col: state.selected_col,
             selected_row: state.selected_row,
             filtered: state.filtered,
+            show_bookmarks: state.show_bookmarks,
         });
 
         // Update resize feedback (decrement frames, build text)
@@ -598,31 +592,13 @@ impl KovaView {
     fn extend_drag_selection(&self) {
         let ivars = self.ivars();
         {
-            let speed = ivars.auto_scroll_speed.get();
+            let speed = ivars.input.autoscroll_speed();
             if speed != 0 {
                 let tabs = ivars.tabs.borrow();
                 let idx = ivars.active_tab.get();
                 if let Some(tab) = tabs.get(idx) {
                     if let Some(pane) = tab.pane(tab.focused_pane) {
-                        let mut term = pane.terminal.write();
-                        if term.selection.is_some() {
-                            term.scroll(-speed);
-                            let sb_len = term.scrollback_len();
-                            let scroll_off = term.scroll_offset();
-                            if speed < 0 {
-                                let first_visible = (sb_len as i64 - scroll_off as i64) as usize;
-                                if let Some(ref mut sel) = term.selection {
-                                    sel.end = crate::terminal::GridPos { line: first_visible, col: 0 };
-                                }
-                            } else {
-                                let last_visible = (sb_len as i64 - scroll_off as i64 + term.rows as i64 - 1) as usize;
-                                let last_col = term.cols.saturating_sub(1);
-                                if let Some(ref mut sel) = term.selection {
-                                    sel.end = crate::terminal::GridPos { line: last_visible, col: last_col };
-                                }
-                            }
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
+                        pane.autoscroll_selection(speed);
                     }
                 }
             }
@@ -688,18 +664,7 @@ impl KovaView {
             let tabs = ivars.tabs.borrow();
             for tab in tabs.iter() {
                 tab.for_each_pane(&mut |pane| {
-                    let term = pane.terminal.read();
-                    let cwd = term.cwd.clone();
-                    let old_branch = term.git_branch.clone();
-                    drop(term);
-                    if let Some(ref cwd) = cwd {
-                        let new_branch = crate::terminal::parser::resolve_git_branch(cwd);
-                        if new_branch != old_branch {
-                            let mut term = pane.terminal.write();
-                            term.git_branch = new_branch;
-                            term.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                    pane.refresh_git_branch();
                 });
             }
         }
@@ -742,6 +707,11 @@ impl KovaView {
                     if ivars.unread_focus.replace(Some(pane.id)) != Some(pane.id) {
                         pane.set_manual_unread(false);
                     }
+                    pane.mark_idle_agent_seen();
+                    // The visit stamp Cmd+J orders its candidates by: stamped
+                    // every frame the pane is under the eye, so the freshest
+                    // stamp is always the pane being looked at right now.
+                    pane.mark_seen_now();
                 }
             }
         }
@@ -834,6 +804,7 @@ impl KovaView {
                 let mut pane_data: Vec<crate::renderer::PaneRenderData> = Vec::new();
                 // Cached set, not the file: this runs for every pane of every frame.
                 let bookmark_keys = ivars.bookmark_keys.borrow();
+                let anchor_keys = ivars.anchor_keys.borrow();
                 let cell_h = renderer.read().cell_size().1;
                 tab.cell_h.set(cell_h);
                 let content = self.drawable_viewport();
@@ -864,9 +835,16 @@ impl KovaView {
                         fg_process: pane.fg_process().map(|p| p.name),
                         // Same key a bookmark is stored under: the conversation
                         // id when the pane runs an agent, its directory otherwise.
+                        // An anchored pane is painted like a bookmarked one:
+                        // both mean "this conversation is one you asked to keep",
+                        // and the status bar has room for one band, not two.
                         bookmarked: match pane.agent_session.borrow().as_ref() {
-                            Some(session) => bookmark_keys.contains(&session.id),
-                            None => pane.cwd().is_some_and(|cwd| bookmark_keys.contains(&cwd)),
+                            Some(session) => {
+                                bookmark_keys.contains(&session.id) || anchor_keys.contains(&session.id)
+                            }
+                            None => pane.cached_cwd().is_some_and(|cwd| {
+                                bookmark_keys.contains(&cwd) || anchor_keys.contains(&cwd)
+                            }),
                         },
                     });
                 });
@@ -914,6 +892,22 @@ impl KovaView {
                     if i != active_idx {
                         t.check_completion();
                     }
+                }
+                // One conversation in two panes: raised here, where the ids
+                // have just been refreshed, and asked about at the top of the
+                // next tick — an alert cannot run with the tabs borrowed.
+                if refresh_fg && ivars.duplicate_session.get().is_none() {
+                    let mut sessions: Vec<(PaneId, Option<String>)> = Vec::new();
+                    for t in tabs.iter() {
+                        t.for_each_pane(&mut |p| sessions.push((p.id, p.agent_session_id())));
+                    }
+                    let alive: std::collections::HashSet<PaneId> =
+                        sessions.iter().map(|(id, _)| *id).collect();
+                    let mut accepted = ivars.accepted_duplicates.borrow_mut();
+                    accepted.retain(|id| alive.contains(id));
+                    ivars
+                        .duplicate_session
+                        .set(crate::window::duplicates::duplicate_session(&sessions, &accepted));
                 }
                 tabs[active_idx].clear_bell();
                 // Derive active tab's completion from pane_data (avoids double atomic read)

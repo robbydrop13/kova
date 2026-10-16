@@ -43,7 +43,22 @@ fn process_owns_session(proc_start: u64, started_at: u64) -> bool {
 /// of times per save for no reason.
 const CACHE_TTL: Duration = Duration::from_secs(1);
 
-static CACHE: Mutex<Option<(Instant, HashMap<u32, Session>)>> = Mutex::new(None);
+static CACHE: Mutex<Option<(Instant, Scan)>> = Mutex::new(None);
+
+/// One pass over `~/.claude/sessions/`, seen from the two angles that matter.
+#[derive(Default)]
+struct Scan {
+    /// Ancestor PID → the session running under it, for "which conversation
+    /// does this pane hold?".
+    by_ancestor: HashMap<u32, Session>,
+    /// Every conversation alive on this machine, whatever its process tree
+    /// looks like, for "is this conversation already running somewhere?".
+    /// Orphans are not in it.
+    live_ids: Vec<String>,
+    /// Conversation id → PID of the interactive sessions that lost their
+    /// terminal: still running, but nobody can type into them or see them.
+    orphans: HashMap<String, u32>,
+}
 
 /// What a live Claude Code session file tells us about the session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +70,11 @@ pub struct Session {
     /// the file is the only way to show it. A name Claude Code derived on its
     /// own does NOT count — see `parse_session_file`.
     pub name: Option<String>,
+    /// The `name` field as Claude Code wrote it, derived or not: the address
+    /// other Claude sessions give `SendMessage` / `ListAgents` ("lempire-f1").
+    /// Unlike `name`, a derived one is kept, because it is exactly what a peer
+    /// has to type to reach a session nobody renamed.
+    pub peer_name: Option<String>,
 }
 
 fn sessions_dir() -> PathBuf {
@@ -64,6 +84,16 @@ fn sessions_dir() -> PathBuf {
 
 /// Parent PID and start time (epoch seconds) of a live process.
 fn proc_info(pid: u32) -> Option<(u32, u64)> {
+    proc_bsdinfo(pid).map(|info| (info.pbi_ppid, info.pbi_start_tvsec))
+}
+
+/// True if `pid` still has a controlling terminal. `NODEV` (all bits set) is
+/// what the kernel reports once the terminal is gone — `ps` prints it `??`.
+fn has_terminal(pid: u32) -> bool {
+    proc_bsdinfo(pid).is_some_and(|info| info.e_tdev != u32::MAX)
+}
+
+fn proc_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     unsafe {
         let mut info: libc::proc_bsdinfo = std::mem::zeroed();
         let ret = libc::proc_pidinfo(
@@ -76,8 +106,18 @@ fn proc_info(pid: u32) -> Option<(u32, u64)> {
         if ret <= 0 {
             return None;
         }
-        Some((info.pbi_ppid, info.pbi_start_tvsec))
+        Some(info)
     }
+}
+
+/// True if the session file describes an interactive session — one that
+/// needs a terminal to be of any use. Headless runs (`claude -p`, the SDK)
+/// never had one, so a missing terminal says nothing about them.
+fn is_interactive_file(data: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|json| json.get("kind").and_then(|v| v.as_str()).map(|k| k == "interactive"))
+        .unwrap_or(false)
 }
 
 /// Read one `~/.claude/sessions/<pid>.json` body into the PID that owns it, the
@@ -103,22 +143,23 @@ fn parse_session_file(data: &str) -> Option<(u32, u64, Session)> {
     // strictly less than the app's own title, so it must not shadow it: only a
     // name the user chose with /rename gets to name the pane.
     let derived = json.get("nameSource").and_then(|v| v.as_str()) == Some("derived");
-    let name = json
+    let peer_name = json
         .get("name")
-        .filter(|_| !derived)
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .map(str::to_string);
-    Some((pid, started_at, Session { id, name }))
+    let name = peer_name.clone().filter(|_| !derived);
+    Some((pid, started_at, Session { id, name, peer_name }))
 }
 
-/// Build a map of "ancestor PID → Claude session" from `~/.claude/sessions/`.
-/// A pane then finds its session by looking up its own shell PID.
-fn scan_uncached() -> HashMap<u32, Session> {
-    let mut map = HashMap::new();
+/// Read `~/.claude/sessions/` once into a `Scan`: a map of "ancestor PID →
+/// Claude session", so a pane finds its session by looking up its own shell
+/// PID, plus the flat list of every live conversation id.
+fn scan_uncached() -> Scan {
+    let mut scan = Scan::default();
     let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
-        return map;
+        return scan;
     };
     let own_pid = std::process::id();
 
@@ -142,23 +183,34 @@ fn scan_uncached() -> HashMap<u32, Session> {
             continue;
         }
 
+        // An interactive session without a terminal outlived the pane it ran
+        // in: nothing shows it and nothing can reach it any more. It counts as
+        // closed, so the search palette offers it, and reopening it ends the
+        // stranded process first (`end_orphan`).
+        if !has_terminal(pid) && is_interactive_file(&data) {
+            scan.orphans.insert(session.id.clone(), pid);
+            continue;
+        }
+
+        // The id goes in before the ancestry walk: a conversation is alive
+        // whether or not any pane turns out to own it.
+        scan.live_ids.push(session.id.clone());
+
         let mut current = pid;
         for _ in 0..MAX_ANCESTRY_DEPTH {
             let Some((parent, _)) = proc_info(current) else { break };
             if parent <= 1 || parent == own_pid {
                 break;
             }
-            map.insert(parent, session.clone());
+            scan.by_ancestor.insert(parent, session.clone());
             current = parent;
         }
     }
-    map
+    scan
 }
 
-/// The Claude Code session running under `shell_pid`, if any. Shared by the
-/// session snapshot (which wants the id) and the pane title (which wants the
-/// name), so both ride the same cached scan.
-pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
+/// Run the scan if the cached one has aged out, then hand `f` the current one.
+fn with_scan<T>(f: impl FnOnce(&Scan) -> T) -> T {
     let mut cache = CACHE.lock();
     let fresh = match cache.as_ref() {
         Some((at, _)) => at.elapsed() < CACHE_TTL,
@@ -167,7 +219,61 @@ pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
     if !fresh {
         *cache = Some((Instant::now(), scan_uncached()));
     }
-    cache.as_ref().and_then(|(_, map)| map.get(&shell_pid).cloned())
+    // Just refreshed above, so the entry is there.
+    f(cache.as_ref().map(|(_, scan)| scan).expect("a scan was just stored"))
+}
+
+/// Ids of every Claude Code conversation running on this machine right now.
+///
+/// Read straight from the session files rather than from what the panes report:
+/// a pane only knows its conversation once the ancestry walk has linked the two
+/// (`MAX_ANCESTRY_DEPTH` deep at most, and not at all during the first moments
+/// of a session), and a conversation Kova failed to link is exactly the one it
+/// must not offer to resume a second time. Two `claude --resume` on the same id
+/// are not refused by Claude Code: both processes adopt the id and append to
+/// the same transcript.
+pub fn live_session_ids() -> Vec<String> {
+    with_scan(|scan| scan.live_ids.clone())
+}
+
+/// Ids of the interactive conversations still running without a terminal.
+pub fn orphan_session_ids() -> Vec<String> {
+    with_scan(|scan| scan.orphans.keys().cloned().collect())
+}
+
+/// How long a stranded session gets to exit on SIGHUP before it is killed.
+const ORPHAN_GRACE: Duration = Duration::from_millis(500);
+
+/// End the process still holding `session_id` without a terminal, so that
+/// reopening the conversation does not put two writers on its transcript.
+/// Blocks for at most `ORPHAN_GRACE`. No-op when the session is not an orphan.
+///
+/// The scan is redone rather than read from the cache: the PID must be the one
+/// that holds the conversation right now, not one recycled since.
+pub fn end_orphan(session_id: &str) {
+    let scan = scan_uncached();
+    let Some(&pid) = scan.orphans.get(session_id) else { return };
+    *CACHE.lock() = Some((Instant::now(), scan));
+    let pid = pid as i32;
+    let alive = || unsafe { libc::kill(pid, 0) } == 0;
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    let deadline = Instant::now() + ORPHAN_GRACE;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+        if !alive() {
+            log::info!("Stranded Claude session (pid {}) exited on SIGHUP", pid);
+            return;
+        }
+    }
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    log::info!("Stranded Claude session (pid {}) killed before being reopened", pid);
+}
+
+/// The Claude Code session running under `shell_pid`, if any. Shared by the
+/// session snapshot (which wants the id) and the pane title (which wants the
+/// name), so both ride the same cached scan.
+pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
+    with_scan(|scan| scan.by_ancestor.get(&shell_pid).cloned())
 }
 
 /// True if `id` is safe to splice into a command line.
@@ -177,7 +283,7 @@ pub fn session_for_shell(shell_pid: u32) -> Option<Session> {
 /// goes straight to the PTY, so a newline inside it would end the `claude` line and
 /// run the rest on its own, no Enter needed. Claude Code writes a UUID here, so
 /// anything outside `[A-Za-z0-9_-]` is refused rather than escaped.
-fn is_safe_session_id(id: &str) -> bool {
+pub(crate) fn is_safe_session_id(id: &str) -> bool {
     !id.is_empty()
         && id
             .bytes()
@@ -314,17 +420,38 @@ mod tests {
     #[test]
     #[ignore]
     fn claude_sessions_are_detected_on_this_machine() {
-        let map = scan_uncached();
-        for (pid, session) in &map {
+        let scan = scan_uncached();
+        for (pid, session) in &scan.by_ancestor {
             println!("  pid {} → {} ({:?})", pid, session.id, session.name);
         }
-        assert!(!map.is_empty(), "no live Claude Code session found");
+        println!("  live ids: {:?}", scan.live_ids);
+        assert!(!scan.by_ancestor.is_empty(), "no live Claude Code session found");
+        assert!(
+            scan.live_ids.len() >= scan.by_ancestor.values().count().min(1),
+            "a scan with panes attached must list live ids too"
+        );
     }
 
     /// Shape of a real file, taken from a live session on 2026-08-09.
     const LIVE_FILE: &str = r#"{"pid":10487,"sessionId":"430e0c8f","cwd":"/Users/x/vigie",
         "startedAt":1786280230040,"version":"2.1.226","kind":"interactive",
         "entrypoint":"cli","name":"images","nameSource":"user","status":"busy"}"#;
+
+    #[test]
+    fn only_an_interactive_session_can_be_stranded() {
+        assert!(is_interactive_file(LIVE_FILE));
+        assert!(!is_interactive_file(r#"{"pid":1,"kind":"print"}"#));
+        assert!(!is_interactive_file(r#"{"pid":1}"#));
+        assert!(!is_interactive_file("not json"));
+    }
+
+    #[test]
+    fn this_test_process_is_seen_with_or_without_a_terminal() {
+        // Whatever runs the tests, the answer must come from the kernel, and
+        // a PID that does not exist has no terminal.
+        let _ = has_terminal(std::process::id());
+        assert!(!has_terminal(u32::MAX / 2));
+    }
 
     #[test]
     fn session_file_yields_pid_start_and_name() {
@@ -348,6 +475,31 @@ mod tests {
         let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,
             "cwd":"/Users/x/eko","name":"eko-e3","nameSource":"derived"}"#;
         assert_eq!(parse_session_file(data).unwrap().2.name, None);
+    }
+
+    #[test]
+    fn derived_name_is_still_the_peer_address() {
+        // The pane title ignores a derived name, but it is the name another
+        // session passes to SendMessage, so `peer_name` keeps it.
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,
+            "cwd":"/Users/x/lempire","name":"lempire-f1","nameSource":"derived"}"#;
+        let session = parse_session_file(data).unwrap().2;
+        assert_eq!(session.name, None);
+        assert_eq!(session.peer_name.as_deref(), Some("lempire-f1"));
+    }
+
+    #[test]
+    fn renamed_session_has_the_same_name_and_peer_name() {
+        let session = parse_session_file(LIVE_FILE).unwrap().2;
+        assert_eq!(session.peer_name, session.name);
+    }
+
+    #[test]
+    fn no_or_blank_name_means_no_peer_name() {
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.peer_name, None);
+        let data = r#"{"pid":1,"sessionId":"abc","startedAt":1000,"name":" ","nameSource":"derived"}"#;
+        assert_eq!(parse_session_file(data).unwrap().2.peer_name, None);
     }
 
     #[test]
