@@ -296,6 +296,12 @@ impl Pty {
         // pre_exec runs in the child after fork, before exec — the correct
         // place for setsid + TIOCSCTTY to establish the controlling terminal.
         let mut command = std::process::Command::new(&shell);
+        // A pane is a fresh terminal, not a child of whoever started Kova.
+        // Dropped before the host's own variables, so a host that passes one
+        // deliberately still gets it.
+        for key in inherited_agent_vars(std::env::vars_os().map(|(k, _)| k)) {
+            command.env_remove(key);
+        }
         // The host's variables first, so the ones Kova sets below win: a host
         // cannot point KOVA_SOCKET / KOVA_PANE_ID somewhere else by accident.
         for (key, value) in &env.vars {
@@ -855,6 +861,28 @@ impl Drop for Pty {
     }
 }
 
+/// The variables a pane must not inherit: everything a coding agent uses to
+/// name the conversation it belongs to.
+///
+/// Kova started from a shell where Claude Code was running inherits its whole
+/// `CLAUDE_CODE_*` set, and hands it to every pane. The Claude in a pane then
+/// reads `CLAUDE_CODE_CHILD_SESSION` and takes itself for a sub-session of a
+/// conversation it has nothing to do with: it saves no transcript, registers
+/// nowhere, and says so in one line above the prompt that is easy to miss.
+/// Seen on 16/10/2026, with hours of conversation saved nowhere.
+///
+/// The whole family goes, rather than a list of the harmful ones: a fresh
+/// shell has no business knowing any of them, and the family grows.
+fn inherited_agent_vars<I>(keys: I) -> Vec<std::ffi::OsString>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    keys.filter(|k| {
+        k.to_str().is_some_and(|k| k.starts_with("CLAUDE_CODE_") || k.starts_with("CLAUDECODE"))
+    })
+    .collect()
+}
+
 /// The `LANG` every shell gets, unless the user set a locale themselves.
 ///
 /// A GUI app inherits no locale from launchd, so without this every shell runs
@@ -891,6 +919,34 @@ fn lang_for(system_locale: &str, shipped: impl Fn(&str) -> bool) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    use std::ffi::OsString;
+
+    fn keys(names: &[&str]) -> Vec<OsString> {
+        names.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_pane_drops_every_agent_marker_it_was_started_with() {
+        let got = inherited_agent_vars(
+            keys(&[
+                "PATH",
+                "CLAUDE_CODE_CHILD_SESSION",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDECODE",
+                "HOME",
+                "CLAUDE_CONFIG_DIR",
+            ])
+            .into_iter(),
+        );
+        // The whole CLAUDE_CODE_* family and the bare CLAUDECODE flag, nothing else.
+        assert_eq!(got, keys(&["CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDECODE"]));
+    }
+
+    #[test]
+    fn a_clean_environment_loses_nothing() {
+        assert!(inherited_agent_vars(keys(&["PATH", "HOME", "KOVA_PANE_ID"]).into_iter()).is_empty());
+    }
     use super::*;
 
     #[test]
