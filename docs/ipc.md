@@ -323,9 +323,11 @@ running at the same time keeps its own questions in memory only, since
 anything it wrote would be shown and delivered a second time by the holder. Kova.app only: a library host answers `command not
 supported by this host`, which sends `kova ask` on to Kova.app.
 
-The card also carries two controls that do not answer the agent: **Copy**, which
-puts the message (or the selection) on the pasteboard, and **Later**, which puts
-the question off for a chosen delay (`ask::SNOOZE_CHOICES`, 5 min to 8 h). A
+Two things on the card do not answer the agent. **Cmd+C** copies what the mouse
+selected in the message, or the whole message when nothing is selected (the body
+has always been selectable; Kova has no Edit menu, so the panel handles the key
+itself). And **Later** puts the question off for a chosen delay
+(`ask::SNOOZE_CHOICES`, 5 min to 8 h). A
 snoozed question leaves the card and its queue count, comes back when the delay
 is over as if it were new (sound, Dock badge), and keeps its snooze across a
 restart. The asker is never told: it keeps waiting and times out as it would

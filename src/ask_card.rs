@@ -7,11 +7,13 @@
 //! keyboard until the user clicks into it. One question at a time; the others
 //! wait behind it ("N more").
 //!
-//! Three things were added here afterwards, for this fork only: a copy control
-//! (the card shows paths and commands worth keeping, and the panel is not the
-//! key window of the active app, so Cmd+C alone cannot be the answer), Cmd+C
-//! when Kova *is* active, and a "Later" control that puts the question off for
-//! a chosen delay. The rest of the look is Kova Float's and stays as it is.
+//! Two things were added here afterwards, for this fork only: Cmd+C, which
+//! copies what the mouse selected in the message (the card often shows a path
+//! or a command worth keeping, the body has always been selectable, and
+//! nothing in Kova turned that key into a copy), and a "Later" control that
+//! puts the question off for a chosen delay. No copy button: the gesture is
+//! select and Cmd+C, as anywhere else. The rest of the look is Kova Float's
+//! and stays as it is.
 //!
 //! Layout: a borderless rounded panel on a translucent HUD background, the
 //! asker's colour washing down from the top edge and rimming the card. Header
@@ -86,8 +88,6 @@ const INSET: CGFloat = 20.0;
 const MAX_LINES: CGFloat = 8.0;
 const FIELD_FONT_SIZE: CGFloat = 14.0;
 const PLACEHOLDER: &str = "Type an answer, or just click a button";
-const COPY_TITLE: &str = "Copy";
-const COPIED_TITLE: &str = "Copied";
 
 /// Answers given since the last [`take_answers`]. A `Mutex` although only the
 /// main thread touches it: `take_answers` takes no `MainThreadMarker`, so a
@@ -121,11 +121,11 @@ define_class!(
             true
         }
 
-        /// Cmd+C copies what is selected (in the message or in the answer being
-        /// typed), and the whole message when nothing is selected. Kova has no
-        /// Edit menu, so nothing else in the app turns Cmd+C into a copy: the
-        /// panel has to do it. It only ever fires while Kova is the active app,
-        /// which is why the card also carries a copy button.
+        /// Cmd+C copies what the mouse selected (in the message or in the answer
+        /// being typed), and the whole message when nothing is selected. Kova
+        /// has no Edit menu, so nothing else in the app turns Cmd+C into a copy:
+        /// the panel has to do it. The body has always been selectable, so this
+        /// is the whole of the gesture, and there is no copy button.
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> Bool {
             if is_copy_key(event) {
@@ -173,13 +173,6 @@ define_class!(
     unsafe impl NSTextFieldDelegate for CardTarget {}
 
     impl CardTarget {
-        #[unsafe(method(copyMessage:))]
-        fn copy_message(&self, _sender: &NSButton) {
-            if let Some(card) = card() {
-                card.copy();
-            }
-        }
-
         /// The "Later" button: the delays, as a menu under it.
         #[unsafe(method(showSnoozeMenu:))]
         fn show_snooze_menu(&self, sender: &NSButton) {
@@ -281,9 +274,6 @@ struct Card {
     body: Retained<NSTextField>,
     field: Retained<NSTextField>,
     field_box: Retained<NSView>,
-    copy_button: Retained<NSButton>,
-    /// Set from the copy button's title: "Copied" is wider than "Copy".
-    copy_width: Retained<NSLayoutConstraint>,
     /// The field's height, set from its text: it grows a line at a time as the
     /// answer gets longer.
     field_height: Retained<NSLayoutConstraint>,
@@ -345,16 +335,15 @@ fn small_title(text: &str) -> Retained<NSAttributedString> {
     )
 }
 
-/// A small secondary pill (copy, Later), drawn by hand for the same reason as
-/// the answer buttons: the card is never the key window, so a system button
-/// would come out grey. Returns the button and its width constraint, which the
-/// caller keeps when the title can change.
+/// A small secondary pill ("Later"), drawn by hand for the same reason as the
+/// answer buttons: the card is never the key window of an app that is active,
+/// so a system button would come out grey.
 fn small_button(
     mtm: MainThreadMarker,
     target: &CardTarget,
     title: &str,
     action: Sel,
-) -> (Retained<NSButton>, Retained<NSLayoutConstraint>) {
+) -> Retained<NSButton> {
     let button = unsafe { NSButton::buttonWithTitle_target_action(&ns(title), Some(target), Some(action), mtm) };
     button.setBordered(false);
     button.setWantsLayer(true);
@@ -364,14 +353,12 @@ fn small_button(
     }
     button.setAttributedTitle(&small_title(title));
     button.setTranslatesAutoresizingMaskIntoConstraints(false);
-    let width = button.widthAnchor().constraintEqualToConstant(small_width(&button));
-    activate(&[width.clone(), button.heightAnchor().constraintEqualToConstant(22.0)]);
-    (button, width)
-}
-
-/// A small button hugs its title with 16 points of padding.
-fn small_width(button: &NSButton) -> CGFloat {
-    button.attributedTitle().size().width + 16.0
+    activate(&[
+        // Hugs its title with 16 points of padding.
+        button.widthAnchor().constraintEqualToConstant(button.attributedTitle().size().width + 16.0),
+        button.heightAnchor().constraintEqualToConstant(22.0),
+    ]);
+    button
 }
 
 /// Whether this key event is a plain Cmd+C (no Control, no Option: those are
@@ -480,11 +467,8 @@ impl Card {
             NSLayoutConstraintOrientation::Horizontal,
         );
         let spacer = NSView::new(mtm);
-        // Copy sits in the header, where it reads as being about the message
-        // rather than as a third way of answering.
-        let (copy_button, copy_width) = small_button(mtm, &target, COPY_TITLE, sel!(copyMessage:));
         let header = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, meta.as_ref(), copy_button.as_ref()]),
+            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, meta.as_ref()]),
             mtm,
         );
         header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -537,7 +521,7 @@ impl Card {
         let footer_spacer = NSView::new(mtm);
         // "Later" on the far left, away from the answers: putting the question
         // off is not one of them, and a mis-click must not answer the agent.
-        let (snooze_button, _) = small_button(mtm, &target, "Later", sel!(showSnoozeMenu:));
+        let snooze_button = small_button(mtm, &target, "Later", sel!(showSnoozeMenu:));
         let footer = NSStackView::stackViewWithViews(
             &NSArray::from_slice(&[snooze_button.as_ref(), &*footer_spacer, buttons.as_ref()]),
             mtm,
@@ -584,8 +568,6 @@ impl Card {
             body,
             field,
             field_box,
-            copy_button,
-            copy_width,
             field_height,
             buttons,
             line_height,
@@ -623,7 +605,6 @@ impl Card {
         }
         crate::appkit_input::copy_to_pasteboard(&text);
         log::info!("Ask card: copied {} characters", text.chars().count());
-        self.set_copy_title(COPIED_TITLE);
     }
 
     /// The text selected in the card, in the message or in the answer field.
@@ -641,14 +622,6 @@ impl Card {
             return String::new();
         }
         string.substringWithRange(range).to_string()
-    }
-
-    fn set_copy_title(&self, title: &str) {
-        if self.copy_button.attributedTitle().string().to_string() == title {
-            return;
-        }
-        self.copy_button.setAttributedTitle(&small_title(title));
-        self.copy_width.setConstant(small_width(&self.copy_button));
     }
 
     /// Queue the snooze and hide the card. The board puts the question back on
@@ -705,7 +678,6 @@ impl Card {
         let meta = if waiting > 0 { format!("{} · {} more", time, waiting) } else { time };
         self.meta.setStringValue(&ns(&meta));
         self.body.setStringValue(&ns(question.message));
-        self.set_copy_title(COPY_TITLE);
         if is_new {
             self.field.setStringValue(&ns(""));
             self.field_height.setConstant(self.line_height);
