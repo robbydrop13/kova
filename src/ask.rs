@@ -84,6 +84,12 @@ pub struct Question {
     /// Epoch seconds, shown on the card.
     #[serde(default)]
     pub asked_at: u64,
+    /// The card holds the question back until this epoch second; 0 when it is
+    /// not snoozed. This one field is Kova's, not the asker's: the user sets it
+    /// from the card or from KovaLink, and it is kept with the question so a
+    /// restart does not bring back what was just put off.
+    #[serde(default)]
+    pub snoozed_until: u64,
 }
 
 fn default_true() -> bool {
@@ -95,6 +101,60 @@ impl Question {
     pub fn buttons(&self) -> Vec<String> {
         if self.actions.is_empty() { vec!["Reply".to_string()] } else { self.actions.clone() }
     }
+
+    /// Whether the card may show it now: never snoozed, or snoozed and the
+    /// delay has run out.
+    pub fn due(&self, now: u64) -> bool {
+        self.snoozed_until == 0 || self.snoozed_until <= now
+    }
+}
+
+/// What the card offers under "Later", in order, and what KovaLink shows on the
+/// phone. Fixed offsets only: no timezone arithmetic to get wrong, and a delay
+/// means the same thing wherever it is chosen.
+pub const SNOOZE_CHOICES: [(&str, u64); 6] = [
+    ("5 min", 5 * 60),
+    ("15 min", 15 * 60),
+    ("30 min", 30 * 60),
+    ("1 hour", 60 * 60),
+    ("3 hours", 3 * 60 * 60),
+    ("8 hours", 8 * 60 * 60),
+];
+
+/// Longest a question can be put off. Past a day the asker's timeout is long
+/// gone and the conversation has moved on; a question that never comes back is
+/// worse than one that comes back too early, so the delay is clamped, never
+/// refused.
+pub const SNOOZE_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// Longest answer text accepted from outside the card (KovaLink). The card's
+/// own field is bounded by what a human types; a socket client is not.
+pub const ANSWER_TEXT_MAX: usize = 8 * 1024;
+
+/// Whether an answer that did not come from the card may be handed to the
+/// agent: the action is one of the buttons the question declared, and the free
+/// text is of human size.
+pub fn accepts_external_answer(question: &Question, action: &str, text: &str) -> Result<(), String> {
+    if !question.buttons().iter().any(|b| b == action) {
+        return Err(format!("{:?} is not one of this question's buttons", action));
+    }
+    if text.len() > ANSWER_TEXT_MAX {
+        return Err(format!("answer text is longer than {} bytes", ANSWER_TEXT_MAX));
+    }
+    Ok(())
+}
+
+/// When a question snoozed for `seconds` from `now` comes back.
+pub fn snooze_until(now: u64, seconds: u64) -> u64 {
+    now + seconds.clamp(1, SNOOZE_MAX_SECS)
+}
+
+/// Now, in epoch seconds.
+pub fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The user's answer.
@@ -761,14 +821,104 @@ impl Board {
         }
     }
 
-    /// Show the oldest question (or hide the card), when something changed.
+    /// An answer given somewhere other than the card: KovaLink, from the phone,
+    /// so a question does not block the user until he is back at the Mac.
+    ///
+    /// `action` must be one of the buttons the question declared. The client
+    /// picks among them and does not get to invent the word the agent reads
+    /// back: that word reaches a command line in `late_answer_message`.
+    pub fn answer_external(&mut self, id: &str, action: &str, text: &str) -> Result<(), String> {
+        let Some((question, _)) = self.pending.iter().find(|(q, _)| q.id == id) else {
+            return Err(format!("no question {}", id));
+        };
+        accepts_external_answer(question, action, text)?;
+        log::info!("ask {}: answered from outside the card", id);
+        self.answer(id, action.to_string(), text.trim().to_string());
+        Ok(())
+    }
+
+    /// The user put `id` off until `until` (epoch seconds), from the card or
+    /// from the phone. The asker is not told: it keeps waiting and times out as
+    /// it would have anyway, and the answer then takes the late path.
+    pub fn snooze(&mut self, id: &str, until: u64) -> Result<(), String> {
+        let Some((question, _)) = self.pending.iter_mut().find(|(q, _)| q.id == id) else {
+            return Err(format!("no question {}", id));
+        };
+        question.snoozed_until = until;
+        let saved = question.clone();
+        log::info!("ask {}: snoozed for {} s", id, until.saturating_sub(now_epoch()));
+        if self.owns_store() {
+            self.store.save_question(&saved);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// The questions waiting, as `list-asks` hands them to KovaLink: the
+    /// snoozed ones too, with the time they come back, since the phone shows
+    /// and cancels them.
+    pub fn list_json(&self) -> serde_json::Value {
+        let now = now_epoch();
+        let asks: Vec<serde_json::Value> = self
+            .pending
+            .iter()
+            .map(|(q, responder)| {
+                serde_json::json!({
+                    "id": q.id,
+                    "from": q.from.name,
+                    "message": q.message,
+                    "buttons": q.buttons(),
+                    "input": q.input,
+                    "asked_at": q.asked_at,
+                    "snoozed_until": q.snoozed_until,
+                    "due": q.due(now),
+                    "waiting": responder.is_some(),
+                    "session_id": q.from.session_id,
+                    "cwd": q.from.cwd,
+                })
+            })
+            .collect();
+        serde_json::json!({"asks": asks, "snooze_choices": SNOOZE_CHOICES.map(|(label, secs)| serde_json::json!({"label": label, "seconds": secs}))})
+    }
+
+    /// A snooze that has run out brings its question back as if it were new:
+    /// same sound, same Dock badge. That is what "notify me later" means.
+    fn wake_snoozed(&mut self) {
+        let now = now_epoch();
+        let woke: Vec<usize> = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, (q, _))| q.snoozed_until != 0 && q.snoozed_until <= now)
+            .map(|(i, _)| i)
+            .collect();
+        if woke.is_empty() {
+            return;
+        }
+        for i in woke {
+            self.pending[i].0.snoozed_until = 0;
+            log::info!("ask {}: snooze is over, back on the card", self.pending[i].0.id);
+            if self.owns_store() {
+                self.store.save_question(&self.pending[i].0);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Show the oldest question that is due (or hide the card), when something
+    /// changed.
     pub fn refresh_card(&mut self, mtm: objc2_foundation::MainThreadMarker) {
         self.retry_owner();
+        self.wake_snoozed();
         if !self.dirty {
             return;
         }
         self.dirty = false;
-        let head = self.pending.first().map(|(q, _)| q);
+        let now = now_epoch();
+        // Snoozed questions leave the card entirely, the queue count included:
+        // "2 more" must not count what the user has put off.
+        let due: Vec<&Question> = self.pending.iter().map(|(q, _)| q).filter(|q| q.due(now)).collect();
+        let head = due.first().copied();
         let buttons = head.map(|q| q.buttons()).unwrap_or_default();
         let card = head.map(|q| crate::ask_card::CardQuestion {
             id: &q.id,
@@ -778,7 +928,7 @@ impl Board {
             input: q.input,
             asked_at: q.asked_at,
         });
-        crate::ask_card::show(mtm, card.as_ref(), self.pending.len().saturating_sub(1));
+        crate::ask_card::show(mtm, card.as_ref(), due.len().saturating_sub(1));
     }
 }
 
@@ -920,7 +1070,8 @@ pub fn run_cli(args: &[String]) -> i32 {
         actions: cli.actions.clone(),
         input: cli.input,
         from: asker,
-        asked_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        asked_at: now_epoch(),
+        snoozed_until: 0,
     };
 
     let body = serde_json::json!({"cmd": "ask", "question": question});
@@ -1046,7 +1197,7 @@ mod tests {
     }
 
     fn question(id: &str) -> Question {
-        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5 }
+        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0 }
     }
 
     #[test]
@@ -1240,6 +1391,47 @@ mod tests {
         assert!(parse_cli(&args(&["a", "--timeout", "0"])).is_err());
         assert!(parse_cli(&args(&["a", "--bogus"])).is_err());
         assert!(parse_cli(&args(&["a", "--from"])).is_err());
+    }
+
+    #[test]
+    fn a_question_is_due_until_it_is_snoozed_and_again_once_the_delay_is_over() {
+        let q = question("1");
+        assert!(q.due(0), "a question nobody put off is always due");
+        let put_off = Question { snoozed_until: 1_000, ..question("1") };
+        assert!(!put_off.due(999));
+        assert!(put_off.due(1_000), "the delay is over on the second it names");
+        assert!(put_off.due(5_000));
+    }
+
+    #[test]
+    fn a_snooze_delay_is_clamped_never_refused() {
+        assert_eq!(snooze_until(100, 60), 160);
+        assert_eq!(snooze_until(100, 0), 101, "a zero delay still puts it off a second");
+        assert_eq!(
+            snooze_until(100, 365 * 24 * 60 * 60),
+            100 + SNOOZE_MAX_SECS,
+            "a delay from the phone cannot hide a question for a year"
+        );
+        // Every choice the card offers must survive the clamp unchanged.
+        for (label, secs) in SNOOZE_CHOICES {
+            assert_eq!(snooze_until(0, secs), secs, "{} was clamped", label);
+        }
+    }
+
+    #[test]
+    fn an_answer_from_outside_the_card_must_name_one_of_the_buttons() {
+        let q = question("1");
+        assert!(accepts_external_answer(&q, "OK", "ship it").is_ok());
+        assert!(accepts_external_answer(&q, "KO", "").is_ok());
+        // The action is retyped into a terminal later: a client picks a button,
+        // it does not get to write the word.
+        assert!(accepts_external_answer(&q, "OK; rm -rf /", "").is_err());
+        assert!(accepts_external_answer(&q, "", "").is_err());
+        assert!(accepts_external_answer(&q, "ok", "").is_err(), "the comparison is exact");
+        assert!(accepts_external_answer(&q, "OK", &"x".repeat(ANSWER_TEXT_MAX + 1)).is_err());
+        // A question with no actions answers with the one default button.
+        let plain = Question { actions: Vec::new(), ..question("2") };
+        assert!(accepts_external_answer(&plain, "Reply", "").is_ok());
     }
 
     #[test]

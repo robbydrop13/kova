@@ -322,6 +322,12 @@ impl AppDelegate {
                         for a in crate::ask_card::take_answers() {
                             asks.answer(&a.id, a.action, a.text);
                         }
+                        for s in crate::ask_card::take_snoozes() {
+                            let until = crate::ask::snooze_until(crate::ask::now_epoch(), s.seconds);
+                            if let Err(e) = asks.snooze(&s.id, until) {
+                                log::warn!("ask: cannot put {} off: {}", s.id, e);
+                            }
+                        }
                         asks.refresh_card(MainThreadMarker::new_unchecked());
                     }
 
@@ -429,6 +435,34 @@ fn drain_ipc(ivars: &AppDelegateIvars, fps: u32) {
         if let crate::ipc::IpcCommand::Ask(question) = cmd {
             ivars.asks.borrow_mut().add(*question, responder);
             continue;
+        }
+        // The three commands KovaLink uses to answer a question from the phone.
+        // Served here for the same reason as `ask`: the board lives on the
+        // delegate, not in a window.
+        match cmd {
+            crate::ipc::IpcCommand::ListAsks => {
+                let data = ivars.asks.borrow().list_json();
+                let _ = responder.send(crate::ipc::IpcResponse::Ok { data: Some(data) });
+                continue;
+            }
+            crate::ipc::IpcCommand::AnswerAsk { ref id, ref action, ref text } => {
+                let result = ivars.asks.borrow_mut().answer_external(id, action, text);
+                let _ = responder.send(match result {
+                    Ok(()) => crate::ipc::IpcResponse::Ok { data: None },
+                    Err(message) => crate::ipc::IpcResponse::Error { message },
+                });
+                continue;
+            }
+            crate::ipc::IpcCommand::SnoozeAsk { ref id, seconds } => {
+                let until = crate::ask::snooze_until(crate::ask::now_epoch(), seconds);
+                let result = ivars.asks.borrow_mut().snooze(id, until);
+                let _ = responder.send(match result {
+                    Ok(()) => crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({"snoozed_until": until})) },
+                    Err(message) => crate::ipc::IpcResponse::Error { message },
+                });
+                continue;
+            }
+            _ => {}
         }
         match handle_ipc_command(cmd, &ivars.windows, &ivars.config) {
             Disposition::Reply(response) => {
@@ -886,10 +920,13 @@ fn handle_ipc_command_sync(
         // Intercepted in the tick, before this dispatcher — it needs the event
         // state, which lives on the delegate. Reaching here means that branch was
         // lost in a refactor.
-        IpcCommand::Ask(_) => {
-            log::error!("IPC: ask reached the generic dispatcher");
+        IpcCommand::Ask(_)
+        | IpcCommand::ListAsks
+        | IpcCommand::AnswerAsk { .. }
+        | IpcCommand::SnoozeAsk { .. } => {
+            log::error!("IPC: an ask command reached the generic dispatcher");
             crate::ipc::IpcResponse::Error {
-                message: "internal: ask was not intercepted".to_string(),
+                message: "internal: an ask command was not intercepted".to_string(),
             }
         }
         IpcCommand::Subscribe { .. } => {

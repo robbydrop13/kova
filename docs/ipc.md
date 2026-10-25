@@ -323,6 +323,64 @@ running at the same time keeps its own questions in memory only, since
 anything it wrote would be shown and delivered a second time by the holder. Kova.app only: a library host answers `command not
 supported by this host`, which sends `kova ask` on to Kova.app.
 
+The card also carries two controls that do not answer the agent: **Copy**, which
+puts the message (or the selection) on the pasteboard, and **Later**, which puts
+the question off for a chosen delay (`ask::SNOOZE_CHOICES`, 5 min to 8 h). A
+snoozed question leaves the card and its queue count, comes back when the delay
+is over as if it were new (sound, Dock badge), and keeps its snooze across a
+restart. The asker is never told: it keeps waiting and times out as it would
+have anyway, so a snooze costs nothing but the late path.
+
+---
+
+### `list-asks`: the questions waiting on the card
+
+```json
+{ "cmd": "list-asks" }
+```
+
+```json
+{ "ok": true, "data": { "asks": [ { "id": "6f1c…", "from": "routine",
+    "message": "Send the reply?", "buttons": ["OK", "KO"], "input": true,
+    "asked_at": 1792000000, "snoozed_until": 0, "due": true, "waiting": true,
+    "session_id": "…", "cwd": "/Users/…/project" } ],
+  "snooze_choices": [ { "label": "5 min", "seconds": 300 }, … ] } }
+```
+
+Read-only, in card order (oldest first). `due` is false while a question is
+snoozed, `snoozed_until` says when it comes back, and `waiting` says whether the
+asker is still on the socket (false once it has timed out: the answer will take
+the late path). Served so KovaLink can show the question on the phone: a
+question that only exists on the Mac's screen blocks the user until he is back
+at the Mac.
+
+---
+
+### `answer-ask`: answer a question from outside the card
+
+```json
+{ "cmd": "answer-ask", "id": "6f1c…", "action": "OK", "text": "coupe le dernier paragraphe" }
+```
+
+Exactly what clicking the button and typing in the field does, delivery
+included. `action` **must** be one of the buttons that question declared
+(`list-asks` lists them): the client picks among them and does not get to write
+the word the agent reads back, which is retyped into a terminal later. `text` is
+optional, 8 KiB at most, and trimmed. Errors: `no question <id>`, `"…" is not
+one of this question's buttons`.
+
+---
+
+### `snooze-ask`: put a question off
+
+```json
+{ "cmd": "snooze-ask", "id": "6f1c…", "seconds": 1800 }
+```
+
+`{"ok":true,"data":{"snoozed_until":1792001800}}`. The delay is clamped to 24 h
+rather than refused, and `seconds` need not be one of `snooze_choices`. Snoozing
+a snoozed question replaces its delay; answering one works as usual.
+
 ---
 
 ### `set-anchor` — put a conversation at the head of the anchors

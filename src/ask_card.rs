@@ -7,6 +7,12 @@
 //! keyboard until the user clicks into it. One question at a time; the others
 //! wait behind it ("N more").
 //!
+//! Three things were added here afterwards, for this fork only: a copy control
+//! (the card shows paths and commands worth keeping, and the panel is not the
+//! key window of the active app, so Cmd+C alone cannot be the answer), Cmd+C
+//! when Kova *is* active, and a "Later" control that puts the question off for
+//! a chosen delay. The rest of the look is Kova Float's and stays as it is.
+//!
 //! Layout: a borderless rounded panel on a translucent HUD background, the
 //! asker's colour washing down from the top edge and rimming the card. Header
 //! (badge, who asks, time, how many wait), the message, the answer field, then
@@ -17,14 +23,15 @@
 //! from inside its event loop, where the window list may be borrowed.
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject, Sel};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSAttributedStringNSExtendedStringDrawing, NSAttributedStringNSStringDrawing,
     NSBackingStoreType, NSButton, NSColor, NSControl, NSControlTextEditingDelegate,
-    NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont,
+    NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont,
     NSFontAttributeName, NSFontWeightRegular, NSFontWeightSemibold,
     NSForegroundColorAttributeName, NSLayoutAttribute, NSLayoutConstraint,
+    NSMenu, NSMenuItem,
     NSLayoutConstraintOrientation, NSLayoutManager, NSLayoutPriorityRequired, NSLineBreakMode,
     NSPanel, NSRequestUserAttentionType, NSResponder, NSScreen, NSSound, NSStackView,
     NSStringDrawingOptions, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTextView,
@@ -65,6 +72,12 @@ pub struct CardAnswer {
     pub text: String,
 }
 
+/// A question the user put off, and for how long.
+pub struct CardSnooze {
+    pub id: String,
+    pub seconds: u64,
+}
+
 /// The card's width, as in Swift.
 const WIDTH: CGFloat = 400.0;
 /// Horizontal inset of every row; the vertical one is 4 points less.
@@ -73,11 +86,15 @@ const INSET: CGFloat = 20.0;
 const MAX_LINES: CGFloat = 8.0;
 const FIELD_FONT_SIZE: CGFloat = 14.0;
 const PLACEHOLDER: &str = "Type an answer, or just click a button";
+const COPY_TITLE: &str = "Copy";
+const COPIED_TITLE: &str = "Copied";
 
 /// Answers given since the last [`take_answers`]. A `Mutex` although only the
 /// main thread touches it: `take_answers` takes no `MainThreadMarker`, so a
 /// thread_local would silently hand another thread an empty queue.
 static ANSWERS: Mutex<Vec<CardAnswer>> = Mutex::new(Vec::new());
+/// Snoozes chosen since the last [`take_snoozes`], same reasoning as `ANSWERS`.
+static SNOOZES: Mutex<Vec<CardSnooze>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// The card, built on the first `show`. Kept for the life of the process:
@@ -102,6 +119,22 @@ define_class!(
         #[unsafe(method(canBecomeKeyWindow))]
         fn can_become_key_window(&self) -> bool {
             true
+        }
+
+        /// Cmd+C copies what is selected (in the message or in the answer being
+        /// typed), and the whole message when nothing is selected. Kova has no
+        /// Edit menu, so nothing else in the app turns Cmd+C into a copy: the
+        /// panel has to do it. It only ever fires while Kova is the active app,
+        /// which is why the card also carries a copy button.
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> Bool {
+            if is_copy_key(event) {
+                if let Some(card) = card() {
+                    card.copy();
+                    return Bool::YES;
+                }
+            }
+            unsafe { msg_send![super(self), performKeyEquivalent: event] }
         }
     }
 );
@@ -140,6 +173,43 @@ define_class!(
     unsafe impl NSTextFieldDelegate for CardTarget {}
 
     impl CardTarget {
+        #[unsafe(method(copyMessage:))]
+        fn copy_message(&self, _sender: &NSButton) {
+            if let Some(card) = card() {
+                card.copy();
+            }
+        }
+
+        /// The "Later" button: the delays, as a menu under it.
+        #[unsafe(method(showSnoozeMenu:))]
+        fn show_snooze_menu(&self, sender: &NSButton) {
+            let mtm = MainThreadMarker::from(self);
+            let menu = NSMenu::new(mtm);
+            for (index, (label, _)) in crate::ask::SNOOZE_CHOICES.iter().enumerate() {
+                let item = NSMenuItem::new(mtm);
+                item.setTitle(&ns(label));
+                item.setTag(index as isize);
+                unsafe {
+                    item.setTarget(Some(self));
+                    item.setAction(Some(sel!(snoozed:)));
+                }
+                menu.addItem(&item);
+            }
+            let view: &NSView = sender.as_ref();
+            // Negative y: just under the button, in an unflipped view.
+            menu.popUpMenuPositioningItem_atLocation_inView(None, CGPoint::new(0.0, -4.0), Some(view));
+        }
+
+        /// A delay was picked: its tag is its index in `ask::SNOOZE_CHOICES`.
+        #[unsafe(method(snoozed:))]
+        fn snoozed(&self, sender: &NSMenuItem) {
+            let Some(card) = card() else { return };
+            let chosen = usize::try_from(sender.tag()).ok().and_then(|i| crate::ask::SNOOZE_CHOICES.get(i));
+            if let Some((_, seconds)) = chosen {
+                card.snooze(*seconds);
+            }
+        }
+
         /// A button: its tag is its index in the question's buttons.
         #[unsafe(method(pressed:))]
         fn pressed(&self, sender: &NSButton) {
@@ -182,6 +252,8 @@ fn enter_in_field(mtm: MainThreadMarker, text_view: &NSTextView, selector: Sel) 
 struct Current {
     id: String,
     buttons: Vec<String>,
+    /// What the copy control puts on the pasteboard.
+    message: String,
 }
 
 /// Everything `show` last drew, to skip a redraw when nothing changed: the tick
@@ -209,6 +281,9 @@ struct Card {
     body: Retained<NSTextField>,
     field: Retained<NSTextField>,
     field_box: Retained<NSView>,
+    copy_button: Retained<NSButton>,
+    /// Set from the copy button's title: "Copied" is wider than "Copy".
+    copy_width: Retained<NSLayoutConstraint>,
     /// The field's height, set from its text: it grows a line at a time as the
     /// answer gets longer.
     field_height: Retained<NSLayoutConstraint>,
@@ -259,6 +334,64 @@ fn cg_colors(colors: &[&NSColor]) -> Retained<NSArray> {
         .map(|c| unsafe { Retained::cast_unchecked::<AnyObject>(c.CGColor()) })
         .collect();
     NSArray::from_retained_slice(&cg)
+}
+
+/// The attributed title of a small control, in the card's secondary style.
+fn small_title(text: &str) -> Retained<NSAttributedString> {
+    attributed(
+        text,
+        &NSFont::systemFontOfSize_weight(11.0, unsafe { NSFontWeightRegular }),
+        &NSColor::whiteColor().colorWithAlphaComponent(0.75),
+    )
+}
+
+/// A small secondary pill (copy, Later), drawn by hand for the same reason as
+/// the answer buttons: the card is never the key window, so a system button
+/// would come out grey. Returns the button and its width constraint, which the
+/// caller keeps when the title can change.
+fn small_button(
+    mtm: MainThreadMarker,
+    target: &CardTarget,
+    title: &str,
+    action: Sel,
+) -> (Retained<NSButton>, Retained<NSLayoutConstraint>) {
+    let button = unsafe { NSButton::buttonWithTitle_target_action(&ns(title), Some(target), Some(action), mtm) };
+    button.setBordered(false);
+    button.setWantsLayer(true);
+    if let Some(layer) = button.layer() {
+        layer.setCornerRadius(6.0);
+        layer.setBackgroundColor(Some(&NSColor::whiteColor().colorWithAlphaComponent(0.10).CGColor()));
+    }
+    button.setAttributedTitle(&small_title(title));
+    button.setTranslatesAutoresizingMaskIntoConstraints(false);
+    let width = button.widthAnchor().constraintEqualToConstant(small_width(&button));
+    activate(&[width.clone(), button.heightAnchor().constraintEqualToConstant(22.0)]);
+    (button, width)
+}
+
+/// A small button hugs its title with 16 points of padding.
+fn small_width(button: &NSButton) -> CGFloat {
+    button.attributedTitle().size().width + 16.0
+}
+
+/// Whether this key event is a plain Cmd+C (no Control, no Option: those are
+/// other bindings, not a copy).
+fn is_copy_key(event: &NSEvent) -> bool {
+    let flags = event.modifierFlags();
+    if !flags.contains(NSEventModifierFlags::Command)
+        || flags.contains(NSEventModifierFlags::Control)
+        || flags.contains(NSEventModifierFlags::Option)
+    {
+        return false;
+    }
+    event.charactersIgnoringModifiers().map(|c| c.to_string()) == Some("c".to_string())
+}
+
+/// What a copy puts on the pasteboard: what the user selected, and the whole
+/// message when the selection is empty or blank. Pulled out of the AppKit code
+/// so the choice itself is covered by a test.
+fn copy_payload(selection: &str, message: &str) -> String {
+    if selection.trim().is_empty() { message.to_string() } else { selection.to_string() }
 }
 
 fn activate(constraints: &[Retained<NSLayoutConstraint>]) {
@@ -347,8 +480,11 @@ impl Card {
             NSLayoutConstraintOrientation::Horizontal,
         );
         let spacer = NSView::new(mtm);
+        // Copy sits in the header, where it reads as being about the message
+        // rather than as a third way of answering.
+        let (copy_button, copy_width) = small_button(mtm, &target, COPY_TITLE, sel!(copyMessage:));
         let header = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, meta.as_ref()]),
+            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, meta.as_ref(), copy_button.as_ref()]),
             mtm,
         );
         header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -399,10 +535,14 @@ impl Card {
         buttons.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         buttons.setSpacing(8.0);
         let footer_spacer = NSView::new(mtm);
+        // "Later" on the far left, away from the answers: putting the question
+        // off is not one of them, and a mis-click must not answer the agent.
+        let (snooze_button, _) = small_button(mtm, &target, "Later", sel!(showSnoozeMenu:));
         let footer = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[&*footer_spacer, buttons.as_ref()]),
+            &NSArray::from_slice(&[snooze_button.as_ref(), &*footer_spacer, buttons.as_ref()]),
             mtm,
         );
+        footer.setAlignment(NSLayoutAttribute::CenterY);
         footer.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
 
         let stack = NSStackView::stackViewWithViews(
@@ -444,6 +584,8 @@ impl Card {
             body,
             field,
             field_box,
+            copy_button,
+            copy_width,
             field_height,
             buttons,
             line_height,
@@ -472,6 +614,57 @@ impl Card {
         self.hide();
     }
 
+    /// Put the message (or the selection) on the pasteboard.
+    fn copy(&self) {
+        let message = self.current.borrow().as_ref().map(|c| c.message.clone()).unwrap_or_default();
+        let text = copy_payload(&self.selected_text(), &message);
+        if text.is_empty() {
+            return;
+        }
+        crate::appkit_input::copy_to_pasteboard(&text);
+        log::info!("Ask card: copied {} characters", text.chars().count());
+        self.set_copy_title(COPIED_TITLE);
+    }
+
+    /// The text selected in the card, in the message or in the answer field.
+    /// Taken from the field editor through `NSString`, never by slicing a Rust
+    /// `String`: an `NSRange` counts UTF-16 units, not bytes.
+    fn selected_text(&self) -> String {
+        let Some(responder) = self.panel.firstResponder() else { return String::new() };
+        let Ok(view) = responder.downcast::<NSTextView>() else { return String::new() };
+        let range = view.selectedRange();
+        if range.length == 0 {
+            return String::new();
+        }
+        let string = view.string();
+        if range.location + range.length > string.length() {
+            return String::new();
+        }
+        string.substringWithRange(range).to_string()
+    }
+
+    fn set_copy_title(&self, title: &str) {
+        if self.copy_button.attributedTitle().string().to_string() == title {
+            return;
+        }
+        self.copy_button.setAttributedTitle(&small_title(title));
+        self.copy_width.setConstant(small_width(&self.copy_button));
+    }
+
+    /// Queue the snooze and hide the card. The board puts the question back on
+    /// it once the delay is over; the agent is not told and keeps waiting, so
+    /// nothing is lost if the user never comes back to it.
+    fn snooze(&self, seconds: u64) {
+        let Some(id) = self.current.borrow().as_ref().map(|c| c.id.clone()) else { return };
+        log::info!("Ask card: {} put off for {} s", id, seconds);
+        if let Ok(mut snoozes) = SNOOZES.lock() {
+            snoozes.push(CardSnooze { id, seconds });
+        }
+        // Deliberately not marked as answered: the question comes back later,
+        // and a card that still thought it was answered would stay blank.
+        self.hide();
+    }
+
     fn show(&self, mtm: MainThreadMarker, question: &CardQuestion, waiting: usize) {
         if self.answered.borrow().as_deref() == Some(question.id) {
             return;
@@ -489,7 +682,11 @@ impl Card {
             return;
         }
         let is_new = self.current.borrow().as_ref().map(|c| c.id.as_str()) != Some(question.id);
-        *self.current.borrow_mut() = Some(Current { id: shown.id.clone(), buttons: shown.buttons.clone() });
+        *self.current.borrow_mut() = Some(Current {
+            id: shown.id.clone(),
+            buttons: shown.buttons.clone(),
+            message: shown.message.clone(),
+        });
         *self.shown.borrow_mut() = Some(shown);
 
         self.who.setStringValue(&ns(question.from));
@@ -508,6 +705,7 @@ impl Card {
         let meta = if waiting > 0 { format!("{} · {} more", time, waiting) } else { time };
         self.meta.setStringValue(&ns(&meta));
         self.body.setStringValue(&ns(question.message));
+        self.set_copy_title(COPY_TITLE);
         if is_new {
             self.field.setStringValue(&ns(""));
             self.field_height.setConstant(self.line_height);
@@ -667,5 +865,29 @@ pub fn take_answers() -> Vec<CardAnswer> {
     match ANSWERS.lock() {
         Ok(mut answers) => std::mem::take(&mut *answers),
         Err(_) => Vec::new(),
+    }
+}
+
+/// Snoozes chosen since the last call.
+pub fn take_snoozes() -> Vec<CardSnooze> {
+    match SNOOZES.lock() {
+        Ok(mut snoozes) => std::mem::take(&mut *snoozes),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_payload;
+
+    #[test]
+    fn copying_takes_the_selection_when_there_is_one() {
+        assert_eq!(copy_payload("/tmp/x", "run /tmp/x then tell me"), "/tmp/x");
+        assert_eq!(copy_payload("", "the whole message"), "the whole message");
+        assert_eq!(
+            copy_payload("  \n ", "the whole message"),
+            "the whole message",
+            "a drag that selected only whitespace is not a selection"
+        );
     }
 }

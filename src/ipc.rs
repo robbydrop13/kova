@@ -228,6 +228,15 @@ pub enum IpcCommand {
     /// that takes; the connection then waits for the client's `ack` before the
     /// answer counts as handed over. Served by `handle_connection` itself.
     Ask(Box<crate::ask::Question>),
+    /// The questions waiting on the card, read-only, with the delays the card
+    /// offers. KovaLink serves them to the phone so a question asked while the
+    /// user is away from the Mac does not block him.
+    ListAsks,
+    /// Answer a question from outside the card (KovaLink). `action` must be one
+    /// of the buttons that question declared.
+    AnswerAsk { id: String, action: String, text: String },
+    /// Put a question off for `seconds`, clamped to `ask::SNOOZE_MAX_SECS`.
+    SnoozeAsk { id: String, seconds: u64 },
 }
 
 /// How long the IPC connection thread should wait for the main thread's response.
@@ -667,6 +676,9 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "reload-config" => &[],
         "subscribe" => &["events"],
         "ask" => &["question"],
+        "list-asks" => &[],
+        "answer-ask" => &["id", "action", "text"],
+        "snooze-ask" => &["id", "seconds"],
         _ => return None,
     })
 }
@@ -1073,8 +1085,49 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             }
             Ok(IpcCommand::Ask(Box::new(question)))
         }
+        "list-asks" => Ok(IpcCommand::ListAsks),
+        "answer-ask" => {
+            let id = ask_id(&v)?;
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .ok_or_else(|| "missing \"action\" field".to_string())?
+                .to_string();
+            // Checked against that question's own buttons by the board: here we
+            // only know the shape.
+            let text = match v.get("text") {
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(serde_json::Value::String(t)) => t.clone(),
+                Some(_) => return Err("\"text\" must be a string".to_string()),
+            };
+            if text.len() > crate::ask::ANSWER_TEXT_MAX {
+                return Err(format!("\"text\" is longer than {} bytes", crate::ask::ANSWER_TEXT_MAX));
+            }
+            Ok(IpcCommand::AnswerAsk { id, action, text })
+        }
+        "snooze-ask" => {
+            let id = ask_id(&v)?;
+            let seconds = v
+                .get("seconds")
+                .and_then(|s| s.as_u64())
+                .ok_or_else(|| "missing \"seconds\" field".to_string())?;
+            Ok(IpcCommand::SnoozeAsk { id, seconds })
+        }
         other => Err(format!("unknown command: {}", other)),
     }
+}
+
+/// The `id` of an `answer-ask` or `snooze-ask`. Refused outside the UUID shape
+/// for the same reason as in `ask`: it names a file in the ask directory.
+fn ask_id(v: &serde_json::Value) -> Result<String, String> {
+    let id = v
+        .get("id")
+        .and_then(|i| i.as_str())
+        .ok_or_else(|| "missing \"id\" field".to_string())?;
+    if !crate::ask::is_safe_question_id(id) {
+        return Err("\"id\" must be a UUID".to_string());
+    }
+    Ok(id.to_string())
 }
 
 /// Shared parser for `get-pane-content` and `count-pane-content` arguments.
