@@ -529,6 +529,11 @@ fn copy_to_clipboard(text: String) {
     std::thread::spawn(move || {
         use std::io::Write;
         let child = std::process::Command::new("/usr/bin/pbcopy")
+            // Kova is a GUI app, so launchd hands it no locale: left alone, pbcopy runs
+            // in the C locale and reads the UTF-8 below as Mac Roman, which is how
+            // "Côté" reached the clipboard as "C√¥t√©". `LC_ALL` rather than
+            // `LANG`, so it also wins over a non UTF-8 locale Kova did inherit.
+            .env("LC_ALL", super::pty::utf8_lang())
             .stdin(std::process::Stdio::piped())
             .spawn();
         match child {

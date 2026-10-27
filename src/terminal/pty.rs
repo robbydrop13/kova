@@ -890,17 +890,26 @@ where
 /// pastes as "‚Ç¨". Terminal.app and iTerm derive `LANG` from the system
 /// locale on startup; so do we, once per process.
 fn shell_lang() -> Option<&'static str> {
-    static LANG: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let user_set = ["LANG", "LC_ALL", "LC_CTYPE"].iter().any(|k| std::env::var_os(k).is_some());
+    if user_set {
+        return None;
+    }
+    Some(utf8_lang())
+}
+
+/// A UTF-8 locale derived from the system one, computed once per process.
+///
+/// Unlike `shell_lang`, this one never gives up: it is for a child Kova pipes its own
+/// UTF-8 bytes into, so a UTF-8 charset is not a preference, it is the contract. The
+/// OSC 52 `pbcopy` reads it (`copy_to_clipboard`, `terminal/parser.rs`).
+pub(crate) fn utf8_lang() -> &'static str {
+    static LANG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LANG.get_or_init(|| {
-        let user_set = ["LANG", "LC_ALL", "LC_CTYPE"].iter().any(|k| std::env::var_os(k).is_some());
-        if user_set {
-            return None;
-        }
         let system = objc2_foundation::NSLocale::currentLocale().localeIdentifier().to_string();
         let shipped = |lang: &str| std::path::Path::new("/usr/share/locale").join(lang).is_dir();
-        Some(lang_for(&system, shipped))
+        lang_for(&system, shipped)
     })
-    .as_deref()
+    .as_str()
 }
 
 /// `<system locale>.UTF-8` when macOS ships that locale, `en_US.UTF-8`
@@ -959,6 +968,17 @@ mod tests {
         // "en_FR" is a common macOS setting with no /usr/share/locale entry.
         assert_eq!(lang_for("en_FR", |l| l == "fr_FR.UTF-8"), "en_US.UTF-8");
         assert_eq!(lang_for("", |_| true), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn the_locale_forced_on_a_child_is_always_utf8() {
+        // `utf8_lang` exists so a child that receives our UTF-8 bytes reads them as
+        // UTF-8. Every branch must therefore name a UTF-8 charset, including the
+        // fallback: a locale without one brings back the Mac Roman mojibake.
+        assert!(lang_for("fr_FR", |l| l == "fr_FR.UTF-8").ends_with(".UTF-8"));
+        assert!(lang_for("ja_JP", |_| false).ends_with(".UTF-8"));
+        assert!(lang_for("", |_| true).ends_with(".UTF-8"));
+        assert!(utf8_lang().ends_with(".UTF-8"));
     }
 
     #[test]
