@@ -14,6 +14,26 @@ fn active_tab_after_removals(active: usize, removed: &[usize], remaining: usize)
 
 use crate::surface::pane_attention;
 
+/// The focus outline only tells which pane has the keyboard when there is
+/// another pane on screen to tell it from; around a lone pane it is noise.
+fn outlines_focused_pane(panes_on_screen: usize) -> bool {
+    panes_on_screen > 1
+}
+
+/// Whether a pane is drawn this frame: not minimized and not scrolled
+/// entirely out of the strip (the test `Renderer::rebuild_pane_draws` skips on).
+fn is_on_screen(minimized: bool, x: f32, width: f32, screen_width: f32) -> bool {
+    !minimized && x + width > 0.0 && x < screen_width
+}
+
+/// The panes of `(id, minimized, x, width)` this frame draws (`is_on_screen`).
+fn shown_pane_ids(panes: impl Iterator<Item = (PaneId, bool, f32, f32)>, screen_width: f32) -> Vec<PaneId> {
+    panes
+        .filter(|&(_, minimized, x, width)| is_on_screen(minimized, x, width, screen_width))
+        .map(|(id, ..)| id)
+        .collect()
+}
+
 /// How many panes sit entirely off-screen, left and right of the visible strip.
 ///
 /// Fed `(x, width, minimized)` per pane, in the tab's own pixel space. Minimized
@@ -81,6 +101,8 @@ struct FramePanes {
     active_tab_name: String,
     working_agents: usize,
     unread_panes: usize,
+    sleeping_panes: usize,
+    subject_strip: crate::renderer::SubjectStrip,
 }
 
 impl KovaView {
@@ -155,6 +177,10 @@ impl KovaView {
             None => return true,
         };
 
+        // Resize asked by a live resize or a separator drag, once per frame.
+        // First, so the commands injected below start at the pane's real size.
+        self.flush_pending_resize();
+
         self.ask_about_duplicate_session();
 
         self.inject_pending_commands();
@@ -163,13 +189,23 @@ impl KovaView {
 
         self.extend_drag_selection();
 
-        self.fire_due_pty_restores();
+        // The band a filter jump left on its line is cleared once it has run
+        // its course. A pane without one pays a read lock and nothing else.
+        {
+            let tabs = ivars.tabs.borrow();
+            for tab in tabs.iter() {
+                tab.for_each_pane(&mut |pane| {
+                    let showing = pane.terminal.read().highlight_line.is_some();
+                    if showing {
+                        pane.terminal.write().tick_highlight_line();
+                    }
+                });
+            }
+        }
 
-        // --- Debounced robust repaint after a resize burst settles ---
-        self.fire_resize_settle_repaints();
-
-        // --- Post-restore hole check: repair clear+partial-repaint frames ---
-        self.fire_post_restore_band_checks();
+        // --- Deferred winsize restores, debounced robust repaint after a
+        // resize burst settles, post-restore hole check ---
+        self.tick_resize_repairs();
 
         self.poll_git_branches();
 
@@ -197,6 +233,8 @@ impl KovaView {
             active_tab_name,
             working_agents,
             unread_panes,
+            sleeping_panes,
+            subject_strip,
         } = match self.collect_frame_panes(&renderer, active_idx, split_min_w) {
             Some(f) => f,
             None => return false,
@@ -205,6 +243,8 @@ impl KovaView {
         self.report_app_focus(focus_reporting, pty_ptr);
 
         self.sync_window_title(&pane_data);
+
+        self.wake_shown_panes(active_idx, &pane_data, screen_width);
 
         // Collect split separators from active tab
         let separators = {
@@ -228,18 +268,13 @@ impl KovaView {
         let show_help = ivars.show_help.get();
         let show_mem_report = ivars.show_mem_report.get();
 
-        // Build filter render data if active
+        // Build filter render data if active. Re-run the search first if the
+        // pane's content changed: the matches hold absolute line indices that
+        // shift as output trims the scrollback or a resize reflows it.
+        self.refresh_filter_matches();
         let filter_data = {
             let filter = ivars.filter.borrow();
-            filter.as_ref().map(|f| FilterRenderData {
-                query: f.query.clone(),
-                matches: f.matches.clone(),
-                // Only while the input is empty: once the user types, the match
-                // count is the useful number.
-                hint: (f.query.is_empty()
-                    && !crate::search_history::is_empty(crate::search_history::Scope::Filter))
-                .then(|| "↑ recent".to_string()),
-            })
+            filter.as_ref().map(|f| f.render_data())
         };
 
         // Compute left_inset from traffic light buttons
@@ -262,6 +297,8 @@ impl KovaView {
         // model before the renderer lock, redraws only on a change.
         self.sync_sidebar();
         let show_tab_bar = !self.sidebar_active();
+        // Output or a scroll may have slid other text under a still pointer.
+        self.refresh_stale_url_hover();
         let (hover_segments, hover_text, hover_pane_id) = {
             let h = ivars.hovered_url.borrow();
             (
@@ -285,11 +322,14 @@ impl KovaView {
         // Build recent projects render data if overlay is active (uses cached data)
         let rp_guard = ivars.recent_projects.borrow();
         let rp_entries: Vec<&crate::renderer::RecentProjectEntry> = rp_guard.as_ref()
-            .map(|state| state.items.iter().map(|item| &item.render).collect())
+            .map(|state| state.visible.iter().map(|&i| &state.items[i].render).collect())
             .unwrap_or_default();
         let rp_data = rp_guard.as_ref().map(|state| {
             crate::renderer::RecentProjectsRenderData {
                 entries: &rp_entries,
+                query: &state.query,
+                cursor: state.cursor,
+                total: state.items.len(),
                 selected: state.selected,
                 scroll: state.scroll,
             }
@@ -373,17 +413,35 @@ impl KovaView {
 
         // Build tab/pane switcher render data (one entry per column)
         let ps_guard = ivars.pane_switcher.borrow();
+        // Each box is drawn in its subject's color: by tab and name for a
+        // header, by pane for a member. Read only while Cmd+P is open.
+        let mut header_colors: std::collections::HashMap<(crate::pane::TabId, String), usize> = std::collections::HashMap::new();
+        let mut member_colors: std::collections::HashMap<PaneId, usize> = std::collections::HashMap::new();
+        if ps_guard.is_some() {
+            for t in ivars.tabs.borrow().iter() {
+                for (name, color) in &t.subject_colors {
+                    header_colors.insert((t.id, name.clone()), *color);
+                }
+                t.for_each_pane(&mut |p| {
+                    if let Some(color) = p.subject.as_deref().and_then(|n| t.subject_color(n)) {
+                        member_colors.insert(p.id, color);
+                    }
+                });
+            }
+        }
         let ps_cols_rows: Vec<Vec<crate::renderer::PaneSwitcherRowRender>> = ps_guard.as_ref()
             .map(|state| state.columns.iter().map(|col| col.iter().map(|r| match r {
-                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None },
-                SwitcherRow::Pane { title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored, raf_todo: raf_todo.as_deref(), raf_idea: raf_idea.as_deref() },
+                SwitcherRow::TabHeader(t) => crate::renderer::PaneSwitcherRowRender { text: t.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false, subject_color: None },
+                // A subject header opens its box; an empty subject's closes it too.
+                SwitcherRow::SubjectHeader { name, empty, tab } => crate::renderer::PaneSwitcherRowRender { text: name.as_str(), is_header: true, has_bell: false, has_completion: false, minimized: false, working: false, process: None, bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: true, in_subject: false, box_top: true, box_bottom: *empty, subject_color: header_colors.get(&(*tab, name.clone())).copied() },
+                SwitcherRow::Pane { pane_id, title, has_bell, has_completion, minimized, working, process, bookmarked, anchored, raf_todo, raf_idea, subject, last_in_subject, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: *has_bell, has_completion: *has_completion, minimized: *minimized, working: *working, process: process.as_deref(), bookmarked: *bookmarked, anchored: *anchored, raf_todo: raf_todo.as_deref(), raf_idea: raf_idea.as_deref(), subject_header: false, in_subject: subject.is_some(), box_top: false, box_bottom: *last_in_subject, subject_color: member_colors.get(pane_id).copied() },
                 // A bookmark row borrows the pane row's shape: its title on the
                 // left, the project and agent dim on the right.
-                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false, raf_todo: None, raf_idea: None },
+                SwitcherRow::Bookmark { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: false, anchored: false, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false, subject_color: None },
                 // An anchor row is the same shape, painted like a saved
                 // conversation: it is one, and its section header is what says
                 // it is today's.
-                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true, raf_todo: None, raf_idea: None },
+                SwitcherRow::Anchor { title, detail, .. } => crate::renderer::PaneSwitcherRowRender { text: title.as_str(), is_header: false, has_bell: false, has_completion: false, minimized: false, working: false, process: detail.as_deref(), bookmarked: true, anchored: true, raf_todo: None, raf_idea: None, subject_header: false, in_subject: false, box_top: false, box_bottom: false, subject_color: None },
             }).collect()).collect())
             .unwrap_or_default();
         let ps_columns: Vec<crate::renderer::PaneSwitcherColumnRender> = ps_guard.as_ref()
@@ -397,7 +455,8 @@ impl KovaView {
             selected_col: state.selected_col,
             selected_row: state.selected_row,
             filtered: state.filtered,
-            show_bookmarks: state.show_bookmarks,
+            show_bookmarks: state.view == super::switcher::SwitcherView::Bookmarks,
+            memory_total: state.memory_total.map(|(bytes, panes)| (super::switcher::format_memory(bytes), panes)),
         });
 
         // Update resize feedback (decrement frames, build text)
@@ -495,7 +554,8 @@ impl KovaView {
         }
         r.window_occluded = occluded;
 
-        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, show_tab_bar, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
+        r.subject_strip = subject_strip;
+        r.render_panes(&layer, &pane_data, &separators, &tab_titles, filter_data.as_ref(), left_inset, show_tab_bar, hidden_left, hidden_right, focused_column, total_columns, active_tab, total_tabs, &active_tab_name, working_agents, unread_panes, sleeping_panes, minimized_counts, show_help, show_mem_report, rp_data.as_ref(), stw_data.as_ref(), sp_data.as_ref(), ps_data.as_ref(), help_hint_remaining, keys_config);
         true
     }
 
@@ -508,6 +568,26 @@ impl KovaView {
                 tab.for_each_pane(&mut |pane| {
                     pane.inject_pending_command();
                 });
+            }
+        }
+    }
+
+    /// Resume the agents a launch restore left asleep (`Surface::wake`) in the
+    /// panes this frame draws. "Shown" is on screen in the window's active tab,
+    /// focused or not: both halves of a split are in view, and a pane left
+    /// asleep there would sit as a bare prompt next to the one being read.
+    /// Click, Cmd+P, Cmd+J, a notification, a tab switch and `focus-pane` all
+    /// end with the pane on screen, so this one place covers them.
+    fn wake_shown_panes(&self, active_idx: usize, pane_data: &[crate::renderer::PaneRenderData], screen_width: f32) {
+        let shown = shown_pane_ids(
+            pane_data.iter().map(|p| (p.pane_id, p.minimized, p.viewport.x, p.viewport.width)),
+            screen_width,
+        );
+        let tabs = self.ivars().tabs.borrow();
+        let Some(tab) = tabs.get(active_idx) else { return };
+        for id in shown {
+            if tab.pane(id).is_some_and(|pane| pane.wake()) {
+                log::info!("Restore: pane {} shown, resuming its agent", id);
             }
         }
     }
@@ -551,7 +631,7 @@ impl KovaView {
                     let config = ivars.config.get().unwrap();
                     let cols = config.terminal.columns;
                     let rows = config.terminal.rows;
-                    match crate::session::restore_saved_tab(&saved_tab, cols, rows, config) {
+                    match crate::session::restore_saved_tab(&saved_tab, cols, rows, config, true) {
                         Some(mut tab) => {
                             tab.adopt_geometry_scale(self.backing_scale());
                             loading += pane_count as u32;
@@ -600,53 +680,6 @@ impl KovaView {
                     if let Some(pane) = tab.pane(tab.focused_pane) {
                         pane.autoscroll_selection(speed);
                     }
-                }
-            }
-        }
-    }
-
-    /// Re-send the winsize to the panes whose `Cmd+R` nudge has come due.
-    fn fire_due_pty_restores(&self) {
-        let ivars = self.ivars();
-        {
-            let mut due: Vec<PaneId> = Vec::new();
-            {
-                let mut restores = ivars.pty_restore.borrow_mut();
-                for r in restores.iter_mut() {
-                    r.remaining_frames = r.remaining_frames.saturating_sub(1);
-                    if r.remaining_frames == 0 {
-                        due.push(r.pane_id);
-                    }
-                }
-                restores.retain(|r| r.remaining_frames > 0);
-            }
-            if !due.is_empty() {
-                // Dims are re-read at fire time: a window resize in between
-                // already set the PTY to the new size, and the terminal grid
-                // is the source of truth for what the winsize should be.
-                let tabs = ivars.tabs.borrow();
-                for tab in tabs.iter() {
-                    tab.for_each_pane(&mut |pane| {
-                        if due.contains(&pane.id) {
-                            let (cols, rows) = {
-                                let t = pane.terminal.read();
-                                (t.cols, t.rows)
-                            };
-                            pane.pty.resize(cols, rows);
-                            // Measure the app's response to this restore
-                            // SIGWINCH from a clean slate.
-                            pane.terminal.write().reset_rows_touched();
-                        }
-                    });
-                }
-                drop(tabs);
-                // The app's answer to a winsize restore is the frame that can
-                // carry the hole (clear + partial repaint). Schedule a grid
-                // scan once that frame has certainly landed.
-                let mut checks = ivars.post_restore_checks.borrow_mut();
-                for &pane_id in &due {
-                    checks.retain(|c| c.pane_id != pane_id);
-                    checks.push(PtyRestore { pane_id, remaining_frames: POST_RESTORE_CHECK_FRAMES });
                 }
             }
         }
@@ -810,7 +843,26 @@ impl KovaView {
                 let content = self.drawable_viewport();
                 let screen_width = content.width;
                 let virtual_width = tab.virtual_width(screen_width, split_min_w);
-                let panes_vp = self.panes_viewport_inner(tab.scroll_offset_x, virtual_width);
+                // Same rule as `subject_strip_height`, which the input and resize
+                // paths read: a row only where a pane is filed.
+                let strip_h = self.subject_strip_height(tab);
+                let panes_vp = self.panes_viewport_inner(tab.scroll_offset_x, virtual_width, strip_h);
+                let subject_strip = if strip_h > 0.0 {
+                    let columns = tab.subject_strip_columns(panes_vp, focused_id);
+                    crate::renderer::SubjectStrip {
+                        // The strip sits in the row the panes gave up for it.
+                        y: panes_vp.y - strip_h,
+                        height: strip_h,
+                        segments: crate::renderer::subject_strip_segments(&columns),
+                    }
+                } else {
+                    crate::renderer::SubjectStrip::default()
+                };
+                if ivars.subject_strip_shown.replace(strip_h > 0.0) != (strip_h > 0.0) {
+                    // The panes gain or lose the strip's row: their terminals
+                    // follow at the start of the next frame.
+                    self.request_resize_all_panes();
+                }
                 tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
                     // First frame this pane is submitted to the renderer = it becomes
                     // visible (loading overlay or content). "time to rectangle".
@@ -824,6 +876,8 @@ impl KovaView {
                         viewport: vp,
                         shell_ready: pane.is_ready(),
                         is_focused,
+                        // Set below, once every pane's viewport is known.
+                        outlined: false,
                         pane_id: pane.id,
                         custom_title: pane.custom_title.clone(),
                         has_completion: completed,
@@ -848,6 +902,16 @@ impl KovaView {
                         },
                     });
                 });
+
+                let on_screen = pane_data
+                    .iter()
+                    .filter(|p| is_on_screen(p.minimized, p.viewport.x, p.viewport.width, screen_width))
+                    .count();
+                if outlines_focused_pane(on_screen) {
+                    for entry in pane_data.iter_mut().filter(|p| p.is_focused) {
+                        entry.outlined = true;
+                    }
+                }
 
                 // Propagate OSC 1 sticky titles to pane custom_title
                 for entry in &mut pane_data {
@@ -936,16 +1000,20 @@ impl KovaView {
                 let active_tab_1based = active_idx + 1;
                 let total_tabs = tabs.len();
                 let active_tab_name = tabs[active_idx].title();
-                // Count panes across every tab of this window whose app is signalling
-                // activity via the OSC-title marker (Claude Code busy).
+                // Count panes across every tab of this window whose app is busy —
+                // Claude Code's OSC-title spinner, or a `working` record from the
+                // Program Status Protocol (OSC 7501, what Pi sends).
                 let mut working_agents = 0usize;
                 // Panes carrying output nobody has looked at: a bell, or a command
                 // that finished while the eye was elsewhere — the same signal as the
                 // per-pane dot and as Cmd+J's first tier.
                 let mut unread_panes = 0usize;
+                // Agent panes a launch restore left asleep (`Surface::wake`).
+                let mut sleeping_panes = 0usize;
                 for t in tabs.iter() {
                     t.for_each_pane(&mut |p| {
                         if p.is_working() { working_agents += 1; }
+                        if p.dormant_session_id().is_some() { sleeping_panes += 1; }
                         let term = p.terminal.read();
                         if term.bell.load(std::sync::atomic::Ordering::Relaxed) || term.unread_completion() {
                             unread_panes += 1;
@@ -966,6 +1034,8 @@ impl KovaView {
             active_tab_name,
             working_agents,
             unread_panes,
+            sleeping_panes,
+            subject_strip,
         })
     }
 
@@ -977,14 +1047,10 @@ impl KovaView {
             let mtm = MainThreadMarker::new_unchecked();
             let app = NSApplication::sharedApplication(mtm);
             let focused = app.isActive();
-            let prev = ivars.last_focused.get();
-            if focused != prev {
-                ivars.last_focused.set(focused);
-                if focus_reporting {
-                    if let Some(pty_ptr) = pty_ptr {
-                        let seq = if focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
-                        (*pty_ptr).write(seq);
-                    }
+            let prev = ivars.last_focused.replace(focused);
+            if let Some(seq) = crate::input::focus_report(prev, focused, focus_reporting) {
+                if let Some(pty_ptr) = pty_ptr {
+                    (*pty_ptr).write(seq);
                 }
             }
         }
@@ -1100,6 +1166,23 @@ mod tests {
     }
 
     #[test]
+    fn the_focus_outline_needs_a_second_visible_pane() {
+        assert!(!outlines_focused_pane(0));
+        assert!(!outlines_focused_pane(1));
+        assert!(outlines_focused_pane(2));
+        assert!(outlines_focused_pane(5));
+    }
+
+    #[test]
+    fn a_pane_scrolled_out_or_minimized_is_not_on_screen() {
+        assert!(is_on_screen(false, 0.0, 500.0, 1000.0));
+        assert!(is_on_screen(false, -300.0, 500.0, 1000.0), "partly visible counts");
+        assert!(!is_on_screen(false, -500.0, 500.0, 1000.0), "touching the left edge is out");
+        assert!(!is_on_screen(false, 1000.0, 500.0, 1000.0), "touching the right edge is out");
+        assert!(!is_on_screen(true, 0.0, 500.0, 1000.0));
+    }
+
+    #[test]
     fn hidden_pane_counts_splits_the_panes_that_scrolled_out_of_sight() {
         // A 1000pt screen: one pane wholly left of it, one wholly right, two
         // visible (one of them straddling the right edge, so still visible).
@@ -1110,6 +1193,18 @@ mod tests {
             (1000.0, 300.0, false),
         ];
         assert_eq!(hidden_pane_counts(panes.into_iter(), 1000.0), (1, 1));
+    }
+
+    #[test]
+    fn every_pane_on_screen_is_shown_focused_or_not() {
+        // Two splits in view, one scrolled out to the right, one minimized.
+        let panes = [
+            (1, false, 0.0, 500.0),
+            (2, false, 500.0, 500.0),
+            (3, false, 1000.0, 500.0),
+            (4, true, 0.0, 0.0),
+        ];
+        assert_eq!(shown_pane_ids(panes.into_iter(), 1000.0), vec![1, 2]);
     }
 
     #[test]

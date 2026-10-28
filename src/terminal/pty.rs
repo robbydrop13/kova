@@ -90,6 +90,63 @@ impl ProcessInfo {
     }
 }
 
+/// The direct children of `pid`, via `proc_listchildpids`.
+fn child_pids(pid: i32) -> Vec<i32> {
+    // First call to get count
+    let count = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0i32; count as usize];
+    let actual = unsafe {
+        libc::proc_listchildpids(
+            pid,
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (pids.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    if actual <= 0 {
+        return Vec::new();
+    }
+    // proc_listchildpids returns a *count* of PIDs written, not a byte
+    // length — dividing by size_of::<i32>() truncated every shell with
+    // fewer than four children down to zero.
+    pids.truncate(actual as usize);
+    pids.retain(|&p| p > 0);
+    pids
+}
+
+/// Resident size of one process in bytes, 0 when it cannot be read (gone, or
+/// not ours).
+fn resident_bytes(pid: i32) -> u64 {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+    let ret = unsafe {
+        libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut info as *mut _ as *mut libc::c_void, size)
+    };
+    if ret == size { info.pti_resident_size } else { 0 }
+}
+
+/// Resident memory of `root` and all its descendants, in bytes. A pid seen
+/// twice is counted once, so a process that moves while the tree is walked
+/// cannot double the total.
+pub fn tree_resident_bytes(root: i32) -> u64 {
+    if root <= 0 {
+        return 0;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    let mut total = 0u64;
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        total += resident_bytes(pid);
+        stack.extend(child_pids(pid));
+    }
+    total
+}
+
 /// The name and version of the program running as `pid`.
 ///
 /// The obvious source, `proc_name`, returns the kernel's `p_comm`: the basename
@@ -112,6 +169,16 @@ pub fn process_info(pid: u32) -> ProcessInfo {
         .unwrap_or_else(|| proc_comm(pid));
     let version = args.as_ref().and_then(|(exe_path, _)| version_from_exe_path(exe_path));
     ProcessInfo { name, version }
+}
+
+/// Which process names the foreground group: the agent when it belongs to
+/// that group (`agent` = its pid and pgid), else the group leader. An agent
+/// suspended or sent to the background has another pgid and is not described.
+fn described_pid(fg_pgid: i32, agent: Option<(u32, i32)>) -> u32 {
+    match agent {
+        Some((pid, pgid)) if pgid == fg_pgid => pid,
+        _ => fg_pgid as u32,
+    }
 }
 
 /// The executable path and argv[0] of `pid`, via `KERN_PROCARGS2`.
@@ -314,6 +381,11 @@ impl Pty {
                 .stdout(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
                 .stderr(std::process::Stdio::from(std::fs::File::from_raw_fd(libc::dup(slave_raw))))
                 .env("TERM", "xterm-256color")
+                // Kova renders 24-bit SGR (38;2;r;g;b), but every program that
+                // sniffs its colours from the environment — Pi, chalk, most
+                // TUIs — only believes COLORTERM. Without this line they all
+                // quantize their theme to the 256-colour palette.
+                .env("COLORTERM", "truecolor")
                 .env("TERM_PROGRAM", "Kova")
                 .envs(shell_lang().map(|lang| ("LANG", lang)))
                 .env("KOVA_SHELL_INTEGRATION", "1")
@@ -639,11 +711,20 @@ impl Pty {
     /// process does; `info.name` is empty when the name could not be resolved,
     /// so an empty name must never be read as "no foreground process".
     pub fn foreground_process(&self) -> Option<ProcessInfo> {
+        self.foreground_process_preferring(None)
+    }
+
+    /// `foreground_process`, but describing `agent_pid` instead of the group
+    /// leader when the agent runs in the foreground group. A launcher script
+    /// (`#!/usr/bin/env bash` that sets up a proxy, then runs `claude`) leads
+    /// the group, so its argv[0] — `bash` — would otherwise name the pane.
+    pub fn foreground_process_preferring(&self, agent_pid: Option<u32>) -> Option<ProcessInfo> {
         if self.is_dummy {
             return None;
         }
         let fg_pgid = foreground_pgid(self.master_fd.as_raw_fd(), self.child_pid)?;
-        Some(process_info(fg_pgid as u32))
+        let agent = agent_pid.map(|pid| (pid, unsafe { libc::getpgid(pid as i32) }));
+        Some(process_info(described_pid(fg_pgid, agent)))
     }
 
     /// Returns the name of the foreground process if it differs from the shell
@@ -660,28 +741,20 @@ impl Pty {
     /// Returns the list of child processes of the shell (pid, name + version).
     /// Uses macOS `proc_listchildpids`, then `process_info` for each child.
     pub fn child_processes(&self) -> Vec<(u32, ProcessInfo)> {
-        let pid = self.child_pid as i32;
-        // First call to get count
-        let count = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
-        if count <= 0 {
-            return Vec::new();
+        child_pids(self.child_pid as i32)
+            .into_iter()
+            .map(|cpid| (cpid as u32, process_info(cpid as u32)))
+            .collect()
+    }
+
+    /// Resident memory of the pane: the shell and every process below it
+    /// (the agent, and the MCP servers and tools it started), in bytes. Zero
+    /// for a pane with no real child.
+    pub fn tree_resident_bytes(&self) -> u64 {
+        if self.is_dummy {
+            return 0;
         }
-        let mut pids = vec![0i32; count as usize];
-        let actual = unsafe {
-            libc::proc_listchildpids(
-                pid,
-                pids.as_mut_ptr() as *mut libc::c_void,
-                (pids.len() * std::mem::size_of::<i32>()) as i32,
-            )
-        };
-        if actual <= 0 {
-            return Vec::new();
-        }
-        // proc_listchildpids returns a *count* of PIDs written, not a byte
-        // length — dividing by size_of::<i32>() truncated every shell with
-        // fewer than four children down to zero.
-        pids.truncate(actual as usize);
-        pids.iter().map(|&cpid| (cpid as u32, process_info(cpid as u32))).collect()
+        tree_resident_bytes(self.child_pid as i32)
     }
 
     /// Returns the current working directory of the child shell process.
@@ -956,6 +1029,28 @@ mod tests {
     fn a_clean_environment_loses_nothing() {
         assert!(inherited_agent_vars(keys(&["PATH", "HOME", "KOVA_PANE_ID"]).into_iter()).is_empty());
     }
+    #[test]
+    fn a_process_tree_holds_at_least_its_root() {
+        let me = std::process::id() as i32;
+        let own = super::tree_resident_bytes(me);
+        assert!(own > 0, "this test process has resident memory");
+        assert_eq!(super::tree_resident_bytes(0), 0);
+        assert_eq!(super::tree_resident_bytes(-1), 0);
+    }
+
+    #[test]
+    fn a_process_tree_counts_its_children() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let me = std::process::id() as i32;
+        let alone = super::resident_bytes(me);
+        let tree = super::tree_resident_bytes(me);
+        let sleep = super::resident_bytes(child.id() as i32);
+        child.kill().ok();
+        child.wait().ok();
+        assert!(sleep > 0);
+        assert!(tree >= alone + sleep - alone / 10, "tree {} alone {} child {}", tree, alone, sleep);
+    }
+
     use super::*;
 
     #[test]
@@ -1070,6 +1165,19 @@ mod tests {
         assert_eq!(version_from_exe_path("/usr/bin/python3.12"), None);
         assert_eq!(version_from_exe_path("/usr/bin/2"), None);
         assert_eq!(version_from_exe_path("/usr/bin/1."), None);
+    }
+
+    #[test]
+    fn an_agent_under_a_launcher_names_the_foreground_group() {
+        // deepseek-cc (bash, pid 100) leads the group and runs claude (pid 130).
+        assert_eq!(described_pid(100, Some((130, 100))), 130);
+    }
+
+    #[test]
+    fn the_group_leader_names_it_when_the_agent_is_elsewhere() {
+        // claude suspended with ^Z, vim (pid 200) in the foreground.
+        assert_eq!(described_pid(200, Some((130, 100))), 200);
+        assert_eq!(described_pid(200, None), 200);
     }
 
     #[test]

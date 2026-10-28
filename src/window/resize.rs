@@ -4,32 +4,6 @@
 
 use super::*;
 
-/// One debounce step for the per-pane resize-settle countdowns: decrement
-/// every entry and return the pane ids whose countdown reached 0 (removing
-/// them from the map). A fresh resize re-arms a pane by re-inserting its
-/// countdown, so the burst only fires once, after it stops.
-fn step_resize_settle(map: &mut std::collections::HashMap<PaneId, u32>) -> Vec<PaneId> {
-    let mut fire: Vec<PaneId> = Vec::new();
-    map.retain(|&pane_id, frames| {
-        *frames = frames.saturating_sub(1);
-        if *frames == 0 {
-            fire.push(pane_id);
-            false
-        } else {
-            true
-        }
-    });
-    fire
-}
-
-/// Whether the post-resize settle repaint (winsize nudge) can be skipped.
-/// Skip only when the app already repainted broadly AND the grid shows no
-/// hole — both conditions observable, so this is strictly safer than always
-/// nudging (the round-4 behavior) which can itself re-trigger the hole.
-fn should_skip_settle_nudge(row_coverage: f32, has_interior_band: bool) -> bool {
-    !has_interior_band && row_coverage >= SETTLE_SKIP_COVERAGE
-}
-
 impl KovaView {
     /// Mode 2: adjust the virtual width override of the active tab (all panes scale proportionally).
     pub(super) fn adjust_virtual_width(&self, dir: f32) {
@@ -100,7 +74,35 @@ impl KovaView {
         }));
     }
 
-    /// Resize all panes in the active tab to match their current viewports.
+    /// Ask for `resize_all_panes` at the start of the next frame. For event
+    /// streams (window live resize, separator drag) that fire several times a
+    /// frame: each event used to resize every pane — a terminal resize under
+    /// its write lock plus a SIGWINCH that makes a TUI redraw its whole
+    /// screen — while only the last size of the frame is ever drawn.
+    pub(super) fn request_resize_all_panes(&self) {
+        self.ivars().resize_pending.set(true);
+    }
+
+    /// Start of a frame: run the resize asked by `request_resize_all_panes`,
+    /// and catch up on panes `resize_all_panes` left off-screen once the
+    /// active tab scrolls or changes.
+    pub(super) fn flush_pending_resize(&self) {
+        let ivars = self.ivars();
+        let view = {
+            let tabs = ivars.tabs.borrow();
+            let idx = ivars.active_tab.get();
+            tabs.get(idx).map(|t| (idx, t.scroll_offset_x))
+        };
+        let catch_up = offscreen_catch_up_due(ivars.offscreen_resize_stale.get(), view);
+        if ivars.resize_pending.replace(false) || catch_up {
+            self.resize_all_panes();
+        }
+    }
+
+    /// Resize the panes of the active tab to match their current viewports.
+    /// A pane entirely off-screen (horizontal scroll) keeps its size until it
+    /// shows up again (`flush_pending_resize`): a window height change would
+    /// otherwise resize, and SIGWINCH, every pane of a tab holding dozens.
     pub(super) fn resize_all_panes(&self) {
         let renderer = match self.ivars().renderer.get() {
             Some(r) => r,
@@ -111,15 +113,19 @@ impl KovaView {
         let status_bar = renderer_r.status_bar_enabled();
         drop(renderer_r);
         let h_pad = self.h_padding();
+        let started = std::time::Instant::now();
+        // A direct call also covers what a pending request asked for.
+        self.ivars().resize_pending.set(false);
+        self.ivars().offscreen_resize_stale.set(None);
 
         // Drop expired resize histories (also clears entries of closed panes)
-        self.ivars().recent_resizes.borrow_mut().retain(|_, h| {
-            h.iter().any(|&(_, t)| t.elapsed().as_millis() < 500)
-        });
+        self.ivars().resize_repair.borrow_mut().prune_history(std::time::Instant::now());
 
+        let screen_w = self.drawable_viewport().width;
         let panes_vp = self.panes_viewport();
         let tabs = self.ivars().tabs.borrow();
         let idx = self.ivars().active_tab.get();
+        let (mut resized, mut deferred) = (0usize, 0usize);
         if let Some(tab) = tabs.get(idx) {
             tab.cell_h.set(cell_h);
             tab.for_each_pane_with_viewport(panes_vp, &mut |pane, vp| {
@@ -130,180 +136,69 @@ impl KovaView {
                 let cols = ((vp.width - 2.0 * h_pad) / cell_w).floor().max(1.0) as u16;
                 let usable_h = if status_bar { vp.height - cell_h } else { vp.height };
                 let rows = (usable_h / cell_h).floor().max(1.0) as u16;
+                // Compare under the read lock: most panes of a pass keep their
+                // size, and the write lock stalls the pane's PTY reader far
+                // longer (a resize reflows the scrollback).
+                {
+                    let term = pane.terminal.read();
+                    if cols == term.cols && rows == term.rows {
+                        return;
+                    }
+                }
+                if vp.off_screen(screen_w) {
+                    deferred += 1;
+                    return;
+                }
                 let mut term = pane.terminal.write();
                 if cols != term.cols || rows != term.rows {
+                    resized += 1;
                     let old = (term.cols, term.rows);
                     term.resize(cols, rows);
                     drop(term);
                     pane.pty.resize(cols, rows);
-                    // A real resize opens a fresh band-repair budget (see
-                    // MAX_BAND_REPAIRS) and coverage window (reset by
-                    // term.resize above).
-                    self.ivars().band_repair_attempts.borrow_mut().remove(&pane.id);
-
-                    // Round-trip detection: returning within 500ms to ANY
-                    // recently-seen size means the child may coalesce the
-                    // SIGWINCHs into one no-op and skip its repaint while our
-                    // reflow round-trip lost information. Nudge it.
-                    let now = std::time::Instant::now();
-                    let mut recent = self.ivars().recent_resizes.borrow_mut();
-                    let history = recent.entry(pane.id).or_default();
-                    history.retain(|&(_, t)| now.duration_since(t).as_millis() < 500);
-                    let round_trip = history.iter().any(|&(sz, _)| sz == (cols, rows));
-                    if round_trip {
-                        history.clear();
-                        drop(recent);
-                        pane.pty.resize(cols, if rows > 1 { rows - 1 } else { rows + 1 });
-                        let mut restores = self.ivars().pty_restore.borrow_mut();
-                        restores.retain(|r| r.pane_id != pane.id);
-                        restores.push(PtyRestore { pane_id: pane.id, remaining_frames: 3 });
-                    } else {
-                        history.push((old, now));
-                        if history.len() > 8 {
-                            history.remove(0);
-                        }
-                    }
-
-                    // Debounce a single robust repaint to run once the resize
-                    // burst settles: rapid CTRL+OPTION+arrow resizes produce a
-                    // storm of SIGWINCHs the child coalesces, and a differential
-                    // TUI (Claude Code) can then skip rows and leave a stale
-                    // blank band. Re-arming on every resize collapses the burst
-                    // into one Cmd+R-style repaint (soft_reset + nudge) at the
-                    // end. See `resize_settle` and `fire_resize_settle_repaints`.
+                    // A real resize opens a fresh band-repair budget, nudges
+                    // the child at once when the pane returns within 500ms to
+                    // a recently-seen size (the SIGWINCHs may coalesce into a
+                    // no-op while our reflow round-trip lost information), and
+                    // re-arms a single robust repaint (soft_reset + nudge) for
+                    // when the resize burst settles: rapid CTRL+OPTION+arrow
+                    // resizes produce a storm of SIGWINCHs the child
+                    // coalesces, and a differential TUI (Claude Code) can then
+                    // skip rows and leave a stale blank band.
                     let fps = self.ivars().config.get().map(|c| c.terminal.fps).unwrap_or(60) as u32;
-                    let settle = (fps / 6).max(4); // ~150ms after the last resize
-                    self.ivars().resize_settle.borrow_mut().insert(pane.id, settle);
+                    self.ivars().resize_repair.borrow_mut().on_resized(
+                        pane,
+                        old,
+                        (cols, rows),
+                        std::time::Instant::now(),
+                        crate::resize_repair::settle_frames(fps),
+                    );
                 }
             });
+            if deferred > 0 {
+                self.ivars().offscreen_resize_stale.set(Some((idx, tab.scroll_offset_x)));
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= std::time::Duration::from_millis(8) {
+            log::info!(
+                "RESIZE: {resized} pane(s) resized, {deferred} off-screen deferred, in {:.1}ms",
+                elapsed.as_secs_f64() * 1000.0
+            );
         }
     }
 
-    /// Tick the per-pane resize-settle debounce. When a pane's countdown
-    /// reaches 0 (no resize for ~150ms), run the same robust repaint as Cmd+R
-    /// so the foreground program fully repaints against a clean grid. Returns
-    /// nothing; safe to call every frame.
-    pub(super) fn fire_resize_settle_repaints(&self) {
-        let fire = {
-            let mut settle = self.ivars().resize_settle.borrow_mut();
-            step_resize_settle(&mut settle)
-        };
-        for pane_id in fire {
-            self.repaint_pane_settle(pane_id);
-        }
-    }
-
-    /// Tick the post-restore hole checks. ~0.5s after each winsize restore,
-    /// scan the pane's grid: if the app answered the restore with a
-    /// clear-screen + partial repaint (interior blank band in alt-screen),
-    /// force another robust repaint — bounded by MAX_BAND_REPAIRS per pane
-    /// between real resizes so a misbehaving app can't loop us.
-    pub(super) fn fire_post_restore_band_checks(&self) {
-        let due: Vec<PaneId> = {
-            let mut checks = self.ivars().post_restore_checks.borrow_mut();
-            let mut due = Vec::new();
-            for c in checks.iter_mut() {
-                c.remaining_frames = c.remaining_frames.saturating_sub(1);
-                if c.remaining_frames == 0 {
-                    due.push(c.pane_id);
-                }
-            }
-            checks.retain(|c| c.remaining_frames > 0);
-            due
-        };
-        for pane_id in due {
-            // None = pane gone; Some(band) = pane found, band presence known.
-            let holed: Option<Option<(usize, usize)>> = {
-                let tabs = self.ivars().tabs.borrow();
-                let mut found = None;
-                for tab in tabs.iter() {
-                    if let Some(p) = tab.pane(pane_id) {
-                        let t = p.terminal.read();
-                        let band = if !p.minimized && t.in_alt_screen {
-                            t.interior_blank_band(BAND_MIN_ROWS)
-                        } else {
-                            None
-                        };
-                        found = Some(band);
-                        break;
-                    }
-                }
-                found
-            };
-            match holed {
-                Some(Some((start, end))) => {
-                    let mut attempts = self.ivars().band_repair_attempts.borrow_mut();
-                    let n = attempts.entry(pane_id).or_insert(0);
-                    if *n < MAX_BAND_REPAIRS {
-                        *n += 1;
-                        let attempt = *n;
-                        drop(attempts);
-                        log::info!(
-                            "post-restore check: pane {} has a {}-row blank band (rows {}..{}) — forcing repaint (attempt {}/{})",
-                            pane_id, end - start + 1, start, end, attempt, MAX_BAND_REPAIRS
-                        );
-                        self.repaint_pane_settle(pane_id);
-                    } else {
-                        log::warn!(
-                            "post-restore check: pane {} still holed after {} repaints — giving up until next resize",
-                            pane_id, MAX_BAND_REPAIRS
-                        );
-                    }
-                }
-                _ => {
-                    // Clean grid or pane closed: reset the repair budget.
-                    self.ivars().band_repair_attempts.borrow_mut().remove(&pane_id);
-                }
-            }
-        }
-    }
-
-    /// Robust repaint for a specific pane (by id), mirroring `do_repaint_pane`
-    /// but without the border flash — used by the automatic post-resize settle.
-    pub(super) fn repaint_pane_settle(&self, pane_id: PaneId) {
-        let pane = {
-            let tabs = self.ivars().tabs.borrow();
-            let mut found: Option<*const Pane> = None;
-            for tab in tabs.iter() {
-                if let Some(p) = tab.pane(pane_id) {
-                    found = Some(p as *const Pane);
-                    break;
-                }
-            }
-            // SAFETY: same invariant as `focused_pane` — Tab mutations happen
-            // only in the render tick, and this runs from the render tick.
-            match found {
-                Some(ptr) => unsafe { &*ptr },
-                None => return,
+    /// One frame of the resize repairs (`crate::resize_repair`): due winsize
+    /// restores, then settle repaints, then post-restore hole checks, over
+    /// the panes of every tab. Safe to call every frame.
+    pub(super) fn tick_resize_repairs(&self) {
+        let tabs = self.ivars().tabs.borrow();
+        let mut lookup = |pane_id: PaneId, f: &mut dyn FnMut(&crate::surface::Surface, bool)| {
+            if let Some(p) = tabs.iter().find_map(|tab| tab.pane(pane_id)) {
+                f(&p.surface, p.minimized);
             }
         };
-        if pane.minimized {
-            return;
-        }
-        let (cols, rows) = {
-            let t = pane.terminal.read();
-            if should_skip_settle_nudge(t.row_coverage(), t.interior_blank_band(BAND_MIN_ROWS).is_some()) {
-                log::debug!(
-                    "settle repaint skipped for pane {}: app repainted {:.0}% of rows since resize, no hole",
-                    pane_id,
-                    t.row_coverage() * 100.0
-                );
-                return;
-            }
-            (t.cols, t.rows)
-        };
-        {
-            let mut t = pane.terminal.write();
-            t.soft_reset();
-            // Fresh coverage window: measure what the app repaints in
-            // response to this nudge, not what came before it.
-            t.reset_rows_touched();
-        }
-        let nudged = if rows > 1 { rows - 1 } else { rows + 1 };
-        pane.pty.resize(cols, nudged);
-        let mut restores = self.ivars().pty_restore.borrow_mut();
-        restores.retain(|r| r.pane_id != pane_id);
-        restores.push(PtyRestore { pane_id, remaining_frames: 3 });
+        self.ivars().resize_repair.borrow_mut().tick(1, &mut lookup);
     }
 
     pub(super) fn handle_resize(&self) {
@@ -381,59 +276,28 @@ impl KovaView {
             }
         }
 
-        self.resize_all_panes();
+        // One per frame: AppKit calls `setFrameSize:` for every step of a live resize.
+        self.request_resize_all_panes();
     }
+}
+
+/// Whether panes left off-screen at their old size by the last
+/// `resize_all_panes` (`stale`: the active tab and its scroll offset then) may
+/// be on screen in `view` (the same pair now): any other tab or offset.
+fn offscreen_catch_up_due(stale: Option<(usize, f32)>, view: Option<(usize, f32)>) -> bool {
+    stale.is_some_and(|s| view != Some(s))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::collections::HashMap;
+    use super::offscreen_catch_up_due;
 
     #[test]
-    fn resize_settle_fires_once_when_burst_ends() {
-        let mut m: HashMap<PaneId, u32> = HashMap::new();
-        m.insert(7, 3);
-        assert!(step_resize_settle(&mut m).is_empty()); // 3 -> 2
-        assert!(step_resize_settle(&mut m).is_empty()); // 2 -> 1
-        assert_eq!(step_resize_settle(&mut m), vec![7]); // 1 -> 0, fires
-        assert!(m.is_empty(), "fired pane is removed");
-        assert!(step_resize_settle(&mut m).is_empty(), "no re-fire");
-    }
-
-    #[test]
-    fn resize_settle_rearms_and_defers_fire() {
-        let mut m: HashMap<PaneId, u32> = HashMap::new();
-        m.insert(1, 2);
-        assert!(step_resize_settle(&mut m).is_empty()); // 2 -> 1
-        // A new resize re-arms the same pane before it could fire.
-        m.insert(1, 2);
-        assert!(step_resize_settle(&mut m).is_empty()); // 2 -> 1 (not 0)
-        assert_eq!(step_resize_settle(&mut m), vec![1]); // 1 -> 0, fires now
-    }
-
-    #[test]
-    fn resize_settle_handles_multiple_panes_independently() {
-        let mut m: HashMap<PaneId, u32> = HashMap::new();
-        m.insert(1, 1);
-        m.insert(2, 3);
-        assert_eq!(step_resize_settle(&mut m), vec![1]); // pane 1 fires; pane 2: 3 -> 2
-        assert!(m.contains_key(&2) && !m.contains_key(&1));
-        assert!(step_resize_settle(&mut m).is_empty()); // pane 2: 2 -> 1
-        assert_eq!(step_resize_settle(&mut m), vec![2]); // pane 2: 1 -> 0, fires
-    }
-
-    #[test]
-    fn settle_nudge_skipped_only_on_broad_repaint_without_hole() {
-        // App fully repainted after the real resize: nudging again is the
-        // exact trigger of the clear+partial-repaint hole — skip.
-        assert!(should_skip_settle_nudge(1.0, false));
-        assert!(should_skip_settle_nudge(SETTLE_SKIP_COVERAGE, false));
-        // App barely repainted (possibly coalesced the SIGWINCH): nudge.
-        assert!(!should_skip_settle_nudge(0.1, false));
-        // A hole is visible: always nudge, whatever the coverage says
-        // (scroll frames can accumulate coverage while the band persists).
-        assert!(!should_skip_settle_nudge(1.0, true));
-        assert!(!should_skip_settle_nudge(0.1, true));
+    fn offscreen_panes_catch_up_once_the_view_moves() {
+        assert!(!offscreen_catch_up_due(None, Some((0, 120.0))), "nothing was deferred");
+        assert!(!offscreen_catch_up_due(Some((0, 120.0)), Some((0, 120.0))), "same tab, same scroll");
+        assert!(offscreen_catch_up_due(Some((0, 120.0)), Some((0, 80.0))), "scrolled");
+        assert!(offscreen_catch_up_due(Some((0, 120.0)), Some((1, 120.0))), "other tab");
+        assert!(offscreen_catch_up_due(Some((0, 120.0)), None), "the tab is gone");
     }
 }

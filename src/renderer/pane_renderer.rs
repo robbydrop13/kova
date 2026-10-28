@@ -18,8 +18,8 @@
 use super::context::RenderContext;
 use super::vertex::Vertex;
 use super::{
-    bg_runs, fade_toward, format_count, format_last_activity, push_bg_quad, PaneAttention,
-    PaneRenderData, PaneViewport, TooltipZone, ITALIC_SHEAR,
+    ITALIC_SHEAR, PaneAttention, PaneRenderData, PaneViewport, TooltipZone, bg_runs, fade_toward,
+    format_count, format_last_activity, program_status_color, push_bg_quad, push_bg_quad_alpha,
 };
 use crate::config::{Config, DimMode};
 use crate::pane::PaneId;
@@ -37,6 +37,10 @@ pub struct PaneStyle {
     /// Colour of a block tagged to be copied out (see `terminal::paste_block`).
     pub(super) paste_block_color: [f32; 3],
     pub(super) selection_color: [f32; 3],
+    /// Band behind the row picked in a list the renderer draws over a pane
+    /// (the Ctrl+F filter's). The window's own lists read the same colour off
+    /// the config; a library pane has no window, so it comes through here.
+    pub(super) list_selected_bg: [f32; 3],
     pub(super) status_bar_enabled: bool,
     /// How much an unfocused pane is faded (see `DimMode`).
     pub(super) dim_opacity: f32,
@@ -61,6 +65,7 @@ impl PaneStyle {
             cursor_color: config.colors.cursor,
             paste_block_color: config.colors.paste_block,
             selection_color: [0.45, 0.42, 0.20],
+            list_selected_bg: config.switcher.selected_bg,
             status_bar_enabled: config.status_bar.enabled,
             dim_opacity: config.splits.dim_opacity,
             dim_mode: config.splits.dim_mode,
@@ -90,6 +95,9 @@ struct PaneVertexEntry {
     zones: Vec<TooltipZone>,
 }
 
+/// The band a filter jump leaves for a moment on the line it landed on.
+const JUMP_HIGHLIGHT: [f32; 3] = [1.0, 0.85, 0.3];
+
 /// What a pane's vertices depend on apart from its terminal grid. These
 /// change without the pane being marked dirty (a cursor blink, a hovered
 /// URL, a focus change, the input counter…), so a cached build is only
@@ -98,6 +106,7 @@ struct PaneVertexEntry {
 pub(super) struct PaneDrawKey {
     pub(super) vp: [f32; 4],
     pub(super) is_focused: bool,
+    pub(super) outlined: bool,
     pub(super) show_blink: bool,
     pub(super) hover: Option<(Vec<(usize, u16, u16)>, Option<String>)>,
     pub(super) custom_title: Option<String>,
@@ -168,6 +177,7 @@ impl PaneRenderer {
         PaneDrawKey {
             vp: [vp.x, vp.y, vp.width, vp.height],
             is_focused: pane.is_focused,
+            outlined: pane.outlined,
             show_blink: if pane.is_focused { blink_on } else { true },
             hover,
             custom_title: pane.custom_title.clone(),
@@ -243,7 +253,7 @@ impl PaneRenderer {
             let pane_attention = PaneAttention::from_flags(pane.has_bell, pane.has_completion);
             let mut verts = if pane.shell_ready {
                 let t = pane.terminal.read();
-                build.build_vertices(&t, vp, show_blink, pane.is_focused, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref(), pane.bookmarked)
+                build.build_vertices(&t, vp, show_blink, pane.is_focused, pane.outlined, pane.custom_title.as_deref(), pane_attention, pin, pane.pane_id, pane.fg_process.as_deref(), pane.bookmarked)
             } else {
                 build.build_loading_vertices(vp)
             };
@@ -292,6 +302,7 @@ impl PaneBuild<'_> {
         vp: &PaneViewport,
         blink_on: bool,
         is_focused: bool,
+        outlined: bool,
         custom_title: Option<&str>,
         attention: PaneAttention,
         pane_input_chars: u64,
@@ -366,15 +377,16 @@ impl PaneBuild<'_> {
         let oy = vp.y;
 
         // Push content to bottom when screen isn't full (single source of truth in Terminal)
-        let y_offset_rows = term.y_offset_rows() as f32;
-        let content_height = (term.rows as f32 - y_offset_rows) * cell_h;
-        let y_offset = (y_offset_rows * cell_h).min((vp.height - content_height).max(0.0));
+        let y_offset = content_y_offset(term.rows, term.y_offset_rows(), cell_h, vp.height);
 
         let mut vertices = Vec::with_capacity(display.len() * term.cols as usize * 6);
 
-        // Precompute selection abs_line base if selection is active
+        // Absolute line the first drawn row sits on: what anything that bands a
+        // row by its index needs — the text selection, and the transient
+        // highlight a filter jump leaves behind.
+        let highlight = term.highlight_line;
         let has_selection = term.selection.is_some();
-        let abs_line_base = if has_selection {
+        let abs_line_base = if has_selection || highlight.is_some() {
             term.scrollback_len() as i64 - term.scroll_offset() as i64
         } else {
             0
@@ -401,6 +413,28 @@ impl PaneBuild<'_> {
                     if term.is_selected(abs_line, col_idx as u16) {
                         let x = (ox + col_idx as f32 * cell_w).round();
                         push_bg_quad(&mut vertices, x, y, cell_w, cell_h, self.style.selection_color);
+                    }
+                }
+            }
+
+            // The band a filter jump leaves on the line it landed on: full
+            // width and fading, so it reads as "here" without ever looking
+            // like a selection someone made.
+            if let Some((line, since)) = highlight {
+                if abs_line == line {
+                    // Read from the clock, not from a counter: the band is as
+                    // strong as the time since the jump says, whatever the
+                    // host's frame rate.
+                    if let Some(alpha) = crate::terminal::highlight_alpha(since.elapsed()) {
+                        push_bg_quad_alpha(
+                            &mut vertices,
+                            vp.x,
+                            y,
+                            vp.width,
+                            cell_h,
+                            JUMP_HIGHLIGHT,
+                            alpha * 0.45,
+                        );
                     }
                 }
             }
@@ -607,7 +641,9 @@ impl PaneBuild<'_> {
         }
 
         // Outline around the focused pane, drawn last so nothing covers it.
-        if is_focused && self.style.focus_border_width > 0.0 {
+        // `outlined`, not `is_focused`: the caller decides whether there is
+        // another pane to tell this one from (`PaneRenderData::outlined`).
+        if outlined && self.style.focus_border_width > 0.0 {
             let w = self.style.focus_border_width.min(vp.width * 0.5).min(vp.height * 0.5);
             let c = self.style.focus_border_color;
             push_bg_quad(&mut vertices, vp.x, vp.y, vp.width, w, c);
@@ -704,6 +740,37 @@ impl PaneBuild<'_> {
             let proc_w = process.chars().count() as f32 * cell_w;
             left_end = self.ctx.render_status_text(vertices, process, proc_x, bar_y, vp.x + vp.width * 0.75, process_fg, no_bg);
             self.push_tooltip_zone(proc_x, bar_y, proc_w, cell_h, "Foreground process running in this pane");
+        }
+
+        // Program status (OSC 7501): the state the program itself reports — an
+        // agent that is working, the approval it is waiting for, the run that
+        // finished. Sits after the process name because it is the same kind of
+        // news (what this pane is doing), only richer. `idle` prints nothing:
+        // the quiet bar already says it.
+        if let Some((label, hue)) = term
+            .program_status
+            .as_ref()
+            .and_then(crate::terminal::program_status::badge)
+        {
+            let status_fg = fade_toward(program_status_color(hue), bar_bg, text_fade);
+            let status_x = left_end + cell_w * 2.0;
+            let status_w = label.chars().count() as f32 * cell_w;
+            left_end = self.ctx.render_status_text(
+                vertices,
+                &label,
+                status_x,
+                bar_y,
+                vp.x + vp.width * 0.85,
+                [status_fg[0], status_fg[1], status_fg[2], 1.0],
+                no_bg,
+            );
+            self.push_tooltip_zone(
+                status_x,
+                bar_y,
+                status_w,
+                cell_h,
+                "Program status reported by the running program (OSC 7501)",
+            );
         }
 
         // Right side: title (custom or hovered URL or OSC) + scroll indicator
@@ -814,8 +881,32 @@ impl PaneBuild<'_> {
     }
 }
 
+/// How far down the pane's first row is drawn, in pixels: content is pushed
+/// to the bottom while the screen is not full (`TerminalState::y_offset_rows`,
+/// the single source of truth), never past the viewport's height. The
+/// renderer and the text-input cursor rect (`appkit_input::cursor_cell_rect`)
+/// both place rows with it.
+pub fn content_y_offset(rows: u16, y_offset_rows: usize, cell_h: f32, vp_height: f32) -> f32 {
+    let y_offset_rows = y_offset_rows as f32;
+    let content_height = (rows as f32 - y_offset_rows) * cell_h;
+    (y_offset_rows * cell_h).min((vp_height - content_height).max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_is_pushed_down_only_while_the_screen_is_not_full() {
+        use super::content_y_offset;
+        // 24 rows of 20 px, the first 4 not yet reached: the 20 rows of
+        // content (400 px) are pushed down by the 4 empty rows (80 px)...
+        assert_eq!(content_y_offset(24, 4, 20.0, 480.0), 80.0);
+        assert_eq!(content_y_offset(24, 4, 20.0, 520.0), 80.0);
+        // ...but never past the viewport's bottom edge.
+        assert_eq!(content_y_offset(24, 4, 20.0, 450.0), 50.0);
+        assert_eq!(content_y_offset(24, 4, 20.0, 400.0), 0.0);
+        assert_eq!(content_y_offset(24, 0, 20.0, 520.0), 0.0);
+    }
+
     use super::*;
     use objc2_metal::{MTLCreateSystemDefaultDevice, MTLPixelFormat};
     use parking_lot::RwLock;
@@ -854,6 +945,7 @@ mod tests {
             viewport: vp,
             shell_ready: true,
             is_focused: true,
+            outlined: true,
             pane_id: 7,
             custom_title: None,
             has_completion: false,
@@ -925,6 +1017,37 @@ mod tests {
     }
 
     #[test]
+    fn the_program_status_badge_is_drawn_only_when_the_program_reports_one() {
+        use crate::terminal::program_status::{BlockedKind, ProgramState, ProgramStatus};
+        let config = Config::default();
+        let mut ctx = context(&config);
+        let style = PaneStyle::from_config(&config);
+        let p = pane(terminal(), vp_at(100.0, 30.0));
+
+        // Nothing reported (a bare shell prompt, or a program that says nothing):
+        // the bar stays quiet.
+        let mut quiet = PaneRenderer::default();
+        let zones = prepare(&mut quiet, &mut ctx, &style, &p, true);
+        assert!(!zones.iter().any(|z| z.text.contains("OSC 7501")), "no badge by default");
+        let quiet_bits = bits(quiet.vertices());
+
+        // A program reports it is waiting for an approval (OSC 7501): the badge
+        // is painted, and it is clickable/hoverable like the rest of the bar.
+        p.terminal.write().program_status = Some(ProgramStatus {
+            state: Some(ProgramState::Blocked),
+            kind: Some(BlockedKind::Permission),
+            ..ProgramStatus::default()
+        });
+        let mut waiting = PaneRenderer::default();
+        let zones = prepare(&mut waiting, &mut ctx, &style, &p, true);
+        assert!(
+            zones.iter().any(|z| z.text.contains("OSC 7501")),
+            "the badge registers its tooltip zone"
+        );
+        assert_ne!(bits(waiting.vertices()), quiet_bits, "and its glyphs are drawn");
+    }
+
+    #[test]
     fn a_moved_pane_is_rebuilt_exactly_where_it_now_is() {
         // Columns scrolling move a pane by a fractional amount. Its cache is
         // keyed on the position, so the frame after the move is a fresh build
@@ -961,7 +1084,7 @@ mod tests {
         let mut zones = Vec::new();
         let mut build = |vp: PaneViewport| {
             PaneBuild { ctx: &mut ctx, style: &style, hovered_url: None, hovered_url_text: None, zones: &mut zones }
-                .build_vertices(&t, &vp, true, true, None, PaneAttention::None, 0, 7, None, false)
+                .build_vertices(&t, &vp, true, true, true, None, PaneAttention::None, 0, 7, None, false)
         };
         let in_place = build(vp_at(100.5, 30.0));
         let at_origin = build(vp_at(0.0, 30.0));

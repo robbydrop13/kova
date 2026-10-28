@@ -1,7 +1,7 @@
-# 2.0.0
+# 2.0.2
 
-- Kova is now also a terminal library: another app (Kana first) can host Kova panes through a C API, with the same terminal code as Kova.app
-- Cmd+digit switches tabs on AZERTY keyboards too
-- The attention banner shows the Claude session name, and `list-panes` gives each pane's SendMessage address
-- Cmd+Shift+F finds words typed in open Claude panes, whole words first, closed sessions by date
-- Wide fallback glyphs such as circled digits fit in their cell, and the cursor blinks on real time even when frames drop
+- Subjects: group a tab's panes under a named subject in Cmd+P (Cmd+Right files a pane, Cmd+Left takes it out); a subject survives a relaunch
+- Each subject gets its own color, and a strip under the tab bar names the subject over its panes
+- After a relaunch, agent conversations resume only when their pane is first shown (or on wake-pane), and the status bar counts the sleeping ones (◌N)
+- Resizing the window or dragging a separator no longer resizes every pane several times a frame, and panes scrolled off-screen catch up when shown
+- IPC: list-subjects, set-pane-subject, rename-subject, delete-subject, a subject field on each pane and a subjects event in subscribe

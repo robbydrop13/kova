@@ -882,7 +882,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn chips_keep_their_colour_and_neutral_ones_follow_the_group() {
         use TileState::*;
         let working = Working.chip_style(false);

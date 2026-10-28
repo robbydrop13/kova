@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::pane::{alloc_tab_id, Column, Pane, PaneId, Tab};
@@ -69,6 +69,13 @@ pub struct SavedTab {
     /// The tab's group is folded in the sidebar.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub collapsed: bool,
+    /// The tab's subjects in creation order, empty ones included (`Tab::subjects`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    /// Each subject's color, an index into the tab palette (`Tab::subject_colors`).
+    /// Absent in sessions written before: colors are then drawn on restore.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub subject_colors: std::collections::BTreeMap<String, usize>,
 }
 
 /// Flat column format (v4): a column is a list of panes with row weights.
@@ -109,6 +116,9 @@ pub struct SavedPane {
     /// prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<SavedAgentSession>,
+    /// The subject of its tab the pane is filed under (`Pane::subject`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 /// The conversation a pane was holding, and which agent to hand it back to.
@@ -116,6 +126,11 @@ pub struct SavedPane {
 pub struct SavedAgentSession {
     pub agent: crate::agent_session::Agent,
     pub id: String,
+    /// Claude's `CLAUDE_CONFIG_DIR` when the session did not run under the
+    /// default one, so the resume line reopens it there (see
+    /// `claude_session::resume_command`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
 }
 
 /// Legacy column format (v3) — kept for backward compat reading.
@@ -179,8 +194,8 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
             // its session file on exit, and a dead Codex no longer holds its
             // transcript open, so this is unreadable once the PTYs are reaped.
             // `will_terminate` saves before `shutdown_all` for this.
-            agent_session: crate::agent_session::for_shell(p.pty.pid())
-                .map(|s| SavedAgentSession { agent: s.agent, id: s.id }),
+            agent_session: session_to_save(crate::agent_session::for_shell(p.pty.pid()), p.unregistered_session()),
+            subject: p.subject.clone(),
         }).collect(),
         row_weights: col.row_weights.clone(),
         custom_row_weights: if col.custom_row_weights.iter().any(|&cw| cw) {
@@ -189,6 +204,74 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
             None
         },
     }
+}
+
+/// Drop a Pi or omp conversation that two panes claim at once.
+///
+/// Pi writes no file per process, and omp's exact source (its open transcript)
+/// can be missing right after start, so both fall back to reading the directory
+/// and the start time. Two panes in the same directory then leave that guess
+/// with one file to hand out, and it would go to both — one pane reopening the
+/// other's transcript. Neither is better than a pane that starts its own
+/// session, so both keep their last command instead. Other agents are left
+/// alone: their detection names the process itself, so the same id twice there
+/// would mean the same conversation really was open twice.
+fn drop_shared_guessed_sessions(windows: &mut [WindowSession]) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for window in windows.iter() {
+        for pane in window
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.flat_columns.iter().flatten())
+            .flat_map(|col| col.panes.iter())
+        {
+            if let Some(session) = pane.agent_session.as_ref().filter(|s| {
+                matches!(
+                    s.agent,
+                    crate::agent_session::Agent::Pi | crate::agent_session::Agent::Omp
+                )
+            }) {
+                *counts.entry(session.id.clone()).or_default() += 1;
+            }
+        }
+    }
+    if counts.values().all(|&count| count < 2) {
+        return;
+    }
+    for window in windows.iter_mut() {
+        for pane in window
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.flat_columns.iter_mut().flatten())
+            .flat_map(|col| col.panes.iter_mut())
+        {
+            let shared = pane
+                .agent_session
+                .as_ref()
+                .filter(|s| {
+                    matches!(
+                        s.agent,
+                        crate::agent_session::Agent::Pi | crate::agent_session::Agent::Omp
+                    )
+                })
+                .is_some_and(|s| counts.get(&s.id).copied().unwrap_or(0) > 1);
+            if shared {
+                pane.agent_session = None;
+            }
+        }
+    }
+}
+
+/// The conversation a pane is saved with: the agent running in it, or else the
+/// one a launch restore left asleep there, or woke but whose agent has not
+/// registered yet (`Surface::unregistered_session`) — no agent is seen running,
+/// but that is the conversation to bring back next time too.
+fn session_to_save(
+    live: Option<crate::agent_session::AgentSession>,
+    dormant: Option<SavedAgentSession>,
+) -> Option<SavedAgentSession> {
+    live.map(|s| SavedAgentSession { agent: s.agent, id: s.id, config_dir: s.config_dir })
+        .or(dormant)
 }
 
 /// Find the flat leaf index of a pane by id across all columns.
@@ -222,6 +305,8 @@ pub fn snapshot_tab(tab: &Tab) -> SavedTab {
         scroll_offset_x: if tab.scroll_offset_x != 0.0 { Some(tab.scroll_offset_x) } else { None },
         geometry_scale: if tab.geometry_scale > 0.0 { Some(tab.geometry_scale) } else { None },
         collapsed: tab.collapsed,
+        subjects: tab.subjects.clone(),
+        subject_colors: tab.subject_colors.iter().map(|(k, v)| (k.clone(), *v)).collect(),
     }
 }
 
@@ -292,9 +377,11 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
     if !owns_session() {
         return;
     }
+    let mut windows = windows.to_vec();
+    drop_shared_guessed_sessions(&mut windows);
     let session = Session {
         version: SESSION_VERSION,
-        windows: windows.to_vec(),
+        windows,
     };
 
     let path = session_path();
@@ -319,7 +406,7 @@ fn save_internal(windows: &[WindowSession], rotate: bool) {
             if let Err(e) = write_owner_only(&path, &json) {
                 log::warn!("Failed to write session file: {}", e);
             } else {
-                log::info!("Session saved to {} ({} window(s))", path.display(), windows.len());
+                log::info!("Session saved to {} ({} window(s))", path.display(), session.windows.len());
             }
         }
         Err(e) => log::warn!("Failed to serialize session: {}", e),
@@ -535,7 +622,6 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 // Restore
 // ---------------------------------------------------------------
 
-/// Restore a flat column (v4 format).
 /// The command line to pre-type into a restored pane.
 ///
 /// A pane that was running an agent when the snapshot was taken gets that
@@ -544,26 +630,54 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
 /// last command happens to name, because that older line can be several
 /// restarts old while the recorded id is the conversation that was live at quit.
 ///
-/// Nothing is executed: the caller writes the command without a newline, so it
-/// waits for the user to press Enter.
+/// Nothing is executed here: the caller writes the command without a newline,
+/// so it waits for the user to press Enter — except an agent's resume line at
+/// app launch (`runs_on_launch`).
 fn restore_command(sp: &SavedPane) -> Option<String> {
+    // A refused id (see `is_safe_session_id`) leaves the pane exactly where a
+    // pane that was never running an agent lands: its own last command.
+    agent_resume_line(sp).or_else(|| sp.last_command.clone())
+}
+
+/// The resume line of the agent the pane was running at snapshot time, if any.
+fn agent_resume_line(sp: &SavedPane) -> Option<String> {
+    let session = saved_agent_session(sp)?;
+    crate::agent_session::resume_command(session.agent, &session.id, sp.last_command.as_deref(), session.config_dir.as_deref())
+}
+
+/// The agent conversation the pane was running at snapshot time, if any.
+fn saved_agent_session(sp: &SavedPane) -> Option<SavedAgentSession> {
     // A file written before v6 only knew about Claude.
-    let session = sp.agent_session.clone().or_else(|| {
+    sp.agent_session.clone().or_else(|| {
         sp.claude_session.as_ref().map(|id| SavedAgentSession {
             agent: crate::agent_session::Agent::Claude,
             id: id.clone(),
+            config_dir: None,
         })
-    });
-    match session {
-        // A refused id (see `is_safe_session_id`) leaves the pane exactly where a
-        // pane that was never running an agent lands: its own last command.
-        Some(s) => crate::agent_session::resume_command(s.agent, &s.id, sp.last_command.as_deref())
-            .or_else(|| sp.last_command.clone()),
-        None => sp.last_command.clone(),
-    }
+    })
 }
 
-fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &Config) -> Option<(Column, Vec<PaneId>)> {
+/// Whether Kova presses Enter on the restored line itself, at app launch.
+///
+/// Only an agent's resume line qualifies, never a pane's last command: that one
+/// can be named by any program printing an OSC 7777 on its tty. And the resume
+/// line keeps the flags of the `claude …` that was last run, which come from the
+/// same place — so the whole line must be plain words, nothing the shell would
+/// expand or redirect (`$(…)`, backticks, `>`, quotes). Anything else waits for
+/// the user's Enter, as before.
+fn runs_on_launch(sp: &SavedPane) -> bool {
+    agent_resume_line(sp).is_some_and(|line| is_plain_command(&line))
+}
+
+fn is_plain_command(line: &str) -> bool {
+    line.chars().all(|c| c == ' ' || c.is_ascii_alphanumeric() || "-_./=:,@+".contains(c))
+}
+
+/// Restore a flat column (v4 format).
+/// `at_launch`: the tab comes back with the app (not from Cmd+O), so the
+/// agents it was running resume without waiting for Enter — each one the
+/// first time its pane is on screen (`Surface::wake`), not all at launch.
+fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &Config, at_launch: bool) -> Option<(Column, Vec<PaneId>)> {
     let mut panes = Vec::new();
     let mut ids = Vec::new();
     for sp in &saved.panes {
@@ -584,8 +698,14 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
             }
             term.title = sp.title.clone();
         }
+        if at_launch && runs_on_launch(sp) {
+            if let Some(session) = saved_agent_session(sp) {
+                pane.sleep_until_shown(session);
+            }
+        }
         pane.custom_title = sp.custom_title.clone();
         pane.minimized = sp.minimized;
+        pane.subject = sp.subject.clone();
         panes.push(pane);
         ids.push(id);
     }
@@ -760,8 +880,9 @@ pub fn count_panes_in_saved_tab(tab: &SavedTab) -> usize {
     }
 }
 
-/// Restore a single saved tab. Used by recent projects and session restore.
-pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config) -> Option<Tab> {
+/// Restore a single saved tab. Used by recent projects and session restore;
+/// `at_launch` is true only for the latter (see `restore_flat_column`).
+pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config, at_launch: bool) -> Option<Tab> {
     let (columns, column_weights, custom_weights, pane_ids) = if let Some(ref flat_cols) = saved.flat_columns {
         // New flat format (v4)
         let weights = saved.column_weights.clone()
@@ -773,7 +894,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         let mut all_ids = Vec::new();
         let mut cols_vec = Vec::new();
         for fc in flat_cols {
-            let (col, ids) = restore_flat_column(fc, cols, rows, config)?;
+            let (col, ids) = restore_flat_column(fc, cols, rows, config, at_launch)?;
             cols_vec.push(col);
             all_ids.extend(ids);
         }
@@ -829,7 +950,10 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         // converts them to the display it actually lands on.
         geometry_scale: saved.geometry_scale.unwrap_or(0.0),
         cell_h: std::cell::Cell::new(0.0),
+        subjects: saved.subjects.clone(),
+        subject_colors: saved.subject_colors.iter().map(|(k, v)| (k.clone(), *v)).collect(),
     };
+    tab.heal_subjects();
     tab.rebuild_minimized_stack();
     Some(tab)
 }
@@ -845,14 +969,14 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
     let active_idx = ws.active_tab.min(total - 1);
 
     // Restore the active tab first (priority)
-    let active_tab = match restore_saved_tab(&ws.tabs[active_idx], cols, rows, config) {
+    let active_tab = match restore_saved_tab(&ws.tabs[active_idx], cols, rows, config, true) {
         Some(tab) => tab,
         None => {
             log::warn!("Failed to restore active tab, falling back to sequential restore");
             // Fallback: try all tabs sequentially
             let mut tabs = Vec::new();
             for saved_tab in &ws.tabs {
-                if let Some(tab) = restore_saved_tab(saved_tab, cols, rows, config) {
+                if let Some(tab) = restore_saved_tab(saved_tab, cols, rows, config, true) {
                     tabs.push(tab);
                 }
             }
@@ -888,9 +1012,96 @@ fn restore_window_tabs(ws: &WindowSession, config: &Config) -> Option<(Vec<Tab>,
     Some((tabs, active_idx, deferred))
 }
 
+/// Every saved pane of a session, flat column format and the legacy trees.
+fn panes_mut(session: &mut Session) -> impl Iterator<Item = &mut SavedPane> {
+    session
+        .windows
+        .iter_mut()
+        .flat_map(|window| window.tabs.iter_mut())
+        .flat_map(|tab| tab.flat_columns.iter_mut().flatten())
+        .flat_map(|column| column.panes.iter_mut())
+}
+
+/// Name the conversation of every pane the snapshot left without one.
+///
+/// The agent of a pane is named at snapshot time by looking at the processes
+/// alive in it. When that lookup cannot see the agent — a Kova built before the
+/// agent was known, a probe that missed at that instant — the pane is saved with
+/// its last command alone, and `omp` on its own is a *fresh* conversation on
+/// restore: the user comes back to an empty pane and reads it as lost, while the
+/// old transcript sits untouched on disk.
+///
+/// The pane does keep the title its agent wrote, though, and an omp transcript
+/// carries its own (see `omp_session::session_by_title`), so the conversation is
+/// recoverable with no process alive. Two guards keep that honest: the last
+/// command in the pane must still be that very agent's (a pane where the agent
+/// was quit and another command typed holds a stale title, and keeps its last
+/// command), and the match must be unique.
+fn recover_agent_sessions_by_title(session: &mut Session, home: &Path) {
+    for pane in panes_mut(session) {
+        if pane.agent_session.is_some() {
+            continue;
+        }
+        let (Some(cwd), Some(title)) = (pane.cwd.as_deref(), pane.title.as_deref()) else {
+            continue;
+        };
+        let Some(command) = pane.last_command.as_deref() else {
+            continue;
+        };
+        if !crate::omp_session::is_omp_invocation(command) {
+            continue;
+        }
+        let Some(found) = crate::omp_session::session_by_title(home, cwd, title) else {
+            continue;
+        };
+        log::info!("Restore: pane at {} matched omp {} by its title", cwd, found.id);
+        pane.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Omp,
+            id: found.id,
+            config_dir: None,
+        });
+    }
+    drop_shared_recovered_sessions(session);
+}
+
+/// Give up on an omp conversation two panes of the restored session claim.
+///
+/// Same rule as `drop_shared_guessed_sessions`, on the other side of the file:
+/// resuming one transcript in two panes writes the same conversation from two
+/// processes, so neither gets it and both keep their last command.
+fn drop_shared_recovered_sessions(session: &mut Session) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for pane in panes_mut(session) {
+        if let Some(id) = pane
+            .agent_session
+            .as_ref()
+            .filter(|s| s.agent == crate::agent_session::Agent::Omp)
+            .map(|s| s.id.clone())
+        {
+            *counts.entry(id).or_default() += 1;
+        }
+    }
+    if counts.values().all(|&count| count < 2) {
+        return;
+    }
+    for pane in panes_mut(session) {
+        let shared = pane
+            .agent_session
+            .as_ref()
+            .filter(|s| s.agent == crate::agent_session::Agent::Omp)
+            .is_some_and(|s| counts.get(&s.id).copied().unwrap_or(0) > 1);
+        if shared {
+            pane.agent_session = None;
+        }
+    }
+}
+
 /// Restore a multi-window session. Returns a list of windows to create.
 pub fn restore_session(session: Session, config: &Config) -> Option<Vec<RestoredWindow>> {
     let mut windows = Vec::new();
+    let mut session = session;
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    recover_agent_sessions_by_title(&mut session, &home);
 
     for ws in &session.windows {
         if let Some((tabs, active_tab, deferred_tabs)) = restore_window_tabs(ws, config) {
@@ -944,6 +1155,7 @@ mod tests {
             title: None,
             claude_session: None,
             agent_session: None,
+            subject: None,
         }
     }
 
@@ -964,6 +1176,57 @@ mod tests {
         let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
         assert!(!keys.contains(&&"title".to_string()), "unexpected keys: {keys:?}");
         assert!(!keys.contains(&&"claude_session".to_string()), "unexpected keys: {keys:?}");
+    }
+
+    #[test]
+    fn subjects_survive_a_save_and_old_files_load_without_them() {
+        let old: SavedTab = serde_json::from_str(
+            r#"{"flat_columns":[{"panes":[{"cwd":"/a"}],"row_weights":[1.0]}],"focused_leaf_index":0,"custom_title":null,"color":null}"#,
+        )
+        .expect("a tab saved before subjects must still parse");
+        assert!(old.subjects.is_empty());
+        assert_eq!(old.flat_columns.as_ref().unwrap()[0].panes[0].subject, None);
+
+        let mut tab = old.clone();
+        tab.subjects = vec!["auth".into(), "empty one".into()];
+        tab.flat_columns.as_mut().unwrap()[0].panes[0].subject = Some("auth".into());
+        let back: SavedTab = serde_json::from_str(&serde_json::to_string(&tab).unwrap()).unwrap();
+        assert_eq!(back.subjects, ["auth", "empty one"], "empty subjects are kept too");
+        assert_eq!(back.flat_columns.unwrap()[0].panes[0].subject.as_deref(), Some("auth"));
+        assert!(back.subject_colors.is_empty(), "a session from before colors has none");
+
+        tab.subject_colors = [("auth".to_string(), 4), ("empty one".to_string(), 1)].into_iter().collect();
+        let back: SavedTab = serde_json::from_str(&serde_json::to_string(&tab).unwrap()).unwrap();
+        assert_eq!(back.subject_colors, tab.subject_colors, "colors survive a save");
+
+        // Nothing filed: the file does not grow.
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("subjects").is_none());
+        assert!(json.get("subject_colors").is_none());
+        assert!(serde_json::to_value(pane("/a")).unwrap().get("subject").is_none());
+    }
+
+    #[test]
+    fn a_pane_still_asleep_is_saved_with_its_conversation() {
+        use crate::agent_session::{Agent, AgentSession};
+        let asleep = Some(SavedAgentSession { agent: Agent::Codex, id: "sleeping".into(), config_dir: None });
+        let saved = session_to_save(None, asleep.clone()).expect("not forgotten");
+        assert_eq!((saved.agent, saved.id.as_str()), (Agent::Codex, "sleeping"));
+
+        let live = AgentSession {
+            pid: None,
+            agent: Agent::Claude,
+            id: "live".into(),
+            name: None,
+            peer_name: None,
+            config_dir: None,
+        };
+        assert_eq!(
+            session_to_save(Some(live), asleep).unwrap().id,
+            "live",
+            "a running agent wins"
+        );
+        assert!(session_to_save(None, None).is_none());
     }
 
     #[test]
@@ -988,6 +1251,85 @@ mod tests {
         let mut sp = pane("/a");
         sp.last_command = Some("npm run dev".into());
         assert_eq!(restore_command(&sp).as_deref(), Some("npm run dev"));
+    }
+
+    /// A home holding one stored omp conversation for `/nowhere/proj`, titled
+    /// `title`, plus the pane title omp writes for it on the terminal.
+    fn omp_home_with_title(test: &str, title: &str) -> (std::path::PathBuf, String) {
+        let home = std::env::temp_dir().join(format!("kova-session-title-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let dir = crate::omp_session::session_dir(&home, "/nowhere/proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "01a17eab-44d5-7315-878f-1c81149f5013";
+        let slot = serde_json::json!({"type": "title", "v": 1, "title": title, "source": "auto"});
+        std::fs::write(dir.join(format!("2026-10-27T15-54-09-646Z_{id}.jsonl")), format!("{slot}\n"))
+            .unwrap();
+        (home, format!("π > {title}"))
+    }
+
+    fn panes_of(session: &Session) -> Vec<&SavedPane> {
+        session
+            .windows
+            .iter()
+            .flat_map(|w| w.tabs.iter())
+            .flat_map(|t| t.flat_columns.iter().flatten())
+            .flat_map(|c| c.panes.iter())
+            .collect()
+    }
+
+    #[test]
+    fn a_pane_whose_agent_was_not_named_comes_back_with_its_conversation() {
+        let (home, pane_title) = omp_home_with_title("recovered", "🔑 PRIV: Passe sur les besoins");
+        let id = "01a17eab-44d5-7315-878f-1c81149f5013";
+
+        let mut dormant = pane("/nowhere/proj");
+        dormant.last_command = Some("omp".into());
+        dormant.title = Some(pane_title.clone());
+        // The agent was quit here and another command run since: the stale
+        // title must not bring it back.
+        let mut moved_on = dormant.clone();
+        moved_on.last_command = Some("npm run dev".into());
+        // A pane the snapshot already named keeps its own conversation.
+        let mut named = dormant.clone();
+        named.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Codex,
+            id: "codex-id".into(),
+            config_dir: None,
+        });
+
+        let mut session = Session {
+            version: SESSION_VERSION,
+            windows: vec![window_with(vec![dormant, moved_on, named])],
+        };
+        recover_agent_sessions_by_title(&mut session, &home);
+
+        let panes = panes_of(&session);
+        assert_eq!(panes[0].agent_session.as_ref().map(|s| (s.agent, s.id.as_str())), Some((crate::agent_session::Agent::Omp, id)));
+        assert_eq!(restore_command(panes[0]).as_deref(), Some("omp --resume 01a17eab-44d5-7315-878f-1c81149f5013"));
+        assert!(panes[1].agent_session.is_none(), "a stale title names nothing");
+        assert_eq!(panes[2].agent_session.as_ref().map(|s| s.id.as_str()), Some("codex-id"));
+        // And the recovered pane resumes on its own at launch.
+        assert!(runs_on_launch(panes[0]));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn one_conversation_shared_by_two_panes_comes_back_in_neither() {
+        let (home, pane_title) = omp_home_with_title("shared", "📂 SESS: même titre");
+        let mut twice = pane("/nowhere/proj");
+        twice.last_command = Some("omp".into());
+        twice.title = Some(pane_title);
+        let mut session = Session {
+            version: SESSION_VERSION,
+            windows: vec![window_with(vec![twice.clone(), twice])],
+        };
+        recover_agent_sessions_by_title(&mut session, &home);
+
+        let panes = panes_of(&session);
+        assert!(panes.iter().all(|p| p.agent_session.is_none()), "two panes, one transcript");
+        assert!(panes.iter().all(|p| restore_command(p).as_deref() == Some("omp")));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1024,10 +1366,87 @@ mod tests {
         sp.agent_session = Some(SavedAgentSession {
             agent: crate::agent_session::Agent::Codex,
             id: "01a07651-015e-78a3-97f2-2eaf0f0cd663".into(),
+            config_dir: None,
         });
         assert_eq!(
             restore_command(&sp).as_deref(),
             Some("codex resume 01a07651-015e-78a3-97f2-2eaf0f0cd663")
+        );
+    }
+
+    fn window_with(panes: Vec<SavedPane>) -> WindowSession {
+        WindowSession {
+            tabs: vec![SavedTab {
+                flat_columns: Some(vec![SavedFlatColumn {
+                    panes,
+                    row_weights: Vec::new(),
+                    custom_row_weights: None,
+                }]),
+                columns: None,
+                column_weights: None,
+                custom_weights: None,
+                tree: None,
+                focused_leaf_index: 0,
+                custom_title: None,
+                color: None,
+                virtual_width_override: None,
+                scroll_offset_x: None,
+                geometry_scale: None,
+                subjects: Vec::new(),
+                subject_colors: Default::default(),
+                collapsed: false,
+            }],
+            active_tab: 0,
+            frame: None,
+            sidebar_sort: Default::default(),
+        }
+    }
+
+    fn pi_pane(cwd: &str, id: &str) -> SavedPane {
+        let mut sp = pane(cwd);
+        sp.last_command = Some("pi".into());
+        sp.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Pi,
+            id: id.into(),
+            config_dir: None,
+        });
+        sp
+    }
+
+    #[test]
+    fn two_panes_claiming_the_same_pi_conversation_both_drop_it() {
+        let mut windows = vec![window_with(vec![
+            pi_pane("/a", "same"),
+            pi_pane("/a", "same"),
+        ])];
+        drop_shared_guessed_sessions(&mut windows);
+        let panes = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes;
+        assert!(
+            panes.iter().all(|p| p.agent_session.is_none()),
+            "neither pane reopens a shared conversation"
+        );
+        assert!(
+            panes
+                .iter()
+                .all(|p| restore_command(p).as_deref() == Some("pi"))
+        );
+    }
+
+    #[test]
+    fn distinct_pi_conversations_are_left_alone() {
+        let mut windows = vec![window_with(vec![
+            pi_pane("/a", "one"),
+            pi_pane("/b", "two"),
+        ])];
+        drop_shared_guessed_sessions(&mut windows);
+        let panes = &windows[0].tabs[0].flat_columns.as_ref().unwrap()[0].panes;
+        assert_eq!(
+            restore_command(&panes[0]).as_deref(),
+            Some("pi --session one")
+        );
+        assert_eq!(
+            restore_command(&panes[1]).as_deref(),
+            Some("pi --session two")
         );
     }
 
@@ -1040,8 +1459,30 @@ mod tests {
         sp.agent_session = Some(SavedAgentSession {
             agent: crate::agent_session::Agent::Codex,
             id: "codex-id".into(),
+            config_dir: None,
         });
         assert_eq!(restore_command(&sp).as_deref(), Some("codex resume codex-id"));
+    }
+
+    #[test]
+    fn a_claude_session_from_another_config_dir_resumes_through_its_launcher() {
+        let mut sp = pane("/a");
+        sp.last_command = Some("proxy-cc".into());
+        sp.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Claude,
+            id: "abc".into(),
+            config_dir: Some("/Users/x/.claude-proxy".into()),
+        });
+        assert_eq!(restore_command(&sp).as_deref(), Some("proxy-cc --resume abc"));
+        assert!(runs_on_launch(&sp));
+
+        // The config dir survives a round trip through the session file, and a
+        // file without it (every older one) still reads.
+        let json = serde_json::to_string(sp.agent_session.as_ref().unwrap()).unwrap();
+        let back: SavedAgentSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.config_dir.as_deref(), Some("/Users/x/.claude-proxy"));
+        let old: SavedAgentSession = serde_json::from_str(r#"{"agent":"claude","id":"abc"}"#).unwrap();
+        assert_eq!(old.config_dir, None);
     }
 
     #[test]
@@ -1050,5 +1491,40 @@ mod tests {
         sp.last_command = None;
         assert_eq!(restore_command(&sp), None);
     }
+
+    #[test]
+    fn only_a_plain_agent_resume_line_runs_by_itself_at_launch() {
+        let mut sp = pane("/a");
+        sp.last_command = Some("claude --model opus".into());
+        sp.claude_session = Some("live-id".into());
+        assert!(runs_on_launch(&sp), "a resume line with plain flags runs");
+
+        let mut codex = pane("/a");
+        codex.agent_session = Some(SavedAgentSession {
+            agent: crate::agent_session::Agent::Codex,
+            id: "codex-id".into(),
+            config_dir: None,
+        });
+        assert!(runs_on_launch(&codex));
+
+        // A shell command, even a harmless one, still waits for Enter.
+        let mut shell = pane("/a");
+        shell.last_command = Some("npm run dev".into());
+        assert!(!runs_on_launch(&shell));
+
+        // A refused id falls back to the last command: not run.
+        let mut bad_id = pane("/a");
+        bad_id.last_command = Some("ls".into());
+        bad_id.claude_session = Some("live-id\nrm -rf ~".into());
+        assert!(!runs_on_launch(&bad_id));
+
+        // Flags carried from the last `claude …` that the shell would expand.
+        let mut expands = pane("/a");
+        expands.last_command = Some("claude --append-system-prompt $(cat ~/.ssh/id_rsa)".into());
+        expands.claude_session = Some("live-id".into());
+        assert!(restore_command(&expands).is_some_and(|l| l.contains("$(")), "the line is still offered");
+        assert!(!runs_on_launch(&expands), "but not run");
+    }
+
 
 }

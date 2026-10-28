@@ -21,7 +21,7 @@ Every frame is drawn on the GPU via Apple's Metal API. Glyph atlas with on-deman
 
 ### Session persistence
 
-Layout (tabs, splits, CWD) is saved on quit and restored on launch. Window position is remembered automatically.
+Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code, Codex, Pi or omp resume their conversation by themselves after a relaunch, each one the first time it is on screen in the active tab (focused or not), so fifty restored agents do not all start at once; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. A pane whose agent the snapshot could not name — a Kova built before that agent existed, a probe that missed at that instant — still comes back with its conversation when the title the agent wrote on the pane matches exactly one transcript of its directory, which is what an omp pane keeps. Window position is remembered automatically.
 
 ### Clickable URLs
 
@@ -31,7 +31,7 @@ Cmd+hover highlights URLs with an underline and pointer cursor. Cmd+click opens 
 
 Cmd+F opens an inline search overlay with match highlighting. Click a match to jump to it.
 
-Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code sessions that are no longer open: closed transcripts are indexed by the prompts you typed in them, and picking one reopens it with `claude --resume` in its own project directory. Bookmarks (Cmd+B) are listed too, matched on their name, directory and prompts. An empty input offers what you searched earlier in the run.
+Cmd+Shift+F searches every pane of every tab at once, and the same palette also reaches the Claude Code and omp sessions that are no longer open: closed transcripts are indexed by the prompts you typed and by what the agent answered, and picking one reopens it with that agent's `--resume` in its own project directory. Bookmarks (Cmd+B) are listed too, matched on their name, directory and prompts. An empty input offers what you searched earlier in the run.
 
 ### Attention routing
 
@@ -41,9 +41,10 @@ Kova tracks which panes have something you have not seen — a bell, or a comman
 - Cmd+P opens the tab/pane switcher: every tab with its panes, arrows or click to pick, Enter to focus. `u` flips it to the panes asking for something; Cmd+Shift+J opens that filtered list directly.
 - A pane whose Claude conversation has open items in `~/.claude/raf/<session-id>.json` ends its Cmd+P row with them: `3 todo` in orange, `· 1 idea` dim (ideas alone show dim). Closing such a pane, tab or window (Cmd+W, Cmd+Shift+W, window close) lists up to five of its todos in the close confirmation — even after `claude` has exited in the pane, since Kova remembers the last Claude conversation each pane held. Ideas never warn; a pane with no running process and no open todos still closes without a dialog. Quitting Kova does not list todos (the sessions reopen at relaunch).
 - Inside the switcher, Cmd+Up/Down moves the selected pane up or down its tab's order, and Cmd+Backspace on a bookmark row removes that bookmark after a confirmation.
+- Subjects group a tab's panes in Cmd+P: a framed box with the subject's name on a tinted title bar and its panes listed under it. Inside the switcher, Cmd+Right files the selected pane under the subject drawn right above it, or asks for a name when there is none (a name the tab already has joins that subject); Cmd+Shift+Right always asks for a name, to start a new subject right under a box; Cmd+Left takes it out, moving it just below the box. Cmd+Up/Down moves a filed pane among its subject's panes only, and moves an unfiled one over a whole box at once. A pane opened with Cmd+D joins the subject of the pane it was split from. Empty subjects stay listed at the top of their tab. On a subject's header, Cmd+Up/Down moves the whole box one line (an empty one among the empty boxes at the top), Enter renames it (a name the tab already has merges the two) and Cmd+Backspace deletes it, its panes staying open out of the box (asked first when it holds any). Subjects belong to their tab and survive a relaunch; a pane moved to another tab loses its subject. Each subject gets a color of the tab palette at random when created (one its tab uses least), kept across relaunches: its Cmd+P box is framed in it, and a tab where a pane is filed gives one row under the tab bar to a strip of colored bands naming the subject over its panes, one band across neighboring panes of the same subject, full color over the focused pane and dimmed elsewhere like the tabs. To choose a subject's color: right-click its band (the palette, or "Draw another color"), or press `c` on its header in Cmd+P to step to the next color.
 - Cmd+B bookmarks the conversation in the focused pane (press again to drop it); bookmarks no pane holds are listed in Cmd+P, and picking one reopens the conversation and runs its resume line.
 - Cmd+Shift+A anchors the focused pane's conversation — the few things today is for. Anchors open Cmd+P in their own section, listed whether or not a pane still holds them, and Cmd+A goes straight to the first one, reopening it when nothing does. A conversation that is both only shows up under the anchors. The list is Kova's own; an outside tool can push into it with the `set-anchor` IPC command.
-- The status bar counts working Claude sessions (`✳N`) and unread panes (`●N`).
+- The status bar counts working Claude sessions (`✳N`), unread panes (`●N`), and agent panes restored asleep that have not been shown yet (`◌N`).
 - Cmd+Shift+Option+Left/Right walks the panes you visited, back then forward.
 - Desktop notifications are posted by Kova itself, so clicking one focuses the pane it came from.
 
@@ -96,7 +97,7 @@ active_bg = [0.22, 0.22, 0.26]
 min_width = 300.0                     # minimum pane width in points before horizontal scroll activates
 dim_opacity = 0.3                     # how much an unfocused pane is faded (0.0 .. 1.0)
 dim_mode = "full"                     # "full" veils the whole pane, "text" fades only its glyphs
-focus_border_width = 2.0              # outline around the focused pane, 0.0 to disable
+focus_border_width = 2.0              # outline around the focused pane (only with 2+ panes on screen; never in a host app), 0.0 to disable
 focus_border_color = [0.4, 0.6, 1.0]
 ```
 
@@ -140,7 +141,7 @@ focus_border_color = [0.4, 0.6, 1.0]
 | Cmd+J | Jump to the next unread pane |
 | Cmd+U | Mark the focused pane as unread, or as read when it is unread |
 | Cmd+Shift+Option+Left/Right | Walk the panes you visited, back and forward |
-| Cmd+O | Reopen a closed tab |
+| Cmd+O | Reopen a closed tab (type to filter by name or path) |
 | Cmd+Shift+W | Close tab |
 | Cmd+Shift+C | Copy selection (raw) |
 | Cmd+C | Copy selection |

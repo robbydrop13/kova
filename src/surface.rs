@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::terminal::program_status::{ProgramState, ProgramStatus};
 use crate::terminal::pty::{ProcessInfo, Pty, SpawnEnv};
 use crate::terminal::TerminalState;
 
@@ -148,6 +149,17 @@ fn is_working_marker(title: &str) -> bool {
     ) && chars.next() == Some(' ')
 }
 
+/// True if the app in this pane is busy, whichever way it says so: Claude Code
+/// animates its OSC title (`is_working_marker`), Pi never touches its title and
+/// reports through the Program Status Protocol instead (`OSC 7501`,
+/// `state=working`). Both are the same fact to the user, so they are one
+/// signal here — the status bar's `✳N` counter, Cmd+J's tiers and IPC's
+/// `working` all read this.
+fn is_busy(title: Option<&str>, status: Option<&ProgramStatus>) -> bool {
+    title.map_or(false, is_working_marker)
+        || status.is_some_and(|s| s.state == Some(ProgramState::Working))
+}
+
 /// True if `title` begins with any Claude Code status marker followed by a
 /// space: the Braille working spinner, an asterisk-like idle marker
 /// (`*`, `✳ ` U+2733, `∗` U+2217), or a vertical half-circle spinner frame
@@ -185,6 +197,20 @@ fn normalize_process_name(raw: &str) -> Option<String> {
     let name = name.rsplit('/').next().unwrap_or(name);
     let name = name.strip_prefix('-').unwrap_or(name);
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// What to call a `claude` that runs from another config dir: the dir's
+/// suffix, so `~/.claude-deepseek` reads `deepseek` — a launcher that points
+/// Claude Code at another model or account names its config dir after it.
+/// `None` keeps the process name (another program, or the default dir).
+fn claude_flavor_name(process: &str, config_dir: Option<&str>) -> Option<String> {
+    if process != "claude" {
+        return None;
+    }
+    let base = config_dir?.trim_end_matches('/').rsplit('/').next()?;
+    base.strip_prefix(".claude-")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Conversation name → custom pane title → non-empty OSC title → foreground
@@ -272,6 +298,16 @@ pub struct Surface {
     /// search palette's resume command), or the `command` a library host
     /// passed to `kova_pane_new`, which that host answers for.
     run_pending: Cell<bool>,
+    /// The agent conversation a launch restore left asleep in this pane: its
+    /// resume line waits in `pending_command`, neither typed nor run, until
+    /// the pane is first on screen (`wake`). Kept here because no agent runs
+    /// yet, so `agent_session` is `None` and the session file would otherwise
+    /// forget the conversation (`session::snapshot_flat_column`).
+    dormant: RefCell<Option<crate::session::SavedAgentSession>>,
+    /// The conversation `wake` just started, until the probe sees its agent
+    /// running (`set_agent_session`). Between the two, `agent_session` is still
+    /// `None`: without this, a quit in that gap would save the pane empty.
+    woken: RefCell<Option<crate::session::SavedAgentSession>>,
     /// Open-latency instrumentation (time-to-rectangle / time-to-prompt).
     pub open_timer: Arc<PaneOpenTimer>,
     /// The app in this pane told us it is waiting for the user (Claude Code
@@ -421,6 +457,8 @@ impl Surface {
             scroll_accumulator: Cell::new(0.0),
             pending_command: Cell::new(None),
             run_pending: Cell::new(false),
+            dormant: RefCell::new(None),
+            woken: RefCell::new(None),
             open_timer,
             awaiting: Cell::new(AwaitingFlag::default()),
             agent_session: RefCell::new(None),
@@ -459,10 +497,16 @@ impl Surface {
     /// An unresolvable name caches as `None` (nothing to display) without
     /// changing the returned yes/no.
     fn refresh_fg_process(&self) -> bool {
-        let probe = self.pty.foreground_process();
+        let (agent_pid, config_dir) = match self.agent_session.borrow().as_ref() {
+            Some(s) => (s.pid, s.config_dir.clone()),
+            None => (None, None),
+        };
+        let probe = self.pty.foreground_process_preferring(agent_pid);
         let running = probe.is_some();
         self.fg_process.replace(probe.and_then(|info| {
-            normalize_process_name(&info.name).map(|name| ProcessInfo { name, ..info })
+            let name = normalize_process_name(&info.name)?;
+            let name = claude_flavor_name(&name, config_dir.as_deref()).unwrap_or(name);
+            Some(ProcessInfo { name, ..info })
         }));
         running
     }
@@ -525,8 +569,18 @@ impl Surface {
     /// Store what the probe found, remembering a Claude conversation's id in
     /// `last_claude_session` so it outlives the session itself.
     pub(crate) fn set_agent_session(&self, found: Option<crate::agent_session::AgentSession>) {
+        if found.is_some() {
+            self.woken.replace(None);
+        }
         if let Some(s) = found.as_ref().filter(|s| s.agent == crate::agent_session::Agent::Claude) {
             self.last_claude_session.replace(Some(s.id.clone()));
+            if let Some(dir) = s.config_dir.as_deref() {
+                if let Some(launcher) =
+                    crate::claude_session::launcher(self.last_command().as_deref(), Some(dir))
+                {
+                    crate::launchers::remember(dir, &launcher);
+                }
+            }
         }
         *self.agent_session.borrow_mut() = found;
     }
@@ -613,6 +667,14 @@ impl Surface {
             .and_then(|s| s.name.clone())
     }
 
+    /// The non-default `CLAUDE_CONFIG_DIR` the pane's Claude session runs
+    /// under, `None` for `~/.claude` or when no Claude runs here.
+    pub fn claude_config_dir(&self) -> Option<String> {
+        self.agent_session.borrow().as_ref()
+            .filter(|s| s.agent == crate::agent_session::Agent::Claude)
+            .and_then(|s| s.config_dir.clone())
+    }
+
     /// Name other Claude sessions reach this one by with `SendMessage` /
     /// `ListAgents`: the session file's `name`, derived or set by `/rename`.
     /// `None` for other agents and before Claude Code has written a name.
@@ -622,16 +684,15 @@ impl Surface {
             .and_then(|s| s.peer_name.clone())
     }
 
-    /// True if the app in this pane is actively working: its live OSC 0/2 title
-    /// leads with one of Claude Code's animated spinners (see `is_working_marker`).
-    /// The asterisk idle marker (`✳ Claude Code`) does NOT count. Reads the live
-    /// OSC 0/2 title even when a sticky custom title shadows it in the display.
+    /// True if the app in this pane is actively working: either its live OSC 0/2
+    /// title leads with one of Claude Code's animated spinners (see
+    /// `is_working_marker`), or it reports `state=working` through the Program
+    /// Status Protocol (`is_busy`) — Pi's way. The asterisk idle marker
+    /// (`✳ Claude Code`) does NOT count. Reads the live OSC 0/2 title even when
+    /// a sticky custom title shadows it in the display.
     pub fn is_working(&self) -> bool {
-        self.terminal
-            .read()
-            .title
-            .as_deref()
-            .map_or(false, is_working_marker)
+        let term = self.terminal.read();
+        is_busy(term.title.as_deref(), term.program_status.as_ref())
     }
 
     /// True if the app in this pane says it is waiting for the user, and
@@ -721,7 +782,7 @@ impl Surface {
     /// — without \r so the user can review before pressing Enter, unless
     /// `run_pending_command` asked for it to run.
     pub fn inject_pending_command(&self) {
-        if !self.is_ready() {
+        if !self.is_ready() || self.dormant.borrow().is_some() {
             return;
         }
         if !prompt_settled(
@@ -746,6 +807,49 @@ impl Surface {
             self.run_pending.set(true);
         }
         self.pending_command.set(cmd);
+    }
+
+    /// Leave the pending resume line of conversation `id` asleep until `wake`:
+    /// a launch restore does this instead of `run_pending_command`, so fifty
+    /// restored agents do not all start at once.
+    pub fn sleep_until_shown(&self, session: crate::session::SavedAgentSession) {
+        *self.dormant.borrow_mut() = Some(session);
+    }
+
+    /// The conversation still asleep in this pane, if any (see `dormant`).
+    pub fn dormant_session(&self) -> Option<(crate::agent_session::Agent, String)> {
+        self.dormant.borrow().as_ref().map(|s| (s.agent, s.id.clone()))
+    }
+
+    pub fn dormant_session_id(&self) -> Option<String> {
+        self.dormant.borrow().as_ref().map(|s| s.id.clone())
+    }
+
+    /// The pane is shown: run the resume line it was keeping. False when it was
+    /// not asleep, so calling it on every frame costs a borrow.
+    pub fn wake(&self) -> bool {
+        let Some(session) = self.dormant.borrow_mut().take() else {
+            return false;
+        };
+        self.woken.replace(Some(session));
+        self.run_pending_command();
+        true
+    }
+
+    /// Someone else took over this sleeping pane (keys sent over IPC): forget
+    /// the resume line, so the first time the pane is shown does not type it
+    /// into whatever they started. A pane that was not asleep is untouched.
+    pub fn cancel_sleep(&self) {
+        if self.dormant.borrow_mut().take().is_some() {
+            self.pending_command.set(None);
+        }
+    }
+
+    /// The conversation to save for this pane while no agent is seen running
+    /// in it: the one still asleep, or the one just woken whose agent has not
+    /// registered yet.
+    pub fn unregistered_session(&self) -> Option<crate::session::SavedAgentSession> {
+        self.dormant.borrow().clone().or_else(|| self.woken.borrow().clone())
     }
 }
 
@@ -791,7 +895,11 @@ fn injected_line(command: &str, run: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_display_title, injected_line, is_working_marker, normalize_process_name, strip_activity_prefix, AwaitingFlag};
+    use super::{
+        AwaitingFlag, claude_flavor_name, derive_display_title, injected_line, is_busy, is_working_marker,
+        normalize_process_name, strip_activity_prefix,
+    };
+    use crate::terminal::program_status::{ProgramState, ProgramStatus};
 
     #[test]
     fn a_read_waiting_pane_re_enters_the_jump_cycle_only_on_a_new_question() {
@@ -815,6 +923,24 @@ mod tests {
         let asked_again = seen.armed(160);
         assert!(!asked_again.is_read(), "a fresh question must resurface the pane");
         assert_eq!(asked_again.since(), Some(100), "the waiting clock keeps its origin");
+    }
+
+    #[test]
+    fn a_pi_working_record_makes_a_pane_busy_without_any_spinner() {
+        // Pi keeps the same title while it works (`π - <cwd>`) and reports
+        // through OSC 7501 instead: that record alone has to count.
+        let pi = |state| ProgramStatus { state: Some(state), app: Some("pi".into()), ..Default::default() };
+        let title = Some("\u{3c0} - kova");
+        assert!(is_busy(title, Some(&pi(ProgramState::Working))));
+        // Every other state is a resting one: idle, done, waiting, failed.
+        for resting in [ProgramState::Idle, ProgramState::Done, ProgramState::Blocked, ProgramState::Error] {
+            assert!(!is_busy(title, Some(&pi(resting))), "{:?} is not working", resting);
+        }
+        assert!(!is_busy(title, None));
+        // Claude's spinner still works on its own, no record needed.
+        assert!(is_busy(Some("\u{2802} Revue"), None));
+        // Neither signal, no work.
+        assert!(!is_busy(None, None));
     }
 
     #[test]
@@ -959,6 +1085,36 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_from_another_config_dir_is_named_after_it() {
+        assert_eq!(
+            claude_flavor_name("claude", Some("/Users/x/.claude-deepseek")).as_deref(),
+            Some("deepseek")
+        );
+        assert_eq!(
+            claude_flavor_name("claude", Some("/Users/x/.claude-deepseek/")).as_deref(),
+            Some("deepseek")
+        );
+    }
+
+    #[test]
+    fn the_process_name_stays_otherwise() {
+        assert_eq!(claude_flavor_name("claude", None), None);
+        assert_eq!(
+            claude_flavor_name("claude", Some("/Users/x/.claude-")),
+            None
+        );
+        assert_eq!(
+            claude_flavor_name("claude", Some("/Users/x/.config/claude")),
+            None
+        );
+        // Something else in the foreground (claude suspended): not renamed.
+        assert_eq!(
+            claude_flavor_name("vim", Some("/Users/x/.claude-deepseek")),
+            None
+        );
+    }
+
+    #[test]
     fn foreground_process_used_when_nothing_named_the_pane() {
         let t = derive_display_title(None, None, None, Some("nvim"), Some("/home/x/proj"), "shell");
         assert_eq!(t, "nvim");
@@ -996,6 +1152,81 @@ mod tests {
         assert_eq!(derive_display_title(None, None, None, None, None, "shell"), "shell");
         // Empty OSC title with no cwd must also reach the fallback, never blank.
         assert_eq!(derive_display_title(None, None, Some(""), None, None, "shell"), "shell");
+    }
+
+    #[test]
+    fn a_sleeping_resume_line_is_neither_typed_nor_run_until_woken() {
+        use crate::agent_session::Agent;
+        use crate::input::tests::drain;
+        let (surface, reader) = super::Surface::capture(80, 24);
+        surface.pending_command.set(Some("claude --resume abc".into()));
+        surface.sleep_until_shown(crate::session::SavedAgentSession { agent: Agent::Claude, id: "abc".into(), config_dir: None });
+        assert_eq!(surface.dormant_session_id().as_deref(), Some("abc"));
+
+        surface.inject_pending_command();
+        assert!(drain(&reader).is_empty(), "asleep: nothing reaches the shell");
+
+        assert!(surface.wake());
+        assert_eq!(surface.dormant_session(), None);
+        surface.inject_pending_command();
+        assert_eq!(drain(&reader), b"claude --resume abc\r", "woken: typed and run");
+
+        assert!(!surface.wake(), "a second wake is a no-op");
+        surface.inject_pending_command();
+        assert!(drain(&reader).is_empty());
+    }
+
+    #[test]
+    fn keys_sent_to_a_sleeping_pane_cancel_its_resume_line() {
+        use crate::agent_session::Agent;
+        use crate::input::tests::drain;
+        let (surface, reader) = super::Surface::capture(80, 24);
+        surface.pending_command.set(Some("claude --resume abc".into()));
+        surface.sleep_until_shown(crate::session::SavedAgentSession { agent: Agent::Claude, id: "abc".into(), config_dir: None });
+        surface.cancel_sleep();
+        assert_eq!(surface.dormant_session(), None);
+        assert!(!surface.wake(), "nothing left to wake");
+        surface.inject_pending_command();
+        assert!(drain(&reader).is_empty(), "the resume line is gone");
+
+        let (awake, reader) = super::Surface::capture(80, 24);
+        awake.pending_command.set(Some("make".into()));
+        awake.cancel_sleep();
+        awake.inject_pending_command();
+        assert_eq!(drain(&reader), b"make", "a pane that was not asleep keeps its line");
+    }
+
+    #[test]
+    fn a_woken_conversation_is_kept_until_its_agent_registers() {
+        use crate::agent_session::{Agent, AgentSession};
+        let (surface, _reader) = super::Surface::capture(80, 24);
+        surface.pending_command.set(Some("claude --resume abc".into()));
+        surface.sleep_until_shown(crate::session::SavedAgentSession { agent: Agent::Claude, id: "abc".into(), config_dir: None });
+        assert!(surface.wake());
+        assert_eq!(surface.dormant_session(), None);
+        assert_eq!(
+            surface.unregistered_session().map(|s| s.id).as_deref(),
+            Some("abc"),
+            "claude not registered yet: a quit now still saves the conversation"
+        );
+        surface.set_agent_session(None);
+        assert!(
+            surface.unregistered_session().is_some(),
+            "an empty probe forgets nothing"
+        );
+        surface.set_agent_session(Some(AgentSession {
+            pid: None,
+            agent: Agent::Claude,
+            id: "abc".into(),
+            name: None,
+            peer_name: None,
+            config_dir: None,
+        }));
+        assert_eq!(
+            surface.unregistered_session(),
+            None,
+            "the live session takes over"
+        );
     }
 
     #[test]

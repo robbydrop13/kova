@@ -387,6 +387,47 @@ fn step_in_order(
     }
 }
 
+/// Append to `subjects` the names in `named` it does not hold yet, in the
+/// order they come, each once.
+pub fn heal_subject_list(subjects: &mut Vec<String>, named: impl IntoIterator<Item = String>) {
+    for name in named {
+        if !subjects.contains(&name) {
+            subjects.push(name);
+        }
+    }
+}
+
+/// The palette entry a new subject gets: drawn at random among the colors
+/// the tab's other subjects use least, so two subjects look alike only once
+/// the palette is used up. `taken` holds those subjects' colors; `seed` is
+/// the randomness, passed in so the choice can be tested.
+pub fn pick_subject_color(taken: impl IntoIterator<Item = usize>, seed: u64) -> usize {
+    pick_subject_color_except(taken, None, seed)
+}
+
+/// `pick_subject_color`, never returning `except`: "Draw another color" must
+/// change the color, even when the one it has is among the least used.
+pub fn pick_subject_color_except(taken: impl IntoIterator<Item = usize>, except: Option<usize>, seed: u64) -> usize {
+    let n = crate::tab_colors::TAB_COLORS.len();
+    let mut uses = vec![0usize; n];
+    for c in taken {
+        uses[c % n] += 1;
+    }
+    let allowed = |i: usize| Some(i) != except.map(|e| e % n);
+    let least = (0..n).filter(|&i| allowed(i)).map(|i| uses[i]).min().unwrap_or(0);
+    let candidates: Vec<usize> = (0..n).filter(|&i| allowed(i) && uses[i] == least).collect();
+    candidates[(seed % candidates.len() as u64) as usize]
+}
+
+/// A fresh random number for `pick_subject_color`, from the std's per-process
+/// random hash keys: Kova has no random crate, and a color needs no more.
+fn random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.finish()
+}
+
 pub struct Tab {
     pub id: TabId,
     pub columns: Vec<Column>,
@@ -424,6 +465,14 @@ pub struct Tab {
     /// Cell height in pixels, used to snap row heights to cell boundaries.
     /// Set by the window before layout; 0.0 = no snapping.
     pub cell_h: Cell<f32>,
+    /// Subjects of work filed in this tab, in creation order — empty ones
+    /// included: Cmd+P lists them at the top of the tab until something is
+    /// filed in them again. A pane names its own in `Pane::subject`.
+    pub subjects: Vec<String>,
+    /// Each subject's color, an index into `TAB_COLORS`: drawn at random when
+    /// the subject is created, then kept (saved with the session) so a
+    /// subject looks the same from one day to the next.
+    pub subject_colors: std::collections::HashMap<String, usize>,
 }
 
 /// Pixel conversion factor between the display a tab's geometry was expressed in
@@ -534,6 +583,8 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            subjects: Vec::new(),
+            subject_colors: std::collections::HashMap::new(),
         })
     }
 
@@ -568,6 +619,8 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            subjects: Vec::new(),
+            subject_colors: std::collections::HashMap::new(),
         }
     }
 
@@ -594,6 +647,8 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            subjects: Vec::new(),
+            subject_colors: std::collections::HashMap::new(),
         })
     }
 
@@ -619,6 +674,8 @@ impl Tab {
             virtual_width_override: 0.0,
             geometry_scale: 0.0,
             cell_h: Cell::new(0.0),
+            subjects: Vec::new(),
+            subject_colors: std::collections::HashMap::new(),
         })
     }
 
@@ -1268,7 +1325,14 @@ impl Tab {
     }
 
     /// Extract a pane by id, returning it separately. The tab retains the remainder.
+    /// The pane leaves its subject behind: subjects belong to this tab.
     pub fn extract_pane(&mut self, id: PaneId) -> Option<Pane> {
+        let mut pane = self.extract_pane_keeping_subject(id)?;
+        pane.subject = None;
+        Some(pane)
+    }
+
+    fn extract_pane_keeping_subject(&mut self, id: PaneId) -> Option<Pane> {
         let col_idx = self.column_index_of(id)?;
 
         if self.columns[col_idx].panes.len() == 1 {
@@ -1457,6 +1521,193 @@ impl Tab {
         true
     }
 
+    /// Exchange two panes of this tab in place, each landing where the other
+    /// was — what Cmd+Up/Down does inside a subject whose members are not
+    /// adjacent in the layout. False when either pane is not in this tab.
+    pub fn swap_pane_positions(&mut self, a: PaneId, b: PaneId) -> bool {
+        match (self.position_of(a), self.position_of(b)) {
+            (Some(pa), Some(pb)) if pa != pb => {
+                self.swap_positions(pa, pb);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Put the tab's panes in `order` (every pane id of the tab, each once),
+    /// in traversal order. The layout keeps its shape: only the occupants of
+    /// its places change, one swap at a time. False when `order` is not a
+    /// permutation of the tab's panes; nothing moves then.
+    pub fn reorder_panes(&mut self, order: &[PaneId]) -> bool {
+        let current: Vec<PaneId> = self.pane_subjects().into_iter().map(|(id, _)| id).collect();
+        let mut sorted_a = current.clone();
+        let mut sorted_b = order.to_vec();
+        sorted_a.sort_unstable();
+        sorted_b.sort_unstable();
+        if sorted_a != sorted_b {
+            return false;
+        }
+        for (i, &want) in order.iter().enumerate() {
+            let here = self.pane_subjects()[i].0;
+            if here != want {
+                self.swap_pane_positions(here, want);
+            }
+        }
+        true
+    }
+
+    /// Every pane's id and subject, in traversal order — the order Cmd+P
+    /// lists and `move_pane_in_order` walks.
+    pub fn pane_subjects(&self) -> Vec<(PaneId, Option<String>)> {
+        let mut out = Vec::new();
+        self.for_each_pane(&mut |p| out.push((p.id, p.subject.clone())));
+        out
+    }
+
+    /// Add to `subjects` every subject a pane names that the tab does not list
+    /// yet: a session file edited by hand, or written by a build that lost the
+    /// list, still shows every pane in its box.
+    pub fn heal_subjects(&mut self) {
+        let named: Vec<String> = self.pane_subjects().into_iter().filter_map(|(_, s)| s).collect();
+        heal_subject_list(&mut self.subjects, named);
+        self.heal_subject_colors();
+    }
+
+    /// Give a color to every subject that has none (a session saved before
+    /// colors existed, a subject created by a path that only pushed its name),
+    /// and forget the colors of names the tab no longer has.
+    fn heal_subject_colors(&mut self) {
+        let subjects = &self.subjects;
+        self.subject_colors.retain(|name, _| subjects.contains(name));
+        for name in self.subjects.clone() {
+            if !self.subject_colors.contains_key(&name) {
+                let color = pick_subject_color(self.subject_colors.values().copied(), random_seed());
+                self.subject_colors.insert(name, color);
+            }
+        }
+    }
+
+    /// Add a subject to the tab, with its color. Returns false when the tab
+    /// already has it.
+    pub fn add_subject(&mut self, name: &str) -> bool {
+        if self.subjects.iter().any(|s| s == name) {
+            return false;
+        }
+        self.subjects.push(name.to_string());
+        self.heal_subject_colors();
+        true
+    }
+
+    /// Whether any pane of the tab is filed under a subject: the tab then
+    /// gives up one row, under the tab bar, to the subject strip.
+    pub fn has_filed_panes(&self) -> bool {
+        self.columns.iter().any(|c| c.panes.iter().any(|p| p.subject.is_some()))
+    }
+
+    /// Give a subject a color chosen by hand (an index into `TAB_COLORS`).
+    /// False when the tab has no such subject.
+    pub fn set_subject_color(&mut self, name: &str, color: usize) -> bool {
+        if !self.subjects.iter().any(|s| s == name) {
+            return false;
+        }
+        self.subject_colors.insert(name.to_string(), color % crate::tab_colors::TAB_COLORS.len());
+        true
+    }
+
+    /// Move a subject to the next color of the palette (Cmd+P's `c` on its
+    /// header). Returns the new color.
+    pub fn cycle_subject_color(&mut self, name: &str) -> Option<usize> {
+        let next = (self.subject_color(name)? + 1) % crate::tab_colors::TAB_COLORS.len();
+        self.set_subject_color(name, next);
+        Some(next)
+    }
+
+    /// Draw a new random color for a subject, never the one it has, among the
+    /// colors the tab's other subjects use least (the strip menu's "Draw
+    /// another color"). Returns the new color.
+    pub fn redraw_subject_color(&mut self, name: &str) -> Option<usize> {
+        let current = self.subject_color(name)?;
+        let others: Vec<usize> = self.subject_colors.iter().filter(|(n, _)| n.as_str() != name).map(|(_, c)| *c).collect();
+        let color = pick_subject_color_except(others, Some(current), random_seed());
+        self.set_subject_color(name, color);
+        Some(color)
+    }
+
+    /// One entry per column for the subject strip, left to right: its x and
+    /// width in `vp`, the subject of its first filed pane (top first) with
+    /// that subject's color, and whether it holds `focused`. What the strip
+    /// draws (`subject_strip_segments`) and what a right-click on it hits.
+    pub fn subject_strip_columns(
+        &self,
+        vp: PaneViewport,
+        focused: PaneId,
+    ) -> Vec<(f32, f32, Option<(String, Option<usize>)>, bool)> {
+        let mut columns: Vec<(f32, f32, Option<(String, Option<usize>)>, bool)> = Vec::new();
+        self.for_each_pane_with_viewport(vp, &mut |pane, pvp| {
+            let subject = pane.subject.as_ref().map(|n| (n.clone(), self.subject_color(n)));
+            let is_focused = pane.id == focused;
+            match columns.last_mut() {
+                Some(col) if col.0 == pvp.x => {
+                    if col.2.is_none() {
+                        col.2 = subject;
+                    }
+                    col.3 |= is_focused;
+                }
+                _ => columns.push((pvp.x, pvp.width, subject, is_focused)),
+            }
+        });
+        columns
+    }
+
+    /// The color of a subject of this tab, an index into `TAB_COLORS`.
+    pub fn subject_color(&self, name: &str) -> Option<usize> {
+        self.subject_colors.get(name).copied()
+    }
+
+    /// Rename a subject, its members following. A name the tab already has
+    /// merges the two: the renamed subject's panes join the other one, which
+    /// keeps its place in the list.
+    pub fn rename_subject(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        // The color follows the name; merged into another subject, it is
+        // that subject's color that stays.
+        let color = self.subject_colors.remove(old);
+        if self.subjects.iter().any(|s| s == new) {
+            self.subjects.retain(|s| s != old);
+        } else if let Some(s) = self.subjects.iter_mut().find(|s| *s == old) {
+            *s = new.to_string();
+            if let Some(color) = color {
+                self.subject_colors.insert(new.to_string(), color);
+            }
+        }
+        for col in &mut self.columns {
+            for p in &mut col.panes {
+                if p.subject.as_deref() == Some(old) {
+                    p.subject = Some(new.to_string());
+                }
+            }
+        }
+    }
+
+    /// Delete a subject. Its panes stay open where they are, out of any box.
+    /// Returns how many panes it held.
+    pub fn delete_subject(&mut self, name: &str) -> usize {
+        self.subjects.retain(|s| s != name);
+        self.subject_colors.remove(name);
+        let mut freed = 0;
+        for col in &mut self.columns {
+            for p in &mut col.panes {
+                if p.subject.as_deref() == Some(name) {
+                    p.subject = None;
+                    freed += 1;
+                }
+            }
+        }
+        freed
+    }
+
     /// Swap the focused pane with its neighbor. For Left/Right, swap entire columns.
     pub fn swap_panes(&mut self, id1: PaneId, id2: PaneId, dir: NavDirection) -> bool {
         if id1 == id2 { return false; }
@@ -1558,6 +1809,9 @@ pub struct Pane {
     pub custom_title: Option<String>,
     /// Whether this pane is minimized (collapsed to a thin bar).
     pub minimized: bool,
+    /// The subject of its tab this pane is filed under in Cmd+P, by name (one
+    /// of `Tab::subjects`). Filed by hand; a pane that leaves its tab loses it.
+    pub subject: Option<String>,
     /// Whether the idle agent session in this pane has been looked at since it
     /// last did anything. Backs Cmd+J's third tier (see `is_idle_agent_unseen`):
     /// an open session nobody is using is a candidate exactly once, then drops
@@ -1623,6 +1877,7 @@ impl Pane {
             surface,
             custom_title: None,
             minimized: false,
+            subject: None,
             idle_agent_seen: Cell::new(false),
             last_seen: Cell::new(0),
             manual_unread: Cell::new(false),
@@ -1646,7 +1901,9 @@ impl Pane {
     /// `list-panes` exposes it, so a client never types a line of its own.
     pub fn resume_target(&self) -> Option<(crate::agent_session::Agent, String, String)> {
         let (agent, id) = self.restored_session()?;
-        let command = crate::agent_session::resume_command(agent, &id, self.last_command().as_deref())?;
+        // No config dir: `resumed_session` only reads a line that starts with the
+        // binary, so a `CLAUDE_CONFIG_DIR=… claude --resume …` line never gets here.
+        let command = crate::agent_session::resume_command(agent, &id, self.last_command().as_deref(), None)?;
         Some((agent, id, command))
     }
 
@@ -2406,10 +2663,29 @@ mod tests {
         assert_eq!(weights, vec![1.0, 1.0]);
     }
 
+    #[test]
+    fn a_pane_whose_program_reports_working_is_counted_by_the_status_bar() {
+        // The status bar's `✳N` counts `Pane::is_working()` per pane across the
+        // window (window/tick.rs). Pi reports through OSC 7501 instead of
+        // animating its title, so that record is what puts it in the count.
+        let (pane, _fd) = super::Pane::capture(10, 2);
+        assert!(!pane.is_working(), "a pane nobody says anything about is idle");
+        pane.terminal.write().program_status = Some(crate::terminal::program_status::ProgramStatus {
+            state: Some(crate::terminal::program_status::ProgramState::Working),
+            app: Some("pi".into()),
+            ..Default::default()
+        });
+        assert!(pane.is_working(), "the pane of a working Pi is busy");
+    }
+
     fn claude_session() -> crate::agent_session::AgentSession {
         crate::agent_session::AgentSession {
-            agent: crate::agent_session::Agent::Claude, id: "claude-id".into(), name: None,
+            pid: None,
+            agent: crate::agent_session::Agent::Claude,
+            id: "claude-id".into(),
+            name: None,
             peer_name: None,
+            config_dir: None,
         }
     }
 
@@ -2426,12 +2702,22 @@ mod tests {
         assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
         // A Codex conversation is not a Claude one: the Claude id stays.
         pane.set_agent_session(Some(AgentSession {
-            agent: Agent::Codex, id: "codex-id".into(), name: None, peer_name: None,
+            pid: None,
+            agent: Agent::Codex,
+            id: "codex-id".into(),
+            name: None,
+            peer_name: None,
+            config_dir: None,
         }));
         assert_eq!(pane.last_claude_session_id().as_deref(), Some("claude-id"));
         // The next Claude conversation replaces it.
         pane.set_agent_session(Some(AgentSession {
-            agent: Agent::Claude, id: "next-id".into(), name: None, peer_name: None,
+            pid: None,
+            agent: Agent::Claude,
+            id: "next-id".into(),
+            name: None,
+            peer_name: None,
+            config_dir: None,
         }));
         assert_eq!(pane.last_claude_session_id().as_deref(), Some("next-id"));
         // A dead shell keeps it too.
@@ -2521,14 +2807,164 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_broken_out_of_its_tab_leaves_its_subject_behind() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (mut b, _fb) = super::Pane::capture(10, 2);
+        b.subject = Some("auth".into());
+        let b_id = b.id;
+        let mut tab = super::Tab::with_columns(vec![vec![a, b]]);
+        tab.subjects.push("auth".into());
+        let out = tab.extract_pane(b_id).expect("the pane comes out");
+        assert_eq!(out.subject, None, "subjects belong to the tab");
+        assert_eq!(tab.subjects, vec!["auth".to_string()], "the subject stays, empty");
+    }
+
+    #[test]
+    fn renaming_a_subject_carries_its_panes_and_merges_into_an_existing_name() {
+        let (mut a, _fa) = super::Pane::capture(10, 2);
+        let (mut b, _fb) = super::Pane::capture(10, 2);
+        let (c, _fc) = super::Pane::capture(10, 2);
+        a.subject = Some("auth".into());
+        b.subject = Some("api".into());
+        let mut tab = super::Tab::with_columns(vec![vec![a, b, c]]);
+        tab.subjects = vec!["auth".into(), "api".into(), "idle".into()];
+
+        tab.rename_subject("auth", "login");
+        assert_eq!(tab.subjects, ["login", "api", "idle"], "renamed in place");
+        let subjects = |t: &super::Tab| t.pane_subjects().into_iter().map(|(_, s)| s).collect::<Vec<_>>();
+        assert_eq!(subjects(&tab), [Some("login".into()), Some("api".into()), None]);
+
+        tab.rename_subject("login", "api");
+        assert_eq!(tab.subjects, ["api", "idle"], "a taken name merges, the other keeps its place");
+        assert_eq!(subjects(&tab), [Some("api".into()), Some("api".into()), None]);
+    }
+
+    #[test]
+    fn a_new_subject_takes_a_color_the_tab_uses_least() {
+        let n = crate::tab_colors::TAB_COLORS.len();
+        // Every color but 2 taken once: 2 is the only least-used one.
+        let taken: Vec<usize> = (0..n).filter(|&c| c != 2).collect();
+        for seed in 0..20 {
+            assert_eq!(super::pick_subject_color(taken.clone(), seed), 2);
+        }
+        // Nothing taken: any color, chosen by the seed.
+        let picks: std::collections::HashSet<usize> = (0..50).map(|seed| super::pick_subject_color([], seed)).collect();
+        assert_eq!(picks.len(), n, "every color can come out");
+    }
+
+    #[test]
+    fn a_subject_color_set_cycled_or_redrawn_by_hand() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let mut tab = super::Tab::with_columns(vec![vec![a]]);
+        tab.add_subject("auth");
+        assert!(tab.set_subject_color("auth", 3));
+        assert_eq!(tab.subject_color("auth"), Some(3));
+        assert!(!tab.set_subject_color("nope", 3), "no such subject");
+        let n = crate::tab_colors::TAB_COLORS.len();
+        tab.set_subject_color("auth", n - 1);
+        assert_eq!(tab.cycle_subject_color("auth"), Some(0), "the last color wraps to the first");
+        assert_eq!(tab.cycle_subject_color("nope"), None);
+        for _ in 0..30 {
+            let before = tab.subject_color("auth").unwrap();
+            let after = tab.redraw_subject_color("auth").unwrap();
+            assert_ne!(before, after, "drawing another color always changes it");
+        }
+        // The excluded color never comes out, even when it is the least used.
+        for seed in 0..50 {
+            assert_ne!(super::pick_subject_color_except([0, 1, 3, 4, 5], Some(2), seed), 2);
+        }
+    }
+
+    #[test]
+    fn subject_colors_follow_creation_rename_merge_and_deletion() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let mut tab = super::Tab::with_columns(vec![vec![a]]);
+        assert!(tab.add_subject("auth"));
+        assert!(!tab.add_subject("auth"), "already there");
+        assert!(tab.add_subject("api"));
+        let (auth, api) = (tab.subject_color("auth").unwrap(), tab.subject_color("api").unwrap());
+        assert_ne!(auth, api, "the palette is not used up: two subjects, two colors");
+
+        tab.rename_subject("auth", "login");
+        assert_eq!(tab.subject_color("login"), Some(auth), "the color follows the name");
+        assert_eq!(tab.subject_color("auth"), None);
+        tab.rename_subject("login", "api");
+        assert_eq!(tab.subject_color("api"), Some(api), "merged: the kept subject keeps its color");
+        assert_eq!(tab.subject_colors.len(), 1);
+        tab.delete_subject("api");
+        assert!(tab.subject_colors.is_empty());
+
+        // A restored tab whose subjects have no color yet gets one each.
+        tab.subjects = vec!["x".into(), "y".into()];
+        tab.heal_subjects();
+        assert!(tab.subject_color("x").is_some() && tab.subject_color("y").is_some());
+    }
+
+    #[test]
+    fn deleting_a_subject_leaves_its_panes_open_out_of_any_box() {
+        let (mut a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        a.subject = Some("auth".into());
+        let mut tab = super::Tab::with_columns(vec![vec![a, b]]);
+        tab.subjects = vec!["auth".into(), "idle".into()];
+        assert_eq!(tab.delete_subject("auth"), 1);
+        assert_eq!(tab.subjects, ["idle"]);
+        assert_eq!(tab.pane_subjects().len(), 2, "no pane closes");
+        assert!(tab.pane_subjects().iter().all(|(_, s)| s.is_none()));
+        assert_eq!(tab.delete_subject("idle"), 0, "an empty subject just goes");
+        assert!(tab.subjects.is_empty());
+    }
+
+    #[test]
+    fn reordering_panes_keeps_the_layout_shape() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        let (c, _fc) = super::Pane::capture(10, 2);
+        let (ia, ib, ic) = (a.id, b.id, c.id);
+        let mut tab = super::Tab::with_columns(vec![vec![a, b], vec![c]]);
+        assert!(tab.reorder_panes(&[ic, ia, ib]));
+        let order: Vec<_> = tab.pane_subjects().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(order, vec![ic, ia, ib]);
+        assert_eq!(tab.columns.iter().map(|c| c.panes.len()).collect::<Vec<_>>(), [2, 1]);
+        assert!(!tab.reorder_panes(&[ia, ib]), "not every pane: nothing moves");
+        assert!(!tab.reorder_panes(&[ia, ia, ib]));
+        let order: Vec<_> = tab.pane_subjects().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(order, vec![ic, ia, ib]);
+    }
+
+    #[test]
+    fn swapping_two_panes_exchanges_their_places_and_nothing_else() {
+        let (a, _fa) = super::Pane::capture(10, 2);
+        let (b, _fb) = super::Pane::capture(10, 2);
+        let (c, _fc) = super::Pane::capture(10, 2);
+        let (ia, ib, ic) = (a.id, b.id, c.id);
+        let mut tab = super::Tab::with_columns(vec![vec![a, b], vec![c]]);
+        assert!(tab.swap_pane_positions(ia, ic));
+        let order: Vec<_> = tab.pane_subjects().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(order, vec![ic, ib, ia]);
+        assert!(!tab.swap_pane_positions(ia, ia), "a pane does not swap with itself");
+    }
+
+    #[test]
+    fn healing_appends_the_subjects_panes_name_once_each() {
+        let mut subjects = vec!["a".to_string()];
+        super::heal_subject_list(&mut subjects, ["b", "a", "c", "b"].map(String::from));
+        assert_eq!(subjects, ["a", "b", "c"]);
+    }
+
+    #[test]
     fn codex_rename_reaches_the_title_without_leaking_into_claude_fields() {
         use crate::agent_session::{Agent, AgentSession};
         let mut pane = super::Pane::placeholder(80, 24, &crate::config::Config::default()).unwrap();
         pane.custom_title = Some("sticky".into());
         pane.terminal.write().title = Some("Codex".into());
         pane.agent_session.replace(Some(AgentSession {
-            agent: Agent::Codex, id: "codex-id".into(), name: Some("premier nom".into()),
+            pid: None,
+            agent: Agent::Codex,
+            id: "codex-id".into(),
+            name: Some("premier nom".into()),
             peer_name: Some("leak".into()),
+            config_dir: None,
         }));
         assert_eq!(pane.display_title("shell"), "premier nom");
         assert_eq!(pane.agent_session_name().as_deref(), Some("premier nom"));
@@ -2545,8 +2981,12 @@ mod tests {
         assert_eq!(pane.display_title("shell"), "Codex");
 
         pane.agent_session.replace(Some(AgentSession {
-            agent: Agent::Claude, id: "claude-id".into(), name: Some("Claude nommé".into()),
+            pid: None,
+            agent: Agent::Claude,
+            id: "claude-id".into(),
+            name: Some("Claude nommé".into()),
             peer_name: Some("Claude nommé".into()),
+            config_dir: None,
         }));
         assert_eq!(pane.display_title("shell"), "Claude nommé");
         assert_eq!(pane.agent_session_name(), pane.claude_session_name());
@@ -2557,11 +2997,15 @@ mod tests {
         // Never renamed: no session name, so the title falls back, but the
         // derived peer name is still exposed for SendMessage.
         pane.agent_session.replace(Some(AgentSession {
-            agent: Agent::Claude, id: "claude-id".into(), name: None,
-            peer_name: Some("lempire-f1".into()),
+            pid: None,
+            agent: Agent::Claude,
+            id: "claude-id".into(),
+            name: None,
+            peer_name: Some("myproject-f1".into()),
+            config_dir: None,
         }));
         assert_eq!(pane.claude_session_name(), None);
-        assert_eq!(pane.claude_peer_name().as_deref(), Some("lempire-f1"));
+        assert_eq!(pane.claude_peer_name().as_deref(), Some("myproject-f1"));
         assert_eq!(pane.display_title("shell"), "Codex");
     }
 

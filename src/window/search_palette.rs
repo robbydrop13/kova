@@ -18,9 +18,14 @@ pub(super) enum SearchTarget {
         /// tab's currently focused pane and skips the per-pane flash.
         pane_id: Option<PaneId>,
     },
-    /// A closed Claude Code session. Opening it means a new pane in the
-    /// session's own project directory, running its `--resume` line.
-    Archived { session_id: String, cwd: String },
+    /// A closed conversation (Claude Code or omp). Opening it means a new pane
+    /// in the session's own project directory, running that agent's resume
+    /// line.
+    Archived {
+        agent: crate::agent_session::Agent,
+        session_id: String,
+        cwd: String,
+    },
     /// A query searched earlier in this run of Kova. Opening it does not jump
     /// anywhere: it retypes the query into the input and searches again.
     Recall { query: String },
@@ -71,6 +76,8 @@ pub(super) struct SearchPaletteState {
     pub(super) selected: usize,
     /// Scroll offset (index of first visible row in the list).
     pub(super) scroll: usize,
+    /// Trackpad scroll remainder, carried until it adds up to a whole row.
+    pub(super) scroll_acc: f64,
     /// Set when the query changed and a live search is owed once debounced.
     pub(super) needs_search: bool,
     /// Timestamp of the last edit, for debouncing the live search.
@@ -90,12 +97,10 @@ struct SearchPaneSnapshot {
     pane_id: PaneId,
     pane_title: String,
     terminal: Arc<parking_lot::RwLock<crate::terminal::TerminalState>>,
-    /// Conversation the pane runs, if any: its indexed prompts are searched
-    /// along with the screen.
-    session_id: Option<String>,
-    /// Conversation id of whatever agent the pane runs (Claude or Codex), the
-    /// id a bookmark is keyed on.
-    agent_session: Option<String>,
+    /// Conversation the pane runs, with the agent that owns it: its indexed
+    /// prompts are searched along with the screen, and the key is the same one
+    /// a bookmark uses.
+    session: Option<(crate::agent_session::Agent, String)>,
 }
 
 /// A key pressed with Cmd or Ctrl held. Option stays typing: it composes
@@ -127,6 +132,41 @@ fn drop_recall_rows(state: &mut SearchPaletteState) {
         state.selected = 0;
         state.scroll = 0;
     }
+}
+
+/// Scroll the result list by `lines` rows (positive goes down), within the
+/// list, and pull the selection along when it leaves the view: Enter opens a
+/// row the user can see, and the renderer does not snap the view back to it.
+fn scroll_rows(state: &mut SearchPaletteState, lines: i64, max_visible: usize) {
+    let max_visible = max_visible.max(1);
+    let max_scroll = state.rows.len().saturating_sub(max_visible);
+    let from = crate::renderer::search_palette_scroll(state.selected, state.scroll, max_visible);
+    state.scroll = (from as i64 + lines).clamp(0, max_scroll as i64) as usize;
+    let end = (state.scroll + max_visible).min(state.rows.len());
+    let in_view = &state.rows[state.scroll..end];
+    if state.selected < state.scroll {
+        if let Some(off) = in_view.iter().position(SearchRow::is_hit) {
+            state.selected = state.scroll + off;
+        }
+    } else if state.selected >= end {
+        if let Some(off) = in_view.iter().rposition(SearchRow::is_hit) {
+            state.selected = state.scroll + off;
+        }
+    }
+}
+
+/// The hit row drawn at height `py`, if any: headers and the space around the
+/// list are not clickable.
+fn hit_row_at(state: &SearchPaletteState, py: f32, geom: &crate::renderer::OverlayListGeometry) -> Option<usize> {
+    if py < geom.content_top || geom.row_height <= 0.0 {
+        return None;
+    }
+    let visible = ((py - geom.content_top) / geom.row_height) as usize;
+    if visible >= geom.max_visible {
+        return None;
+    }
+    let idx = crate::renderer::search_palette_scroll(state.selected, state.scroll, geom.max_visible) + visible;
+    state.rows.get(idx).filter(|r| r.is_hit()).map(|_| idx)
 }
 
 /// Whether a key event's character is something to type into a text input.
@@ -242,9 +282,9 @@ struct PaneMatch {
 }
 
 /// Match one pane against `terms`. A term counts if the pane's title, its
-/// screen or — for a Claude pane — its conversation's indexed prompts carry it;
-/// the best of the three is kept per term, and the pane fits as well as its
-/// weakest term.
+/// screen or — for a Claude or omp pane — what the indexed conversation says
+/// carry it (both the user's prompts and the agent's replies); the best of the
+/// three is kept per term, and the pane fits as well as its weakest term.
 ///
 /// The screen alone is not enough: Claude Code draws on the alternate screen,
 /// which keeps no scrollback, so a word typed an hour ago is nowhere in the
@@ -294,9 +334,31 @@ fn match_pane(p: &SearchPaneSnapshot, terms: &[String], session_text: Option<&St
     PaneMatch { fit: worst, snippet }
 }
 
-/// Match one bookmark against `terms`: its saved label, its directory and —
-/// for a Claude conversation — the indexed prompts. Same rule as a pane: the
-/// best source per term, the weakest term for the bookmark.
+/// How a pane or tab name answers the query: its weakest term's fit, so `Word`
+/// means the name alone carries every term as a whole word.
+fn title_fit(title: &str, terms: &[String]) -> crate::claude_history::Fit {
+    use crate::claude_history::{fit, Fit};
+    let lower = lowercase_same_len(title);
+    terms.iter().map(|t| fit(&lower, t)).min().unwrap_or(Fit::Absent)
+}
+
+/// Order name hits by how close the name is to the query: a name made of
+/// exactly the typed words first, then the names with the fewest words. Stable,
+/// so equal names keep their window → tab order.
+fn rank_by_name(named: &mut [(String, SearchHit)], terms: &[String]) {
+    let mut typed: Vec<&String> = terms.iter().collect();
+    typed.sort();
+    named.sort_by_cached_key(|(name, _)| {
+        let mut words = crate::claude_history::split_terms(name);
+        words.sort();
+        let exact = words.iter().eq(typed.iter().copied());
+        (!exact, words.len())
+    });
+}
+
+/// Match one bookmark against `terms`: its saved label, its directory and — for
+/// a Claude or omp conversation — the indexed transcript. Same rule as a pane:
+/// the best source per term, the weakest term for the bookmark.
 fn match_bookmark(
     bm: &crate::bookmarks::Bookmark,
     terms: &[String],
@@ -332,17 +394,27 @@ fn match_bookmark(
 fn bookmark_hits(
     bookmarks: &[crate::bookmarks::Bookmark],
     terms: &[String],
-    said: &std::collections::HashMap<String, String>,
-    listed_sessions: &std::collections::HashSet<String>,
+    said: &std::collections::HashMap<(crate::agent_session::Agent, String), String>,
+    listed_sessions: &std::collections::HashSet<(crate::agent_session::Agent, String)>,
 ) -> (Vec<SearchHit>, Vec<SearchHit>) {
     use crate::claude_history::Fit;
     let mut word = Vec::new();
     let mut inside = Vec::new();
     for bm in bookmarks {
-        if bm.session_id.as_ref().is_some_and(|id| listed_sessions.contains(id)) {
+        // A bookmark written before agents were named is a Claude one.
+        let key = bm.session_id.as_ref().map(|id| {
+            (
+                bm.agent.unwrap_or(crate::agent_session::Agent::Claude),
+                id.clone(),
+            )
+        });
+        if key
+            .as_ref()
+            .is_some_and(|key| listed_sessions.contains(key))
+        {
             continue;
         }
-        let m = match_bookmark(bm, terms, bm.session_id.as_ref().and_then(|id| said.get(id)));
+        let m = match_bookmark(bm, terms, key.as_ref().and_then(|key| said.get(key)));
         let dir = std::path::Path::new(&bm.cwd)
             .file_name()
             .and_then(|n| n.to_str())
@@ -368,23 +440,24 @@ fn bookmark_hits(
 /// The query is cut into terms on spaces and commas, and a pane or tab has to
 /// carry every one of them (see `claude_history::split_terms`): one word is too
 /// coarse once there are dozens of panes, and matching the whole query as a
-/// single string would make "dust mcp" find nothing.
+/// single string would make "parser mcp" find nothing.
 ///
 /// A term counts in full only as a whole word: "pitr" is the backup, not the
 /// middle of "chapitre". What matches only inside longer words is not dropped
 /// — the term may be a prefix still being typed — but moved to a last section
 /// of its own, so it never sits among the real hits.
 ///
-/// Produces up to four sections:
-///   1. Panes whose title, screen or conversation matches, grouped under a
+/// Produces up to five sections:
+///   0. "Names": panes and tabs whose own name carries every term, the name
+///      closest to the query first (see `rank_by_name`).
+///   1. Other panes whose screen or conversation matches, grouped under a
 ///      per-tab header (one entry per pane).
-///   2. A "Tabs" section listing tabs whose title matches.
 ///   3. A "Bookmarks" section: saved conversations (Cmd+B) whose label,
 ///      directory or prompts match, minus those whose pane is listed in 1.
-///   4. A "Claude sessions (closed)" section: past conversations that match,
-///      most recent first. This is what makes a session findable once its pane
-///      is gone — the whole point of `claude_history`. A bookmarked one is
-///      left to section 3.
+///   4. A "Closed sessions" section: past Claude and omp conversations that
+///      match, most recent first. This is what makes a session findable once
+///      its pane is gone — the whole point of `claude_history`. A bookmarked
+///      one is left to section 3.
 ///   5. "Inside longer words": the panes, tabs, bookmarks and closed sessions
 ///      of sections 1–4 that only matched that way.
 /// `panes` arrives already ordered by tab (window → tab → pane), so consecutive
@@ -393,10 +466,10 @@ fn run_search_worker(
     query: &str,
     tabs: &[SearchTabSnapshot],
     panes: &[SearchPaneSnapshot],
-    live_sessions: &[String],
+    live_sessions: &[(crate::agent_session::Agent, String)],
     bookmarks: &[crate::bookmarks::Bookmark],
 ) -> Vec<SearchRow> {
-    use crate::claude_history::{fit, Fit};
+    use crate::claude_history::Fit;
     let terms = crate::claude_history::split_terms(query);
     let mut rows: Vec<SearchRow> = Vec::new();
     if terms.is_empty() {
@@ -405,26 +478,72 @@ fn run_search_worker(
 
     // First, as it refreshes the index the live panes are then matched on.
     // A bookmarked conversation is not offered again as a closed session.
-    let mut not_closed: Vec<String> = live_sessions.to_vec();
-    not_closed.extend(bookmarks.iter().filter_map(|b| b.session_id.clone()));
+    let mut not_closed: Vec<(crate::agent_session::Agent, String)> = live_sessions.to_vec();
+    not_closed.extend(bookmarks.iter().filter_map(|b| {
+        b.session_id
+            .clone()
+            .map(|id| (b.agent.unwrap_or(crate::agent_session::Agent::Claude), id))
+    }));
     let archived = crate::claude_history::search(query, &not_closed);
-    let mut indexed: Vec<String> = panes.iter().filter_map(|p| p.session_id.clone()).collect();
-    indexed.extend(bookmarks.iter().filter_map(|b| b.session_id.clone()));
+    let mut indexed: Vec<(crate::agent_session::Agent, String)> =
+        panes.iter().filter_map(|p| p.session.clone()).collect();
+    indexed.extend(bookmarks.iter().filter_map(|b| {
+        b.session_id
+            .clone()
+            .map(|id| (b.agent.unwrap_or(crate::agent_session::Agent::Claude), id))
+    }));
     let said = crate::claude_history::texts_of(&indexed);
     let mut inside: Vec<SearchHit> = Vec::new();
-    let mut listed_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut listed_sessions: std::collections::HashSet<(crate::agent_session::Agent, String)> =
+        std::collections::HashSet::new();
 
-    // Section 1: matching panes, grouped by tab.
+    // Section 0: panes and tabs whose own name carries every term. A pane
+    // named "PR" is what "PR" means; listing it in window order among every
+    // pane whose screen says "PR" buries it.
+    let mut named: Vec<(String, SearchHit)> = Vec::new();
+    for p in panes {
+        if title_fit(&p.pane_title, &terms) == Fit::Word {
+            listed_sessions.extend(p.session.clone());
+            named.push((
+                p.pane_title.clone(),
+                SearchHit {
+                    target: SearchTarget::Open {
+                        tab_id: p.tab_id,
+                        pane_id: Some(p.pane_id),
+                    },
+                    label: format!("{} · {}", p.tab_title, p.pane_title),
+                },
+            ));
+        }
+    }
+    for tab in tabs {
+        if title_fit(&tab.title, &terms) == Fit::Word {
+            named.push((tab.title.clone(), SearchHit {
+                target: SearchTarget::Open { tab_id: tab.tab_id, pane_id: None },
+                label: format!("Tab · {}", tab.title),
+            }));
+        }
+    }
+    if !named.is_empty() {
+        rank_by_name(&mut named, &terms);
+        rows.push(SearchRow::Header("Names".to_string()));
+        rows.extend(named.into_iter().map(|(_, hit)| SearchRow::Hit(hit)));
+    }
+
+    // Section 1: panes matching by their screen or conversation, grouped by tab.
     let mut current_tab: Option<TabId> = None;
     for p in panes {
-        let m = match_pane(p, &terms, p.session_id.as_ref().and_then(|id| said.get(id)));
+        if title_fit(&p.pane_title, &terms) == Fit::Word {
+            continue;
+        }
+        let m = match_pane(p, &terms, p.session.as_ref().and_then(|key| said.get(key)));
         let label = match m.snippet {
             Some(s) => format!("{}  ·  {}", p.pane_title, s),
             None => p.pane_title.clone(),
         };
         let target = SearchTarget::Open { tab_id: p.tab_id, pane_id: Some(p.pane_id) };
         if m.fit != Fit::Absent {
-            listed_sessions.extend(p.agent_session.clone());
+            listed_sessions.extend(p.session.clone());
         }
         match m.fit {
             Fit::Absent => continue,
@@ -441,25 +560,14 @@ fn run_search_worker(
         rows.push(SearchRow::Hit(SearchHit { target, label }));
     }
 
-    // Section 2: tabs whose title matches.
-    let mut tab_section_open = false;
+    // Tabs whose title matches only inside a longer word (a whole-word match
+    // is listed under "Names").
     for tab in tabs {
-        let title = lowercase_same_len(&tab.title);
-        let worst = terms.iter().map(|t| fit(&title, t)).min().unwrap_or(Fit::Absent);
-        let hit = SearchHit {
-            target: SearchTarget::Open { tab_id: tab.tab_id, pane_id: None },
-            label: tab.title.clone(),
-        };
-        match worst {
-            Fit::Absent => {}
-            Fit::Inside => inside.push(SearchHit { label: format!("Tab · {}", hit.label), ..hit }),
-            Fit::Word => {
-                if !tab_section_open {
-                    rows.push(SearchRow::Header("Tabs".to_string()));
-                    tab_section_open = true;
-                }
-                rows.push(SearchRow::Hit(hit));
-            }
+        if title_fit(&tab.title, &terms) == Fit::Inside {
+            inside.push(SearchHit {
+                target: SearchTarget::Open { tab_id: tab.tab_id, pane_id: None },
+                label: format!("Tab · {}", tab.title),
+            });
         }
     }
 
@@ -471,26 +579,30 @@ fn run_search_worker(
     }
     inside.extend(bookmarked_inside);
 
-    // Section 4: Claude conversations that are not open anywhere any more.
+    // Section 4: conversations that are not open anywhere any more.
     // Only the latest few are listed — a common word matches hundreds of
     // sessions, and the rest of them would bury the open panes above. What was
     // cut is named in the header rather than dropped silently.
     let orphans = crate::claude_session::orphan_session_ids();
     let archived_hit = |hit: crate::claude_history::Hit| {
         let mut label = crate::claude_history::hit_label(&hit);
-        if orphans.contains(&hit.id) {
+        if hit.agent == crate::agent_session::Agent::Claude && orphans.contains(&hit.id) {
             // Its pane is gone but the process lives on: say so, since
             // reopening it ends that process.
             label.push_str(" · stranded");
         }
         SearchHit {
             label,
-            target: SearchTarget::Archived { session_id: hit.id, cwd: hit.cwd },
+            target: SearchTarget::Archived {
+                agent: hit.agent,
+                session_id: hit.id,
+                cwd: hit.cwd,
+            },
         }
     };
     if !archived.hits.is_empty() {
         rows.push(SearchRow::Header(capped_header(
-            "Claude sessions (closed)",
+            "Closed sessions",
             archived.hits.len(),
             archived.total,
         )));
@@ -582,9 +694,10 @@ fn open_pane_in_tab_for_cwd(cwd: &str, config: &crate::config::Config, command: 
     false
 }
 
-/// Focus the pane running Claude conversation `session_id`, in whichever window
-/// holds it, and pulse its border. False when no pane in this process has it.
-fn focus_pane_with_claude_session(session_id: &str) -> bool {
+/// Focus the pane running `agent`'s conversation `session_id`, in whichever
+/// window holds it, and pulse its border. False when no pane in this process
+/// has it.
+fn focus_pane_with_session(agent: crate::agent_session::Agent, session_id: &str) -> bool {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);
     let ns_windows = app.windows();
@@ -596,7 +709,13 @@ fn focus_pane_with_claude_session(session_id: &str) -> bool {
             let mut found = None;
             for tab in tabs.iter() {
                 tab.for_each_pane(&mut |pane| {
-                    if found.is_none() && pane.claude_session_id().as_deref() == Some(session_id) {
+                    // Asleep since launch counts: focusing it wakes it.
+                    let asleep = pane
+                        .dormant_session()
+                        .is_some_and(|(owner, id)| owner == agent && id == session_id);
+                    let live = pane.agent_kind() == Some(agent)
+                        && pane.agent_session_id().as_deref() == Some(session_id);
+                    if found.is_none() && (live || asleep) {
                         found = Some(pane.id);
                     }
                 });
@@ -659,36 +778,54 @@ fn jump_to_search_hit(hit: &SearchHit) {
 }
 
 impl KovaView {
-    /// Bring back a Claude conversation that is no longer open in any pane.
+    /// Bring back a conversation that is no longer open in any pane.
     ///
-    /// The pane has to land in the session's own project directory: `claude
-    /// --resume <id>` only finds a conversation from the directory it ran in.
-    /// Where exactly it lands follows what is still around — the tab it lived in
-    /// is not recoverable, since nothing outlives the pane that held it:
+    /// The pane has to land in the session's own project directory: Claude's
+    /// `--resume` only finds a conversation from the directory it ran in, and
+    /// omp's bucket is built from the same cwd. Where exactly it lands follows
+    /// what is still around — the tab it lived in is not recoverable, since
+    /// nothing outlives the pane that held it:
     ///   1. a tab already open on that directory → a new pane next to it;
     ///   2. else the project is in the recents → its saved tab comes back first;
     ///   3. else a new tab on that directory.
-    /// The `--resume` line is typed and run: picking the hit already said which
+    /// The resume line is typed and run: picking the hit already said which
     /// conversation to bring back.
-    fn open_archived_claude_session(&self, session_id: &str, cwd: &str) {
+    fn open_archived_session(
+        &self,
+        agent: crate::agent_session::Agent,
+        session_id: &str,
+        cwd: &str,
+    ) {
         // The rows were built a moment ago, off the main thread: the pick can
         // land on a conversation that has been reopened since, in Kova or
         // elsewhere. Focusing the pane that holds it beats running a second
-        // `--resume` on a live id, which Claude Code accepts without a word.
-        if focus_pane_with_claude_session(session_id) {
+        // `--resume` on a live id, which the agents accept without a word.
+        if focus_pane_with_session(agent, session_id) {
             return;
         }
-        // A conversation stranded by a closed pane still has a process writing
-        // to its transcript: end it before a second one takes over.
-        crate::claude_session::end_orphan(session_id);
-        // Same guard as the restore path: an id that cannot make a safe command
-        // line never reaches a PTY.
-        let command = match crate::claude_session::resume_command(None, session_id) {
-            Some(c) => c,
-            None => {
-                log::warn!("Refusing to resume an unsafe session id: {:?}", session_id);
-                return;
-            }
+        let command = if agent == crate::agent_session::Agent::Claude {
+            // A conversation stranded by a closed pane still has a process
+            // writing to its transcript: end it before a second one takes over.
+            crate::claude_session::end_orphan(session_id);
+            // Same guard as the restore path: an id that cannot make a safe
+            // command line never reaches a PTY. A conversation started by a
+            // launcher with its own config dir (`deepseek-cc`) comes back
+            // through that launcher, or at least under that dir.
+            let config_dir = crate::claude_session::config_dir_of(session_id);
+            let launcher = config_dir
+                .as_deref()
+                .and_then(crate::launchers::for_config_dir);
+            crate::claude_session::resume_command(
+                launcher.as_deref(),
+                session_id,
+                config_dir.as_deref(),
+            )
+        } else {
+            crate::agent_session::resume_command(agent, session_id, None, None)
+        };
+        let Some(command) = command else {
+            log::warn!("Refusing to resume an unsafe session id: {:?}", session_id);
+            return;
         };
         self.open_conversation_in_project(Some(command), cwd);
     }
@@ -776,7 +913,7 @@ impl KovaView {
 
     /// Open the search palette overlay (Cmd+Shift+F — global search across all panes).
     pub(super) fn do_open_search_palette(&self) {
-        // Index the closed Claude sessions now, so the scan overlaps with the
+        // Index the closed conversations now, so the scan overlaps with the
         // user typing rather than delaying the first query.
         crate::claude_history::warm();
         // An empty input is not an empty screen: it offers what was searched
@@ -793,6 +930,7 @@ impl KovaView {
             rows,
             selected,
             scroll: 0,
+            scroll_acc: 0.0,
             needs_search: false,
             last_edit: None,
         });
@@ -801,15 +939,23 @@ impl KovaView {
 
     /// Walk every Kova window in the process and collect a snapshot suitable for
     /// off-thread substring search. Cloning Arc<RwLock<TerminalState>> is cheap.
-    fn collect_search_snapshot() -> (Vec<SearchTabSnapshot>, Vec<SearchPaneSnapshot>, Vec<String>) {
+    fn collect_search_snapshot() -> (
+        Vec<SearchTabSnapshot>,
+        Vec<SearchPaneSnapshot>,
+        Vec<(crate::agent_session::Agent, String)>,
+    ) {
         let mut tabs_snap = Vec::new();
         let mut panes_snap = Vec::new();
-        // Claude conversations that must not show up as closed. Every live
+        // Conversations that must not show up as closed. Every live Claude
         // session file on the machine is the seed rather than only what the
         // panes report: a pane that Kova has not yet linked to its conversation
         // would otherwise offer it as closed, and resuming it would put the same
         // conversation in two panes (see `claude_session::live_session_ids`).
-        let mut live_sessions = crate::claude_session::live_session_ids();
+        let mut live_sessions: Vec<(crate::agent_session::Agent, String)> =
+            crate::claude_session::live_session_ids()
+                .into_iter()
+                .map(|id| (crate::agent_session::Agent::Claude, id))
+                .collect();
 
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let app = NSApplication::sharedApplication(mtm);
@@ -825,17 +971,21 @@ impl KovaView {
                 let tab_title = tab.title();
                 tabs_snap.push(SearchTabSnapshot { tab_id: tab.id, title: tab_title.clone() });
                 tab.for_each_pane(&mut |pane| {
-                    if let Some(id) = pane.agent_session_id() {
-                        live_sessions.push(id);
+                    // Asleep since launch is open too: not a closed session.
+                    if let (Some(agent), Some(id)) = (pane.agent_kind(), pane.agent_session_id()) {
+                        live_sessions.push((agent, id));
                     }
+                    if let Some((agent, id)) = pane.dormant_session() {
+                        live_sessions.push((agent, id));
+                    }
+                    let session = pane.agent_kind().zip(pane.agent_session_id());
                     panes_snap.push(SearchPaneSnapshot {
                         tab_id: tab.id,
                         tab_title: tab_title.clone(),
                         pane_id: pane.id,
                         pane_title: pane.display_title("shell"),
                         terminal: pane.terminal.clone(),
-                        session_id: pane.claude_session_id(),
-                        agent_session: pane.agent_session_id(),
+                        session,
                     });
                 });
             }
@@ -994,6 +1144,114 @@ impl KovaView {
         self.mark_dirty();
     }
 
+    /// Open the selected hit (Enter, or a click on a row). Live search keeps
+    /// the rows fresh, so the only fallback is to force a scan if one is owed
+    /// but the debounce hasn't fired yet.
+    fn open_selected_search_hit(&self) {
+        let action = {
+            let guard = self.ivars().search_palette.borrow();
+            let state = match guard.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            // Rows that answer an older query (a paste or a keystroke
+            // still inside the debounce) must not be opened: search the
+            // query on screen instead, and let the next Enter open.
+            let stale = state.needs_search
+                || state.searching
+                || state.query != state.submitted_query;
+            match state.rows.get(state.selected) {
+                Some(SearchRow::Hit(hit))
+                    if !stale || matches!(hit.target, SearchTarget::Recall { .. }) =>
+                {
+                    Some(hit.clone())
+                }
+                _ => None,
+            }
+        };
+        match action {
+            // A recalled query stays in the palette: it retypes the
+            // query and searches again, it does not open anything.
+            Some(SearchHit { target: SearchTarget::Recall { query }, .. }) => {
+                if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
+                    state.cursor = query.chars().count();
+                    state.query = query;
+                    state.needs_search = true;
+                    // No debounce for a query the user did not type:
+                    // it is complete, so run it on the next tick.
+                    state.last_edit = None;
+                }
+                self.mark_dirty();
+            }
+            Some(hit) => {
+                self.close_search_palette();
+                match &hit.target {
+                    SearchTarget::Open { .. } => jump_to_search_hit(&hit),
+                    SearchTarget::Archived {
+                        agent,
+                        session_id,
+                        cwd,
+                    } => self.open_archived_session(*agent, session_id, cwd),
+                    SearchTarget::Bookmark(bm) => self.open_saved_conversation(bm),
+                    SearchTarget::Recall { .. } => unreachable!("handled above"),
+                }
+            }
+            None => self.submit_search_palette(),
+        }
+    }
+
+    fn search_palette_geometry(&self) -> Option<crate::renderer::OverlayListGeometry> {
+        let renderer = self.ivars().renderer.get()?;
+        let vh = self.drawable_viewport().height;
+        let geom = renderer.read().search_palette_list_geometry(vh);
+        Some(geom)
+    }
+
+    /// A click on a result row opens it, as Enter would; anywhere else in the
+    /// palette it does nothing.
+    pub(super) fn handle_search_palette_click(&self, py: f32) {
+        let Some(geom) = self.search_palette_geometry() else { return };
+        let row = {
+            let guard = self.ivars().search_palette.borrow();
+            match guard.as_ref() {
+                Some(state) => hit_row_at(state, py, &geom),
+                None => return,
+            }
+        };
+        let Some(row) = row else { return };
+        if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
+            state.selected = row;
+        }
+        self.mark_dirty();
+        self.open_selected_search_hit();
+    }
+
+    /// The wheel or trackpad scrolls the result list, the selection following
+    /// along so it stays on screen.
+    pub(super) fn handle_search_palette_scroll(&self, event: &NSEvent, is_trackpad: bool) {
+        let Some(geom) = self.search_palette_geometry() else { return };
+        let mut guard = self.ivars().search_palette.borrow_mut();
+        let Some(state) = guard.as_mut() else { return };
+        // Same feel as the Cmd+P list: natural scrolling, a trackpad's fine
+        // deltas added up until they make a whole row.
+        let dy = event.scrollingDeltaY();
+        let lines = if is_trackpad {
+            let acc = state.scroll_acc - dy / 8.0;
+            let discrete = acc.trunc();
+            state.scroll_acc = acc - discrete;
+            discrete as i64
+        } else {
+            state.scroll_acc = 0.0;
+            -dy as i64
+        };
+        if lines == 0 {
+            return;
+        }
+        scroll_rows(state, lines, geom.max_visible);
+        drop(guard);
+        self.mark_dirty();
+    }
+
     /// Handle key events while the search palette overlay is active.
     pub(super) fn handle_search_palette_key(&self, event: &NSEvent) {
         let key_code = event.keyCode();
@@ -1067,59 +1325,7 @@ impl KovaView {
                 // a search abandoned is still a search one may want back.
                 self.close_search_palette();
             }
-            '\r' => {
-                // Enter: open the selected hit. Live search keeps the rows fresh,
-                // so the only fallback is to force a scan if one is owed but the
-                // debounce hasn't fired yet.
-                let action = {
-                    let guard = self.ivars().search_palette.borrow();
-                    let state = match guard.as_ref() {
-                        Some(s) => s,
-                        None => return,
-                    };
-                    // Rows that answer an older query (a paste or a keystroke
-                    // still inside the debounce) must not be opened: search the
-                    // query on screen instead, and let the next Enter open.
-                    let stale = state.needs_search
-                        || state.searching
-                        || state.query != state.submitted_query;
-                    match state.rows.get(state.selected) {
-                        Some(SearchRow::Hit(hit))
-                            if !stale || matches!(hit.target, SearchTarget::Recall { .. }) =>
-                        {
-                            Some(hit.clone())
-                        }
-                        _ => None,
-                    }
-                };
-                match action {
-                    // A recalled query stays in the palette: it retypes the
-                    // query and searches again, it does not open anything.
-                    Some(SearchHit { target: SearchTarget::Recall { query }, .. }) => {
-                        if let Some(state) = self.ivars().search_palette.borrow_mut().as_mut() {
-                            state.cursor = query.chars().count();
-                            state.query = query;
-                            state.needs_search = true;
-                            // No debounce for a query the user did not type:
-                            // it is complete, so run it on the next tick.
-                            state.last_edit = None;
-                        }
-                        self.mark_dirty();
-                    }
-                    Some(hit) => {
-                        self.close_search_palette();
-                        match &hit.target {
-                            SearchTarget::Open { .. } => jump_to_search_hit(&hit),
-                            SearchTarget::Archived { session_id, cwd } => {
-                                self.open_archived_claude_session(session_id, cwd)
-                            }
-                            SearchTarget::Bookmark(bm) => self.open_saved_conversation(bm),
-                            SearchTarget::Recall { .. } => unreachable!("handled above"),
-                        }
-                    }
-                    None => self.submit_search_palette(),
-                }
-            }
+            '\r' => self.open_selected_search_hit(),
             '\u{7F}' | '\u{08}' => {
                 // Backspace — remove char before cursor; queue a live search.
                 let mut guard = self.ivars().search_palette.borrow_mut();
@@ -1203,6 +1409,7 @@ mod tests {
             selected: rows.iter().position(SearchRow::is_hit).unwrap_or(0),
             rows,
             scroll: 0,
+            scroll_acc: 0.0,
             needs_search: false,
             last_edit: None,
         }
@@ -1233,7 +1440,11 @@ mod tests {
         // Real results are never dropped by an edit.
         let results = vec![SearchRow::Hit(SearchHit {
             label: "a pane".to_string(),
-            target: SearchTarget::Archived { session_id: "x".into(), cwd: "/tmp".into() },
+            target: SearchTarget::Archived {
+                agent: crate::agent_session::Agent::Omp,
+                session_id: "x".into(),
+                cwd: "/tmp".into(),
+            },
         })];
         let mut state = palette_state("de", "d", results);
         drop_recall_rows(&mut state);
@@ -1242,6 +1453,8 @@ mod tests {
 
     fn bookmark(id: Option<&str>, cwd: &str, label: &str) -> crate::bookmarks::Bookmark {
         crate::bookmarks::Bookmark {
+            config_dir: None,
+            launcher: None,
             agent: id.map(|_| crate::agent_session::Agent::Claude),
             session_id: id.map(str::to_string),
             cwd: cwd.to_string(),
@@ -1258,21 +1471,24 @@ mod tests {
         use std::collections::{HashMap, HashSet};
         let items = vec![
             bookmark(Some("a"), "/Users/x/kova", "Search palette"),
-            bookmark(Some("b"), "/Users/x/cto", "Weekly"),
-            bookmark(None, "/Users/x/janus", "shell"),
+            bookmark(Some("b"), "/Users/x/api", "Weekly"),
+            bookmark(None, "/Users/x/infra", "shell"),
         ];
-        let said: HashMap<String, String> =
-            [("b".to_string(), "on parle du deploy staging".to_string())].into();
+        let said: HashMap<(crate::agent_session::Agent, String), String> = [(
+            (crate::agent_session::Agent::Claude, "b".to_string()),
+            "we deploy to staging".to_string(),
+        )]
+        .into();
         let none = HashSet::new();
         let terms = crate::claude_history::split_terms;
 
         let (word, _) = bookmark_hits(&items, &terms("palette"), &said, &none);
         assert_eq!(hit_labels(&word), ["kova · Search palette"]);
-        let (word, _) = bookmark_hits(&items, &terms("janus"), &said, &none);
-        assert_eq!(hit_labels(&word), ["janus · shell"], "the directory counts");
+        let (word, _) = bookmark_hits(&items, &terms("infra"), &said, &none);
+        assert_eq!(hit_labels(&word), ["infra · shell"], "the directory counts");
         // Found by what was said in it: the row shows the line that matched.
-        let (word, _) = bookmark_hits(&items, &terms("cto deploy"), &said, &none);
-        assert_eq!(hit_labels(&word), ["cto · Weekly  ·  on parle du deploy staging"]);
+        let (word, _) = bookmark_hits(&items, &terms("api deploy"), &said, &none);
+        assert_eq!(hit_labels(&word), ["api · Weekly  ·  we deploy to staging"]);
         // Every term has to be there.
         let (word, inside) = bookmark_hits(&items, &terms("kova deploy"), &said, &none);
         assert!(word.is_empty() && inside.is_empty());
@@ -1293,8 +1509,12 @@ mod tests {
 
     #[test]
     fn a_bookmark_whose_pane_is_listed_is_not_listed_twice() {
-        let items = vec![bookmark(Some("a"), "/k", "palette"), bookmark(None, "/k", "palette")];
-        let listed: std::collections::HashSet<String> = ["a".to_string()].into();
+        let items = vec![
+            bookmark(Some("a"), "/k", "palette"),
+            bookmark(None, "/k", "palette"),
+        ];
+        let listed: std::collections::HashSet<(crate::agent_session::Agent, String)> =
+            [(crate::agent_session::Agent::Claude, "a".to_string())].into();
         let (word, _) = bookmark_hits(
             &items,
             &crate::claude_history::split_terms("palette"),
@@ -1309,6 +1529,89 @@ mod tests {
         fn target_is_shell_bookmark(&self) -> bool {
             matches!(&self.target, SearchTarget::Bookmark(b) if b.session_id.is_none())
         }
+    }
+
+    /// A header, then `n` hits, then a header and `n` more hits.
+    fn two_sections(n: usize) -> Vec<SearchRow> {
+        let hit = |i: usize| {
+            SearchRow::Hit(SearchHit {
+                target: SearchTarget::Recall { query: String::new() },
+                label: i.to_string(),
+            })
+        };
+        let mut rows = vec![SearchRow::Header("A".into())];
+        rows.extend((0..n).map(hit));
+        rows.push(SearchRow::Header("B".into()));
+        rows.extend((n..2 * n).map(hit));
+        rows
+    }
+
+    #[test]
+    fn the_wheel_scrolls_within_the_list_and_drags_the_selection_along() {
+        let mut state = palette_state("q", "q", two_sections(10)); // 22 rows
+        assert_eq!(state.selected, 1);
+        scroll_rows(&mut state, 5, 4);
+        assert_eq!(state.scroll, 5);
+        assert_eq!(state.selected, 5, "the first hit in view");
+        scroll_rows(&mut state, 100, 4);
+        assert_eq!(state.scroll, 18, "stops on the last screenful");
+        assert_eq!(state.selected, 18);
+        // Back up past the selection: it moves to the last hit in view.
+        scroll_rows(&mut state, -10, 4);
+        assert_eq!(state.scroll, 8);
+        assert_eq!(state.selected, 10);
+        scroll_rows(&mut state, -100, 4);
+        assert_eq!((state.scroll, state.selected), (0, 3));
+    }
+
+    #[test]
+    fn the_wheel_keeps_a_selection_already_in_view() {
+        let mut state = palette_state("q", "q", two_sections(10));
+        state.selected = 3;
+        scroll_rows(&mut state, 2, 4);
+        assert_eq!((state.scroll, state.selected), (2, 3));
+        // Starts from the view on screen, which the selection had pushed down.
+        state.selected = 9;
+        state.scroll = 0;
+        scroll_rows(&mut state, 1, 4);
+        assert_eq!((state.scroll, state.selected), (7, 9));
+    }
+
+    #[test]
+    fn a_click_lands_on_the_hit_drawn_under_it() {
+        let geom = crate::renderer::OverlayListGeometry { content_top: 100.0, row_height: 20.0, max_visible: 5 };
+        let mut state = palette_state("q", "q", two_sections(3)); // A 0 1 2 B 3 4 5
+        assert_eq!(hit_row_at(&state, 125.0, &geom), Some(1));
+        assert_eq!(hit_row_at(&state, 105.0, &geom), None, "a header");
+        assert_eq!(hit_row_at(&state, 90.0, &geom), None, "above the list");
+        assert_eq!(hit_row_at(&state, 205.0, &geom), None, "below the last visible row");
+        // Selection at row 6 pushes the view down by 2, as the renderer does.
+        state.selected = 6;
+        assert_eq!(hit_row_at(&state, 105.0, &geom), Some(2));
+    }
+
+    #[test]
+    fn a_name_matching_the_query_ranks_first() {
+        let terms = crate::claude_history::split_terms("PR");
+        let hit = |name: &str| {
+            (name.to_string(), SearchHit {
+                target: SearchTarget::Recall { query: String::new() },
+                label: name.to_string(),
+            })
+        };
+        let mut named = vec![hit("review PR acme"), hit("PR merge"), hit("PR")];
+        rank_by_name(&mut named, &terms);
+        let order: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(order, ["PR", "PR merge", "review PR acme"]);
+    }
+
+    #[test]
+    fn a_name_holds_the_query_only_as_whole_words() {
+        use crate::claude_history::{split_terms, Fit};
+        assert_eq!(title_fit("PR", &split_terms("pr")), Fit::Word);
+        assert_eq!(title_fit("fix PR review", &split_terms("review pr")), Fit::Word);
+        assert_eq!(title_fit("prompts", &split_terms("pr")), Fit::Inside);
+        assert_eq!(title_fit("PR", &split_terms("pr kova")), Fit::Absent);
     }
 
     #[test]

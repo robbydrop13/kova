@@ -453,6 +453,12 @@ fn drain_ipc(ivars: &AppDelegateIvars, fps: u32) {
                 });
                 continue;
             }
+            crate::ipc::IpcCommand::WithdrawAsks { ref session_id } => {
+                let withdrawn = ivars.asks.borrow_mut().withdraw(session_id);
+                let _ = responder
+                    .send(crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "withdrawn": withdrawn })) });
+                continue;
+            }
             crate::ipc::IpcCommand::SnoozeAsk { ref id, seconds } => {
                 let until = crate::ask::snooze_until(crate::ask::now_epoch(), seconds);
                 let result = ivars.asks.borrow_mut().snooze(id, until);
@@ -893,6 +899,18 @@ fn handle_ipc_command_sync(
             handle_ipc_set_anchor(windows, pane_id, cwd, session_id, agent, label)
         }
         IpcCommand::ClearAnchors => handle_ipc_clear_anchors(windows),
+        IpcCommand::WakePane(pane_id) => handle_ipc_wake_pane(windows, pane_id),
+        IpcCommand::ListSubjects => handle_ipc_list_subjects(windows),
+        IpcCommand::SetPaneSubject { pane_id, subject } => {
+            handle_ipc_set_pane_subject(windows, pane_id, subject)
+        }
+        IpcCommand::RenameSubject { tab_id, name, new_name } => {
+            handle_ipc_rename_subject(windows, tab_id, &name, &new_name)
+        }
+        IpcCommand::DeleteSubject { tab_id, name } => handle_ipc_delete_subject(windows, tab_id, &name),
+        IpcCommand::SetSubjectColor { tab_id, name, color } => {
+            handle_ipc_set_subject_color(windows, tab_id, &name, color)
+        }
         IpcCommand::ReloadConfig => {
             handle_ipc_reload_config(windows)
         }
@@ -923,7 +941,8 @@ fn handle_ipc_command_sync(
         IpcCommand::Ask(_)
         | IpcCommand::ListAsks
         | IpcCommand::AnswerAsk { .. }
-        | IpcCommand::SnoozeAsk { .. } => {
+        | IpcCommand::SnoozeAsk { .. }
+        | IpcCommand::WithdrawAsks { .. } => {
             log::error!("IPC: an ask command reached the generic dispatcher");
             crate::ipc::IpcResponse::Error {
                 message: "internal: an ask command was not intercepted".to_string(),
@@ -1314,6 +1333,8 @@ fn handle_ipc_set_anchor(
             match agent.as_deref() {
                 Some("claude") => Some(crate::agent_session::Agent::Claude),
                 Some("codex") => Some(crate::agent_session::Agent::Codex),
+                Some("pi") => Some(crate::agent_session::Agent::Pi),
+                Some("omp") => Some(crate::agent_session::Agent::Omp),
                 _ => None,
             },
             label,
@@ -1368,6 +1389,117 @@ fn handle_ipc_clear_anchors(
     }
     log::info!("IPC: cleared {} anchor(s)", removed);
     crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "removed": removed })) }
+}
+
+/// IPC: resume the agent asleep in `pane_id` where it is, focus untouched.
+/// `woken` is false when the pane was not asleep (already running, or never
+/// restored with an agent): nothing was done.
+fn handle_ipc_wake_pane(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+) -> crate::ipc::IpcResponse {
+    for win in windows.borrow().iter() {
+        if let Some(woken) = kova_view(win).and_then(|view| view.ipc_wake_pane(pane_id)) {
+            if woken {
+                log::info!("IPC: woke pane {}", pane_id);
+            }
+            return crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "woken": woken })) };
+        }
+    }
+    crate::ipc::IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// IPC: every subject of every window's tabs, window by window.
+fn handle_ipc_list_subjects(windows: &RefCell<Vec<Retained<NSWindow>>>) -> crate::ipc::IpcResponse {
+    let mut out = Vec::new();
+    for (win_idx, win) in windows.borrow().iter().enumerate() {
+        if let Some(view) = kova_view(win) {
+            view.ipc_collect_subjects(win_idx, &mut out);
+        }
+    }
+    crate::ipc::IpcResponse::Ok { data: Some(serde_json::Value::Array(out)) }
+}
+
+/// IPC: file a pane under a subject of its tab, or take it out of its subject.
+fn handle_ipc_set_pane_subject(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    pane_id: u32,
+    subject: Option<String>,
+) -> crate::ipc::IpcResponse {
+    for win in windows.borrow().iter() {
+        if let Some(data) = kova_view(win).and_then(|view| view.ipc_set_pane_subject(pane_id, subject.clone())) {
+            return crate::ipc::IpcResponse::Ok { data: Some(data) };
+        }
+    }
+    crate::ipc::IpcResponse::Error { message: format!("pane {} not found", pane_id) }
+}
+
+/// The error of a subject command whose tab or subject was not found anywhere.
+fn subject_error(error: crate::window::SubjectError, tab_id: u32, name: &str) -> crate::ipc::IpcResponse {
+    let message = match error {
+        crate::window::SubjectError::NoTab => format!("tab {} not found", tab_id),
+        crate::window::SubjectError::NoSubject => format!("tab {} has no subject \"{}\"", tab_id, name),
+    };
+    crate::ipc::IpcResponse::Error { message }
+}
+
+/// IPC: rename a subject of a tab, merging into a name the tab already has.
+fn handle_ipc_rename_subject(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    tab_id: u32,
+    name: &str,
+    new_name: &str,
+) -> crate::ipc::IpcResponse {
+    for win in windows.borrow().iter() {
+        let Some(view) = kova_view(win) else { continue };
+        match view.ipc_rename_subject(tab_id, name, new_name) {
+            Ok(merged) => {
+                return crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "merged": merged })) };
+            }
+            Err(crate::window::SubjectError::NoTab) => continue,
+            Err(e) => return subject_error(e, tab_id, name),
+        }
+    }
+    subject_error(crate::window::SubjectError::NoTab, tab_id, name)
+}
+
+/// IPC: delete a subject of a tab; its panes stay open, out of any box.
+fn handle_ipc_delete_subject(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    tab_id: u32,
+    name: &str,
+) -> crate::ipc::IpcResponse {
+    for win in windows.borrow().iter() {
+        let Some(view) = kova_view(win) else { continue };
+        match view.ipc_delete_subject(tab_id, name) {
+            Ok(released) => {
+                return crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "released": released })) };
+            }
+            Err(crate::window::SubjectError::NoTab) => continue,
+            Err(e) => return subject_error(e, tab_id, name),
+        }
+    }
+    subject_error(crate::window::SubjectError::NoTab, tab_id, name)
+}
+
+/// IPC: give a subject of a tab a palette color.
+fn handle_ipc_set_subject_color(
+    windows: &RefCell<Vec<Retained<NSWindow>>>,
+    tab_id: u32,
+    name: &str,
+    color: usize,
+) -> crate::ipc::IpcResponse {
+    for win in windows.borrow().iter() {
+        let Some(view) = kova_view(win) else { continue };
+        match view.ipc_set_subject_color(tab_id, name, color) {
+            Ok(()) => {
+                return crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "color": color })) };
+            }
+            Err(crate::window::SubjectError::NoTab) => continue,
+            Err(e) => return subject_error(e, tab_id, name),
+        }
+    }
+    subject_error(crate::window::SubjectError::NoTab, tab_id, name)
 }
 
 /// IPC: re-read the config file and push its appearance half into every open

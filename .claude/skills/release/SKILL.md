@@ -37,9 +37,11 @@ Argument: `$ARGUMENTS` must be one of `major`, `minor`, or `patch`. If missing o
 
 9. **Build and test** (warnings are errors):
    ```bash
-   RUSTFLAGS="-D warnings" cargo build --release && RUSTFLAGS="-D warnings" cargo test
+   RUSTFLAGS="-D warnings" ./build.sh && RUSTFLAGS="-D warnings" cargo test
    ```
    Abort if either fails. Do not tag a version that doesn't compile, has warnings, or fails tests.
+   `./build.sh`, not `cargo build --release`: it also installs the released binary and Info.plist
+   into `/Applications/Kova.app`, so the app carries the version being tagged.
 
 10. **Generate release commit message:** Use `git log` since the last tag to summarize changes. Format:
     ```
@@ -54,6 +56,11 @@ Argument: `$ARGUMENTS` must be one of `major`, `minor`, or `patch`. If missing o
 12. **Tag** as `vX.Y.Z`.
 
 13. **Ask the user for confirmation** before pushing and creating the release. Show a summary: version bump, commits included, tag name.
+    The GitHub release is a public post that notifies the repo's watchers: an outbound guard
+    on the machine may refuse `gh release create` even when the user asked for the release.
+    So show the release notes (step 15's text) in this same message, and have the user's
+    go-ahead cover that post explicitly, in the form their guard expects, before step 15. A
+    refused call still means the push went through: never retry it until they answer.
 
 14. **Push** commit and tag atomically:
     ```bash

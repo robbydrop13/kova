@@ -2,6 +2,8 @@
 
 Terminal Mac ultra-rapide en Rust + Metal.
 
+Ce repo est public : rien de personnel dans un fichier suivi, et un exemple pris dans une conversation est reecrit de facon generique avant d'atterrir dans `skill/SKILL.md` ou ailleurs.
+
 ## Stack
 
 - **Rust** — langage principal
@@ -42,6 +44,7 @@ Nos ajouts propres à garder par-dessus sa base : file drag-and-drop, `cmd+1..9`
 - Le binaire release se trouve donc dans `~/.cargo/target/release/kova`
 - **Build** : **toujours** utiliser `./build.sh`, même pour vérifier que le code compile. Ne jamais lancer `cargo build` directement — le binaire ne serait pas copié dans le bundle `/Applications/Kova.app` et l'app ne serait pas mise à jour.
 - `build.sh` fait : cargo build → copie du binaire + Info.plist dans le bundle → codesign du bundle entier (nécessaire pour que macOS conserve les permissions TCC entre les builds).
+- **Le Kova qui tourne a-t-il le dernier build ?** Comparer son heure de lancement avec celle du binaire : `ps -axo pid=,lstart=,comm= | /usr/bin/grep Kova.app/Contents/MacOS/kova` et `ls -lT /Applications/Kova.app/Contents/MacOS/kova`. Ne pas passer par `pgrep` : depuis un appel Bash de Claude Code, `pgrep -l kova` n'a rien affiché alors que Kova tournait, et le `ps -p $(pgrep …)` qui suit échoue sur un argument vide. Même chose pour une app hôte qui lie la bibliothèque : elle ne reçoit un correctif qu'une fois son addon reconstruit contre `~/.cargo/target/release/libkova.a` et l'app relancée.
 
 ## Installation
 
@@ -97,6 +100,7 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 - **Lancer les tests automatisés après chaque modification de code.** Dès qu'une modif touche le code Rust, exécuter `cargo test` (le target est global, pas besoin de `build.sh` pour ça) et vérifier que tout est vert avant de considérer la modif terminée. Un test rouge fait partie du diff : le corriger, ne pas le laisser de côté.
 - **Écrire un TU quand on ajoute/modifie de la logique pure et testable** (formatage, calcul de layout/géométrie, hit-test, parsing, machine à états). Ajouter un `#[test]` inline qui la couvre, dans un `#[cfg(test)] mod tests` du même fichier. Ne pas chercher à tester le rendu Metal ni l'UI AppKit (effets de bord GPU/fenêtre) : isoler la logique pure et la tester elle.
 - Ne jamais lancer l'application (open, Kova.app, etc.) — laisser l'utilisateur tester manuellement.
+- **Capturer une fenêtre de Kova** (pour mesurer un correctif visuel) : `screencapture -x -o -l <window id>` demande le numéro de fenêtre CoreGraphics, que rien dans Kova ne rapporte. L'obtenir depuis le pid en quelques lignes de Swift : `CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID)`, garder les entrées dont le `kCGWindowOwnerPID` est le pid et le `kCGWindowLayer` vaut 0. Un process Kova possède plusieurs fenêtres en layer 0 (bandes fines, une petite icône) : la principale est la plus grande, donc capturer chacune et garder celle qui a la taille complète de la fenêtre.
 - **Une instance de test (le binaire de build lancé à côté du Kova de Mickael, quand il l'a autorisé) s'annonce avant de partir, par une carte** : `kova ask "…" --actions "OK,Plus tard"` (ou `kfloat ask` tant que son Kova ne connaît pas `ask`), et on attend son OK. Sa fenêtre passe devant au lancement ; vue arriver en plein travail, il la ferme. Lancer avec un environnement propre (`env -i HOME USER SHELL PATH…`) : héritées de la session Claude qui lance, les variables `CLAUDE_CODE_*` font croire aux Claude des panes qu'ils sont des sous-sessions, sans registre ni transcript. Et un `KOVA_ASK_DIR` à part, pour ne pas toucher aux questions du vrai Kova. Né le 14/10/2026 pendant le portage de `kova ask` ; ses mots : « préviens moi parce que qd je vois la fenetre arrivée alors que je travaille je la ferme, maintenant qu'on a un moyen de communiquer pendant que kova est pas focus, utilise-le ».
 
 ## Principes

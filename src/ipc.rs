@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 
 /// Maximum length of a single JSON line from a client (64 KB).
 const MAX_LINE_LEN: usize = 65536;
@@ -57,6 +57,9 @@ pub enum IpcCommand {
     SendKeys { pane_id: u32, text: String },
     /// Focus a pane by its ID (switching tab/window if needed).
     FocusPane(u32),
+    /// Resume the agent a launch restore left asleep in a pane, without
+    /// focusing it (`Surface::wake`).
+    WakePane(u32),
     /// Create a new tab with an optional CWD and command.
     NewTab {
         cwd: Option<String>,
@@ -64,16 +67,10 @@ pub enum IpcCommand {
     },
     /// Set the custom title of the tab containing the given pane.
     /// `title: None` clears the custom title (falls back to auto-derived title).
-    SetTabTitle {
-        pane_id: u32,
-        title: Option<String>,
-    },
+    SetTabTitle { pane_id: u32, title: Option<String> },
     /// Set the color of the tab containing the given pane.
     /// `color: None` clears it (tab falls back to the default background).
-    SetTabColor {
-        pane_id: u32,
-        color: Option<usize>,
-    },
+    SetTabColor { pane_id: u32, color: Option<usize> },
     /// Return the rendered text of the requested panes.
     GetPaneContent {
         panes: PaneFilter,
@@ -89,10 +86,7 @@ pub enum IpcCommand {
     },
     /// Block until `pane_id` is marked completed (OSC 133;D from the shell, or
     /// the `mark-completed` command), or until `timeout_ms` elapses. Returns immediately if the flag is already set.
-    WaitForCompletion {
-        pane_id: u32,
-        timeout_ms: u64,
-    },
+    WaitForCompletion { pane_id: u32, timeout_ms: u64 },
     /// List all tabs across all windows.
     ListTabs,
     /// Close a tab by ID. Refuses if it would close the last tab (would terminate the app).
@@ -112,10 +106,7 @@ pub enum IpcCommand {
     },
     /// Swap two panes. Both must live in the same tab.
     /// Same column → swap inside the column. Different columns → swap the whole columns.
-    SwapPane {
-        pane_id_a: u32,
-        pane_id_b: u32,
-    },
+    SwapPane { pane_id_a: u32, pane_id_b: u32 },
     /// Adjust the ratio of the split containing `pane_id`.
     /// `axis = "horizontal"` resizes the column; `axis = "vertical"` resizes the row.
     /// `direction = "grow" | "shrink"`. `amount_pct` is in [0.1, 50.0].
@@ -127,18 +118,12 @@ pub enum IpcCommand {
     },
     /// Set/clear a pane's custom title (sticky — equivalent to OSC 1 or Cmd+Option+R).
     /// `title: None` clears the custom title (pane falls back to OSC 0/2 or auto-derived).
-    RenamePane {
-        pane_id: u32,
-        title: Option<String>,
-    },
+    RenamePane { pane_id: u32, title: Option<String> },
     /// Set/clear the "this pane is waiting for the user" flag. Pushed by the
     /// app running in the pane (Claude Code's hooks) rather than guessed by
     /// Kova. `waiting: false` retracts it; Kova also retracts it on its own
     /// when the pane contradicts the claim (see `Pane::is_awaiting`).
-    SetPaneStatus {
-        pane_id: u32,
-        waiting: bool,
-    },
+    SetPaneStatus { pane_id: u32, waiting: bool },
     /// Run the pane's resume line, exactly as the sidebar's `Resume` button
     /// (`Pane::run_resume`). The line is Kova's own, never the client's.
     ResumePane(u32),
@@ -155,24 +140,18 @@ pub enum IpcCommand {
     /// For apps that must not print on the tty they share with a running
     /// program (Claude Code's `Stop` hook): a write there lands in the middle
     /// of the app's own escape sequences and corrupts the grid.
-    MarkCompleted {
-        pane_id: u32,
-    },
+    MarkCompleted { pane_id: u32 },
     /// Raise the pane's bell flag, as a BEL on its tty does, without writing
     /// to the tty (same reason as `MarkCompleted`: a BEL there can cut one of
     /// the running app's OSC sequences short).
-    Bell {
-        pane_id: u32,
-    },
+    Bell { pane_id: u32 },
     /// Clear the pane's "finished" flag, as OSC 133;C does when a command
     /// starts. Claude Code's `UserPromptSubmit` hook sends it, so a
     /// `wait-for-completion` issued after a prompt waits for that turn's
     /// `mark-completed` instead of answering at once with the previous one.
     /// Leaves the running indicator to the foreground-process probe: a turn
     /// cut short with Esc fires no `Stop` hook and would strand it.
-    MarkStarted {
-        pane_id: u32,
-    },
+    MarkStarted { pane_id: u32 },
     /// Trigger any keyboard action by its stable name (see `action_from_ipc_name`).
     /// `pane_id` optionally targets (and focuses) a specific pane's window first;
     /// without it, the action runs against the key window.
@@ -220,23 +199,58 @@ pub enum IpcCommand {
     /// Turn this connection into an event stream for the given topics.
     /// The main thread answers with a snapshot of the current state; every
     /// change after that is pushed as its own line. See `topic`.
-    Subscribe {
-        topics: u32,
-    },
+    Subscribe { topics: u32 },
     /// An agent's question for the user (`kova ask`, `crate::ask`). Kova.app
     /// shows it on a card and answers only when the user does, however long
     /// that takes; the connection then waits for the client's `ack` before the
     /// answer counts as handed over. Served by `handle_connection` itself.
     Ask(Box<crate::ask::Question>),
-    /// The questions waiting on the card, read-only, with the delays the card
-    /// offers. KovaLink serves them to the phone so a question asked while the
-    /// user is away from the Mac does not block him.
+    /// The questions still waiting on this Kova's card, oldest first (a remote
+    /// client shows them on a phone). Served on the main thread from the `Board`.
     ListAsks,
-    /// Answer a question from outside the card (KovaLink). `action` must be one
-    /// of the buttons that question declared.
-    AnswerAsk { id: String, action: String, text: String },
+    /// Answer a pending question from elsewhere than the card (a remote client): the same
+    /// `Board` path as a click, so the asker gets it the same way. `action`
+    /// and `text` are checked against the question there, not here.
+    AnswerAsk {
+        id: String,
+        action: String,
+        text: String,
+    },
     /// Put a question off for `seconds`, clamped to `ask::SNOOZE_MAX_SECS`.
+    /// KovaLink's "later" button: the card hides it until then.
     SnoozeAsk { id: String, seconds: u64 },
+    /// Take back every question a conversation still has on the card: the user
+    /// answered it in the conversation itself (a prompt typed in the pane, or
+    /// from a remote client), so the card would only deliver a stale answer.
+    /// Nothing is delivered late; a `kova ask` still waiting exits with code 3.
+    WithdrawAsks { session_id: String },
+    /// Every subject of every tab, with the panes filed under it, in the order
+    /// Cmd+P draws them.
+    ListSubjects,
+    /// File a pane under a subject of its tab, created when the tab has none by
+    /// that name (Cmd+Right / Cmd+Shift+Right). `subject: None` takes it out of
+    /// its subject, as Cmd+Left does.
+    SetPaneSubject {
+        pane_id: u32,
+        subject: Option<String>,
+    },
+    /// Rename a subject of a tab; a name the tab already has merges the two
+    /// (Enter on the subject's header in Cmd+P).
+    RenameSubject {
+        tab_id: u32,
+        name: String,
+        new_name: String,
+    },
+    /// Delete a subject of a tab. Its panes stay open, out of any box
+    /// (Cmd+Backspace on the header, without the confirmation).
+    DeleteSubject { tab_id: u32, name: String },
+    /// Give a subject of a tab a color of the tab palette (the strip's
+    /// right-click menu, Cmd+P's `c`).
+    SetSubjectColor {
+        tab_id: u32,
+        name: String,
+        color: usize,
+    },
 }
 
 /// How long the IPC connection thread should wait for the main thread's response.
@@ -374,8 +388,7 @@ fn wake_main() {
 ///
 /// Returns the receiver end of the channel — the main thread polls this
 /// in its timer tick to process commands.
-pub fn start(
-) -> mpsc::Receiver<IpcRequest> {
+pub fn start() -> mpsc::Receiver<IpcRequest> {
     start_at(socket_path())
 }
 
@@ -442,7 +455,9 @@ fn bind(path: &std::path::Path) -> std::io::Result<UnixListener> {
     let bound = UnixListener::bind(path);
 
     #[cfg(unix)]
-    unsafe { libc::umask(prev_umask); }
+    unsafe {
+        libc::umask(prev_umask);
+    }
 
     let listener = bound?;
 
@@ -486,10 +501,7 @@ fn serve(listener: UnixListener, path: PathBuf, tx: mpsc::Sender<IpcRequest>) {
 }
 
 /// Handle a single client connection: read one JSON line, dispatch, respond.
-fn handle_connection(
-    stream: std::os::unix::net::UnixStream,
-    tx: mpsc::Sender<IpcRequest>,
-) {
+fn handle_connection(stream: std::os::unix::net::UnixStream, tx: mpsc::Sender<IpcRequest>) {
     // Set a read timeout so a misbehaving client doesn't block the thread forever
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
 
@@ -516,7 +528,9 @@ fn handle_connection(
             buf.pop();
         }
         if buf.len() > MAX_LINE_LEN {
-            let resp = IpcResponse::Error { message: "request too large".to_string() };
+            let resp = IpcResponse::Error {
+                message: "request too large".to_string(),
+            };
             let _ = writeln!(writer, "{}", resp.to_json());
             break;
         }
@@ -540,8 +554,8 @@ fn handle_connection(
                 // main thread refused (shutting down, timed out), streaming would
                 // park this thread on a subscription no tick will ever feed.
                 let live = matches!(response, IpcResponse::Ok { .. });
-                let sent = writeln!(writer, "{}", response.to_json()).is_ok()
-                    && writer.flush().is_ok();
+                let sent =
+                    writeln!(writer, "{}", response.to_json()).is_ok() && writer.flush().is_ok();
                 if live && sent {
                     // From here the connection is one-way: we never read from it
                     // again. A client that also needs to issue commands opens a
@@ -580,8 +594,13 @@ const ASK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 fn serve_ask(stream: &UnixStream, tx: &mpsc::Sender<IpcRequest>, question: crate::ask::Question) {
     let mut writer = stream;
     let (resp_tx, resp_rx) = mpsc::channel::<IpcResponse>();
-    if tx.send((IpcCommand::Ask(Box::new(question.clone())), resp_tx)).is_err() {
-        let resp = IpcResponse::Error { message: "app shutting down".to_string() };
+    if tx
+        .send((IpcCommand::Ask(Box::new(question.clone())), resp_tx))
+        .is_err()
+    {
+        let resp = IpcResponse::Error {
+            message: "app shutting down".to_string(),
+        };
         let _ = writeln!(writer, "{}", resp.to_json());
         return;
     }
@@ -602,10 +621,17 @@ fn serve_ask(stream: &UnixStream, tx: &mpsc::Sender<IpcRequest>, question: crate
     let mut ack = String::new();
     let acked = sent && BufReader::new(stream).read_line(&mut ack).is_ok() && ack.trim() == "ack";
     if acked {
-        log::info!("ask {}: answer returned to the waiting asker: {}", question.id, answer.line());
+        log::info!(
+            "ask {}: answer returned to the waiting asker: {}",
+            question.id,
+            answer.line()
+        );
         store.remove_delivery(&question.id);
     } else {
-        log::info!("ask {}: the asker no longer waits, delivering late", question.id);
+        log::info!(
+            "ask {}: the asker no longer waits, delivering late",
+            question.id
+        );
         let own = socket_path().to_string_lossy().into_owned();
         crate::ask::deliver_late(&store, &question, &answer, &own);
     }
@@ -648,6 +674,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "close-pane" => &["pane_id"],
         "send-keys" => &["pane_id", "text"],
         "focus-pane" => &["pane_id"],
+        "wake-pane" => &["pane_id"],
         "new-tab" => &["cwd", "command"],
         "set-tab-title" => &["pane_id", "title"],
         "set-tab-color" => &["pane_id", "color"],
@@ -679,6 +706,12 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "list-asks" => &[],
         "answer-ask" => &["id", "action", "text"],
         "snooze-ask" => &["id", "seconds"],
+        "withdraw-asks" => &["session_id"],
+        "list-subjects" => &[],
+        "set-pane-subject" => &["pane_id", "subject"],
+        "rename-subject" => &["tab_id", "name", "new_name"],
+        "delete-subject" => &["tab_id", "name"],
+        "set-subject-color" => &["tab_id", "name", "color"],
         _ => return None,
     })
 }
@@ -699,8 +732,39 @@ fn optional_u32(v: &serde_json::Value, key: &str) -> Result<Option<u32>, String>
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .map(Some)
-            .ok_or_else(|| format!("\"{key}\" must be a non-negative integer up to {}", u32::MAX)),
+            .ok_or_else(|| {
+                format!(
+                    "\"{key}\" must be a non-negative integer up to {}",
+                    u32::MAX
+                )
+            }),
     }
+}
+
+/// Longest subject name accepted, in chars: a box header in Cmd+P is one line.
+const MAX_SUBJECT_NAME_CHARS: usize = 200;
+
+/// A subject name: a string, trimmed as the Cmd+P prompt trims it, not empty,
+/// no control character (a newline would break the one-line header).
+fn subject_name(v: &serde_json::Value, key: &str) -> Result<String, String> {
+    let raw = match v.get(key) {
+        None => return Err(format!("missing \"{key}\" field")),
+        Some(serde_json::Value::String(s)) => s,
+        Some(_) => return Err(format!("\"{key}\" must be a string")),
+    };
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(format!("\"{key}\" must not be empty"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(format!("\"{key}\" must not contain control characters"));
+    }
+    if name.chars().count() > MAX_SUBJECT_NAME_CHARS {
+        return Err(format!(
+            "\"{key}\" is longer than {MAX_SUBJECT_NAME_CHARS} characters"
+        ));
+    }
+    Ok(name.to_string())
 }
 
 pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
@@ -778,6 +842,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::FocusPane(pane_id))
         }
+        "wake-pane" => {
+            let pane_id = required_u32(&v, "pane_id")?;
+            Ok(IpcCommand::WakePane(pane_id))
+        }
         "new-tab" => {
             let cwd = v.get("cwd").and_then(|c| c.as_str()).map(String::from);
             let cmd_str = v.get("command").and_then(|c| c.as_str()).map(String::from);
@@ -814,11 +882,19 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
         }
         "get-pane-content" => {
             let (panes, mode, trim) = parse_pane_content_args(&v)?;
-            Ok(IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines: trim })
+            Ok(IpcCommand::GetPaneContent {
+                panes,
+                mode,
+                trim_trailing_blank_lines: trim,
+            })
         }
         "count-pane-content" => {
             let (panes, mode, trim) = parse_pane_content_args(&v)?;
-            Ok(IpcCommand::CountPaneContent { panes, mode, trim_trailing_blank_lines: trim })
+            Ok(IpcCommand::CountPaneContent {
+                panes,
+                mode,
+                trim_trailing_blank_lines: trim,
+            })
         }
         "wait-for-completion" => {
             let pane_id = required_u32(&v, "pane_id")?;
@@ -837,7 +913,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                     timeout_ms, MAX_TIMEOUT_MS
                 ));
             }
-            Ok(IpcCommand::WaitForCompletion { pane_id, timeout_ms })
+            Ok(IpcCommand::WaitForCompletion {
+                pane_id,
+                timeout_ms,
+            })
         }
         "list-tabs" => Ok(IpcCommand::ListTabs),
         "close-tab" => {
@@ -850,7 +929,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             if source_tab_id == target_tab_id {
                 return Err("source_tab_id and target_tab_id must differ".to_string());
             }
-            Ok(IpcCommand::MergeTab { source_tab_id, target_tab_id })
+            Ok(IpcCommand::MergeTab {
+                source_tab_id,
+                target_tab_id,
+            })
         }
         "move-tab" => {
             let tab_id = v
@@ -871,7 +953,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             if pane_id_a == pane_id_b {
                 return Err("pane_id_a and pane_id_b must differ".to_string());
             }
-            Ok(IpcCommand::SwapPane { pane_id_a, pane_id_b })
+            Ok(IpcCommand::SwapPane {
+                pane_id_a,
+                pane_id_b,
+            })
         }
         "resize-pane" => {
             let pane_id = required_u32(&v, "pane_id")?;
@@ -881,7 +966,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .unwrap_or("horizontal")
                 .to_string();
             if axis != "horizontal" && axis != "vertical" {
-                return Err(format!("\"axis\" must be \"horizontal\" or \"vertical\" (got \"{}\")", axis));
+                return Err(format!(
+                    "\"axis\" must be \"horizontal\" or \"vertical\" (got \"{}\")",
+                    axis
+                ));
             }
             let direction = v
                 .get("direction")
@@ -889,7 +977,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .ok_or_else(|| "missing \"direction\" field".to_string())?
                 .to_string();
             if direction != "grow" && direction != "shrink" {
-                return Err(format!("\"direction\" must be \"grow\" or \"shrink\" (got \"{}\")", direction));
+                return Err(format!(
+                    "\"direction\" must be \"grow\" or \"shrink\" (got \"{}\")",
+                    direction
+                ));
             }
             let amount_pct = match v.get("amount_pct") {
                 None | Some(serde_json::Value::Null) => 5.0_f32,
@@ -904,7 +995,12 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                     f
                 }
             };
-            Ok(IpcCommand::ResizePane { pane_id, axis, direction, amount_pct })
+            Ok(IpcCommand::ResizePane {
+                pane_id,
+                axis,
+                direction,
+                amount_pct,
+            })
         }
         "rename-pane" => {
             let pane_id = required_u32(&v, "pane_id")?;
@@ -920,11 +1016,7 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             let waiting = match v.get("status").and_then(|s| s.as_str()) {
                 Some("waiting") => true,
                 Some("none") => false,
-                _ => {
-                    return Err(
-                        "\"status\" must be \"waiting\" or \"none\"".to_string()
-                    )
-                }
+                _ => return Err("\"status\" must be \"waiting\" or \"none\"".to_string()),
             };
             Ok(IpcCommand::SetPaneStatus { pane_id, waiting })
         }
@@ -986,7 +1078,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             if source_window == target_window {
                 return Err("source_window and target_window must differ".to_string());
             }
-            Ok(IpcCommand::MergeWindow { source_window, target_window })
+            Ok(IpcCommand::MergeWindow {
+                source_window,
+                target_window,
+            })
         }
         "notify" => {
             let message = v
@@ -1006,7 +1101,12 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 Some(serde_json::Value::Bool(b)) => *b,
                 Some(_) => return Err("\"sound\" must be a boolean".to_string()),
             };
-            Ok(IpcCommand::Notify { pane_id, title, message, sound })
+            Ok(IpcCommand::Notify {
+                pane_id,
+                title,
+                message,
+                sound,
+            })
         }
         "set-anchor" => {
             let text = |key: &str| -> Result<Option<String>, String> {
@@ -1020,8 +1120,8 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             let cwd = text("cwd")?;
             let agent = text("agent")?;
             if let Some(a) = agent.as_deref() {
-                if a != "claude" && a != "codex" {
-                    return Err("\"agent\" must be \"claude\" or \"codex\"".to_string());
+                if a != "claude" && a != "codex" && a != "pi" && a != "omp" {
+                    return Err("\"agent\" must be \"claude\", \"codex\", \"pi\" or \"omp\"".to_string());
                 }
             }
             if pane_id.is_none() && cwd.is_none() {
@@ -1045,7 +1145,9 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 None | Some(serde_json::Value::Null) => topic::ALL,
                 Some(serde_json::Value::Array(items)) => {
                     if items.is_empty() {
-                        return Err("\"events\" must not be empty (omit it to get every topic)".to_string());
+                        return Err(
+                            "\"events\" must not be empty (omit it to get every topic)".to_string()
+                        );
                     }
                     let mut mask = 0u32;
                     for item in items {
@@ -1059,7 +1161,7 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                                     "unknown event \"{}\" — known events: {}",
                                     name,
                                     topic::ALL_NAMES.join(", ")
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1070,7 +1172,9 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::Subscribe { topics })
         }
         "ask" => {
-            let raw = v.get("question").ok_or_else(|| "missing \"question\" field".to_string())?;
+            let raw = v
+                .get("question")
+                .ok_or_else(|| "missing \"question\" field".to_string())?;
             let question: crate::ask::Question = serde_json::from_value(raw.clone())
                 .map_err(|e| format!("invalid \"question\": {}", e))?;
             // The id names files on disk; the session id may end up on a command line.
@@ -1080,7 +1184,12 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             if question.message.trim().is_empty() {
                 return Err("\"question.message\" must not be empty".to_string());
             }
-            if question.from.session_id.as_deref().is_some_and(|s| !crate::ask::is_safe_session_id(s)) {
+            if question
+                .from
+                .session_id
+                .as_deref()
+                .is_some_and(|s| !crate::ask::is_safe_session_id(s))
+            {
                 return Err("\"question.from.session_id\" must be a plain session id".to_string());
             }
             Ok(IpcCommand::Ask(Box::new(question)))
@@ -1088,11 +1197,13 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
         "list-asks" => Ok(IpcCommand::ListAsks),
         "answer-ask" => {
             let id = ask_id(&v)?;
-            let action = v
-                .get("action")
-                .and_then(|a| a.as_str())
-                .ok_or_else(|| "missing \"action\" field".to_string())?
-                .to_string();
+            let action = match v.get("action") {
+                None | Some(serde_json::Value::Null) => {
+                    return Err("missing \"action\" field".to_string());
+                }
+                Some(serde_json::Value::String(a)) => a.clone(),
+                Some(_) => return Err("\"action\" must be a string".to_string()),
+            };
             // Checked against that question's own buttons by the board: here we
             // only know the shape.
             let text = match v.get("text") {
@@ -1112,6 +1223,66 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .and_then(|s| s.as_u64())
                 .ok_or_else(|| "missing \"seconds\" field".to_string())?;
             Ok(IpcCommand::SnoozeAsk { id, seconds })
+        }
+        "withdraw-asks" => {
+            let session_id = v
+                .get("session_id")
+                .ok_or_else(|| "missing \"session_id\" field".to_string())?
+                .as_str()
+                .ok_or_else(|| "\"session_id\" must be a string".to_string())?
+                .to_string();
+            if !crate::ask::is_safe_session_id(&session_id) {
+                return Err("\"session_id\" must be a plain session id".to_string());
+            }
+            Ok(IpcCommand::WithdrawAsks { session_id })
+        }
+        "list-subjects" => Ok(IpcCommand::ListSubjects),
+        "set-pane-subject" => {
+            let pane_id = required_u32(&v, "pane_id")?;
+            // Required, so a forgotten field never reads as "take it out".
+            let subject = match v.get("subject") {
+                None => {
+                    return Err(
+                        "missing \"subject\" field (null takes the pane out of its subject)"
+                            .to_string(),
+                    );
+                }
+                Some(serde_json::Value::Null) => None,
+                Some(_) => Some(subject_name(&v, "subject")?),
+            };
+            Ok(IpcCommand::SetPaneSubject { pane_id, subject })
+        }
+        "rename-subject" => {
+            let tab_id = required_u32(&v, "tab_id")?;
+            let name = subject_name(&v, "name")?;
+            let new_name = subject_name(&v, "new_name")?;
+            Ok(IpcCommand::RenameSubject {
+                tab_id,
+                name,
+                new_name,
+            })
+        }
+        "delete-subject" => {
+            let tab_id = required_u32(&v, "tab_id")?;
+            let name = subject_name(&v, "name")?;
+            Ok(IpcCommand::DeleteSubject { tab_id, name })
+        }
+        "set-subject-color" => {
+            let tab_id = required_u32(&v, "tab_id")?;
+            let name = subject_name(&v, "name")?;
+            // Required and never null: a subject always has a color.
+            let color = v
+                .get("color")
+                .ok_or_else(|| "missing \"color\" field".to_string())?
+                .as_u64()
+                .filter(|&c| (c as usize) < TAB_COLOR_COUNT)
+                .ok_or_else(|| format!("\"color\" must be 0..{}", TAB_COLOR_COUNT - 1))?
+                as usize;
+            Ok(IpcCommand::SetSubjectColor {
+                tab_id,
+                name,
+                color,
+            })
         }
         other => Err(format!("unknown command: {}", other)),
     }
@@ -1136,9 +1307,7 @@ fn ask_id(v: &serde_json::Value) -> Result<String, String> {
 /// - `panes`: omitted / null → `All`; `"all"` → `All`; array of integers → `Ids`.
 /// - `mode`: `"visible"` (must be one of `visible|scrollback|all`).
 /// - `trim_trailing_blank_lines`: `true`.
-fn parse_pane_content_args(
-    v: &serde_json::Value,
-) -> Result<(PaneFilter, String, bool), String> {
+fn parse_pane_content_args(v: &serde_json::Value) -> Result<(PaneFilter, String, bool), String> {
     let panes = match v.get("panes") {
         None | Some(serde_json::Value::Null) => PaneFilter::All,
         Some(serde_json::Value::String(s)) if s == "all" => PaneFilter::All,
@@ -1148,9 +1317,10 @@ fn parse_pane_content_args(
         Some(serde_json::Value::Array(arr)) => {
             let mut ids = Vec::with_capacity(arr.len());
             for (i, item) in arr.iter().enumerate() {
-                let id = item.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| {
-                    format!("\"panes\"[{}] must be a non-negative integer", i)
-                })?;
+                let id = item
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| format!("\"panes\"[{}] must be a non-negative integer", i))?;
                 ids.push(id);
             }
             PaneFilter::Ids(ids)
@@ -1218,16 +1388,20 @@ pub mod topic {
     pub const PANE_OPEN: u32 = 1 << 3;
     /// A pane went away.
     pub const PANE_CLOSE: u32 = 1 << 4;
+    /// The subjects of Cmd+P changed: one created, renamed, deleted, moved, or
+    /// a pane filed into or out of one, whoever did it.
+    pub const SUBJECTS: u32 = 1 << 5;
 
-    pub const ALL: u32 = FOCUS | PANE_STATUS | PANE_WORKING | PANE_OPEN | PANE_CLOSE;
+    pub const ALL: u32 = FOCUS | PANE_STATUS | PANE_WORKING | PANE_OPEN | PANE_CLOSE | SUBJECTS;
 
     /// Wire names, in bit order — `names()` relies on that ordering.
-    pub const ALL_NAMES: [&str; 5] = [
+    pub const ALL_NAMES: [&str; 6] = [
         "focus",
         "pane-status",
         "pane-working",
         "pane-open",
         "pane-close",
+        "subjects",
     ];
 
     pub fn from_name(name: &str) -> Option<u32> {
@@ -1287,7 +1461,11 @@ fn register_subscriber(topics: u32) -> (u64, mpsc::Receiver<String>) {
     let mut subs = subscribers();
     subs.push(Subscriber { id, topics, tx });
     refresh_topic_mask(&subs);
-    log::info!("IPC: subscriber {} listening on {:?}", id, topic::names(topics));
+    log::info!(
+        "IPC: subscriber {} listening on {:?}",
+        id,
+        topic::names(topics)
+    );
     (id, rx)
 }
 
@@ -1373,13 +1551,22 @@ mod tests {
 
     #[test]
     fn response_json_shape() {
-        assert_eq!(IpcResponse::Ok { data: None }.to_json(), serde_json::json!({"ok": true}));
         assert_eq!(
-            IpcResponse::Ok { data: Some(serde_json::json!([1])) }.to_json(),
+            IpcResponse::Ok { data: None }.to_json(),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(
+            IpcResponse::Ok {
+                data: Some(serde_json::json!([1]))
+            }
+            .to_json(),
             serde_json::json!({"ok": true, "data": [1]})
         );
         assert_eq!(
-            IpcResponse::Error { message: "pane 3 not found".into() }.to_json(),
+            IpcResponse::Error {
+                message: "pane 3 not found".into()
+            }
+            .to_json(),
             serde_json::json!({"ok": false, "error": "pane 3 not found"})
         );
     }
@@ -1396,12 +1583,18 @@ mod tests {
         let d = data(pane_content_response(vec![2, 9, 2], |id| {
             (id == 2).then(|| serde_json::json!({"id": 2, "text": "x"}))
         }));
-        assert_eq!(d, serde_json::json!({"panes": [
-            {"id": 2, "text": "x"},
-            {"id": 9, "error": "not found"},
-            {"id": 2, "text": "x"},
-        ]}));
-        assert_eq!(data(pane_content_response(vec![], |_| None)), serde_json::json!({"panes": []}));
+        assert_eq!(
+            d,
+            serde_json::json!({"panes": [
+                {"id": 2, "text": "x"},
+                {"id": 9, "error": "not found"},
+                {"id": 2, "text": "x"},
+            ]})
+        );
+        assert_eq!(
+            data(pane_content_response(vec![], |_| None)),
+            serde_json::json!({"panes": []})
+        );
     }
 
     #[test]
@@ -1411,27 +1604,120 @@ mod tests {
             2 => Some((10, 12)),
             _ => None,
         }));
-        assert_eq!(d, serde_json::json!({
-            "total_chars": 13,
-            "total_bytes": 16,
-            "panes": [
-                {"id": 1, "chars": 3, "bytes": 4},
-                {"id": 5, "error": "not found"},
-                {"id": 2, "chars": 10, "bytes": 12},
-            ],
-        }));
+        assert_eq!(
+            d,
+            serde_json::json!({
+                "total_chars": 13,
+                "total_bytes": 16,
+                "panes": [
+                    {"id": 1, "chars": 3, "bytes": 4},
+                    {"id": 5, "error": "not found"},
+                    {"id": 2, "chars": 10, "bytes": 12},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn withdraw_asks_parses_and_refuses_odd_session_ids() {
+        match parse_command(r#"{"cmd":"withdraw-asks","session_id":"7cc50c49-61e0"}"#) {
+            Ok(IpcCommand::WithdrawAsks { session_id }) => assert_eq!(session_id, "7cc50c49-61e0"),
+            _ => panic!("withdraw-asks"),
+        }
+        assert_eq!(
+            err(r#"{"cmd":"withdraw-asks"}"#),
+            "missing \"session_id\" field"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"withdraw-asks","session_id":3}"#),
+            "\"session_id\" must be a string"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"withdraw-asks","session_id":"a b"}"#),
+            "\"session_id\" must be a plain session id"
+        );
+    }
+
+    #[test]
+    fn ask_board_commands_parse() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"list-asks"}"#),
+            Ok(IpcCommand::ListAsks)
+        ));
+        assert_eq!(
+            err(r#"{"cmd":"list-asks","id":"x"}"#),
+            "unknown field \"id\" for command \"list-asks\""
+        );
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        match parse_command(&format!(
+            r#"{{"cmd":"answer-ask","id":"{id}","action":"OK","text":"go"}}"#
+        )) {
+            Ok(IpcCommand::AnswerAsk {
+                id: got,
+                action,
+                text,
+            }) => {
+                assert_eq!(
+                    (got.as_str(), action.as_str(), text.as_str()),
+                    (id, "OK", "go")
+                )
+            }
+            _ => panic!("answer-ask"),
+        }
+        match parse_command(&format!(
+            r#"{{"cmd":"answer-ask","id":"{id}","action":"KO"}}"#
+        )) {
+            Ok(IpcCommand::AnswerAsk { text, .. }) => {
+                assert_eq!(text, "", "text defaults to empty")
+            }
+            _ => panic!("answer-ask without text"),
+        }
+        assert_eq!(
+            err(r#"{"cmd":"answer-ask","action":"OK"}"#),
+            "missing \"id\" field"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"answer-ask","id":"../x","action":"OK"}"#),
+            "\"id\" must be a UUID"
+        );
+        assert_eq!(
+            err(&format!(r#"{{"cmd":"answer-ask","id":"{id}"}}"#)),
+            "missing \"action\" field"
+        );
+        assert_eq!(
+            err(&format!(r#"{{"cmd":"answer-ask","id":"{id}","action":1}}"#)),
+            "\"action\" must be a string"
+        );
+        assert_eq!(
+            err(&format!(
+                r#"{{"cmd":"answer-ask","id":"{id}","action":"OK","pane_id":1}}"#
+            )),
+            "unknown field \"pane_id\" for command \"answer-ask\""
+        );
     }
 
     #[test]
     fn pane_commands_parse() {
-        assert!(matches!(parse_command(r#"{"cmd":"list-panes"}"#), Ok(IpcCommand::ListPanes)));
-        assert!(matches!(parse_command(r#"{"cmd":"close-pane","pane_id":4}"#), Ok(IpcCommand::ClosePaneById(4))));
-        assert!(matches!(parse_command(r#"{"cmd":"focus-pane","pane_id":4}"#), Ok(IpcCommand::FocusPane(4))));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"list-panes"}"#),
+            Ok(IpcCommand::ListPanes)
+        ));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"close-pane","pane_id":4}"#),
+            Ok(IpcCommand::ClosePaneById(4))
+        ));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"focus-pane","pane_id":4}"#),
+            Ok(IpcCommand::FocusPane(4))
+        ));
         match parse_command(r#"{"cmd":"send-keys","pane_id":4,"text":"ls\r"}"#) {
             Ok(IpcCommand::SendKeys { pane_id: 4, text }) => assert_eq!(text, "ls\r"),
             _ => panic!("send-keys"),
         }
-        assert_eq!(err(r#"{"cmd":"send-keys","pane_id":4}"#), "missing \"text\" field");
+        assert_eq!(
+            err(r#"{"cmd":"send-keys","pane_id":4}"#),
+            "missing \"text\" field"
+        );
         assert!(parse_command(r#"{"cmd":"close-pane"}"#).is_err());
         assert!(parse_command(r#"{"cmd":"focus-pane","pane_id":"4"}"#).is_err());
     }
@@ -1439,13 +1725,23 @@ mod tests {
     #[test]
     fn pane_content_args_defaults_and_errors() {
         match parse_command(r#"{"cmd":"get-pane-content"}"#) {
-            Ok(IpcCommand::GetPaneContent { panes: PaneFilter::All, mode, trim_trailing_blank_lines: true }) => {
+            Ok(IpcCommand::GetPaneContent {
+                panes: PaneFilter::All,
+                mode,
+                trim_trailing_blank_lines: true,
+            }) => {
                 assert_eq!(mode, "visible")
             }
             _ => panic!("defaults"),
         }
-        match parse_command(r#"{"cmd":"count-pane-content","panes":[3,1,3],"mode":"scrollback","trim_trailing_blank_lines":false}"#) {
-            Ok(IpcCommand::CountPaneContent { panes: PaneFilter::Ids(ids), mode, trim_trailing_blank_lines: false }) => {
+        match parse_command(
+            r#"{"cmd":"count-pane-content","panes":[3,1,3],"mode":"scrollback","trim_trailing_blank_lines":false}"#,
+        ) {
+            Ok(IpcCommand::CountPaneContent {
+                panes: PaneFilter::Ids(ids),
+                mode,
+                trim_trailing_blank_lines: false,
+            }) => {
                 assert_eq!(ids, vec![3, 1, 3]);
                 assert_eq!(mode, "scrollback");
             }
@@ -1453,7 +1749,10 @@ mod tests {
         }
         assert!(matches!(
             parse_command(r#"{"cmd":"get-pane-content","panes":"all","mode":"all"}"#),
-            Ok(IpcCommand::GetPaneContent { panes: PaneFilter::All, .. })
+            Ok(IpcCommand::GetPaneContent {
+                panes: PaneFilter::All,
+                ..
+            })
         ));
         assert_eq!(
             err(r#"{"cmd":"get-pane-content","panes":"some"}"#),
@@ -1533,11 +1832,17 @@ mod tests {
     fn set_pane_status_parses_both_states() {
         assert!(matches!(
             parse_command(r#"{"cmd":"set-pane-status","pane_id":7,"status":"waiting"}"#),
-            Ok(IpcCommand::SetPaneStatus { pane_id: 7, waiting: true })
+            Ok(IpcCommand::SetPaneStatus {
+                pane_id: 7,
+                waiting: true
+            })
         ));
         assert!(matches!(
             parse_command(r#"{"cmd":"set-pane-status","pane_id":7,"status":"none"}"#),
-            Ok(IpcCommand::SetPaneStatus { pane_id: 7, waiting: false })
+            Ok(IpcCommand::SetPaneStatus {
+                pane_id: 7,
+                waiting: false
+            })
         ));
     }
 
@@ -1576,7 +1881,12 @@ mod tests {
         // that the shortest possible call still produces a usable notification.
         let parsed = parse_command(r#"{"cmd":"notify","message":"done"}"#);
         match parsed {
-            Ok(IpcCommand::Notify { pane_id, title, message, sound }) => {
+            Ok(IpcCommand::Notify {
+                pane_id,
+                title,
+                message,
+                sound,
+            }) => {
                 assert_eq!(pane_id, None);
                 assert_eq!(title, "Kova");
                 assert_eq!(message, "done");
@@ -1590,12 +1900,21 @@ mod tests {
     fn set_anchor_takes_a_pane_or_a_named_conversation() {
         assert!(matches!(
             parse_command(r#"{"cmd":"set-anchor","pane_id":3}"#),
-            Ok(IpcCommand::SetAnchor { pane_id: Some(3), .. })
+            Ok(IpcCommand::SetAnchor {
+                pane_id: Some(3),
+                ..
+            })
         ));
         match parse_command(
             r#"{"cmd":"set-anchor","cwd":"/w","session_id":"abc","agent":"codex","label":"prez"}"#,
         ) {
-            Ok(IpcCommand::SetAnchor { cwd, session_id, agent, label, .. }) => {
+            Ok(IpcCommand::SetAnchor {
+                cwd,
+                session_id,
+                agent,
+                label,
+                ..
+            }) => {
                 assert_eq!(cwd.as_deref(), Some("/w"));
                 assert_eq!(session_id.as_deref(), Some("abc"));
                 assert_eq!(agent.as_deref(), Some("codex"));
@@ -1611,21 +1930,40 @@ mod tests {
         // where a path was expected, and a field nobody reads. A session id with
         // no agent is not here: it parses, and the handler drops the id (see
         // `anchors::from_named`), because the directory alone is still an anchor.
-        assert_eq!(err(r#"{"cmd":"set-anchor"}"#), "set-anchor needs \"pane_id\" or \"cwd\"");
+        assert_eq!(
+            err(r#"{"cmd":"set-anchor"}"#),
+            "set-anchor needs \"pane_id\" or \"cwd\""
+        );
         assert!(parse_command(r#"{"cmd":"set-anchor","cwd":"/w","agent":"aider"}"#).is_err());
         assert!(parse_command(r#"{"cmd":"set-anchor","cwd":""}"#).is_err());
         assert!(parse_command(r#"{"cmd":"set-anchor","cwd":"/w","project":"x"}"#).is_err());
     }
 
     #[test]
+    fn wake_pane_takes_a_pane_id() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"wake-pane","pane_id":4}"#),
+            Ok(IpcCommand::WakePane(4))
+        ));
+        assert!(parse_command(r#"{"cmd":"wake-pane"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"wake-pane","pane_id":4,"focus":true}"#).is_err());
+    }
+
+    #[test]
     fn clear_anchors_takes_no_argument() {
-        assert!(matches!(parse_command(r#"{"cmd":"clear-anchors"}"#), Ok(IpcCommand::ClearAnchors)));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"clear-anchors"}"#),
+            Ok(IpcCommand::ClearAnchors)
+        ));
         assert!(parse_command(r#"{"cmd":"clear-anchors","all":true}"#).is_err());
     }
 
     #[test]
     fn reload_config_takes_no_argument() {
-        assert!(matches!(parse_command(r#"{"cmd":"reload-config"}"#), Ok(IpcCommand::ReloadConfig)));
+        assert!(matches!(
+            parse_command(r#"{"cmd":"reload-config"}"#),
+            Ok(IpcCommand::ReloadConfig)
+        ));
         assert!(parse_command(r#"{"cmd":"reload-config","path":"/tmp/x"}"#).is_err());
     }
 
@@ -1635,7 +1973,12 @@ mod tests {
             r#"{"cmd":"notify","pane_id":42,"title":"Claude Code","message":"terminé","sound":true}"#,
         );
         match parsed {
-            Ok(IpcCommand::Notify { pane_id, title, message, sound }) => {
+            Ok(IpcCommand::Notify {
+                pane_id,
+                title,
+                message,
+                sound,
+            }) => {
                 assert_eq!(pane_id, Some(42));
                 assert_eq!(title, "Claude Code");
                 assert_eq!(message, "terminé");
@@ -1667,7 +2010,10 @@ mod tests {
             parse_command(r#"{"cmd":"mark-completed","pane_id":7}"#),
             Ok(IpcCommand::MarkCompleted { pane_id: 7 })
         ));
-        assert_eq!(err(r#"{"cmd":"mark-completed"}"#), "missing \"pane_id\" field");
+        assert_eq!(
+            err(r#"{"cmd":"mark-completed"}"#),
+            "missing \"pane_id\" field"
+        );
         assert_eq!(
             err(r#"{"cmd":"mark-completed","pane_id":7,"status":"done"}"#),
             "unknown field \"status\" for command \"mark-completed\""
@@ -1693,7 +2039,10 @@ mod tests {
             parse_command(r#"{"cmd":"mark-started","pane_id":7}"#),
             Ok(IpcCommand::MarkStarted { pane_id: 7 })
         ));
-        assert_eq!(err(r#"{"cmd":"mark-started"}"#), "missing \"pane_id\" field");
+        assert_eq!(
+            err(r#"{"cmd":"mark-started"}"#),
+            "missing \"pane_id\" field"
+        );
     }
 
     #[test]
@@ -1706,7 +2055,9 @@ mod tests {
         assert_eq!(err(r#"{"cmd":"notify","message":"m","pane_id":7.5}"#), bad);
         assert!(matches!(
             parse_command(r#"{"cmd":"bell","pane_id":4294967295}"#),
-            Ok(IpcCommand::Bell { pane_id: 4294967295 })
+            Ok(IpcCommand::Bell {
+                pane_id: 4294967295
+            })
         ));
     }
 
@@ -1780,7 +2131,112 @@ mod tests {
 
     #[test]
     fn unknown_command_takes_precedence_over_field_check() {
-        assert_eq!(err(r#"{"cmd":"bogus","whatever":1}"#), "unknown command: bogus");
+        assert_eq!(
+            err(r#"{"cmd":"bogus","whatever":1}"#),
+            "unknown command: bogus"
+        );
+    }
+
+    #[test]
+    fn subject_commands_parse_and_check_their_names() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"list-subjects"}"#),
+            Ok(IpcCommand::ListSubjects)
+        ));
+        match parse_command(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":"  auth  "}"#) {
+            Ok(IpcCommand::SetPaneSubject {
+                pane_id: 4,
+                subject,
+            }) => {
+                assert_eq!(
+                    subject.as_deref(),
+                    Some("auth"),
+                    "trimmed as the Cmd+P prompt trims"
+                );
+            }
+            _ => panic!("set-pane-subject with a name"),
+        }
+        assert!(matches!(
+            parse_command(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":null}"#),
+            Ok(IpcCommand::SetPaneSubject {
+                pane_id: 4,
+                subject: None
+            })
+        ));
+        let err = |line: &str| match parse_command(line) {
+            Err(e) => e,
+            Ok(_) => panic!("{line} must be refused"),
+        };
+        assert!(
+            err(r#"{"cmd":"set-pane-subject","pane_id":4}"#).contains("missing \"subject\""),
+            "a forgotten field never reads as taking the pane out"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":"  "}"#),
+            "\"subject\" must not be empty"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":"a\nb"}"#),
+            "\"subject\" must not contain control characters"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-pane-subject","pane_id":4,"subject":3}"#),
+            "\"subject\" must be a string"
+        );
+        let long = format!(
+            r#"{{"cmd":"set-pane-subject","pane_id":4,"subject":"{}"}}"#,
+            "x".repeat(201)
+        );
+        assert!(err(&long).contains("longer than 200"));
+
+        match parse_command(
+            r#"{"cmd":"rename-subject","tab_id":2,"name":"auth","new_name":"login"}"#,
+        ) {
+            Ok(IpcCommand::RenameSubject {
+                tab_id: 2,
+                name,
+                new_name,
+            }) => {
+                assert_eq!((name.as_str(), new_name.as_str()), ("auth", "login"));
+            }
+            _ => panic!("rename-subject"),
+        }
+        assert_eq!(
+            err(r#"{"cmd":"rename-subject","tab_id":2,"name":"auth"}"#),
+            "missing \"new_name\" field"
+        );
+        match parse_command(r#"{"cmd":"delete-subject","tab_id":2,"name":"auth"}"#) {
+            Ok(IpcCommand::DeleteSubject { tab_id: 2, name }) => assert_eq!(name, "auth"),
+            _ => panic!("delete-subject"),
+        }
+        assert_eq!(
+            err(r#"{"cmd":"delete-subject","name":"auth"}"#),
+            "missing \"tab_id\" field"
+        );
+        match parse_command(r#"{"cmd":"set-subject-color","tab_id":2,"name":"auth","color":5}"#) {
+            Ok(IpcCommand::SetSubjectColor {
+                tab_id: 2,
+                name,
+                color: 5,
+            }) => assert_eq!(name, "auth"),
+            _ => panic!("set-subject-color"),
+        }
+        assert_eq!(
+            err(r#"{"cmd":"set-subject-color","tab_id":2,"name":"auth","color":12}"#),
+            format!("\"color\" must be 0..{}", TAB_COLOR_COUNT - 1)
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-subject-color","tab_id":2,"name":"auth","color":null}"#),
+            format!("\"color\" must be 0..{}", TAB_COLOR_COUNT - 1)
+        );
+        assert_eq!(
+            err(r#"{"cmd":"set-subject-color","tab_id":2,"name":"auth"}"#),
+            "missing \"color\" field"
+        );
+        assert_eq!(
+            err(r#"{"cmd":"delete-subject","tab_id":2,"name":"auth","pane_id":1}"#),
+            "unknown field \"pane_id\" for command \"delete-subject\""
+        );
     }
 
     #[test]
@@ -1805,7 +2261,7 @@ mod tests {
         // that will never come — the failure has to be loud and immediate.
         assert_eq!(
             err(r#"{"cmd":"subscribe","events":["focous"]}"#),
-            "unknown event \"focous\" — known events: focus, pane-status, pane-working, pane-open, pane-close"
+            "unknown event \"focous\" — known events: focus, pane-status, pane-working, pane-open, pane-close, subjects"
         );
         assert_eq!(
             err(r#"{"cmd":"subscribe","events":[]}"#),

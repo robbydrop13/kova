@@ -71,7 +71,7 @@ different command fails loudly instead of making the command do something else.
 
 - `direction` defaults to `horizontal`.
 - `cwd` falls back to the focused pane's CWD.
-- If `command` is provided, the new shell runs it on launch.
+- If `command` is provided, the new shell **types it at its prompt without pressing Enter**, once the shell is ready: the line waits for review (this is what `ask` relies on to leave a `--resume` line on screen). Send `{"cmd":"send-keys","pane_id":N,"text":"\n"}` to run it. An Enter sent before the line appears would reach the shell first.
 
 Response: `{ "data": { "pane_id": <new-id> } }`
 
@@ -82,6 +82,8 @@ Response: `{ "data": { "pane_id": <new-id> } }`
 ```json
 { "cmd": "new-tab", "cwd": "<optional>", "command": "<optional>" }
 ```
+
+`command` is typed at the new shell's prompt without Enter, exactly like `split` above.
 
 Response: `{ "data": { "tab_id": <int>, "pane_id": <int> } }`
 
@@ -136,13 +138,16 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "minimized": false,
   "agent": "claude",
   "agent_session_id": "0b6f…",
-  "agent_session_name": "subscribe côté Kova",
+  "agent_session_name": "subscribe on the Kova side",
   "claude_session_id": "0b6f…",
-  "claude_session_name": "subscribe côté Kova",
+  "claude_config_dir": null,
+  "claude_session_name": "subscribe on the Kova side",
   "resume_agent": null,
   "resume_session_id": null,
   "resume_command": null,
-  "peer_name": "subscribe côté Kova"
+  "peer_name": "subscribe on the Kova side",
+  "dormant_session_id": null,
+  "subject": "auth"
 }
 ```
 
@@ -152,21 +157,33 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
 
 `child_processes[].name` is the program's name as it was invoked (argv[0], what `ps` shows), not the kernel's `p_comm`. The difference matters for anything installed under a versioned filename: Claude Code's binary is `~/.local/share/claude/versions/2.1.226`, so `p_comm` there is `2.1.226` and the name would say nothing about which program is running. `version` carries that number when the executable's own filename is one, and is `null` otherwise — so a Claude Code pane reads `{"name": "claude", "version": "2.1.226"}`.
 
-`claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab, and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
+`claude_session_id` is the id of the Claude Code conversation running in the pane — the argument `claude --resume` takes — and `claude_session_name` is the name its `/rename` set (`null` until the user sets one). Both are `null` in a pane with no Claude session. They are read from `~/.claude/sessions/<pid>.json`, on the same throttled probe as the rest, and they matter because **the id is the only identifier here that outlives the pane**: a client tying a pane to a subject must key on it rather than on `id` or `cwd`. A pane id dies with its tab and does not survive a Kova relaunch either (every restored pane is numbered afresh, so an id noted before the relaunch may name another pane), and a directory is shared by every unrelated conversation started in the same repository. The name also appears inside `title`, but only as one candidate among five (see `display_title`), where it cannot be told apart from an OSC title or a directory name.
 
-`peer_name` is the name other Claude Code sessions use to reach this one with `SendMessage` / `ListAgents` (e.g. `"lempire-f1"`). It is the session file's `name` field as Claude Code wrote it, **including a name it derived on its own** (`nameSource: "derived"`), which `claude_session_name` deliberately drops so that it never shadows the pane title. After a `/rename` the two fields carry the same value. It is `null` in a pane with no Claude session, for Codex, and while Claude Code has not yet written a name. It comes from the same cached scan of `~/.claude/sessions/` as `claude_session_id`, with no extra filesystem pass.
+`claude_config_dir` is the `CLAUDE_CONFIG_DIR` the pane's Claude session runs under when it is not the default `~/.claude` (a launcher that points Claude Code at another account or at a proxy), `null` otherwise. Kova scans the `sessions/` of every `~/.claude-*` directory as well as `~/.claude/sessions/`; such a session's transcript lives under `<claude_config_dir>/projects/`, and a relaunch reopens it through the command that started it (`<that command> --resume <id>`, so a launcher must pass `--resume` on to Claude Code) or, when that command was `claude` itself, with `CLAUDE_CONFIG_DIR=<dir>` in front.
 
-`agent` is `"claude"`, `"codex"`, or `null`. `agent_session_id` and `agent_session_name` expose the detected conversation's id and name for either agent; the name is `null` when absent. The `claude_*` fields remain `null` for Codex, including named Codex sessions. Codex resumes with `codex resume <id>`.
+`peer_name` is the name other Claude Code sessions use to reach this one with `SendMessage` / `ListAgents` (e.g. `"myproject-f1"`). It is the session file's `name` field as Claude Code wrote it, **including a name it derived on its own** (`nameSource: "derived"`), which `claude_session_name` deliberately drops so that it never shadows the pane title. After a `/rename` the two fields carry the same value. It is `null` in a pane with no Claude session, for Codex, Pi and omp, and while Claude Code has not yet written a name. It comes from the same cached scan of `~/.claude/sessions/` as `claude_session_id`, with no extra filesystem pass.
+
+`agent` is `"claude"`, `"codex"`, `"pi"`, `"omp"`, or `null`. `agent_session_id` and `agent_session_name` expose the detected conversation's id and name for any agent; the name is `null` when the conversation has none yet. The `claude_*` fields remain `null` for Codex, Pi and omp, including named sessions. Codex resumes with `codex resume <id>`; Pi resumes with `pi --session <id>`; omp resumes with `omp --resume <id>`, each keeping the flags its command line carried.
+
+A Pi conversation's name is the title Pi itself shows for it in `/resume`: the latest `/name` (`session_info` entry in its transcript), and failing that the first thing the user typed — `session.name ?? session.firstMessage`, exactly the rule Pi's session picker applies. Kova reads it from the same file it already found for the id, and only ever the bytes appended since last time.
 
 Codex names come from `~/.codex/session_index.jsonl`, joined by session id to the live process detection. The last valid entry for an id wins; a blank name clears it. Reads share the detection's one-second cache, and missing or malformed entries leave the normal title fallback available. Unlike Claude's session files, this index does not distinguish automatic names from explicit `/rename` names: Kova displays the latest persisted name in both cases.
 
+Pi keeps no file of its own to read: neither a per-process file like Claude's nor an open transcript like Codex's. Its conversations live in `~/.pi/agent/sessions/--<cwd>--/<created>_<id>.jsonl`, named after the moment they were created, so Kova ties a `pi` process to a conversation by that process's working directory and start time. A `pi` that resumed an older conversation matches no start time: the environment of one of its running commands carries `PI_SESSION_ID`, which pins that pane for the rest of its life, and without such a hit the file written most recently in that directory is taken instead — which cannot tell apart two panes resuming conversations of the same directory. When a snapshot hands two panes the same id, the session file drops it for both rather than reopen one pane on the other's transcript. A `pi` started with `--no-session` or pointed elsewhere with `--session-dir` / `PI_CODING_AGENT_SESSION_DIR` is not detected at all, and its pane keeps its last command.
+
+omp is a Pi fork, but its detection is exact: it holds the session journal open with a writer for the whole life of the conversation, so Kova finds the file descriptor of the `omp` process that points under `~/.omp/` and reads the id from its name. That works for a resumed conversation too. The environment of an omp child (`PI_SESSION_FILE`, inherited from the Pi bridge) is the second exact source; only when neither is visible does Kova fall back to the start time and the newest file in `~/.omp/agent/sessions/<cwd bucket>`, and the shared-id guard drops that guess. An omp conversation's name is the title in its fixed-width `type: "title"` slot, else the latest `title_change` (`/rename`), else the first thing the user typed. Its buckets are omp's own encoding (`-<cwd relative to $HOME>`, `-tmp-…`, or `--<absolute>--`), not Pi's `--…--`, and `omp --resume <id>` reopens it. A profile lives under `~/.omp` and is found by the same file descriptor; `--no-session`, or a `--session-dir` outside `~/.omp`, is not detected and leaves the pane on its last command.
+
 The pane switcher, open-pane search results, IPC `title`, and automatic tab titles use the conversation name before the pane's custom title, OSC title, foreground process, and directory. An explicitly named tab keeps its own title. The per-pane status bar has its own existing rule (hovered URL, custom pane title, OSC title), and does not read the conversation name directly.
+
+`dormant_session_id` is the conversation a relaunch left asleep in the pane. After a relaunch, Kova resumes a restored Claude Code, Codex, Pi or omp conversation only the first time its pane is drawn in the active tab of a window (focused or not; a pane minimized or scrolled out of view does not count, but a window hidden behind others, on another Space or in the Dock still wakes its active tab), or on `wake-pane`, or when a late `ask` answer is delivered to it. Until then the pane is a bare shell: its resume line is neither typed nor run, `agent`, the `*_session_id` fields and `peer_name` are `null`, and the session does not appear in `ListAgents`, so `SendMessage` cannot reach it. A tab reopened with Cmd+O is not concerned: its line is typed and waits for Enter. A `send-keys` to a sleeping pane cancels its sleep instead: the client is using the pane, so the resume line is dropped and will never be typed over what it started; `wake-pane` is the way to get the conversation back. `null` once the pane is woken or for any other pane. A sleeping pane, or one woken whose agent has not reported its session yet, is still saved with its conversation on quit, and the global status bar counts the sleeping ones as `◌N`.
 
 `minimized` is `true` for a pane collapsed with `minimize-pane` (`Cmd+M` by default). Such a pane still runs and is still listed here; it simply takes no layout space and is not drawn. Kova marks it with a `⊟` glyph in the pane switcher and counts it in the status bar. A remote client should keep showing it and mark it the same way rather than filter it out.
 
 `working` is `true` when the app in the pane is actively generating or running a tool, detected from its OSC 0/2 title: Claude Code prepends an **animated Braille spinner glyph** (U+2800–U+28FF, e.g. `⠂`/`⠐`) followed by a space *only while it works*. At the prompt it instead shows an asterisk-like idle marker (`✳ Claude Code`) or a plain title, so the asterisk is explicitly NOT treated as busy. Counting panes with `working: true` therefore gives the number of Claude Code sessions actually busy — as opposed to those merely open and waiting for input (which stay `is_idle: false` too, since the `claude` process is always a child). It reads the live OSC 0/2 title even when a sticky custom title (OSC 1 / manual rename) shadows the display. Kova also shows this count in the global status bar as `✳N` (hidden when zero).
 
 `awaiting` is `true` when the app in the pane has declared, over `set-pane-status`, that it is waiting for the user — and nothing Kova observed since contradicts it. `awaiting_since` is the epoch second at which the wait started (`null` when not waiting), so a client can show how long a session has been unanswered. Unlike `working`, this is *pushed*, not guessed: `working` is inferred from the terminal title, while `awaiting` is a claim the running app makes about itself. See `set-pane-status` for how it is set and, more importantly, for the ways Kova retracts it on its own.
+
+`subject` is the name of the subject the pane is filed under in `Cmd+P` (the box it is drawn in), or `null`. Kova.app only: a library host has no subjects and its panes carry no such field. See `list-subjects`.
 
 `awaiting_seen` is `true` when a waiting pane has been looked at on this Mac since it started waiting: Kova stamps it on the focused pane of the key window, on every frame. It is the difference between the two things `awaiting` alone cannot tell apart, and the reason `Cmd+J` does not hand you the same pane twice. The marker stays up either way, because reading a question is not answering it; only the jump set shrinks. A remote client that walks waiting panes should obey the same halt, otherwise it offers panes already read here. It is `false` on a pane that is not waiting, where the bit means nothing.
 
@@ -251,6 +268,20 @@ command does not. Response: `{ "ok": true }`.
 
 ---
 
+### `wake-pane` — resume the conversation asleep in a pane
+
+```json
+{ "cmd": "wake-pane", "pane_id": 42 }
+```
+
+Runs the resume line of a pane whose `dormant_session_id` is set (see
+`list-panes`), where it is, without focusing it or switching tab. Response:
+`{ "ok": true, "data": { "woken": true } }`; `woken` is `false` when the pane
+was not asleep, and nothing was done. The agent reports its session in
+`list-panes` once it has started, a few seconds later.
+
+---
+
 ### `notify` — post a desktop notification that focuses a pane when clicked
 
 ```json
@@ -277,20 +308,29 @@ The first notification of a fresh install triggers the system permission prompt;
 if the user declines, `notify` still answers `{ "ok": true }` and macOS silently
 drops the banner.
 
+A library host (an app that embeds Kova, `include/kova.h`) posts the notification
+itself: it registers a handler with `kova_set_notify_handler`, which receives the
+pane, title, message and sound, and handles the click (it knows which of its
+documents holds the pane). The answer is `{ "ok": true }` once the request is
+queued for that handler; a library host that registered none answers
+`notify is not supported by this host`.
+
 ---
 
 ### `ask` — put an agent's question on the user's screen and wait for the answer
 
 ```json
 { "cmd": "ask", "question": {
-    "id": "6f1c…-uuid", "message": "Send the reply to Robin?",
+    "id": "6f1c…-uuid", "message": "Deploy to staging?",
     "actions": ["OK", "KO"], "input": true, "asked_at": 1792000000,
     "from": { "name": "routine", "session_id": "…", "pane_id": 12,
               "kova_socket": "/tmp/kova-123.sock", "cwd": "/Users/…/project" } } }
 ```
 
 Not meant to be spoken by hand: `kova ask "<message>" [--actions OK,KO]` builds it
-from its environment (`CLAUDE_CODE_SESSION_ID`, `KOVA_PANE_ID`, `KOVA_SOCKET`) and
+from its environment (`CLAUDE_CODE_SESSION_ID`, or `PI_SESSION_FILE` /
+`PI_SESSION_ID` for Pi and omp, plus `OMPCODE` to tell omp from Pi; `KOVA_PANE_ID`,
+`KOVA_SOCKET`) and
 `kova ask --help` documents the client. `id` must be a UUID (it names files on
 disk), `session_id` must be a plain `[A-Za-z0-9_-]` id (it reaches a command line).
 
@@ -301,18 +341,29 @@ the user does — there is no server-side timeout. The response is
 write the line `ack` within 2 s: without it, the answer is considered lost on
 the way and Kova delivers it to the conversation itself:
 
-1. typed into the asker's pane, if that pane still runs the asker's Claude
-   conversation (same `claude_session_id`, or the conversation's process
-   descends from the pane's shell);
-2. if the conversation is open in another process, Kova waits for it to end;
-3. then reopens it in a new tab: `claude --dangerously-skip-permissions --resume
-   <session_id> '<the answer>'`, in the directory the conversation ran in (read
-   from its transcript, which `claude --resume` needs; not the asker's `cwd`).
-   No transcript, or `claude` no longer running in the new pane 10 s after
-   Enter (it exits at once on "No conversation found"), and the answer stays
-   on disk, retried at the next launch.
+1. if the conversation sleeps in a pane since a relaunch (`dormant_session_id`,
+   looked up in the asker's Kova and in the one delivering), Kova wakes that
+   pane (`wake-pane`), waits up to 60 s for its agent to report the session,
+   and types the answer there; if the wake fails or the agent does not come
+   up, the answer stays on disk, retried at the next launch. Steps 2
+   to 4 are skipped then: a resume in a new tab would run the conversation twice
+   once the sleeping pane is shown;
+2. typed into the asker's pane, if that pane still runs the asker's
+   conversation (`agent_session_id`, with the matching `agent`; for Claude an
+   older Kova's `claude_session_id` also counts, and the conversation's process
+   descending from the pane's shell);
+3. if the conversation is open in another process, Kova waits for it to end
+   (Claude only: the other agents keep no per-process registry);
+4. then reopens it in a new tab with the asker agent's resume line:
+   `claude --dangerously-skip-permissions --resume <session_id> '<the answer>'`,
+   `codex resume <session_id> '<the answer>'`, `pi --session <session_id>
+   '<the answer>'` or `omp --resume <session_id> '<the answer>'`. Claude is
+   opened in the directory its transcript records (`claude --resume` needs it);
+   the other agents use the asker's `cwd`. No transcript (Claude), or the agent
+   no longer running in the new pane 10 s after Enter, and the answer stays on
+   disk, retried at the next launch.
 
-A pane of a library host (Kana) names that host's socket, which answers `ask`
+A pane of a library host (an app that embeds Kova) names that host's socket, which answers `ask`
 with `command not supported by this host` (or `unknown command: ask` for a
 build older than `ask`): `kova ask` then asks Kova.app.
 
@@ -385,11 +436,79 @@ a snoozed question replaces its delay; answering one works as usual.
 
 ---
 
+### `list-asks` — the questions waiting on the card
+
+```json
+{ "cmd": "list-asks" }
+```
+
+For a client that answers somewhere else than the card, such as a companion app
+that shows them on a phone. Response:
+`{"ok":true,"data":{"asks":[…]}}`, oldest first (the one on the card comes
+first), each entry the `question` object of `ask` exactly as it was asked, plus
+`"buttons"`: the buttons the card shows, in order (`["Reply"]` when `actions` is
+empty; `actions` plus a trailing `"Other"` when the card has a text field), so a
+client never re-derives those defaults. `"asks": []` when nothing
+waits. Questions restored after a restart are listed like the others.
+
+Kova.app only: a library host answers `command not supported by this host`.
+
+---
+
+### `answer-ask` — answer a pending question as if on the card
+
+```json
+{ "cmd": "answer-ask", "id": "6f1c…-uuid", "action": "OK", "text": "go ahead" }
+```
+
+`text` is optional (default `""`) and trimmed, as the card trims its field. The answer takes the card's own path: the
+waiting `kova ask` client gets it (or it is delivered late, exactly as described
+under `ask`), and the card moves on to the next question or disappears. An
+answer given here is indistinguishable from a click. Response:
+`{"ok":true,"data":{"id":…,"action":"OK","text":"go ahead"}}`.
+
+Errors:
+
+- `"id" must be a UUID`;
+- `no pending question <id>`: already answered (on the Mac, or by another
+  client), or never asked here;
+- `"action" must be one of: OK, KO`: `action` is not one of that question's
+  `buttons` (case matters);
+- `"text" must be empty: this question has no text field`: the question was
+  asked with `input: false`.
+
+Kova.app only: a library host answers `command not supported by this host`.
+
+---
+
+### `withdraw-asks` — take back a conversation's questions, answered elsewhere
+
+```json
+{ "cmd": "withdraw-asks", "session_id": "6e67ffdd-…" }
+```
+
+The user answered in the conversation itself (typed a prompt in its pane, or
+from a remote client) rather than on the card: every question that
+conversation (`from.session_id`) still has on the card is taken off it and off
+disk, and **nothing is delivered late** — a click twenty minutes later would
+only retype a stale answer. A `kova ask` still waiting gets the error
+`withdrawn: the user answered in the conversation instead of on the card` and
+exits with code 3. Answers already given and waiting for delivery are not
+touched. Response: `{"ok":true,"data":{"withdrawn":1}}` (0 when nothing was
+pending).
+
+Sent by a Claude Code `UserPromptSubmit` hook running
+`kova ask --withdraw --session -` (it reads the hook's JSON input for the
+`session_id`, prints nothing and always exits 0). Kova.app only: a library host
+answers `command not supported by this host`, and the client then asks Kova.app.
+
+---
+
 ### `set-anchor` — put a conversation at the head of the anchors
 
 ```json
 { "cmd": "set-anchor", "pane_id": 42 }
-{ "cmd": "set-anchor", "cwd": "/Users/x/projects/prez", "session_id": "abc123", "agent": "claude", "label": "Prez steerco" }
+{ "cmd": "set-anchor", "cwd": "/Users/x/projects/prez", "session_id": "abc123", "agent": "claude", "label": "Release notes" }
 ```
 
 The anchors are the few conversations today is for: they open `Cmd+P` in their
@@ -400,7 +519,7 @@ answers this.
 
 Either name a pane of this Kova with `pane_id` — its conversation, directory and
 title are read from the pane — or name the conversation outright with `cwd`,
-plus `session_id` and `agent` (`"claude"` or `"codex"`) for Kova to be able to
+plus `session_id` and `agent` (`"claude"`, `"codex"`, `"pi"` or `"omp"`) for Kova to be able to
 reopen it, and `label` for the row (the directory's name otherwise). A
 `session_id` without an `agent` is dropped: nothing could resume it. A
 conversation already anchored moves to the head rather than gaining a second
@@ -410,7 +529,7 @@ from outside always lands, where `Cmd+Shift+A` on a full list refuses instead
 (you are there to drop one). An anchored conversation stops appearing among
 the bookmarks below, even when it is bookmarked too.
 
-Response: `{ "ok": true, "data": { "label": "Prez steerco", "anchors": 3, "dropped": null } }`.
+Response: `{ "ok": true, "data": { "label": "Release notes", "anchors": 3, "dropped": null } }`.
 
 Errors rather than a surprise: a request naming neither `pane_id` nor `cwd`, a
 `pane_id` that is not open (or holds neither a conversation nor a directory), and
@@ -556,9 +675,79 @@ Response: `{ "ok": true }`.
 
 Sets the pane's custom title — the same field that `Cmd+Option+R` and `OSC 1` write to. Sticky: survives OSC 0/2 (window title) sequences emitted by programs running in the pane. Pass `"title": null` to clear (pane falls back to its OSC 0/2 / auto-derived title).
 
-One thing outranks it in the pane's display title: the current Claude or Codex conversation name (`agent_session_name` in `list-panes`). A sticky title outlives whatever the pane is used for next, so a pane running a named session shows that name, and the custom title reappears once the session ends or its name is cleared. The per-pane status bar uses the separate rule described under `list-panes`.
+One thing outranks it in the pane's display title: the current agent conversation name (`agent_session_name` in `list-panes`). A sticky title outlives whatever the pane is used for next, so a pane running a named session shows that name, and the custom title reappears once the session ends or its name is cleared. The per-pane status bar uses the separate rule described under `list-panes`.
 
 Response: `{ "ok": true }`.
+
+---
+
+### `list-subjects` — the subjects of every tab
+
+```json
+{ "cmd": "list-subjects" }
+```
+
+A subject is a named group of panes inside one tab, drawn in `Cmd+P` as a box under its name. It belongs to its tab: the same name in two tabs is two subjects. Response: one entry per subject, tab by tab, each tab's in the order `Cmd+P` draws the boxes (empty subjects first, then each where its first member sits):
+
+```json
+{ "ok": true, "data": [
+  { "tab_id": 3, "window": 0, "tab_index": 0, "name": "idle", "color": 2, "pane_ids": [] },
+  { "tab_id": 3, "window": 0, "tab_index": 0, "name": "auth", "color": 4, "pane_ids": [42, 57] }
+] }
+```
+
+`color` is the subject's color, an index into the twelve-color tab palette (the same indices as `set-tab-color`): drawn at random when the subject is created, among the colors its tab uses least (ties broken at random), then kept across relaunches. The user can change it (right-click on the band, `c` on the header in `Cmd+P`), and so can `set-subject-color`. It frames the subject's box in `Cmd+P` and paints its band in the strip Kova draws under the tab bar. `pane_ids` follows the tab's order. To follow changes instead of polling, `subscribe` to `subjects`: the event carries this same list whenever anything in it changes. A pane id dies with its pane (see `list-panes`); a client that must remember which conversation sits in which subject keys on the pane's `agent_session_id`. Kova.app only: a library host answers `command not supported by this host`.
+
+---
+
+### `set-pane-subject` — file a pane under a subject, or take it out
+
+```json
+{ "cmd": "set-pane-subject", "pane_id": 42, "subject": "auth" }
+{ "cmd": "set-pane-subject", "pane_id": 42, "subject": null }
+```
+
+With a name, files the pane under that subject of its own tab, as `Cmd+→` does; a name the tab does not have yet creates the subject. A pane already in another subject moves to this one. Nothing moves on screen. With `null`, takes the pane out of its subject, as `Cmd+←` does: a pane from the middle of the box moves past its last member, so it lands right under the box, and the subject stays even left empty. Taking out a pane that is in no subject does nothing and is not an error.
+
+`subject` is required (a forgotten field never reads as "take it out"). The name is trimmed; it must not be empty, hold a control character, or exceed 200 characters. An open `Cmd+P` is redrawn with the new boxes.
+
+Response: `{ "ok": true, "data": { "tab_id": 3, "subject": "auth", "created": false } }`. Error: `pane <id> not found`.
+
+---
+
+### `rename-subject` — rename a subject of a tab
+
+```json
+{ "cmd": "rename-subject", "tab_id": 3, "name": "auth", "new_name": "login" }
+```
+
+Renames the subject in place, its panes following, as Enter on its header in `Cmd+P` does. A `new_name` the tab already has merges the two: the renamed subject's panes join the other one, which keeps its place. Names are checked as in `set-pane-subject`.
+
+Response: `{ "ok": true, "data": { "merged": false } }`. Errors: `tab <id> not found`, `tab <id> has no subject "<name>"`.
+
+---
+
+### `delete-subject` — delete a subject of a tab
+
+```json
+{ "cmd": "delete-subject", "tab_id": 3, "name": "auth" }
+```
+
+Deletes the subject. Its panes stay open where they are, out of any box. Unlike `Cmd+⌫` on the header in `Cmd+P`, nothing is confirmed: the client asked.
+
+Response: `{ "ok": true, "data": { "released": 2 } }` — how many panes the subject held. Errors as in `rename-subject`.
+
+---
+
+### `set-subject-color` — choose a subject's color
+
+```json
+{ "cmd": "set-subject-color", "tab_id": 3, "name": "auth", "color": 4 }
+```
+
+Gives the subject a color of the tab palette, `0` to `11` (the same indices as `set-tab-color`). It is saved with the session and repaints the subject's box in `Cmd+P` and its band in the strip together. Required and never `null`: a subject always has a color.
+
+Response: `{ "ok": true, "data": { "color": 4 } }`. Errors as in `rename-subject`, plus `"color" must be 0..11`.
 
 ---
 
@@ -589,7 +778,7 @@ Runs the exact same handler as the corresponding keyboard shortcut — this is t
 
 Response: `{ "ok": true }`, or `{ "ok": false, "error": "unknown action: ..." }`.
 
-**Action names** (kebab-case, mirroring the config keys in `config.rs`):
+**Action names** (kebab-case; the table is `action_from_ipc_name` in `src/keybindings.rs`):
 
 ```
 new-tab  close-pane-or-tab  close-tab  close-window  kill-window  new-window
@@ -712,6 +901,8 @@ Response:
 ] } }
 ```
 
+`cols` and `rows` are the pane's terminal size. A pane scrolled entirely off-screen (a tab wider than the window) keeps the size it had until it is on screen again: a window resize does not reach it, so it does not redraw for nothing.
+
 Per-pane errors don't fail the whole request — missing IDs come back as `{ "id": ..., "error": "not found" }` entries inside the array.
 
 ---
@@ -772,7 +963,7 @@ Response:
 ### `subscribe` — stream state changes as they happen
 
 ```json
-{ "cmd": "subscribe", "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close"] }
+{ "cmd": "subscribe", "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close", "subjects"] }
 ```
 
 Turns this connection into an event stream. `events` is optional — omit it to get
@@ -785,10 +976,11 @@ separate `list-panes` to bootstrap, and has no gap between "what is true now" an
 
 ```json
 { "ok": true, "data": {
-  "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close"],
+  "events": ["focus", "pane-status", "pane-working", "pane-open", "pane-close", "subjects"],
   "app_active": true,
   "focus": { ...pane object, or null... },
-  "panes": [ ...same objects as `list-panes`... ]
+  "panes": [ ...same objects as `list-panes`... ],
+  "subjects": [ ...same entries as `list-subjects`... ]
 } }
 ```
 
@@ -801,6 +993,7 @@ Every line after that is one event, told apart from a response by its `event` ke
 | `pane-working` | `pane_id`, `working` | a pane started or stopped working |
 | `pane-open` | `pane` | a pane appeared |
 | `pane-close` | `pane_id`, `window`, `tab` | a pane went away |
+| `subjects` | `subjects` (the whole `list-subjects` answer) | a subject was created, renamed, recolored, deleted or moved, or a pane was filed into or out of one — from Cmd+P, a split inheriting its subject, a closed pane or tab, or IPC |
 | `ping` | — | 30 s of silence (see below) |
 
 **`focus` folds "is Kova even frontmost" into the same stream.** Leaving Kova for
@@ -813,7 +1006,7 @@ at it" are one fact here. `reason` is one of `pane`, `tab`, `window`, `session`,
 true hop: a pane change that is also a tab change reads `tab`.
 
 `session` is the one that does not involve moving: the focused pane is the same,
-but the Claude or Codex conversation in it changed — you launched an agent, it ended,
+but the agent conversation in it changed — you launched an agent, it ended,
 or its name changed through `/rename`, right where you already were. The conversation is deliberately part of the focused
 pane's identity rather than just its payload, because a client keyed on
 conversations would otherwise hear about a session started in place only when the
@@ -836,10 +1029,17 @@ Notes that matter when writing a client:
 - **The connection is one-way once subscribed.** Kova stops reading it. Open a
   second connection for commands.
 - **`focus` is compared every frame; the pane sweep runs at ~4 Hz.** So
-  `pane-status` / `pane-working` / `pane-open` / `pane-close` can lag a change by
+  `pane-status` / `pane-working` / `pane-open` / `pane-close` / `subjects` can lag a change by
   up to ~250 ms, while `focus` is reported on the next frame.
 - **The socket name carries Kova's pid**, so a Kova restart moves it. A long-lived
   subscriber needs to re-glob `/tmp/kova-*.sock` and re-subscribe.
+- **A library host serves it too**, over its panes in the socket's model (window 0,
+  one tab per pane). Its `focus` is the pane whose view has the keyboard in the
+  host's key window, and `app_active` is the host app being frontmost: `app-inactive`
+  means the host went to the background, `no-key-window` that the host is in front
+  but the keyboard is elsewhere in it (an editor next to the terminal), and moving
+  between two panes reads `tab`. Its sweep runs every fps/4 calls of the host's
+  poll, so the ~250 ms holds when the host polls at Kova's frame rate.
 
 ## Common patterns
 

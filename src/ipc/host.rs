@@ -5,7 +5,7 @@
 //! it to the main thread. There, `dispatch` runs the commands that only need
 //! "the panes and tabs this app holds" against an `IpcHost`, and gives every
 //! other command back to the app. Kova.app implements `IpcHost` over its
-//! windows (`crate::app`); another host (Kana, one tab per note) implements the
+//! windows (`crate::app`); another host (a library host, one tab per document) implements the
 //! same trait and gets the same commands, the same JSON and the same errors.
 //!
 //! What a command does to one pane (`send_keys_to`, `pane_text_entry`…) is
@@ -48,7 +48,7 @@ pub enum IpcCloseTabResult {
     NotFound,
 }
 
-/// One `list-tabs` entry. The shape is the host-independent contract Kite reads
+/// One `list-tabs` entry. The shape is the host-independent contract a remote client reads
 /// (`tab_json`); a host fills it from whatever it calls a tab.
 pub struct TabInfo {
     pub id: u32,
@@ -375,6 +375,9 @@ pub fn poll_pending_waits(host: &impl IpcHost, waits: &mut Vec<PendingWait>) {
 pub fn send_keys_to(surface: &Surface, text: &str) {
     // Same rule as a keystroke: someone answered this pane.
     surface.clear_awaiting();
+    // A pane still asleep since a relaunch is being used by whoever sends
+    // this: its resume line must not be typed over their command once shown.
+    surface.cancel_sleep();
     // A submitted line starts a command or a turn: the finished
     // flag of the last one must not answer the wait that usually
     // follows. Cleared here rather than on the shell's 133;C or
@@ -432,15 +435,22 @@ pub fn surface_json(
         // this Mac. False on a pane that is not waiting at all, where the bit means nothing.
         "awaiting_seen": pane.is_awaiting() && !pane.is_awaiting_unseen(),
         "minimized": minimized,
-        // Which agent holds the pane's conversation ("claude", "codex"), absent
-        // at a bare shell. `claude_session_id` stays Claude-only so a client
-        // that resumes with it never gets an id Claude cannot open; the
+        // Which agent holds the pane's conversation ("claude", "codex", "pi"),
+        // absent at a bare shell. `claude_session_id` stays Claude-only so a
+        // client that resumes with it never gets an id Claude cannot open; the
         // agent-agnostic id is next to it.
         "agent": pane.agent_kind().map(|a| a.as_str()),
         "agent_session_id": pane.agent_session_id(),
         "agent_session_name": pane.agent_session_name(),
         "claude_session_id": pane.claude_session_id(),
         "claude_session_name": pane.claude_session_name(),
+        // The CLAUDE_CONFIG_DIR the session runs under when it is not
+        // ~/.claude: its transcript is under <dir>/projects, not ~/.claude/projects.
+        "claude_config_dir": pane.claude_config_dir(),
+        // A conversation a launch restore left asleep here: its resume line
+        // waits until the pane is on screen or `wake-pane`. No agent runs, so
+        // the session ids above are null and it has no `peer_name`.
+        "dormant_session_id": pane.dormant_session_id(),
         // The SendMessage / ListAgents address of the pane's Claude session,
         // derived names included — `claude_session_name` only carries /rename.
         "peer_name": pane.claude_peer_name(),
@@ -791,6 +801,11 @@ mod tests {
             r#"{"cmd":"clear-anchors"}"#,
             r#"{"cmd":"reload-config"}"#,
             r#"{"cmd":"subscribe"}"#,
+            r#"{"cmd":"list-subjects"}"#,
+            r#"{"cmd":"set-pane-subject","pane_id":1,"subject":"x"}"#,
+            r#"{"cmd":"rename-subject","tab_id":1,"name":"x","new_name":"y"}"#,
+            r#"{"cmd":"delete-subject","tab_id":1,"name":"x"}"#,
+            r#"{"cmd":"set-subject-color","tab_id":1,"name":"x","color":0}"#,
         ] {
             let cmd = parse_command(request).unwrap();
             assert!(dispatch(&host, cmd).is_err(), "{request} belongs to the app");

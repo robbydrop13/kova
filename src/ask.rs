@@ -23,8 +23,8 @@
 //! environment, which any process can set: session ids are refused outside
 //! `[A-Za-z0-9_-]`, question ids outside the UUID shape.
 //!
-//! Ported from Kova Float (`~/projects/perso/kova-float`, `kfloat ask`),
-//! 14/10/2026, where every delivery path was measured first.
+//! Ported from an earlier Swift prototype,
+//! where every delivery path was measured first.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -39,7 +39,12 @@ use serde::{Deserialize, Serialize};
 pub struct Asker {
     /// Shown on the card. Defaults to the working directory's last component.
     pub name: String,
-    /// `CLAUDE_CODE_SESSION_ID` of the Claude Code conversation that ran `kova ask`.
+    /// Which agent ran `kova ask`, so a late answer resumes with the right
+    /// command. Absent on files written before omp existed: Claude then.
+    #[serde(default)]
+    pub agent: crate::agent_session::Agent,
+    /// `CLAUDE_CODE_SESSION_ID`, or the id in omp/Pi's `PI_SESSION_FILE`, of the
+    /// conversation that ran `kova ask`.
     #[serde(default)]
     pub session_id: Option<String>,
     /// `KOVA_PANE_ID` and `KOVA_SOCKET` of the pane it runs in, when that terminal is Kova.
@@ -59,14 +64,54 @@ impl Asker {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| cwd.to_string());
+        let (agent, session_id) = agent_and_session(&env);
         Asker {
             name: name.unwrap_or(default_name),
-            session_id: env("CLAUDE_CODE_SESSION_ID").filter(|id| is_safe_session_id(id)),
+            agent,
+            session_id,
             pane_id: env("KOVA_PANE_ID").and_then(|p| p.parse().ok()),
             kova_socket: env("KOVA_SOCKET").filter(|s| !s.is_empty()),
             cwd: Some(cwd.to_string()),
         }
     }
+}
+
+/// The agent that ran `kova ask`, and its conversation id, from the environment
+/// its children inherit. Claude is tried first; omp and Pi both hand their
+/// commands `PI_SESSION_FILE` / `PI_SESSION_ID`, and `OMPCODE` (or a path under
+/// `~/.omp`) tells the two apart.
+fn agent_and_session(
+    env: &impl Fn(&str) -> Option<String>,
+) -> (crate::agent_session::Agent, Option<String>) {
+    if let Some(id) = env("CLAUDE_CODE_SESSION_ID").filter(|id| is_safe_session_id(id)) {
+        return (crate::agent_session::Agent::Claude, Some(id));
+    }
+    let omps = env("OMPCODE").as_deref() == Some("1")
+        || env("PI_SESSION_FILE").is_some_and(|path| path.contains("/.omp/"));
+    if let Some(path) = env("PI_SESSION_FILE") {
+        let id = Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(crate::omp_session::session_id_from_file_name)
+            .filter(|id| is_safe_session_id(id));
+        if id.is_some() {
+            let agent = if omps {
+                crate::agent_session::Agent::Omp
+            } else {
+                crate::agent_session::Agent::Pi
+            };
+            return (agent, id);
+        }
+    }
+    if let Some(id) = env("PI_SESSION_ID").filter(|id| is_safe_session_id(id)) {
+        let agent = if omps {
+            crate::agent_session::Agent::Omp
+        } else {
+            crate::agent_session::Agent::Pi
+        };
+        return (agent, Some(id));
+    }
+    (crate::agent_session::Agent::Claude, None)
 }
 
 /// One question, as it travels on the socket and sits on disk.
@@ -96,10 +141,21 @@ fn default_true() -> bool {
     true
 }
 
+/// The button always added after the asker's actions when the card has a text field: a typed
+/// answer that is none of the proposed choices must not ride on one of them ("A: stop everything").
+pub const OTHER: &str = "Other";
+
 impl Question {
     /// The buttons the card shows.
     pub fn buttons(&self) -> Vec<String> {
-        if self.actions.is_empty() { vec!["Reply".to_string()] } else { self.actions.clone() }
+        if self.actions.is_empty() {
+            return vec!["Reply".to_string()];
+        }
+        let mut buttons = self.actions.clone();
+        if self.input && !buttons.iter().any(|b| b == OTHER) {
+            buttons.push(OTHER.to_string());
+        }
+        buttons
     }
 
     /// Whether the card may show it now: never snoozed, or snoozed and the
@@ -132,14 +188,18 @@ pub const SNOOZE_MAX_SECS: u64 = 24 * 60 * 60;
 pub const ANSWER_TEXT_MAX: usize = 8 * 1024;
 
 /// Whether an answer that did not come from the card may be handed to the
-/// agent: the action is one of the buttons the question declared, and the free
-/// text is of human size.
+/// agent: the action is one of the buttons the question declared, the free text
+/// is of human size, and there is no text at all unless the question asked for
+/// some. The card constrains all three by construction; a socket client does not.
 pub fn accepts_external_answer(question: &Question, action: &str, text: &str) -> Result<(), String> {
     if !question.buttons().iter().any(|b| b == action) {
         return Err(format!("{:?} is not one of this question's buttons", action));
     }
     if text.len() > ANSWER_TEXT_MAX {
         return Err(format!("answer text is longer than {} bytes", ANSWER_TEXT_MAX));
+    }
+    if !question.input && !text.is_empty() {
+        return Err("this question has no text field, so \"text\" must be empty".to_string());
     }
     Ok(())
 }
@@ -186,7 +246,11 @@ pub enum Delivery {
     /// Type it into this pane of this Kova socket: the conversation is still open there.
     Pane { socket: String, pane_id: u32 },
     /// Reopen the conversation in a new Kova tab, in its directory.
-    Resume { session_id: String, cwd: Option<String> },
+    Resume {
+        agent: crate::agent_session::Agent,
+        session_id: String,
+        cwd: Option<String>,
+    },
     /// The conversation is still open in a process Kova cannot type into:
     /// wait for it to end, then resume.
     OpenElsewhere { pid: i32 },
@@ -209,7 +273,11 @@ pub fn delivery(asker: &Asker, pane_holds_session: bool, live_pid: Option<i32>) 
     if let Some(pid) = live_pid {
         return Delivery::OpenElsewhere { pid };
     }
-    Delivery::Resume { session_id: session, cwd: asker.cwd.clone() }
+    Delivery::Resume {
+        agent: asker.agent,
+        session_id: session,
+        cwd: asker.cwd.clone(),
+    }
 }
 
 /// Whether an answer given after the asker stopped waiting can still reach it.
@@ -324,17 +392,28 @@ pub fn descends(pid: i32, ancestor: i32) -> bool {
 /// the proof. Two proofs, either is enough: Kova reports the session in that
 /// pane, or the process running the conversation descends from the pane's
 /// shell. The second exists because the report lags: a pane opened minutes
-/// before still showed no session (14/10/2026, pane 205 in Kova Float's tests).
+/// before still showed no session.
 pub fn pane_holds_session(
     panes: &[serde_json::Value],
     pane_id: u32,
+    agent: crate::agent_session::Agent,
     session_id: &str,
     live_pid: Option<i32>,
     descends: impl Fn(i32, i32) -> bool,
 ) -> Option<String> {
-    let pane = panes.iter().find(|p| p.get("id").and_then(|v| v.as_u64()) == Some(pane_id as u64))?;
-    let reported = pane.get("claude_session_id").and_then(|v| v.as_str());
-    if reported == Some(session_id) {
+    let pane = panes
+        .iter()
+        .find(|p| p.get("id").and_then(|v| v.as_u64()) == Some(pane_id as u64))?;
+    // An older Kova published only the Claude field.
+    let reported_agent = pane
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("claude");
+    let reported = pane
+        .get("agent_session_id")
+        .or_else(|| pane.get("claude_session_id"))
+        .and_then(|v| v.as_str());
+    if reported == Some(session_id) && reported_agent == agent.as_str() {
         return Some("reported by Kova".to_string());
     }
     let live = live_pid?;
@@ -497,11 +576,30 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
     let message = late_answer_message(question, answer);
     let asker = &question.from;
     let id = &question.id;
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let registry = PathBuf::from(home).join(".claude/sessions");
-    let live = asker.session_id.as_deref().and_then(|s| live_session_pid(s, &registry));
-    let holds = holding_pane(asker, live);
-    match delivery(asker, holds, live) {
+    let target = match wake_sleeping_asker(asker, own_socket) {
+        Some(Woken::Ready { socket, pane_id }) => Delivery::Pane { socket, pane_id },
+        Some(Woken::NotYet { pane_id }) => {
+            log::warn!("ask {}: pane {} holds the conversation asleep, its agent did not come up ({})", id, pane_id, kept());
+            return;
+        }
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let registry = PathBuf::from(home).join(".claude/sessions");
+            // Only Claude registers a per-process session file; for the other
+            // agents the pane report is the whole evidence.
+            let live = (asker.agent == crate::agent_session::Agent::Claude)
+                .then(|| {
+                    asker
+                        .session_id
+                        .as_deref()
+                        .and_then(|s| live_session_pid(s, &registry))
+                })
+                .flatten();
+            let holds = holding_pane(asker, live);
+            delivery(asker, holds, live)
+        }
+    };
+    match target {
         Delivery::Pane { socket, pane_id } => {
             // The text, then Enter on its own: Claude Code takes a pasted
             // newline as part of the message.
@@ -522,7 +620,19 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
                 store.remove_delivery(id);
             }
         }
-        Delivery::Resume { session_id, cwd } => resume(store, id, &session_id, cwd.as_deref(), &message, own_socket),
+        Delivery::Resume {
+            agent,
+            session_id,
+            cwd,
+        } => resume(
+            store,
+            id,
+            agent,
+            &session_id,
+            cwd.as_deref(),
+            &message,
+            own_socket,
+        ),
         Delivery::OpenElsewhere { pid } => {
             log::info!(
                 "ask {}: conversation still open in process {}, outside a pane Kova can type into; resuming once it exits",
@@ -535,7 +645,15 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
                 std::thread::sleep(Duration::from_secs(2));
             }
             match asker.session_id.as_deref() {
-                Some(session) if !alive() => resume(store, id, session, asker.cwd.as_deref(), &message, own_socket),
+                Some(session) if !alive() => resume(
+                    store,
+                    id,
+                    asker.agent,
+                    session,
+                    asker.cwd.as_deref(),
+                    &message,
+                    own_socket,
+                ),
                 _ => log::warn!(
                     "ask {}: NOT delivered, process {} still alive after 24 h ({}): {}",
                     id,
@@ -552,6 +670,79 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
     }
 }
 
+/// What waking a sleeping asker's pane gave (`wake_sleeping_asker`).
+enum Woken {
+    /// Its agent runs the conversation again: type the answer there.
+    Ready { socket: String, pane_id: u32 },
+    /// Woken, but its agent did not report the conversation in time.
+    NotYet { pane_id: u32 },
+}
+
+/// How long a woken agent gets to report its conversation in `list-panes`.
+const WAKE_WAIT: Duration = Duration::from_secs(60);
+
+/// The pane of `panes` where conversation `session_id` sleeps since a Kova
+/// relaunch (`dormant_session_id`), resume line not run yet.
+pub fn sleeping_pane(panes: &[serde_json::Value], session_id: &str) -> Option<u32> {
+    panes
+        .iter()
+        .find(|p| p.get("dormant_session_id").and_then(|v| v.as_str()) == Some(session_id))
+        .and_then(|p| p.get("id")?.as_u64()?.try_into().ok())
+}
+
+/// The pane `pane_id` of `panes` reports that it runs `session_id`.
+fn reports_session(
+    panes: &[serde_json::Value],
+    pane_id: u32,
+    agent: crate::agent_session::Agent,
+    session_id: &str,
+) -> bool {
+    panes.iter().any(|p| {
+        p.get("id").and_then(|v| v.as_u64()) == Some(pane_id as u64)
+            && p.get("agent_session_id").and_then(|v| v.as_str()) == Some(session_id)
+            && p.get("agent").and_then(|v| v.as_str()) == Some(agent.as_str())
+    })
+}
+
+fn list_panes(socket: &str) -> Option<Vec<serde_json::Value>> {
+    let reply = request(socket, serde_json::json!({"cmd": "list-panes"}), Duration::from_secs(3))?;
+    reply.get("data")?.as_array().cloned()
+}
+
+/// A Kova relaunch leaves restored agents asleep until their pane is shown. If
+/// the asker's conversation sleeps in a pane, wake that pane and wait for the
+/// agent: resuming it in a new tab would run the conversation twice once the
+/// sleeping pane is shown. Looked up in this Kova too, not only the asker's: a
+/// question asked before the relaunch names a socket that died with the old
+/// Kova. `None` when it sleeps nowhere.
+fn wake_sleeping_asker(asker: &Asker, own_socket: &str) -> Option<Woken> {
+    let session = asker.session_id.as_deref()?;
+    let (socket, pane_id) = asker
+        .kova_socket
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(own_socket))
+        .find_map(|socket| Some((socket, sleeping_pane(&list_panes(socket)?, session)?)))?;
+    let woke = request(socket, serde_json::json!({"cmd": "wake-pane", "pane_id": pane_id}), Duration::from_secs(5));
+    if !reply_ok(&woke) {
+        // Still asleep there: a resume elsewhere would be the second one.
+        return Some(Woken::NotYet { pane_id });
+    }
+    log::info!("ask: session {} was asleep in pane {}, woke it", session, pane_id);
+    let deadline = std::time::Instant::now() + WAKE_WAIT;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(1));
+        if list_panes(socket)
+            .is_some_and(|panes| reports_session(&panes, pane_id, asker.agent, session))
+        {
+            // Registered is not drawn yet: give the agent's input a moment.
+            std::thread::sleep(Duration::from_secs(2));
+            return Some(Woken::Ready { socket: socket.to_string(), pane_id });
+        }
+    }
+    Some(Woken::NotYet { pane_id })
+}
+
 /// Whether the asker's Kova pane still runs the asker's conversation, read now
 /// from that Kova's `list-panes`. Logs the proof it used.
 fn holding_pane(asker: &Asker, live: Option<i32>) -> bool {
@@ -562,7 +753,7 @@ fn holding_pane(asker: &Asker, live: Option<i32>) -> bool {
     let Some(panes) = reply.as_ref().and_then(|r| r.get("data")).and_then(|d| d.as_array()) else {
         return false;
     };
-    match pane_holds_session(panes, pane_id, session, live, descends) {
+    match pane_holds_session(panes, pane_id, asker.agent, session, live, descends) {
         Some(proof) => {
             log::info!("ask: pane {} holds session {}: {}", pane_id, session, proof);
             true
@@ -572,12 +763,26 @@ fn holding_pane(asker: &Asker, live: Option<i32>) -> bool {
 }
 
 /// The line typed into a new tab to reopen the conversation with the answer as
-/// its next message. Same permission mode as the user's sessions: a reopened
-/// agent that cannot run its tools would read the answer and do nothing with it.
-pub fn resume_line(session_id: &str, message: &str) -> Option<String> {
-    is_safe_session_id(session_id).then(|| {
-        format!("claude --dangerously-skip-permissions --resume {} {}", session_id, shell_quote(message))
-    })
+/// its next message. Claude keeps the same permission mode as the user's
+/// sessions: a reopened agent that cannot run its tools would read the answer
+/// and do nothing with it. The other agents reopen with their own resume line.
+pub fn resume_line(
+    agent: crate::agent_session::Agent,
+    session_id: &str,
+    message: &str,
+) -> Option<String> {
+    if !is_safe_session_id(session_id) {
+        return None;
+    }
+    let base = if agent == crate::agent_session::Agent::Claude {
+        format!(
+            "claude --dangerously-skip-permissions --resume {}",
+            session_id
+        )
+    } else {
+        crate::agent_session::resume_command(agent, session_id, None, None)?
+    };
+    Some(format!("{} {}", base, shell_quote(message)))
 }
 
 /// The directory conversation `session_id` ran in, read from its transcript
@@ -606,8 +811,16 @@ const RESUME_CHECK: Duration = Duration::from_secs(10);
 
 /// Reopen the conversation in a new tab of this Kova, in its directory, with
 /// the answer as its next prompt: visible, so the user sees the agent go on.
-fn resume(store: &AskStore, id: &str, session_id: &str, cwd: Option<&str>, message: &str, own_socket: &str) {
-    let Some(line) = resume_line(session_id, message) else {
+fn resume(
+    store: &AskStore,
+    id: &str,
+    agent: crate::agent_session::Agent,
+    session_id: &str,
+    cwd: Option<&str>,
+    message: &str,
+    own_socket: &str,
+) {
+    let Some(line) = resume_line(agent, session_id, message) else {
         log::warn!("ask {}: refusing to resume a non-plain session id", id);
         return;
     };
@@ -615,8 +828,16 @@ fn resume(store: &AskStore, id: &str, session_id: &str, cwd: Option<&str>, messa
     // ran in (`claude_session::resume_command`), which is not always the
     // asker's cwd (a `cd` before `kova ask`). The transcript records it: no
     // transcript, or a directory gone since, and the answer stays on disk.
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let Some(dir) = transcript_cwd(&PathBuf::from(home).join(".claude/projects"), session_id).filter(|d| Path::new(d).is_dir()) else {
+    // omp and Pi carry their whole path in `PI_SESSION_FILE`, and their resume
+    // command does not need the original directory; the asker's cwd is a fine
+    // place to put the tab back.
+    let dir = if agent == crate::agent_session::Agent::Claude {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        transcript_cwd(&PathBuf::from(home).join(".claude/projects"), session_id)
+    } else {
+        cwd.map(str::to_string)
+    };
+    let Some(dir) = dir.filter(|d| Path::new(d).is_dir()) else {
         log::warn!(
             "ask {}: no transcript (or its directory is gone) for session {}, NOT delivered ({})",
             id,
@@ -798,9 +1019,37 @@ impl Board {
         self.dirty = true;
     }
 
-    /// The user answered `id` on the card.
-    pub fn answer(&mut self, id: &str, action: String, text: String) {
-        let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return };
+    /// The questions on the card, oldest first (`list-asks`).
+    pub fn questions(&self) -> Vec<&Question> {
+        self.pending.iter().map(|(q, _)| q).collect()
+    }
+
+    /// The user answered `session_id`'s questions in the conversation itself:
+    /// take them off the card and off disk, deliver nothing. A `kova ask` still
+    /// waiting gets [`WITHDRAWN`] and exits 3. Returns how many were withdrawn.
+    pub fn withdraw(&mut self, session_id: &str) -> usize {
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.pending).into_iter().partition(|(q, _)| asked_from(q, session_id));
+        self.pending = kept;
+        for (question, responder) in &gone {
+            log::info!("ask {}: withdrawn, the user answered in the conversation", question.id);
+            if self.owns_store() {
+                self.store.remove_question(&question.id);
+            }
+            if let Some(tx) = responder {
+                let _ = tx.send(crate::ipc::IpcResponse::Error { message: WITHDRAWN.to_string() });
+            }
+        }
+        if !gone.is_empty() {
+            self.dirty = true;
+        }
+        gone.len()
+    }
+
+    /// The user answered `id` on the card. False when no such question waits
+    /// (already answered elsewhere): nothing happens then.
+    pub fn answer(&mut self, id: &str, action: String, text: String) -> bool {
+        let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return false };
         let (question, responder) = self.pending.remove(index);
         self.dirty = true;
         let answer = Answer { id: id.to_string(), action, text };
@@ -819,6 +1068,7 @@ impl Board {
         if !handed {
             spawn_late(self.store.clone(), question, answer);
         }
+        true
     }
 
     /// An answer given somewhere other than the card: KovaLink, from the phone,
@@ -859,10 +1109,12 @@ impl Board {
     /// and cancels them.
     pub fn list_json(&self) -> serde_json::Value {
         let now = now_epoch();
+        let waiting: std::collections::HashSet<&str> =
+            self.pending.iter().filter(|(_, r)| r.is_some()).map(|(q, _)| q.id.as_str()).collect();
         let asks: Vec<serde_json::Value> = self
-            .pending
-            .iter()
-            .map(|(q, responder)| {
+            .questions()
+            .into_iter()
+            .map(|q| {
                 serde_json::json!({
                     "id": q.id,
                     "from": q.from.name,
@@ -872,7 +1124,7 @@ impl Board {
                     "asked_at": q.asked_at,
                     "snoozed_until": q.snoozed_until,
                     "due": q.due(now),
-                    "waiting": responder.is_some(),
+                    "waiting": waiting.contains(q.id.as_str()),
                     "session_id": q.from.session_id,
                     "cwd": q.from.cwd,
                 })
@@ -932,6 +1184,14 @@ impl Board {
     }
 }
 
+/// What a `kova ask` still waiting receives when its question is withdrawn.
+pub const WITHDRAWN: &str = "withdrawn: the user answered in the conversation instead of on the card";
+
+/// Whether `question` was asked from the conversation `session_id`.
+pub fn asked_from(question: &Question, session_id: &str) -> bool {
+    question.from.session_id.as_deref() == Some(session_id)
+}
+
 /// How often a Kova without the ask directory's lock tries to take it.
 const OWNER_RETRY: Duration = Duration::from_secs(10);
 
@@ -954,7 +1214,8 @@ usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--from <name>] [--
 Shows a card in Kova with the message, one button per action and a text field, then waits for
 the user and prints the answer on stdout: the action, or \"action: text\" when they typed something.
 
-  --actions     buttons, comma-separated (default: a single \"Reply\" button)
+  --actions     buttons, comma-separated (default: a single \"Reply\" button). With a text field, the
+                card adds an \"Other\" button after them, and text sent with Enter answers \"Other: text\"
   --no-input    no text field, buttons only
   --from        the name shown on the card (default: the working directory's name)
   --timeout     seconds to wait. Default: 540 inside a Claude Code conversation (under the Bash tool's
@@ -963,7 +1224,8 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
   --json        print the answer as JSON
   --socket      the Kova to ask (default: $KOVA_SOCKET, else the running Kova.app)
 
-Exit codes: 0 answered · 2 no answer within the timeout · 1 error, or Kova quit while you waited.
+Exit codes: 0 answered · 2 no answer within the timeout · 3 the user answered in the conversation
+instead (the card is withdrawn; their message is the answer) · 1 error, or Kova quit while you waited.
 On a timeout the question stays on the user's screen. When they answer, Kova delivers the answer to
 this conversation itself: typed into its Kova pane if it is still open there, else by reopening it
 in a new Kova tab with `claude --resume`. So after exit 2, end your turn: the answer will come as a message.";
@@ -1002,7 +1264,10 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
             flag if flag.starts_with("--") => return Err(format!("kova ask: unknown flag {}\n\n{}", flag, USAGE)),
             _ => {
                 if message.is_some() {
-                    return Err(format!("kova ask: one message only (quote it)\n\n{}", USAGE));
+                    return Err(format!(
+                        "kova ask: unexpected extra argument '{}': the message is one quoted string, and so is an --actions list whose labels contain spaces (--actions \"Yes please,No\")\n\n{}",
+                        a, USAGE
+                    ));
                 }
                 message = Some(a.clone());
             }
@@ -1021,7 +1286,7 @@ fn exe_path(pid: i32) -> Option<String> {
 
 /// The Kova to ask when the caller names none and runs outside a Kova pane (a
 /// routine started by launchd): the live `/tmp/kova-<pid>.sock` served by
-/// Kova.app itself. Kana serves the same path shape, hence the executable check.
+/// Kova.app itself. A library host serves the same path shape, hence the executable check.
 fn discover_socket() -> Option<String> {
     let mut found: Vec<(bool, i32, String)> = Vec::new();
     for entry in std::fs::read_dir("/tmp").ok()?.flatten() {
@@ -1042,8 +1307,75 @@ fn discover_socket() -> Option<String> {
     found.into_iter().map(|(_, _, path)| path).next()
 }
 
+const WITHDRAW_USAGE: &str = "kova ask --withdraw [--session <id> | --session -] [--socket <path>]
+
+Take back the questions a Claude Code conversation still has on the card, because the user answered
+in the conversation instead. Meant for a UserPromptSubmit hook: `--session -` reads the hook's JSON
+input on stdin and takes its `session_id`; without --session, $CLAUDE_CODE_SESSION_ID. Prints
+nothing and exits 0 whatever happens (no Kova, an older Kova, nothing to withdraw), so a prompt is
+never held up by it.";
+
+/// The session `kova ask --withdraw` names: `-` is a hook's JSON input.
+fn withdraw_session(flag: Option<&str>, stdin: impl FnOnce() -> String, env: Option<String>) -> Option<String> {
+    let id = match flag {
+        Some("-") => serde_json::from_str::<serde_json::Value>(&stdin())
+            .ok()?
+            .get("session_id")?
+            .as_str()?
+            .to_string(),
+        Some(id) => id.to_string(),
+        None => env?,
+    };
+    is_safe_session_id(&id).then_some(id)
+}
+
+/// `kova ask --withdraw …`: always 0, see [`WITHDRAW_USAGE`].
+fn run_withdraw(args: &[String]) -> i32 {
+    let mut session: Option<String> = None;
+    let mut socket: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--session" => session = it.next().cloned(),
+            "--socket" => socket = it.next().cloned(),
+            _ => {
+                eprintln!("{}", WITHDRAW_USAGE);
+                return 0;
+            }
+        }
+    }
+    let read_stdin = || {
+        let mut input = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+        input
+    };
+    let Some(session_id) = withdraw_session(session.as_deref(), read_stdin, std::env::var("CLAUDE_CODE_SESSION_ID").ok()) else {
+        return 0;
+    };
+    let body = serde_json::json!({"cmd": "withdraw-asks", "session_id": session_id});
+    let first = socket.or_else(|| std::env::var("KOVA_SOCKET").ok().filter(|s| !s.is_empty())).or_else(discover_socket);
+    let Some(first) = first else { return 0 };
+    let reply = request(&first, body.clone(), Duration::from_secs(1));
+    // A library host's socket has no card: the questions are on Kova.app.
+    let refused = reply.as_ref().and_then(|r| r.get("error")).and_then(|e| e.as_str())
+        .is_some_and(|e| e == "command not supported by this host");
+    if refused {
+        if let Some(app) = discover_socket().filter(|s| *s != first) {
+            let _ = request(&app, body, Duration::from_secs(1));
+        }
+    }
+    0
+}
+
 /// `kova ask …`: returns the process exit code.
 pub fn run_cli(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("--withdraw") {
+        if args.iter().any(|a| a == "-h" || a == "--help") {
+            println!("{}", WITHDRAW_USAGE);
+            return 0;
+        }
+        return run_withdraw(&args[1..]);
+    }
     let fail = |msg: &str, code: i32| -> i32 {
         eprintln!("{}", msg);
         code
@@ -1088,10 +1420,10 @@ pub fn run_cli(args: &[String]) -> i32 {
         let _ = stream.set_read_timeout(wait.map(Duration::from_secs));
         let mut line = String::new();
         let read = BufReader::new(&stream).read_line(&mut line);
-        // A pane of Kana (the library host) names Kana's socket, which serves
-        // panes but no card: ask Kova.app instead. The asker keeps Kana's socket
+        // A pane of a library host names the host's socket, which serves
+        // panes but no card: ask Kova.app instead. The asker keeps the host's socket
         // and pane, which is where a late answer is typed.
-        // Same for a socket that predates `ask` altogether (an older Kana build).
+        // Same for a socket that predates `ask` altogether (an older host build).
         let error = serde_json::from_str::<serde_json::Value>(line.trim())
             .ok()
             .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
@@ -1145,6 +1477,13 @@ pub fn run_cli(args: &[String]) -> i32 {
                 socket, err
             ), 1);
         }
+        if err == WITHDRAWN {
+            return fail(
+                "kova ask: the user answered in the conversation instead of on the card; the card is gone. \
+                 End your turn now: their message is the answer.",
+                3,
+            );
+        }
         return fail(&format!("kova ask: Kova refused the question: {}", err), 1);
     }
     let Some(answer) = reply.get("data").and_then(|d| serde_json::from_value::<Answer>(d.clone()).ok()) else {
@@ -1189,6 +1528,7 @@ mod tests {
     fn asker() -> Asker {
         Asker {
             name: "routine".into(),
+            agent: crate::agent_session::Agent::Claude,
             session_id: Some("abc-123".into()),
             pane_id: Some(7),
             kova_socket: Some("/tmp/kova-1.sock".into()),
@@ -1201,6 +1541,29 @@ mod tests {
     }
 
     #[test]
+    fn withdraw_takes_the_session_from_the_flag_the_hook_input_or_the_environment() {
+        let none = || -> String { panic!("stdin read without --session -") };
+        assert_eq!(withdraw_session(Some("abc-1"), none, None), Some("abc-1".into()));
+        assert_eq!(withdraw_session(None, none, Some("env-2".into())), Some("env-2".into()));
+        assert_eq!(withdraw_session(None, none, None), None);
+        let hook = || r#"{"session_id":"hook-3","prompt":"deploy"}"#.to_string();
+        assert_eq!(withdraw_session(Some("-"), hook, None), Some("hook-3".into()));
+        assert_eq!(withdraw_session(Some("-"), || "not json".into(), None), None);
+        assert_eq!(withdraw_session(Some("a;b"), none, None), None, "an odd id is dropped, not sent");
+    }
+
+    #[test]
+    fn a_question_belongs_to_the_conversation_that_asked_it() {
+        let q = question("0f8fad5b-d9cb-469f-a165-70867728950e");
+        let own = q.from.session_id.clone().expect("the test asker has a session");
+        assert!(asked_from(&q, &own));
+        assert!(!asked_from(&q, "someone-else"));
+        let mut anonymous = q.clone();
+        anonymous.from.session_id = None;
+        assert!(!asked_from(&anonymous, &own));
+    }
+
+    #[test]
     fn delivery_prefers_the_live_pane() {
         assert_eq!(delivery(&asker(), true, None), Delivery::Pane { socket: "/tmp/kova-1.sock".into(), pane_id: 7 });
         // Open in the pane wins over "open in some process": it is that process.
@@ -1209,9 +1572,27 @@ mod tests {
 
     #[test]
     fn delivery_resumes_when_the_pane_no_longer_holds_the_conversation() {
-        assert_eq!(delivery(&asker(), false, None), Delivery::Resume { session_id: "abc-123".into(), cwd: Some("/tmp/w".into()) });
-        let headless = Asker { pane_id: None, kova_socket: None, ..asker() };
-        assert_eq!(delivery(&headless, true, None), Delivery::Resume { session_id: "abc-123".into(), cwd: Some("/tmp/w".into()) });
+        assert_eq!(
+            delivery(&asker(), false, None),
+            Delivery::Resume {
+                agent: crate::agent_session::Agent::Claude,
+                session_id: "abc-123".into(),
+                cwd: Some("/tmp/w".into()),
+            }
+        );
+        let headless = Asker {
+            pane_id: None,
+            kova_socket: None,
+            ..asker()
+        };
+        assert_eq!(
+            delivery(&headless, true, None),
+            Delivery::Resume {
+                agent: crate::agent_session::Agent::Claude,
+                session_id: "abc-123".into(),
+                cwd: Some("/tmp/w".into()),
+            }
+        );
     }
 
     #[test]
@@ -1237,18 +1618,88 @@ mod tests {
             "KOVA_SOCKET" => Some("/tmp/k.sock".to_string()),
             _ => None,
         };
-        let a = Asker::from_env(env, None, "/Users/x/projects/lemlist");
-        assert_eq!(a, Asker {
-            name: "lemlist".into(),
-            session_id: Some("e2e1d3cf-7cc0-48a2".into()),
-            pane_id: Some(3),
-            kova_socket: Some("/tmp/k.sock".into()),
-            cwd: Some("/Users/x/projects/lemlist".into()),
-        });
-        let evil = Asker::from_env(|k| (k == "CLAUDE_CODE_SESSION_ID").then(|| "x; rm -rf ~".to_string()), Some("n".into()), "/");
+        let a = Asker::from_env(env, None, "/Users/x/projects/app");
+        assert_eq!(
+            a,
+            Asker {
+                name: "app".into(),
+                agent: crate::agent_session::Agent::Claude,
+                session_id: Some("e2e1d3cf-7cc0-48a2".into()),
+                pane_id: Some(3),
+                kova_socket: Some("/tmp/k.sock".into()),
+                cwd: Some("/Users/x/projects/app".into()),
+            }
+        );
+        let evil = Asker::from_env(
+            |k| (k == "CLAUDE_CODE_SESSION_ID").then(|| "x; rm -rf ~".to_string()),
+            Some("n".into()),
+            "/",
+        );
         assert_eq!(evil.session_id, None);
         assert!(!is_safe_session_id("a\nb"));
         assert!(!is_safe_session_id(""));
+    }
+
+    #[test]
+    fn an_omp_child_names_its_agent_and_conversation_from_pi_session_file() {
+        let path = "/Users/x/.omp/agent/sessions/-w/2026-10-27T15-54-09-646Z_01a17e11-ab6e-76b2-a4f3-e856a40686d7.jsonl";
+        let omp = |k: &str| match k {
+            "OMPCODE" => Some("1".to_string()),
+            "PI_SESSION_FILE" => Some(path.to_string()),
+            _ => None,
+        };
+        let asker = Asker::from_env(omp, None, "/w");
+        assert_eq!(asker.agent, crate::agent_session::Agent::Omp);
+        assert_eq!(
+            asker.session_id.as_deref(),
+            Some("01a17e11-ab6e-76b2-a4f3-e856a40686d7")
+        );
+
+        // A Pi child inherits the same variable; the tell is the omp path.
+        let pi = |k: &str| match k {
+            "PI_SESSION_FILE" => Some(
+                "/Users/x/.pi/agent/sessions/--w--/t_01a17e11-ab6e-76b2-a4f3-e856a40686d7.jsonl"
+                    .to_string(),
+            ),
+            _ => None,
+        };
+        assert_eq!(
+            Asker::from_env(pi, None, "/w").agent,
+            crate::agent_session::Agent::Pi
+        );
+
+        // Claude's own id wins when both are present.
+        let both = |k: &str| match k {
+            "CLAUDE_CODE_SESSION_ID" => Some("claude-id".to_string()),
+            "OMPCODE" => Some("1".to_string()),
+            "PI_SESSION_FILE" => Some(path.to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            Asker::from_env(both, None, "/w").agent,
+            crate::agent_session::Agent::Claude
+        );
+    }
+
+    #[test]
+    fn answers_from_elsewhere_are_held_to_the_card() {
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let mut q = question(id);
+        q.actions = vec!["OK".into(), "KO".into()];
+        assert_eq!(accepts_external_answer(&q, "OK", "fine"), Ok(()));
+        assert_eq!(
+            accepts_external_answer(&q, "Other", "my own answer"),
+            Ok(()),
+            "a text field brings Other"
+        );
+        let refused = "\"Reply\" is not one of this question's buttons".to_string();
+        assert_eq!(accepts_external_answer(&q, "Reply", ""), Err(refused));
+        assert!(accepts_external_answer(&q, "ok", "").is_err(), "the comparison is exact");
+        q.actions.clear();
+        assert_eq!(accepts_external_answer(&q, "Reply", "x"), Ok(()), "no actions: the single Reply button");
+        q.input = false;
+        assert_eq!(accepts_external_answer(&q, "Reply", ""), Ok(()));
+        assert!(accepts_external_answer(&q, "Reply", "x").unwrap_err().contains("no text field"));
     }
 
     #[test]
@@ -1282,6 +1733,26 @@ mod tests {
     }
 
     #[test]
+    fn a_card_with_a_text_field_always_offers_other() {
+        let mut q = question("q1");
+        q.actions = vec!["A".into(), "B".into()];
+        assert_eq!(
+            q.buttons(),
+            vec!["A", "B", OTHER],
+            "typed text must not ride on A"
+        );
+        q.actions = vec!["Retry".into(), OTHER.into()];
+        assert_eq!(q.buttons(), vec!["Retry", OTHER], "never twice");
+        q.actions = vec!["A".into(), "B".into()];
+        q.input = false;
+        assert_eq!(
+            q.buttons(),
+            vec!["A", "B"],
+            "no field, nothing to type, no Other"
+        );
+    }
+
+    #[test]
     fn descends_walks_the_parent_chain() {
         let me = std::process::id() as i32;
         let parent = parent_pid(me).expect("this process has a parent");
@@ -1291,17 +1762,106 @@ mod tests {
     }
 
     #[test]
+    fn a_sleeping_conversation_is_found_and_then_seen_running() {
+        let asleep = vec![
+            serde_json::json!({"id": 3, "agent_session_id": null, "dormant_session_id": "other"}),
+            serde_json::json!({"id": 7, "agent_session_id": null, "dormant_session_id": "abc-123"}),
+        ];
+        assert_eq!(sleeping_pane(&asleep, "abc-123"), Some(7));
+        assert_eq!(sleeping_pane(&asleep, "nowhere"), None);
+        assert!(
+            !reports_session(&asleep, 7, crate::agent_session::Agent::Claude, "abc-123"),
+            "asleep is not running"
+        );
+
+        let woken = vec![
+            serde_json::json!({"id": 7, "agent": "omp", "agent_session_id": "abc-123", "dormant_session_id": null}),
+        ];
+        assert!(reports_session(
+            &woken,
+            7,
+            crate::agent_session::Agent::Omp,
+            "abc-123"
+        ));
+        assert!(
+            !reports_session(&woken, 7, crate::agent_session::Agent::Claude, "abc-123"),
+            "another agent's id is not it"
+        );
+        assert!(!reports_session(
+            &woken,
+            8,
+            crate::agent_session::Agent::Omp,
+            "abc-123"
+        ));
+        assert_eq!(sleeping_pane(&woken, "abc-123"), None);
+    }
+
+    #[test]
     fn pane_holds_session_takes_either_proof() {
         let panes = vec![
-            serde_json::json!({"id": 7, "pid": 100, "claude_session_id": "abc-123"}),
-            serde_json::json!({"id": 8, "pid": 200, "claude_session_id": null}),
+            serde_json::json!({"id": 7, "pid": 100, "agent": "claude", "agent_session_id": "abc-123"}),
+            serde_json::json!({"id": 8, "pid": 200, "agent": "omp", "agent_session_id": "def-456"}),
         ];
         let never = |_: i32, _: i32| false;
-        assert_eq!(pane_holds_session(&panes, 7, "abc-123", None, never).as_deref(), Some("reported by Kova"));
-        assert_eq!(pane_holds_session(&panes, 8, "abc-123", None, never), None);
+        assert_eq!(
+            pane_holds_session(
+                &panes,
+                7,
+                crate::agent_session::Agent::Claude,
+                "abc-123",
+                None,
+                never
+            )
+            .as_deref(),
+            Some("reported by Kova")
+        );
+        assert_eq!(
+            pane_holds_session(
+                &panes,
+                7,
+                crate::agent_session::Agent::Omp,
+                "abc-123",
+                None,
+                never
+            ),
+            None
+        );
+        assert_eq!(
+            pane_holds_session(
+                &panes,
+                8,
+                crate::agent_session::Agent::Omp,
+                "def-456",
+                None,
+                never
+            )
+            .as_deref(),
+            Some("reported by Kova")
+        );
         let from_200 = |pid: i32, shell: i32| pid == 555 && shell == 200;
-        assert!(pane_holds_session(&panes, 8, "abc-123", Some(555), from_200).unwrap().contains("descends from its shell 200"));
-        assert_eq!(pane_holds_session(&panes, 9, "abc-123", Some(555), from_200), None);
+        assert!(
+            pane_holds_session(
+                &panes,
+                8,
+                crate::agent_session::Agent::Claude,
+                "abc-123",
+                Some(555),
+                from_200
+            )
+            .unwrap()
+            .contains("descends from its shell 200")
+        );
+        assert_eq!(
+            pane_holds_session(
+                &panes,
+                9,
+                crate::agent_session::Agent::Claude,
+                "abc-123",
+                Some(555),
+                from_200
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1372,10 +1932,31 @@ mod tests {
     #[test]
     fn resume_line_quotes_the_answer_and_refuses_odd_ids() {
         assert_eq!(
-            resume_line("abc-1", "[Kova] it's \"ok\"").as_deref(),
+            resume_line(
+                crate::agent_session::Agent::Claude,
+                "abc-1",
+                "[Kova] it's \"ok\""
+            )
+            .as_deref(),
             Some("claude --dangerously-skip-permissions --resume abc-1 '[Kova] it'\\''s \"ok\"'")
         );
-        assert_eq!(resume_line("abc; rm", "m"), None);
+        assert_eq!(
+            resume_line(
+                crate::agent_session::Agent::Omp,
+                "abc-1",
+                "[Kova] it's \"ok\""
+            )
+            .as_deref(),
+            Some("omp --resume abc-1 '[Kova] it'\\''s \"ok\"'")
+        );
+        assert_eq!(
+            resume_line(crate::agent_session::Agent::Claude, "abc; rm", "m"),
+            None
+        );
+        assert_eq!(
+            resume_line(crate::agent_session::Agent::Omp, "abc; rm", "m"),
+            None
+        );
     }
 
     #[test]
@@ -1388,6 +1969,9 @@ mod tests {
         assert_eq!(c.timeout, Some(30));
         assert!(parse_cli(&args(&[])).is_err());
         assert!(parse_cli(&args(&["a", "b"])).is_err());
+        // An unquoted --actions list with spaces splits into stray arguments: the error names one and says to quote.
+        let e = parse_cli(&args(&["a", "--actions", "Yes", "please,No"])).err().expect("stray argument must be refused");
+        assert!(e.contains("'please,No'") && e.contains("--actions \"Yes please,No\""), "{}", e);
         assert!(parse_cli(&args(&["a", "--timeout", "0"])).is_err());
         assert!(parse_cli(&args(&["a", "--bogus"])).is_err());
         assert!(parse_cli(&args(&["a", "--from"])).is_err());
@@ -1437,7 +2021,7 @@ mod tests {
     #[test]
     fn agent_colour_is_stable_and_varies() {
         assert_eq!(agent_rgb("Claude · FLoat"), agent_rgb("Claude · FLoat"));
-        let names = ["routine-a", "routine-b", "lemlist", "kova", "mira", "vigie", "cto", "self"];
+        let names = ["routine-a", "routine-b", "app", "kova", "mira", "docs", "api", "web"];
         let distinct: std::collections::HashSet<String> = names.iter().map(|n| format!("{:?}", agent_rgb(n))).collect();
         assert!(distinct.len() > 3);
     }

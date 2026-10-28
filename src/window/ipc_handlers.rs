@@ -65,7 +65,35 @@ pub fn pane_json(
         obj.insert("resume_session_id".to_string(), serde_json::json!(resume.as_ref().map(|r| r.1.clone())));
         obj.insert("resume_command".to_string(), serde_json::json!(resume.as_ref().map(|r| r.2.clone())));
     }
+    // Kova.app's own too: a library host has no subjects, and its panes carry
+    // no such field.
+    json["subject"] = serde_json::json!(pane.subject);
     json
+}
+
+/// `list-subjects` for one window's tabs: one entry per subject, tab by tab,
+/// each tab's in the order Cmd+P draws them (`subject_listing`).
+pub fn collect_subjects_in(tabs: &[Tab], win_idx: usize, out: &mut Vec<serde_json::Value>) {
+    for (tab_idx, tab) in tabs.iter().enumerate() {
+        for (name, pane_ids) in super::switcher::subject_listing(&tab.subjects, &tab.pane_subjects()) {
+            out.push(serde_json::json!({
+                "tab_id": tab.id,
+                "window": win_idx,
+                "tab_index": tab_idx,
+                "color": tab.subject_color(&name),
+                "name": name,
+                "pane_ids": pane_ids,
+            }));
+        }
+    }
+}
+
+/// Why a subject command against a named tab failed.
+pub enum SubjectError {
+    /// This window has no tab with that id: keep scanning.
+    NoTab,
+    /// Final answer: the tab is here, the subject is not.
+    NoSubject,
 }
 
 /// `list-panes` for one window's tabs: every pane in tab then column then row
@@ -481,6 +509,90 @@ impl KovaView {
         }
     }
 
+    /// IPC: `list-subjects` for this window.
+    pub fn ipc_collect_subjects(&self, win_idx: usize, out: &mut Vec<serde_json::Value>) {
+        collect_subjects_in(&self.ivars().tabs.borrow(), win_idx, out);
+    }
+
+    /// IPC: file `pane_id` under `subject`, or take it out of its subject with
+    /// `None` — what Cmd+Right and Cmd+Left do. `None` back when this window
+    /// does not hold the pane; otherwise the reply's data: the tab, and
+    /// whether the subject was created. Taking out a pane in no subject does
+    /// nothing and is not an error: the pane ends where it was asked to be.
+    pub fn ipc_set_pane_subject(&self, pane_id: PaneId, subject: Option<String>) -> Option<serde_json::Value> {
+        let (tab_id, created, moved) = {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let tab = tabs.iter_mut().find(|t| t.pane(pane_id).is_some())?;
+            let (created, moved) = match &subject {
+                Some(name) => (super::switcher::file_under_subject(tab, pane_id, name)?, false),
+                None => (false, super::switcher::take_out_of_subject(tab, pane_id).unwrap_or(false)),
+            };
+            (tab.id, created, moved)
+        };
+        log::info!("IPC: pane {} filed under {:?}", pane_id, subject);
+        self.after_subject_change(moved);
+        Some(serde_json::json!({ "tab_id": tab_id, "subject": subject, "created": created }))
+    }
+
+    /// IPC: rename a subject of tab `tab_id`; a name the tab already has merges
+    /// the two (`Tab::rename_subject`). Ok(true) when it merged.
+    pub fn ipc_rename_subject(&self, tab_id: TabId, name: &str, new_name: &str) -> Result<bool, SubjectError> {
+        let merged = {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let tab = tabs.iter_mut().find(|t| t.id == tab_id).ok_or(SubjectError::NoTab)?;
+            if !tab.subjects.iter().any(|s| s == name) {
+                return Err(SubjectError::NoSubject);
+            }
+            let merged = name != new_name && tab.subjects.iter().any(|s| s == new_name);
+            tab.rename_subject(name, new_name);
+            merged
+        };
+        log::info!("IPC: renamed subject {} to {} in tab {}", name, new_name, tab_id);
+        self.after_subject_change(false);
+        Ok(merged)
+    }
+
+    /// IPC: delete a subject of tab `tab_id`. Its panes stay open, out of any
+    /// box. Ok(n): how many panes it held.
+    pub fn ipc_delete_subject(&self, tab_id: TabId, name: &str) -> Result<usize, SubjectError> {
+        let released = {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let tab = tabs.iter_mut().find(|t| t.id == tab_id).ok_or(SubjectError::NoTab)?;
+            if !tab.subjects.iter().any(|s| s == name) {
+                return Err(SubjectError::NoSubject);
+            }
+            tab.delete_subject(name)
+        };
+        log::info!("IPC: deleted subject {} in tab {} ({} panes released)", name, tab_id, released);
+        self.after_subject_change(false);
+        Ok(released)
+    }
+
+    /// IPC: give a subject of tab `tab_id` a palette color.
+    pub fn ipc_set_subject_color(&self, tab_id: TabId, name: &str, color: usize) -> Result<(), SubjectError> {
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let tab = tabs.iter_mut().find(|t| t.id == tab_id).ok_or(SubjectError::NoTab)?;
+            if !tab.set_subject_color(name, color) {
+                return Err(SubjectError::NoSubject);
+            }
+        }
+        log::info!("IPC: subject {} in tab {} colored {}", name, tab_id, color);
+        self.after_subject_change(false);
+        Ok(())
+    }
+
+    /// What follows a subject change made from outside: the layout catches up
+    /// when a pane moved, and an open Cmd+P is rebuilt, since its rows are a
+    /// snapshot that would keep showing the old boxes.
+    fn after_subject_change(&self, moved: bool) {
+        if moved {
+            self.resize_all_panes();
+        }
+        self.refresh_open_pane_switcher();
+        self.mark_dirty();
+    }
+
     /// IPC: write text to a pane's PTY. Returns true if the pane was found.
     pub fn ipc_send_keys(&self, pane_id: PaneId, text: &str) -> bool {
         send_keys_in(&self.ivars().tabs.borrow(), pane_id, text)
@@ -546,6 +658,13 @@ impl KovaView {
         self.ivars().active_tab.set(tab_idx);
         self.resize_all_panes();
         true
+    }
+
+    /// IPC: wake the agent asleep in `pane_id` (`Surface::wake`). `None` when
+    /// the pane is not in this window.
+    pub fn ipc_wake_pane(&self, pane_id: PaneId) -> Option<bool> {
+        let tabs = self.ivars().tabs.borrow();
+        tabs.iter().find_map(|t| t.pane(pane_id)).map(|pane| pane.wake())
     }
 
     /// IPC: collect all pane IDs in this window (used to expand `panes: "all"`).
@@ -1104,16 +1223,20 @@ mod tests {
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         let mut keys = keys;
         keys.sort();
-        // The four last ones are Kova.app's own, added on top of the library's
-        // `surface_json`: what the sidebar reads off the pane, and the line its
-        // `Resume` button would run.
+        // `unread`, the three `resume_*` and `subject` are Kova.app's own, added
+        // on top of the library's `surface_json`: what the sidebar reads off the
+        // pane, the line its `Resume` button would run, and the subject it is filed under.
         assert_eq!(keys, [
             "agent", "agent_session_id", "agent_session_name", "awaiting", "awaiting_seen",
-            "awaiting_since", "child_processes", "claude_session_id", "claude_session_name",
-            "cwd", "focused", "id", "is_idle", "minimized", "peer_name", "pid",
-            "resume_agent", "resume_command", "resume_session_id", "tab", "title", "unread",
-            "window", "working",
+            "awaiting_since", "child_processes", "claude_config_dir", "claude_session_id",
+            "claude_session_name", "cwd", "dormant_session_id", "focused", "id", "is_idle", "minimized",
+            "peer_name", "pid", "resume_agent", "resume_command", "resume_session_id", "subject", "tab",
+            "title", "unread", "window", "working",
         ]);
+        assert_eq!(v["subject"], serde_json::Value::Null, "a pane in no subject");
+        let (mut b, _fb) = pane("");
+        b.subject = Some("auth".into());
+        assert_eq!(pane_json(&b, 0, 0, false)["subject"], "auth");
         assert_eq!(v["id"], a.id);
         assert_eq!(v["window"], 1);
         assert_eq!(v["tab"], 2);
