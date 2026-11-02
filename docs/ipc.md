@@ -71,6 +71,7 @@ different command fails loudly instead of making the command do something else.
 
 - `direction` defaults to `horizontal`.
 - `cwd` falls back to the focused pane's CWD.
+- `pane_id` targets that pane instead of the focused one, in whichever tab and window holds it. The split happens there and **nothing moves on screen**: focus, active tab and scroll stay put, and the command is still typed, not run. If that tab already scrolls horizontally, it grows by the new column: the columns already on screen keep their pixel width, and no column is ever left under the `min_width` of `[splits]`.
 - If `command` is provided, the new shell **types it at its prompt without pressing Enter**, once the shell is ready: the line waits for review (this is what `ask` relies on to leave a `--resume` line on screen). Send `{"cmd":"send-keys","pane_id":N,"text":"\n"}` to run it. An Enter sent before the line appears would reach the shell first.
 
 Response: `{ "data": { "pane_id": <new-id> } }`
