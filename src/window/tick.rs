@@ -840,6 +840,7 @@ impl KovaView {
                 let anchor_keys = ivars.anchor_keys.borrow();
                 let cell_h = renderer.read().cell_size().1;
                 tab.cell_h.set(cell_h);
+                tab.min_col_w.set(split_min_w);
                 let content = self.drawable_viewport();
                 let screen_width = content.width;
                 let virtual_width = tab.virtual_width(screen_width, split_min_w);
