@@ -814,6 +814,7 @@ impl KovaView {
                     virtual_width_override: 0.0,
                     geometry_scale: self.backing_scale(),
                     cell_h: std::cell::Cell::new(0.0),
+                    min_col_w: std::cell::Cell::new(0.0),
                     subjects: Vec::new(),
                     subject_colors: std::collections::HashMap::new(),
                 };
