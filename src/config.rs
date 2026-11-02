@@ -145,6 +145,8 @@ impl Default for SwitcherConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SplitsConfig {
+    /// Width, in points, no pane is ever laid out under: the tab scrolls
+    /// horizontally instead (see `Tab::min_layout_width`).
     pub min_width: f32,
     /// How much an unfocused pane is faded, 0.0 (not at all) .. 1.0 (invisible).
     pub dim_opacity: f32,
