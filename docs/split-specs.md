@@ -253,15 +253,14 @@ The cursor goes back to the default arrow when the mouse leaves the tolerance zo
 
 **Invariant**: no pane is ever laid out narrower than `splits.min_width`. The tab scrolls horizontally instead. This holds after every event that changes the layout: keyboard and IPC splits (`split` with `pane_id` is how `team spawn` opens a background session), a restored session, a window or display change, and a separator drag.
 
-The floor is carried by the virtual width, so no other code has to enforce it:
+Two pieces, both in the layout:
 
-```
-needed = min_split_width * sum(visible column weights) / smallest(visible column weight)
-```
+- the virtual width is at least one `min_split_width` per visible column (`needed = visible_columns * min_split_width`), whatever the override says;
+- the widths are then distributed by weight, and any column landing under the minimum is pinned there, its share taken from the columns above it (proportionally, until nothing is left under). A tab with room keeps its exact proportions; a tab squeezed to the minimum renders every column at it.
 
-With equal weights that is exactly one minimum per column, the old rule. Unequal ones (a restored session, a dragged separator) get whatever their own proportions ask for, so the narrowest column lands on the minimum and the widest keeps its share. A fully minimized column is left out of both the sum and the smallest.
+So a restored tab whose weights have drifted (`Tab Product` held a column 8 times narrower than its widest) is repaired on screen without losing a pane, and a split from another pane cannot squeeze the columns already there. A fully minimized column takes no space and asks for no minimum.
 
-A new column inserted while the tab already scrolls grows the virtual width by its own width: the columns on screen keep their pixel size, and the newcomer is born at the minimum at worst.
+A new column inserted while the tab already scrolls grows the virtual width by its own width: the columns on screen keep their pixel size, and the newcomer is born at the minimum at worst. In a tab sitting exactly at the minimum (no slack) a separator drag has nothing to give; widen the tab first (`Ctrl+Option+Right`) or close a pane.
 
 ## Navigation
 
@@ -290,26 +289,16 @@ Navigate the pane list of the current column. If already at the first/last, stay
 
 ## Virtual width
 
-`needed` is the min pane width floor (see "Min pane width invariant"): one
-`min_split_width` per column when the weights are equal, more when they are not.
-
 ```
-needed = min_split_width * sum(visible weights) / smallest(visible weight)
+needed = visible_columns * min_split_width
+virtual_width = max(needed, screen_width, virtual_width_override)
 ```
 
-Without a manual override:
-```
-virtual_width = max(needed, screen_width)
-```
-
-With `virtual_width_override > 0`:
-```
-virtual_width = max(virtual_width_override, needed, screen_width)
-```
-
-The floor always wins: a stale override (restored session, background split,
-display change) cannot squeeze the columns under the minimum, it only leaves
-the tab scrolling at a width its panes can live with.
+`virtual_width_override` is 0 when the user never set one, and the max then
+behaves as `max(needed, screen_width)`. The floor always wins: a stale override
+(restored session, background split, display change) cannot squeeze the columns
+under the minimum, it only leaves the tab scrolling at a width its panes can
+live with.
 
 ## Session persistence
 
