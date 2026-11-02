@@ -335,12 +335,26 @@ impl KovaView {
         let tab = &mut tabs[tab_idx];
         match direction {
             SplitDirection::Horizontal => {
+                // Still scrolling: grow the virtual space by the new column's
+                // share, so the columns already on screen keep their width
+                // instead of every one of them losing a slice. Same rule as the
+                // focused split; this path (an agent opening a session next to
+                // another pane) used to shrink the whole tab.
+                let screen = self.drawable_viewport().width;
+                let min_w = self.min_split_width_px();
+                let old_virtual = tab.virtual_width(screen, min_w);
                 // The column insert keys on the focused pane: point it at the
                 // target for the insert, then give the focus back.
                 let focused = tab.focused_pane;
                 tab.focused_pane = target;
                 tab.insert_column_after_focused(new_pane);
                 tab.focused_pane = focused;
+                if old_virtual > screen {
+                    if let Some(new_col_idx) = tab.column_index_of(new_id) {
+                        let new_col_px = target_vp.width.max(min_w);
+                        tab.grow_virtual_for_scrolled_split(new_col_idx, old_virtual, new_col_px, screen);
+                    }
+                }
             }
             SplitDirection::Vertical => tab.vsplit_at_pane(target, new_pane),
         }
