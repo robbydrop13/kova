@@ -90,6 +90,35 @@ fn max_visible_fraction(weights: &[f32], minimized: &[bool]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// Width the visible entries need so that none of them renders under `min_px`.
+/// An entry of weight `w` renders at `total * w / sum`, so the narrowest one
+/// needs `min * sum / w`. Equal weights give exactly `entries * min`, which is
+/// the rule this replaces; unequal ones (a restored session, a dragged
+/// separator) get the extra width their own proportions ask for, so the
+/// narrowest entry lands on the minimum and the widest keeps its share.
+fn min_width_total(weights: &[f32], minimized: &[bool], min_px: f32) -> f32 {
+    if !(min_px > 0.0) {
+        return 0.0;
+    }
+    let visible: Vec<f32> = weights
+        .iter()
+        .zip(minimized.iter())
+        .filter(|&(_, &m)| !m)
+        .map(|(&w, _)| w)
+        .collect();
+    if visible.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = visible.iter().sum();
+    let smallest = visible.iter().copied().fold(f32::INFINITY, f32::min);
+    let needed = if sum > 0.0 && smallest > 0.0 {
+        min_px * sum / smallest
+    } else {
+        min_px * visible.len() as f32
+    };
+    if needed.is_finite() { needed } else { min_px * visible.len() as f32 }
+}
+
 /// Shrink the weights of the entries wider than `max_px` so they render at
 /// exactly `max_px`, leaving the others alone. Shrinking one entry grows every
 /// other one's share, so the sum is re-read at each step.
@@ -679,16 +708,22 @@ impl Tab {
         })
     }
 
-    /// Compute the virtual width for this tab's split layout.
-    /// If a manual override is set, use it. Otherwise: max(screen_width, visible columns * min_split_width).
-    /// Fully-minimized columns take no space, so they don't extend the virtual width.
+    /// Compute the virtual width for this tab's split layout: the screen, or a
+    /// manual override, but never less than the columns need to stay at
+    /// `min_split_width` (`min_layout_width`). An override left over from an
+    /// earlier layout, a display change or a background split cannot squeeze
+    /// the panes below the minimum: the tab scrolls instead.
+    /// Fully-minimized columns take no space, so they don't extend the width.
     pub fn virtual_width(&self, screen_width: f32, min_split_width: f32) -> f32 {
-        if self.virtual_width_override > 0.0 {
-            self.virtual_width_override.max(screen_width)
-        } else {
-            let n = self.num_visible_columns() as f32;
-            (n * min_split_width).max(screen_width)
-        }
+        self.virtual_width_override
+            .max(screen_width)
+            .max(self.min_layout_width(min_split_width))
+    }
+
+    /// Width the visible columns need so that none of them renders under
+    /// `min_split_width` (see `min_width_total`).
+    pub fn min_layout_width(&self, min_split_width: f32) -> f32 {
+        min_width_total(&self.column_weights, &self.minimized_columns(), min_split_width)
     }
 
     /// Convert this tab's pixel geometry to a display whose backing scale is
@@ -2402,7 +2437,7 @@ impl Column {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjacent_visible_pairs, geometry_ratio, pinned_virtual_width, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, distribute_visible, grow_virtual_for_restored_column, max_visible_fraction, new_entry_weight, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column};
+    use super::{adjacent_visible_pairs, geometry_ratio, pinned_virtual_width, apply_directional_resize, apply_separator_drag, clamp_weights_to_max, distribute_visible, grow_virtual_for_restored_column, max_visible_fraction, min_width_total, new_entry_weight, reweight_for_edge_grow, reweight_for_scrolled_split, shrink_virtual_for_hidden_column};
 
     // ------------------------------------------------------------------
     // Minimized entries must not pollute the layout of the visible ones.
@@ -2564,6 +2599,69 @@ mod tests {
         let after_min = shrink_virtual_for_hidden_column(2000.0, 500.0, 1000.0);
         let restored = grow_virtual_for_restored_column(1.0, 3.0, after_min, 1000.0);
         assert!((restored - 2000.0).abs() < 0.01);
+    }
+
+    // ------------------------------------------------------------------
+    // No column may render under `min_split_width`, whatever set the width:
+    // a split from another pane, a stale override, a restored session.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn equal_columns_need_one_minimum_each() {
+        let weights = [1.0, 1.0, 1.0, 1.0];
+        assert!((min_width_total(&weights, &[false; 4], 300.0) - 1200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_stale_override_is_lifted_to_the_minimum() {
+        // The live Tab Product tab: five panes squeezed into a 900px override,
+        // 180px each. The override stays below the floor, so the floor wins.
+        let weights = [1.0; 5];
+        let minimized = [false; 5];
+        let needed = min_width_total(&weights, &minimized, 300.0);
+        let virtual_width = 900.0f32.max(1000.0).max(needed);
+        assert!((virtual_width - 1500.0).abs() < 0.01, "virtual = {}", virtual_width);
+        for (i, px) in distribute_visible(&weights, &minimized, virtual_width).iter().enumerate() {
+            assert!(px >= &300.0, "column {} renders at {}px", i, px);
+        }
+    }
+
+    #[test]
+    fn the_narrowest_restored_column_sets_the_width() {
+        // A restored session with unequal weights: the total must let the
+        // narrowest column reach the minimum, and the widest keeps its
+        // proportion instead of swallowing the extra.
+        let weights = [3.0, 1.0];
+        let minimized = [false, false];
+        let virtual_width = min_width_total(&weights, &minimized, 300.0).max(1000.0);
+        assert!((virtual_width - 1200.0).abs() < 0.01, "virtual = {}", virtual_width);
+        let px = distribute_visible(&weights, &minimized, virtual_width);
+        assert!((px[0] - 900.0).abs() < 0.01, "wide = {}", px[0]);
+        assert!((px[1] - 300.0).abs() < 0.01, "narrow = {}", px[1]);
+    }
+
+    #[test]
+    fn a_minimized_column_asks_for_no_minimum() {
+        let weights = [1.0, 1.0, 4.0];
+        assert!((min_width_total(&weights, &[false, false, true], 300.0) - 600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_split_while_scrolling_lands_the_newcomer_on_the_minimum() {
+        // Two 1000px columns scrolling in a 1000px screen: the insert gives the
+        // column the average weight, then the split reweights it to its share
+        // and grows the virtual space, so the two keep 1000px each and the
+        // newcomer lands on the minimum instead of squeezing anyone.
+        let mut weights = vec![1000.0, 1000.0, 1000.0];
+        let minimized = [false; 3];
+        let virtual_width =
+            reweight_for_scrolled_split(&mut weights, &minimized, 1, 2000.0, 600.0).unwrap();
+        assert!((virtual_width - 2600.0).abs() < 0.01, "virtual = {}", virtual_width);
+        let px = distribute_visible(&weights, &minimized, virtual_width);
+        assert!((px[0] - 1000.0).abs() < 0.01, "first = {}", px[0]);
+        assert!((px[1] - 600.0).abs() < 0.01, "new = {}", px[1]);
+        assert!((px[2] - 1000.0).abs() < 0.01, "last = {}", px[2]);
+        assert!(px.iter().all(|&w| w >= 600.0), "no column under the minimum: {:?}", px);
     }
 
     #[test]
