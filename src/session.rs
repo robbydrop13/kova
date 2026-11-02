@@ -950,6 +950,7 @@ pub fn restore_saved_tab(saved: &SavedTab, cols: u16, rows: u16, config: &Config
         // converts them to the display it actually lands on.
         geometry_scale: saved.geometry_scale.unwrap_or(0.0),
         cell_h: std::cell::Cell::new(0.0),
+        min_col_w: std::cell::Cell::new(0.0),
         subjects: saved.subjects.clone(),
         subject_colors: saved.subject_colors.iter().map(|(k, v)| (k.clone(), *v)).collect(),
     };
