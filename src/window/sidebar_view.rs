@@ -18,19 +18,19 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAffineTransformNSAppKitAdditions, NSBezierPath, NSColor, NSColorSpace, NSCursor, NSEvent, NSEventMask, NSFont, NSGradient, NSGraphicsContext,
+    NSAffineTransformNSAppKitAdditions, NSBezierPath, NSColor, NSCursor, NSEvent, NSEventMask, NSFont, NSGraphicsContext,
     NSImage, NSLineBreakMode, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView, NSScrollerStyle,
     NSShadow, NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTrackingArea,
     NSTrackingAreaOptions, NSView,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSAffineTransform, NSArray, NSDictionary, NSObjectProtocol, NSString};
+use objc2_foundation::{NSAffineTransform, NSDictionary, NSObjectProtocol, NSString};
 
 use super::feather::{self, Icon};
 use super::sidebar::{
-    self, displacements, drag_bounds, next_slot, placeholder_y, sel_tile_alpha, tab_tint, tokens, wash_stops,
-    wash_strength, ChipStyle, NextPill, SidebarSort, Slot, SummaryRun, TileButton, TileState, OPEN_LABEL,
-    RESUME_LABEL, START_CLAUDE_LABEL, STOP_LABEL,
+    self, displacements, drag_bounds, next_slot, placeholder_y, sel_tile_alpha, tab_tint, tokens, ChipStyle,
+    NextPill, SidebarSort, Slot, SummaryRun, TileButton, TileState, OPEN_LABEL, RESUME_LABEL,
+    START_CLAUDE_LABEL, STOP_LABEL,
 };
 use super::sidebar_model::{GroupVm, RoutineVm, SidebarList, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
@@ -66,9 +66,9 @@ const GROUP_GAP: f64 = 16.0;
 const HEADER_H: f64 = 28.0;
 /// The header's hover ground is a full pill.
 const HEADER_RADIUS: f64 = HEADER_H / 2.0;
-/// A group's panel: its radius, the padding around its rows (the header at
-/// the top included) and the gap between the rows.
-const PANEL_RADIUS: f64 = 12.0;
+/// The active group's card radius; `PANEL_PAD` is the padding around its rows
+/// (the header at the top included) and `PANEL_GAP` the gap between them.
+const PANEL_RADIUS: f64 = 8.0;
 const PANEL_PAD: f64 = 12.0;
 const PANEL_GAP: f64 = 12.0;
 /// The chevron zone at the left of a header, then the colour dot's box.
@@ -894,29 +894,6 @@ fn stroke_icon(icon: Icon, r: &Rect, size: f64, c: [f32; 3], alpha: f64) {
 fn fill_icon(icon: Icon, r: &Rect, size: f64, c: [f32; 3], alpha: f64) {
     color(c, alpha).setFill();
     feather::path(icon, feather::centred_box((r.x, r.y, r.w, r.h), size)).fill();
-}
-
-/// A group's wash: the tint fading down the panel (`wash_stops` at
-/// `strength`) over the raised ground, inside the panel's rounded rect.
-fn draw_wash(r: &Rect, radius: f64, tint: [f32; 3], strength: f64, alpha: f64) {
-    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r.cg(), radius, radius);
-    color(tokens::TILE, alpha).setFill();
-    path.fill();
-    let stops = wash_stops(strength);
-    let colors: Vec<Retained<NSColor>> = stops.iter().map(|&(a, _)| color(tint, a * alpha)).collect();
-    let locations: Vec<f64> = stops.iter().map(|&(_, l)| l).collect();
-    let gradient = unsafe {
-        NSGradient::initWithColors_atLocations_colorSpace(
-            NSGradient::alloc(),
-            &NSArray::from_retained_slice(&colors),
-            locations.as_ptr(),
-            &NSColorSpace::sRGBColorSpace(),
-        )
-    };
-    if let Some(gradient) = gradient {
-        // The view is flipped: 90 degrees runs from the top edge down.
-        gradient.drawInBezierPath_angle(&path, 90.0);
-    }
 }
 
 /// A menu swatch: a 12 pt image holding a filled dot in `c`, or a hollow
@@ -2002,15 +1979,15 @@ impl SidebarListView {
         let dirty_bottom = dirty.origin.y + dirty.size.height;
         let visible = |r: &Rect| r.bottom() >= dirty_top && r.y <= dirty_bottom;
 
-        // Group panels, each washed with its tint: stronger on the
-        // selected tab.
+        // The active group is a raised card; the others have no fill.
         for (gi, block) in sh.layout.groups.iter().enumerate() {
             if !visible(block) {
                 continue;
             }
-            let Some(g) = sh.model.groups.get(gi) else { continue };
-            let hovered = sh.hovered_tab == Some(g.tab_id);
-            draw_wash(block, PANEL_RADIUS, tab_tint(g.color), wash_strength(g.active, hovered), 1.0);
+            if sh.model.groups.get(gi).is_some_and(|g| g.active) {
+                fill_round(block, PANEL_RADIUS, tokens::TILE, 1.0);
+                stroke_round(block, PANEL_RADIUS, 1.0, tokens::BORDER_SUBTLE, 1.0);
+            }
         }
 
         // The lifted header or tile, resolved against the current layout: a
@@ -2123,8 +2100,8 @@ impl SidebarListView {
         let add_pressed = sh.pressed == ListHit::HeaderAdd(group);
         let dot_hovered = sh.hovered == ListHit::HeaderDot(group);
         let dot_pressed = sh.pressed == ListHit::HeaderDot(group);
-        // Ground: a header has none of its own (the panel's wash shows
-        // through) and lights up white 5 % under the mouse.
+        // Ground: a header has none of its own (the card shows through) and
+        // lights up white 5 % under the mouse.
         if body_pressed {
             fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.10 * alpha);
         } else if row_hovered {

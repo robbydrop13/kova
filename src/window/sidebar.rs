@@ -73,71 +73,70 @@ pub fn persist() {
 }
 
 // ---------------------------------------------------------------
-// Colour tokens (KovaLink `theme/tokens.ts`, dark set)
+// Colour tokens (Claap design system, dark set)
 // ---------------------------------------------------------------
 
-/// The palette the sidebar is painted with, shared with the phone app so the
-/// two screens read the same. RGB floats.
+/// The palette the sidebar is painted with: the Claap design system, generated
+/// into `src/window/ds_tokens.rs` from KovaLink's `packages/protocol/tokens/
+/// ds.json`. RGB floats.
 pub mod tokens {
-    pub const GROUND: [f32; 3] = [0.043, 0.051, 0.063];
-    pub const TILE: [f32; 3] = [0.078, 0.090, 0.110];
-    pub const TILE_HOVER: [f32; 3] = [0.106, 0.122, 0.149];
-    pub const TILE_PRESSED: [f32; 3] = [0.122, 0.141, 0.169];
-    pub const BORDER_SUBTLE: [f32; 3] = [0.137, 0.153, 0.184];
-    pub const BORDER_STRONG: [f32; 3] = [0.200, 0.224, 0.267];
-    pub const ACCENT: [f32; 3] = [0.298, 0.553, 1.000];
-    pub const ACCENT_PRESSED: [f32; 3] = [0.227, 0.475, 0.902];
-    pub const TEXT_PRIMARY: [f32; 3] = [0.910, 0.918, 0.929];
-    pub const TEXT_SECONDARY: [f32; 3] = [0.608, 0.639, 0.686];
-    pub const TEXT_TERTIARY: [f32; 3] = [0.486, 0.522, 0.576];
+    use crate::window::ds_tokens::dark as ds;
+
+    /// The generated tokens carry alpha; the sidebar paints in RGB.
+    const fn rgb(c: [f32; 4]) -> [f32; 3] {
+        [c[0], c[1], c[2]]
+    }
+
+    #[allow(dead_code)]
+    pub const BG2: [f32; 3] = rgb(ds::BG2);
+    pub const GROUND: [f32; 3] = rgb(ds::BG0);
+    pub const TILE: [f32; 3] = rgb(ds::BG1);
+    pub const TILE_HOVER: [f32; 3] = rgb(ds::HOVER);
+    pub const TILE_PRESSED: [f32; 3] = rgb(ds::BTN2_HOVER);
+    #[allow(dead_code)]
+    pub const SEL_BG: [f32; 3] = rgb(ds::SEL_BG);
+    #[allow(dead_code)]
+    pub const SEL_TEXT: [f32; 3] = rgb(ds::SEL_TEXT);
+    #[allow(dead_code)]
+    pub const SEL_RAIL: [f32; 3] = rgb(ds::SEL_RAIL);
+    pub const BORDER_SUBTLE: [f32; 3] = rgb(ds::B3);
+    pub const BORDER_STRONG: [f32; 3] = rgb(ds::B2);
+    pub const ACCENT: [f32; 3] = rgb(ds::ACCENT);
+    pub const ACCENT_PRESSED: [f32; 3] = rgb(ds::ACCENT_HOVER);
+    pub const TEXT_PRIMARY: [f32; 3] = rgb(ds::T1);
+    pub const TEXT_SECONDARY: [f32; 3] = rgb(ds::T2);
+    pub const TEXT_TERTIARY: [f32; 3] = rgb(ds::T3);
     pub const TEXT_ON_FILL: [f32; 3] = [1.0, 1.0, 1.0];
-    pub const AWAITING: [f32; 3] = [1.000, 0.690, 0.125];
-    pub const AWAITING_BG: [f32; 3] = [0.165, 0.122, 0.031];
-    pub const WORKING: [f32; 3] = [0.220, 0.741, 0.973];
-    pub const ERROR: [f32; 3] = [1.000, 0.361, 0.361];
-    pub const INTERRUPT: [f32; 3] = [1.000, 0.478, 0.478];
-    pub const TAB_NONE: [f32; 3] = [0.486, 0.522, 0.576];
-    pub const SEPARATOR: [f32; 3] = BORDER_SUBTLE;
+    pub const AWAITING: [f32; 3] = rgb(ds::WARN_DOT);
+    pub const AWAITING_BG: [f32; 3] = rgb(ds::WARN_BG);
+    pub const WORKING: [f32; 3] = rgb(ds::INFO_DOT);
+    pub const ERROR: [f32; 3] = rgb(ds::CRIT_DOT);
+    pub const INTERRUPT: [f32; 3] = rgb(ds::CRIT);
+    pub const TAB_NONE: [f32; 3] = rgb(ds::T3);
+    pub const SEPARATOR: [f32; 3] = rgb(ds::B3);
+    #[allow(dead_code)]
+    pub const OK_DOT: [f32; 3] = rgb(ds::OK_DOT);
+    #[allow(dead_code)]
+    pub const WARN_TEXT: [f32; 3] = rgb(ds::WARN);
+    #[allow(dead_code)]
+    pub const INFO_TEXT: [f32; 3] = rgb(ds::INFO);
+    #[allow(dead_code)]
+    pub const CRIT_TEXT: [f32; 3] = rgb(ds::CRIT);
     /// The white every translucent layer of the selected group is cut from.
     pub const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
     pub const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
 }
 
 // ---------------------------------------------------------------
-// Selected tab wash
+// Selected tab layers
 // ---------------------------------------------------------------
 
-/// Alpha of the tab colour at the top of a group's panel: the selected tab's
-/// strength, the strength under the mouse, and the other tabs'.
-pub const WASH_SELECTED: f64 = 0.65;
-pub const WASH_HOVER: f64 = 0.40;
-pub const WASH_OTHER: f64 = 0.20;
 /// Alpha of the white the selected group's tiles are filled with.
 pub const SEL_TILE_ALPHA: f64 = 0.12;
 /// The tile's lift under the mouse (a point less on the focused tile, which
 /// is already the brightest), and the focused tile's lift.
 pub const SEL_TILE_HOVER_LIFT: f64 = 0.04;
 pub const SEL_TILE_FOCUS_LIFT: f64 = 0.10;
-
-/// The vertical gradient washed over a group's panel: the tab colour at
-/// `strength` at the top, fading to 45 % of it at 42 % of the height and
-/// 14 % at the bottom. `(alpha, location)`, top to bottom.
-pub fn wash_stops(strength: f64) -> [(f64, f64); 3] {
-    [(strength, 0.0), (strength * 0.45, 0.42), (strength * 0.14, 1.0)]
-}
-
-/// The wash strength of a group: `WASH_SELECTED` on the active tab, which
-/// stays clearly the brightest, `WASH_HOVER` on the tab under the mouse (the
-/// whole panel reacts), `WASH_OTHER` otherwise.
-pub fn wash_strength(selected: bool, hovered: bool) -> f64 {
-    if selected {
-        WASH_SELECTED
-    } else if hovered {
-        WASH_HOVER
-    } else {
-        WASH_OTHER
-    }
-}
 
 /// Fill alpha of a tile in the selected group.
 pub fn sel_tile_alpha(focused: bool, hovered: bool) -> f64 {
@@ -896,22 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wash_fades_from_the_top_and_tiles_lift_under_focus_and_hover() {
-        assert_eq!(wash_strength(true, false), WASH_SELECTED);
-        assert_eq!(wash_strength(true, true), WASH_SELECTED);
-        assert_eq!(wash_strength(false, true), WASH_HOVER);
-        assert_eq!(wash_strength(false, false), WASH_OTHER);
-        // The selected tab reads louder than a merely hovered one.
-        assert!(WASH_SELECTED > WASH_HOVER && WASH_HOVER > WASH_OTHER);
-        let stops = wash_stops(wash_strength(true, false));
-        assert_eq!(stops[0], (0.65, 0.0));
-        assert!((stops[1].0 - 0.2925).abs() < 1e-9 && stops[1].1 == 0.42);
-        assert!((stops[2].0 - 0.091).abs() < 1e-9 && stops[2].1 == 1.0);
-        assert!(stops.windows(2).all(|w| w[0].0 > w[1].0 && w[0].1 < w[1].1));
-        let other = wash_stops(wash_strength(false, false));
-        assert_eq!(other[0], (0.20, 0.0));
-        assert!((other[1].0 - 0.09).abs() < 1e-9 && other[1].1 == 0.42);
-        assert!((other[2].0 - 0.028).abs() < 1e-9 && other[2].1 == 1.0);
+    fn tiles_lift_under_focus_and_hover() {
         assert_eq!(sel_tile_alpha(false, false), 0.12);
         assert_eq!(sel_tile_alpha(false, true), 0.16);
         assert_eq!(sel_tile_alpha(true, false), 0.22);

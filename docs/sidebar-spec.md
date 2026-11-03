@@ -112,27 +112,21 @@ visible), the question wrapped to two lines with an ellipsis on the last
 
 ### 3.4 Group (one per tab; `TabGroupView.tsx`)
 
-Content inset 12 on each side; groups 16 apart. Every group is a panel
-(option "A. Wash"), radius 12, filled `bg.raised` and washed with a vertical
-gradient of the tint (`sidebar::wash_stops(strength)`, an `NSGradient` in
-the panel's rounded path): `strength` at the top, x 0.45 at 42 % of the
-height, x 0.14 at the bottom; `strength` is 0.40 on the selected tab
-(`WASH_SELECTED`) and on the tab under the mouse (`wash_strength(selected,
-hovered)`: any hit inside the panel, controls and tiles included, bound as
-`hovered_tab`, a tab id, on every mouse move), 0.20 on the others
-(`WASH_OTHER`). The whole panel is one click target: a click on its
-padding, on a gap or on the empty bottom (`ListHit::Panel`, the fallback
-once no row or control took the point) selects the tab, and the hand
-cursor covers every panel (cursor rects on the list view, refreshed on
-relayout). The header sits at
-the top of the panel, the tiles 12 pt apart (`PANEL_GAP`), and the panel
-pads 12 pt all around (`PANEL_PAD`: above the header, at the sides, under
-the last row). No tint bar. The tint is `TAB_COLORS[c]` (twelve colours:
-red, orange, yellow, green, blue, violet, pink, coral, lime, teal, cyan,
-indigo) or `tabNone` grey.
+Content inset 12 on each side; groups 16 apart. Groups have no colour wash
+any more: the active group is a `bg1` card, radius 8, with a 1 pt
+`border.subtle` stroke; the other groups draw nothing. The whole panel is
+one click target: a click on its padding, on a gap or on the empty bottom
+(`ListHit::Panel`, the fallback once no row or control took the point)
+selects the tab, and the hand cursor covers every panel (cursor rects on the
+list view, refreshed on relayout). The header sits at the top of the panel,
+the tiles 12 pt apart (`PANEL_GAP`), and the panel pads 12 pt all around
+(`PANEL_PAD`: above the header, at the sides, under the last row). No tint
+bar. The tint is `TAB_COLORS[c]` (twelve colours: red, orange, yellow,
+green, blue, violet, pink, coral, lime, teal, cyan, indigo) or `tabNone`
+grey.
 
 Header 28 tall, its hover ground a full pill (radius 14), no ground of its
-own otherwise (the wash shows through):
+own otherwise (the group's background shows through):
 the `chevron-down` / `chevron-right` icon, the 8 pt tint dot, the Cmd+N
 number, the title (15 semibold, primary), then at the right the `+` button
 (24 pt, radius 8) and, when folded, the collapsed summary: a 6 pt amber dot
@@ -147,7 +141,7 @@ between the chevron zone and the number, and a 1 pt white ring at 20 %
 
 #### 3.4.1 Selected tab
 
-The selected tab's panel differs by its stronger wash and by its text:
+The selected tab's card differs by its fill and border, and by its text:
 
 - Header: title white; number, chevron and collapsed count white 72 %
   (secondary / tertiary elsewhere); the dot in the tint with a 3 pt halo at
@@ -178,7 +172,7 @@ secondary, a `★` in amber first when bookmarked; a bare shell shows
 `play` (accent link, primary on hover) right-aligned instead of the end of
 the subtitle. An unread tile with a turn-end summary adds a third row in
 secondary. Heights 54 / 72. Fill, border, hover, pressed, minimized and
-the focused pane: 3.4.1 (white layers over the panel's wash, no accent
+the focused pane: 3.4.1 (white layers over the card, no accent
 ring).
 
 Identity (`sidebar_model::tile_title`, `subtitle`; the phone's `paneLabel`
@@ -506,35 +500,44 @@ fallback reads the last assistant text of the transcript
 Cleared on a rising edge of `is_working()` and with the waiting flag in
 `Pane::clear_awaiting`. Fixtures under `tests/fixtures/prompt/`.
 
-## 6. Tokens (`sidebar::tokens`, RGB floats from `link/app/src/theme/tokens.ts`)
+## 6. Tokens (`sidebar::tokens`, RGB floats, Claap design system)
+
+The palette comes from KovaLink `packages/protocol/tokens/ds.json`, the
+Claap design system, generated into `src/window/ds_tokens.rs`; `sidebar::tokens`
+names the dark set and drops the alpha channel.
 
 ```
-ground           bg.base           #0B0D10
-tile             bg.raised         #14171C
-tile.hover       bg.overlay        #1B1F26   (also the neutral chip)
-tile.pressed     bg.pressed        #1F242B
-border.subtle                      #23272F   (= separator, hairlines)
-border.strong                      #333944   (ring glyph, pill border)
-accent           accent.primary    #4C8DFF   (= unread, focus ring, links)
-accent.pressed                     #3A79E6
-text.primary                       #E8EAED
-text.secondary                     #9BA3AF
-text.tertiary                      #7C8593
-text.onFill                        #FFFFFF
-status.awaiting                    #FFB020
-status.awaitingBg                  #2A1F08
-status.working                     #38BDF8
-status.success                     #3DD68C
-status.error                       #FF5C5C
-action.interrupt.text              #FF7A7A
-tabNone                            #7C8593
+ground            bg0
+tile              bg1
+tile.hover        hover
+tile.pressed      btn2.hover
+bg2               bg2
+sel.bg            selBg
+sel.text          selText
+sel.rail          selRail
+border.subtle     b3   (= separator, hairlines)
+border.strong     b2
+accent            accent   (= unread, focus ring, links)
+accent.pressed    accent.hover
+text.primary      t1
+text.secondary    t2
+text.tertiary     t3
+text.onFill       #FFFFFF
+status.awaiting   warnDot
+status.awaitingBg warnBg
+status.working    infoDot
+status.error      critDot
+status.interrupt  crit
+status.ok         okDot
+status.warnText   warn
+status.infoText   info
+status.critText   crit
+tabNone           t3
 tab tint          TAB_COLORS[c] (Kova palette, mirrored by the phone)
-panel wash        tint at s -> s x 0.45 (42 %) -> s x 0.14, over bg.raised;
-                  s = 0.40 on the selected tab, 0.20 on the others
 
 top 36  summary 24  pill region 36 (pill 28, radius 14, content-sized, right inset 12, pad 12)
 list inset 12 (+6 top, +12 bottom)  group gap 16  header 28 (hover pill radius 14)
-panel radius 12, pad 12, row gap 12  dot box 16
+active card radius 8, pad 12, row gap 12  dot box 16
 tile radius 10, pad 8/10  card radius 12, pad 10/12, bar 4
 rows: title 20, secondary 16, question 16/line, gap 2  chip 18 (radius 9, pad 7)
 hover button 24 (radius 7, gap 2, icon 16)  header + 24 (radius 8)
