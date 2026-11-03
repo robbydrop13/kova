@@ -54,8 +54,15 @@ const BODY_GAP: f64 = 4.0;
 const KV_H: f64 = 17.0;
 const KV_LABEL_W: f64 = 72.0;
 const BODY_BTN_TOP_GAP: f64 = 4.0;
-const BODY_BTN_PAD: f64 = 8.0;
+/// A body button: a real 24 pt button, its 12 pt glyph, the gap after it,
+/// 6 pt of padding either side (the snooze chips'), 6 pt between buttons.
+const BODY_BTN_H: f64 = 24.0;
+const BODY_BTN_ICON: f64 = 12.0;
+const BODY_BTN_ICON_GAP: f64 = 6.0;
+const BODY_BTN_PAD: f64 = 6.0;
 const BODY_BTN_GAP: f64 = 6.0;
+/// The confirmation's buttons keep the wider padding they had.
+const CONFIRM_BTN_PAD: f64 = 8.0;
 const BODY_PAD_B: f64 = 8.0;
 /// The inline delete confirmation: a crit wash, two lines and two buttons.
 const CONFIRM_GAP: f64 = 8.0;
@@ -118,6 +125,12 @@ impl SchedButton {
     /// Drawn in the crit colour: the delete, and what confirms it.
     pub fn crit(self) -> bool {
         matches!(self, SchedButton::Delete | SchedButton::ConfirmDelete)
+    }
+
+    /// The type style of a labelled button: the body's are the chip, the
+    /// confirmation's filled `Delete` one weight heavier.
+    pub fn style(self) -> Style {
+        if self == SchedButton::ConfirmDelete { Style::ChipStrong } else { Style::Chip }
     }
 
     /// The `routinectl` verb this button runs, if it runs one.
@@ -320,6 +333,16 @@ fn last_value(r: &RoutineVm) -> String {
     }
 }
 
+/// The ink of one of the body's values: `Last run` turns crit when the run it
+/// reports failed, the one line of the grid that carries a verdict.
+pub fn body_value_ink(label: &str, r: &RoutineVm) -> [f32; 3] {
+    if label == "Last run" && matches!(r.last_status, LastStatus::Failed(_)) {
+        tokens::CRIT_TEXT
+    } else {
+        tokens::TEXT_PRIMARY
+    }
+}
+
 /// A path with the home directory written `~`.
 pub fn short_home(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -500,7 +523,7 @@ fn place_buttons(row: &mut Row, r: &RoutineVm, confirm: bool, m: &dyn TextMetric
     let button_y = box_.y + CONFIRM_PAD + CONFIRM_TITLE_H + CONFIRM_SUB_GAP + CONFIRM_SUB_H + CONFIRM_BTN_GAP;
     let mut right = box_.x + box_.w - CONFIRM_PAD;
     for button in [SchedButton::ConfirmDelete, SchedButton::ConfirmCancel] {
-        let w = m.width(button.label(), Style::Chip) + 2.0 * BODY_BTN_PAD;
+        let w = m.width(button.label(), button.style()) + 2.0 * CONFIRM_BTN_PAD;
         right -= w;
         row.sched.push((button, Rect::new(right, button_y, w, BTN), SchedSpot::Confirm));
         right -= CONFIRM_BTN_GAP;
@@ -516,16 +539,23 @@ fn body_buttons(r: &RoutineVm, x: f64, y: f64, width: f64, m: &dyn TextMetrics) 
     let mut by = y;
     let mut lines = 1.0;
     for &button in buttons(r) {
-        let w = m.width(button.label(), Style::Chip) + 2.0 * BODY_BTN_PAD;
+        let w = body_button_width(button, m);
         if !out.is_empty() && bx + w > x + width {
             bx = x;
-            by += BTN + BODY_BTN_GAP;
+            by += BODY_BTN_H + BODY_BTN_GAP;
             lines += 1.0;
         }
-        out.push((button, Rect::new(bx, by, w, BTN)));
+        out.push((button, Rect::new(bx, by, w, BODY_BTN_H)));
         bx += w + BODY_BTN_GAP;
     }
-    (out, lines * BTN + (lines - 1.0) * BODY_BTN_GAP)
+    (out, lines * BODY_BTN_H + (lines - 1.0) * BODY_BTN_GAP)
+}
+
+/// The width one body button needs: its padding, its glyph, the gap after it
+/// and its label. `draw_body_button` lays the same boxes out.
+fn body_button_width(button: SchedButton, m: &dyn TextMetrics) -> f64 {
+    let lead = if button.icon().is_some() { BODY_BTN_ICON + BODY_BTN_ICON_GAP } else { 0.0 };
+    2.0 * BODY_BTN_PAD + lead + m.width(button.label(), Style::Chip)
 }
 
 /// What a point inside a scheduled row lands on: one of its buttons, the
@@ -708,6 +738,27 @@ fn draw_glyph(r: &RoutineVm, cx: f64, cy: f64, a: f64) {
     stroke_icon(icon, &box_, GLYPH_D, c, a);
 }
 
+/// One of the body's labelled buttons: a 24 pt ground, its 12 pt glyph and
+/// its label, the pair left-aligned like the ask card's action buttons.
+/// `Delete` is the exception: no ground and crit ink, so the button that only
+/// opens the confirmation does not wear the colour of the one that deletes.
+fn draw_body_button(sh: &Shared, button: SchedButton, r: &Rect, hovered: bool, pressed: bool, a: f64) {
+    let crit = button.crit();
+    if !crit {
+        let ground = if hovered || pressed { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
+        fill_round(r, BTN_RADIUS, ground, a);
+    }
+    let fg = if crit { tokens::CRIT_TEXT } else { tokens::TEXT_PRIMARY };
+    let mut x = r.x + BODY_BTN_PAD;
+    if let Some(icon) = button.icon() {
+        let icon_box = Rect::new(x, r.y + (r.h - BODY_BTN_ICON) / 2.0, BODY_BTN_ICON, BODY_BTN_ICON);
+        stroke_icon(icon, &icon_box, BODY_BTN_ICON, fg, a);
+        x = icon_box.right() + BODY_BTN_ICON_GAP;
+    }
+    let w = (r.right() - BODY_BTN_PAD - x).max(0.0);
+    draw_text(sh, button.label(), &Rect::new(x, r.y, w, r.h), Style::Chip, fg, a, Align::Left, false);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_body(
     sh: &Shared,
@@ -725,20 +776,15 @@ fn draw_body(
     let mut y = frame.y + ROW_H + BODY_GAP;
     for (label, value) in body_rows(r) {
         draw_text(sh, label, &Rect::new(body_x, y, KV_LABEL_W, KV_H), Style::Secondary, tokens::TEXT_TERTIARY, a, Align::Left, false);
-        draw_text(sh, &value, &Rect::new(body_x + KV_LABEL_W, y, (body_w - KV_LABEL_W).max(20.0), KV_H), Style::Secondary, tokens::TEXT_PRIMARY, a, Align::Left, true);
+        let ink = body_value_ink(label, r);
+        draw_text(sh, &value, &Rect::new(body_x + KV_LABEL_W, y, (body_w - KV_LABEL_W).max(20.0), KV_H), Style::Secondary, ink, a, Align::Left, true);
         y += KV_H;
     }
     for (button, rect, spot) in &row.sched {
         if *spot != SchedSpot::Body {
             continue;
         }
-        let hovered_here = hovered == hit(*button);
-        let pressed_here = pressed == hit(*button);
-        if pressed_here || hovered_here {
-            fill_round(rect, BTN_RADIUS, tokens::WHITE, if pressed_here { 0.16 } else { 0.10 } * a);
-        }
-        let fg = if button.crit() { tokens::CRIT_TEXT } else { tokens::TEXT_SECONDARY };
-        draw_text(sh, button.label(), rect, Style::Chip, fg, a, Align::Center, false);
+        draw_body_button(sh, *button, rect, hovered == hit(*button), pressed == hit(*button), a);
     }
     let Some(box_) = row.sched_confirm else { return };
     // The confirmation: a crit wash, the question in bold, what it removes,
@@ -762,12 +808,13 @@ fn draw_body(
         if *spot != SchedSpot::Confirm {
             continue;
         }
+        let hovered_here = hovered == hit(*button);
         let pressed_here = pressed == hit(*button);
         if *button == SchedButton::ConfirmDelete {
-            fill_round(rect, BTN_RADIUS, tokens::INTERRUPT, if pressed_here { 0.85 } else { 1.0 } * a);
-            draw_text(sh, button.label(), rect, Style::Chip, tokens::TEXT_ON_FILL, 1.0, Align::Center, false);
+            let ground = if hovered_here || pressed_here { tokens::CRIT_SOLID_HOVER } else { tokens::CRIT_SOLID };
+            fill_round(rect, BTN_RADIUS, ground, a);
+            draw_text(sh, button.label(), rect, Style::ChipStrong, tokens::TEXT_ON_FILL, 1.0, Align::Center, false);
         } else {
-            let hovered_here = hovered == hit(*button);
             if hovered_here || pressed_here {
                 fill_round(rect, BTN_RADIUS, tokens::WHITE, if pressed_here { 0.16 } else { 0.10 } * a);
             }
@@ -888,13 +935,14 @@ mod tests {
         assert_eq!(row.frame.h, ROW_H + body_height(false, buttons_h(row)));
         // Five key/value lines, the button row, and the padding around them.
         assert_eq!(
-            body_height(false, BTN),
-            BODY_GAP + 5.0 * KV_H + BODY_BTN_TOP_GAP + BTN + BODY_PAD_B
+            body_height(false, BODY_BTN_H),
+            BODY_GAP + 5.0 * KV_H + BODY_BTN_TOP_GAP + BODY_BTN_H + BODY_PAD_B
         );
-        // Five labels do not fit one line in a narrow sidebar.
-        assert_eq!(buttons_h(row), 2.0 * BTN + BODY_BTN_GAP);
+        // Five labelled buttons, glyph included, do not fit one line in a
+        // narrow sidebar: two lines at 280, one at 520.
+        assert_eq!(buttons_h(row), 2.0 * BODY_BTN_H + BODY_BTN_GAP);
         let (_, wide) = layout(&routines, &SchedState::default(), 520.0, &FakeMetrics);
-        assert_eq!(buttons_h(row_of(&wide, alpha)), BTN);
+        assert_eq!(buttons_h(row_of(&wide, alpha)), BODY_BTN_H);
 
         // The confirmation adds its box to the open row.
         let mut state = SchedState::default();
@@ -902,7 +950,7 @@ mod tests {
         let (_, rows) = layout(&routines, &state, 280.0, &FakeMetrics);
         let row = row_of(&rows, alpha);
         assert_eq!(row.frame.h, ROW_H + body_height(true, buttons_h(row)));
-        assert!(body_height(true, BTN) > body_height(false, BTN));
+        assert!(body_height(true, BODY_BTN_H) > body_height(false, BODY_BTN_H));
     }
 
     #[test]
@@ -967,6 +1015,71 @@ mod tests {
             let rect = row.sched.iter().find(|(b, _, _)| *b == button).map(|(_, r, _)| *r).expect("its button");
             assert_eq!(hit(row, rect.x + 2.0, rect.y + 2.0), Some(SchedHit::Button(alpha, button)));
         }
+    }
+
+    #[test]
+    fn a_body_button_holds_its_glyph_and_its_label() {
+        let mut routines = fixture();
+        let alpha = index_of(&routines, "alpha-digest");
+        routines[alpha].expanded = true;
+        let (_, rows) = layout(&routines, &SchedState::default(), 280.0, &FakeMetrics);
+        let row = row_of(&rows, alpha);
+        let body: Vec<(SchedButton, Rect)> =
+            row.sched.iter().filter(|(_, _, s)| *s == SchedSpot::Body).map(|(b, r, _)| (*b, *r)).collect();
+        assert_eq!(body.len(), 5);
+        for (button, rect) in &body {
+            assert_eq!(rect.h, BODY_BTN_H);
+            assert_eq!(rect.w, body_button_width(*button, &FakeMetrics));
+            let icon = Rect::new(
+                rect.x + BODY_BTN_PAD,
+                rect.y + (rect.h - BODY_BTN_ICON) / 2.0,
+                BODY_BTN_ICON,
+                BODY_BTN_ICON,
+            );
+            assert!(icon.right() <= rect.right(), "{button:?}: the glyph leaves its button");
+            assert!(rect.y <= icon.y && icon.bottom() <= rect.bottom(), "{button:?}: the glyph spills out");
+            let label_x = icon.right() + BODY_BTN_ICON_GAP;
+            let label_w = FakeMetrics.width(button.label(), Style::Chip);
+            assert!(
+                label_x + label_w <= rect.right() - BODY_BTN_PAD + 1e-9,
+                "{button:?}: {} does not fit its button",
+                button.label()
+            );
+        }
+        // 6 pt between two buttons on a line, the same left edge on the next
+        // (FakeMetrics fits Run, Log and Pause on the first line at 280).
+        let first = body[0].1;
+        assert_eq!(body[1].1.x, first.right() + BODY_BTN_GAP);
+        assert_eq!(body[3].1.x, first.x);
+        assert!(body[3].1.y >= first.bottom() + BODY_BTN_GAP);
+    }
+
+    #[test]
+    fn the_confirmation_deletes_in_the_solid_danger_colour() {
+        // `#ED3726` solid, `#CC2314` under the mouse, white 11 semibold on it.
+        assert_eq!(tokens::CRIT_SOLID, [0.929, 0.216, 0.149]);
+        assert_eq!(tokens::CRIT_SOLID_HOVER, [0.800, 0.137, 0.078]);
+        assert_eq!(SchedButton::ConfirmDelete.style(), Style::ChipStrong);
+        assert_eq!(SchedButton::ConfirmDelete.style().size(), 11.0);
+        assert_eq!(
+            SchedButton::ConfirmDelete.style().weight(),
+            crate::window::sidebar_view::Weight::Semibold
+        );
+        // Cancel stays the ghost chip, and the body's Delete is not the solid.
+        assert_eq!(SchedButton::ConfirmCancel.style(), Style::Chip);
+        assert_eq!(SchedButton::Delete.style(), Style::Chip);
+    }
+
+    #[test]
+    fn a_failed_last_run_inks_its_value_crit() {
+        let routines = fixture();
+        let failed = index_of(&routines, "gamma-report");
+        let ok = index_of(&routines, "alpha-digest");
+        assert_eq!(body_value_ink("Last run", &routines[failed]), tokens::CRIT_TEXT);
+        assert_eq!(body_value_ink("Last run", &routines[ok]), tokens::TEXT_PRIMARY);
+        // Only that value: the rest of the grid keeps its ink.
+        assert_eq!(body_value_ink("Next", &routines[failed]), tokens::TEXT_PRIMARY);
+        assert_eq!(body_value_ink("Runs at", &routines[failed]), tokens::TEXT_PRIMARY);
     }
 
     #[test]

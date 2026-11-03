@@ -183,13 +183,16 @@ A 44 pt row (5 + an 18 pt title line + a 16 pt subtitle line + 5, floored at
   tail-truncated, `⊟ ` prefix when minimized) over the subtitle
   (`Style::Secondary`, 12, one line, tail-truncated). A `★` in amber comes
   first when bookmarked; a bare shell shows `Start Claude` and a restored
-  session `Resume`, each after a filled 11 pt `play` (accent link, primary on
-  hover) right-aligned at the end of the subtitle line, never on a waiting
-  tile: the wait takes that line.
+  session `Resume`, each after a filled 11 pt `play` (accent link;
+  `text.primary`, the same weight, once the tile is focused or under the
+  mouse: accent on the selected blue is blue on blue) right-aligned at the
+  end of the subtitle line, never on a waiting tile: the wait takes that
+  line.
 - A pane with an open ask or permission prompt (`TileVm::waiting`, filled by
   `SidebarModel::apply_needs`) says `waiting 4m · Answer` at the start of the
   subtitle instead: the age in `warn.text`, `Answer` an accent link hit
-  target (`ListHit::NeedAnswer`) that lands where that pane's ask row does.
+  target (`ListHit::NeedAnswer`) that lands where that pane's ask row does,
+  `text.primary` on the focused tile like the other links.
 - Right, 6 pt in: the meta column (`Style::Number`, 11, right-aligned):
   `working` (or `starting`) while it works; empty for an awaiting pane, whose
   subtitle carries the wait; a 6 pt accent dot comes before it on an unread
@@ -366,19 +369,25 @@ Clicking the row opens its body (one at a time, `open_routine`), indented 24:
 | `Where` | the working directory, its home written `~` |
 | `Prompt` | `prompts/<name>.md` |
 
-Then a row of small ghost buttons, the same actions with their labels; the
-labels wrap onto a second line when the sidebar is too narrow. `body_height`
-is shared by the layout and the draw so the two cannot disagree; the body is
-carried in the model only while the row is open (`cwd` is emptied
-otherwise), so a closed list stays as cheap to compare on the tick as it was.
+Then a row of real small buttons, the same actions with their labels: 24 pt
+high, radius 6, `bg.hover` ground (`bg.pressed` under the mouse and the
+press), an 11 medium `text.primary` label led by its 12 pt glyph with a 6 pt
+gap, 6 pt of padding either side, 6 pt between buttons. `Delete` is the
+exception: no ground, crit glyph and label, so the button that only opens the
+confirmation does not wear the colour of the one that deletes. The buttons
+wrap onto as many lines as the width needs. `body_height` is shared by the
+layout and the draw so the two cannot disagree; the body is carried in the
+model only while the row is open (`cwd` is emptied otherwise), so a closed
+list stays as cheap to compare on the tick as it was.
 
 #### 3.7.2.1 Deleting
 
 `Delete` opens an inline confirmation in the body: a crit wash (radius 6,
 padding 8 10), `Delete <name>?` in bold over `Removes its schedule and its
-prompt`, then `Cancel` (ghost) and `Delete` (filled `crit`). Escape or
-`Cancel` closes it; a click on the row does too. Nothing is deleted until
-the filled button is clicked.
+prompt`, then `Cancel` (ghost, unchanged) and `Delete` filled solid
+`crit.solid` (`#ED3726`, `#CC2314` under the mouse) in white 11 semibold.
+Escape or `Cancel` closes it; a click on the row does too. Nothing is deleted
+until the filled button is clicked.
 
 #### 3.7.2.2 Running, failing
 
@@ -781,6 +790,7 @@ status.ok         okDot
 status.warnText   warn
 status.infoText   info
 status.critText   crit
+crit.solid        #ED3726 (spelled out: no dark token carries it), hover #CC2314
 tabNone           t3
 tab tint          TAB_COLORS[c] (Kova palette, mirrored by the phone)
 

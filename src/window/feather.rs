@@ -398,13 +398,20 @@ pub fn path(icon: Icon, rect: (f64, f64, f64, f64)) -> Retained<NSBezierPath> {
                 // (cx + r cos t, cy + r sin t) with y growing downward, so
                 // the increasing direction reads clockwise on screen and
                 // `clockwise: false` sweeps start -> end the way we store it.
-                path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
+                // An arc is a stroke of its own: appended to a path that
+                // already has a current point, AppKit joins it there with a
+                // straight line, which drew a chord across the moon and made
+                // it read as a pie. Its own path keeps its own move; the outer
+                // path takes it as a fresh subpath.
+                let arc = NSBezierPath::bezierPath();
+                arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
                     CGPoint { x: ox, y: oy },
                     radius,
                     start_deg,
                     end_deg,
                     false,
                 );
+                path.appendBezierPath(&arc);
             }
         }
     }
@@ -525,5 +532,27 @@ mod tests {
         assert!(matches!(&Icon::Mic.segments()[8], Segment::Polyline(p) if p == &[(12.0, 19.0), (12.0, 23.0)]));
         assert!(matches!(&Icon::Off.segments()[0], Segment::Circle(12.0, 12.0, 10.0)));
         assert_eq!(Icon::Sort.segments().len(), 2);
+    }
+
+    #[test]
+    fn the_moon_is_two_strokes_with_no_chord_across_it() {
+        // Feather's moon is an outer large arc and an inner small one meeting
+        // at the two tips. AppKit joins an appended arc to the path's current
+        // point with a straight line, which drew the chord from one tip to the
+        // other and made the crescent read as a pie: each arc must open its
+        // own subpath.
+        let p = path(Icon::Moon, (0.0, 0.0, 24.0, 24.0));
+        let mut moves = 0;
+        for i in 0..p.elementCount() {
+            let mut pts = [CGPoint { x: 0.0, y: 0.0 }; 3];
+            let e = unsafe { p.elementAtIndex_associatedPoints(i, pts.as_mut_ptr()) };
+            match e.0 {
+                0 => moves += 1,
+                // 2 is a cubic curve; 1 would be the chord.
+                2 => {}
+                other => panic!("element {i} is {other}, a chord or a close"),
+            }
+        }
+        assert_eq!(moves, 2, "one move per arc");
     }
 }

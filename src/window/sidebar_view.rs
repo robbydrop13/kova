@@ -194,6 +194,8 @@ pub enum Style {
     Title,
     Secondary,
     Chip,
+    /// An 11 pt label on a filled button: the confirmation's `Delete`.
+    ChipStrong,
     Question,
     Detail,
     Summary,
@@ -215,11 +217,12 @@ pub enum Weight {
 }
 
 impl Style {
-    pub const ALL: [Style; 13] = [
+    pub const ALL: [Style; 14] = [
         Style::ViewTitle,
         Style::Title,
         Style::Secondary,
         Style::Chip,
+        Style::ChipStrong,
         Style::Question,
         Style::Detail,
         Style::Summary,
@@ -236,14 +239,14 @@ impl Style {
             Style::ViewTitle => 15.0,
             Style::Title => 13.0,
             Style::Secondary | Style::Question | Style::Detail | Style::Link | Style::Pill => 12.0,
-            Style::Chip | Style::Summary | Style::Hint | Style::Number | Style::Sort => 11.0,
+            Style::Chip | Style::ChipStrong | Style::Summary | Style::Hint | Style::Number | Style::Sort => 11.0,
             Style::PillBadge => 10.0,
         }
     }
 
     pub fn weight(self) -> Weight {
         match self {
-            Style::ViewTitle | Style::Pill => Weight::Semibold,
+            Style::ViewTitle | Style::Pill | Style::ChipStrong => Weight::Semibold,
             Style::Title | Style::Chip | Style::Link | Style::Sort => Weight::Medium,
             Style::PillBadge => Weight::Bold,
             _ => Weight::Regular,
@@ -1240,6 +1243,12 @@ fn draw_link(sh: &Shared, icon: Icon, label: &str, r: &Rect, c: [f32; 3], alpha:
     let x = r.x + (r.w - w) / 2.0;
     fill_icon(icon, &Rect::new(x, r.y, LINK_ICON_D, r.h), LINK_ICON_D, c, alpha);
     draw_text(sh, label, &Rect::new(x + LINK_ICON_D + LINK_ICON_GAP, r.y, text_w, r.h), Style::Link, c, alpha, Align::Left, false);
+}
+
+/// The ink of a tile's links: accent on the ground, t1 once the tile is
+/// focused (accent on the selected blue is blue on blue) and under the mouse.
+fn link_ink(focused: bool, hovered: bool) -> [f32; 3] {
+    if focused || hovered { tokens::TEXT_PRIMARY } else { tokens::ACCENT }
 }
 
 /// The `KovaView` of the window a sidebar view sits in.
@@ -2868,7 +2877,7 @@ impl SidebarListView {
             };
             let r = shifted(r);
             let b_hovered = sh.hovered == ListHit::TileButton(tile.pane_id, *b);
-            draw_link(sh, b.icon(), label, &r, if b_hovered { tokens::TEXT_PRIMARY } else { tokens::ACCENT }, alpha);
+            draw_link(sh, b.icon(), label, &r, link_ink(tile.focused, b_hovered), alpha);
             sec_right = r.x - 6.0;
         }
         let mut sx = text_x;
@@ -2886,7 +2895,7 @@ impl SidebarListView {
             if let Some(area) = answer {
                 draw_text(sh, "\u{b7}", &Rect::new(area.x - 9.0, line2.y, 8.0, LINE_SEC_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
                 let hovered_answer = sh.hovered == ListHit::NeedAnswer(tile.pane_id);
-                let fg = if hovered_answer { tokens::TEXT_PRIMARY } else { tokens::ACCENT };
+                let fg = link_ink(tile.focused, hovered_answer);
                 draw_text(sh, NEED_ANSWER, &area, Style::Link, fg, alpha, Align::Left, false);
             }
         } else {
@@ -3429,7 +3438,10 @@ mod tests {
         assert_eq!(Style::Sort.weight(), Weight::Medium);
         assert_eq!(Style::PillBadge.size(), 10.0);
         assert_eq!(Style::PillBadge.weight(), Weight::Bold);
-        assert_eq!(Style::ALL.len(), 13);
+        // The filled button's label: the chip at 11, one step heavier.
+        assert_eq!(Style::ChipStrong.size(), 11.0);
+        assert_eq!(Style::ChipStrong.weight(), Weight::Semibold);
+        assert_eq!(Style::ALL.len(), 14);
         let _ = PaneFlags::default();
     }
 

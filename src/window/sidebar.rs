@@ -121,6 +121,12 @@ pub mod tokens {
     pub const INFO_TEXT: [f32; 3] = rgb(ds::INFO);
     #[allow(dead_code)]
     pub const CRIT_TEXT: [f32; 3] = rgb(ds::CRIT);
+    /// The solid danger fill, `#ED3726` in both sets: the confirmation's
+    /// `Delete`, the one that really deletes. No generated token carries it in
+    /// the dark set (`crit.dot` is `#FF6551` there), so it is spelled out.
+    pub const CRIT_SOLID: [f32; 3] = [0.929, 0.216, 0.149];
+    /// `#CC2314`: the same fill under the mouse and under the press.
+    pub const CRIT_SOLID_HOVER: [f32; 3] = [0.800, 0.137, 0.078];
     /// The white every translucent layer of the selected group is cut from.
     pub const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
     pub const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
