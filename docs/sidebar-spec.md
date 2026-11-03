@@ -27,6 +27,9 @@ Code:
   area, summary row, Next pill, resize edge, and an `NSScrollView`)
   and `SidebarListView` (its document: groups and tiles, hover, press, drags,
   right click, tooltips).
+- `src/window/sidebar_asks.rs`: pure layout, drawing and hit test of the Asks
+  list (cards, answers, snooze, the folded snoozed section), plus `AskQueue`,
+  the queue the app delegate drains into `ask::Board`. Unit tests.
 - `src/window/sidebar_ui.rs`: the window's side. `apply_layout` (the split
   between the sidebar and the Metal view), the mode switch, `sync_sidebar`
   (once per tick: tabs -> `SidebarModel` -> view), the actions the view calls
@@ -348,11 +351,61 @@ and `ago_words` for the grouped redesign. Grouping and phrasing are pure
 functions with the clock passed in, tested against
 `tests/fixtures/routines/list.json`.
 
-### 3.7.3 Asks and Agents, still empty
+### 3.7.3 Asks list (`SidebarList::Asks`)
 
-Both switch like the others but have no rows yet: the list draws one
-centred line in the same tertiary hint style as the empty routines view,
-`No open questions` for Asks and `Agents view coming next` for Agents.
+`src/window/sidebar_asks.rs` owns this list: the view model, the pure layout,
+the drawing and the hit test. The board (`ask::Board`) holds the questions;
+`sidebar_ui::ask_cards` turns them into `AskCardVm`s once per tick while this
+list is up, resolving each `pane_id` to its tab across every window and
+checking `claude_session::live_session_ids` for a conversation that outlived
+its pane. The meta line reads `N need you · newest first`; the open cards are
+newest first.
+
+A card (radius 8, `bg1` `TILE`, 1 pt `b3` `BORDER_SUBTLE`, 10 v / 12 h
+padding, 8 pt apart):
+
+| Part | Content | Style |
+|---|---|---|
+| Header (18 pt) | 8 pt `awaiting` dot, then `from` (the asker's name), the tab name, and the age at the right (`4m`, `2h`) | `Title` primary, tab `Summary` tertiary, age `Number`; `warn.text` from 2 h |
+| Message | the question, wrapped, six lines then an ellipsis | `Secondary` (12) primary |
+| Actions (28 pt) | OK 32 x 28 (check, `ok` colour), KO (cross, `crit`), Brief (pencil, primary), then at the right the ghost Open (only when the ask has a pane) and Moon, 26 wide | button ground `bg.hover` / `bg.pressed`; ghost icons tertiary, primary under the mouse |
+| Note (14 pt) | a small green check and the first option, a small red cross and the second, so the user knows what OK and KO send; right-aligned `Session ended` with an info icon when the ask has no pane and no live conversation | `Hint` (11) tertiary |
+
+OK answers with the question's first action, KO with its second (or `No`
+when it declared only one). The Board's answer path is the floating card's:
+`AskQueue` on the app delegate is drained by the timer tick in `app.rs`, which
+calls `Board::answer`, `Board::snooze` or `Board::unsnooze`. A click is
+queued once: the card flips to `Sending to <from>...` (send icon) at once and
+ignores further clicks; when the board drops the question the card reads
+`Sent to <from>` (check-circle, `ok` colour) for 1.5 s before it disappears.
+A sending click that the board never takes gives up after 3 s, so the card
+is clickable again.
+
+The Moon opens a row of three small buttons under the actions: `1 h`,
+`Tonight 20:00`, `Tomorrow 9:00`. Tonight is the next local 20:00 (tomorrow
+when that one has passed), Tomorrow is the next local 09:00, and all three
+keep the board's 24 h bound (`ask::SNOOZE_MAX_SECS`). The row grows the card
+by 28 pt; on a narrow sidebar the three share the width equally and the
+labels truncate.
+
+The snoozed section is a folded 28 pt header at the bottom, `Snoozed N` with
+a chevron (`AsksState::folded`, true by default, remembered per window). Open
+it and each snoozed question is a dimmed card (alpha 0.55) on the same
+geometry, without the action rows: `back at 20:00` on the left and a
+`Show now` ghost button on the right, which cancels the snooze.
+
+Brief is K12: the pencil records `SidebarState::brief_open = Some(ask_id)`
+and draws nothing else yet. Open focuses the ask's pane in any window.
+
+A need row that lands on an ask (`ListHit::Need`, `Cmd+J`) switches to this
+list, sets `AsksState::highlight` to the ask id and scrolls its card into
+view once; the card's border takes `sel.rail` for two seconds
+(`HIGHLIGHT_MS`, cleared on the tick). With no question at all the list draws
+its own empty state, not the hint line: a check-circle, `No open questions`
+and `Agents ask here when they need you`, both tertiary and centred.
+
+The Agents list still has no rows: it keeps the centred `Agents view coming
+next` line in the hint slot.
 
 ### 3.7.4 `Needs you` block (`SidebarList::Panes`)
 
@@ -383,11 +436,11 @@ card: `Show all N` while folded, `Show less` once every row shows
 
 Clicks: an error row focuses its pane (in any window), a failed routine opens
 the Scheduled list on that routine (`open_routine`), an ask or a permission
-opens the Asks list and sets `SidebarState::highlight_ask` to the ask id. A
-pane holding an open ask or a permission prompt drops its meta column and
-says `waiting 4m · Answer` on the subtitle instead: the age in `warn.text`,
-`Answer` an accent link whose hit target (`ListHit::NeedAnswer`) lands where
-that pane's ask row would.
+opens the Asks list and sets `AsksState::highlight` to the ask id (2 s, the
+card border in `sel.rail`). A pane holding an open ask or a permission prompt
+drops its meta column and says `waiting 4m · Answer` on the subtitle instead:
+the age in `warn.text`, `Answer` an accent link whose hit target
+(`ListHit::NeedAnswer`) lands where that pane's ask row would.
 
 ### 3.8 List extras
 

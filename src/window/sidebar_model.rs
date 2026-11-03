@@ -5,6 +5,7 @@
 //! the facts to the model is pure and tested here.
 
 use super::needs::{NeedItem, NeedKind};
+use super::sidebar_asks::AsksState;
 use super::sidebar::{
     display_order, format_age, summary_runs, CollapsedSummary, NextPill, PaneFlags, SidebarSort,
     SummaryRun, TileState,
@@ -194,6 +195,8 @@ pub struct SidebarModel {
     pub needs: Vec<NeedRowVm>,
     /// `Show all`: the block lists every row rather than the four it folds to.
     pub needs_all: bool,
+    /// The Asks list's cards and transient state. Empty for every other list.
+    pub asks: AsksState,
     /// Fewer than three panes in the window: show the `⌘T new tab · ⌘D split` hint.
     pub show_hint: bool,
 }
@@ -516,6 +519,7 @@ impl SidebarModel {
             groups,
             needs: Vec::new(),
             needs_all: false,
+            asks: AsksState::default(),
             show_hint: total_panes < 3,
         }
     }

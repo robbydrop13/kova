@@ -33,6 +33,7 @@ use super::sidebar::{
     self, displacements, drag_bounds, next_slot, placeholder_y, tab_tint, tokens, NextPill, SidebarSort, Slot,
     SummaryRun, TileButton, TileState, RESUME_LABEL, START_CLAUDE_LABEL,
 };
+use super::sidebar_asks::{self, AsksHit, AsksLayout};
 use super::sidebar_model::{need_rows_shown, GroupVm, NeedRowVm, RoutineVm, SidebarList, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
 use super::KovaView;
@@ -45,7 +46,7 @@ use crate::pane::{PaneId, TabId};
 /// The separator line at the sidebar's right edge, part of its width.
 pub const SEP_W: f64 = 1.0;
 /// Points either side of the separator that grab the resize handle.
-const EDGE_TOLERANCE: f64 = 4.0;
+pub(super) const EDGE_TOLERANCE: f64 = 4.0;
 /// The top row, under the title bar: the traffic lights on the left and the
 /// view switcher at its right end.
 const TOP_H: f64 = 38.0;
@@ -67,9 +68,9 @@ const PILL_ICON_GAP: f64 = 4.0;
 const PILL_BADGE_GAP: f64 = 6.0;
 const PILL_BADGE_H: f64 = 16.0;
 /// Horizontal padding of the chrome and the list content.
-const PAD_H: f64 = 12.0;
-const LIST_TOP: f64 = 6.0;
-const LIST_BOTTOM: f64 = 12.0;
+pub(super) const PAD_H: f64 = 12.0;
+pub(super) const LIST_TOP: f64 = 6.0;
+pub(super) const LIST_BOTTOM: f64 = 12.0;
 const GROUP_GAP: f64 = 4.0;
 /// The selected group's card padding, above the header and under the last
 /// tile.
@@ -380,6 +381,8 @@ pub enum ListHit {
     /// The `Answer` link of a waiting tile: the same landing as the pane's
     /// ask row.
     NeedAnswer(PaneId),
+    /// A button of the Asks list: an answer, Brief, the pane, a snooze.
+    Ask(AsksHit),
     Empty,
 }
 
@@ -399,7 +402,8 @@ fn arms_press(hit: ListHit) -> bool {
         | ListHit::Routine(_)
         | ListHit::Need(_)
         | ListHit::NeedAll
-        | ListHit::NeedAnswer(_) => true,
+        | ListHit::NeedAnswer(_)
+        | ListHit::Ask(_) => true,
         // Headers and tiles arm themselves: they may become a drag instead.
         ListHit::Header(_) | ListHit::Tile(_) | ListHit::Empty => false,
     }
@@ -409,6 +413,7 @@ impl ListHit {
     pub fn pane(self) -> Option<PaneId> {
         match self {
             ListHit::Tile(id) | ListHit::TileButton(id, _) | ListHit::NeedAnswer(id) => Some(id),
+            ListHit::Ask(AsksHit::Open(id)) => Some(id),
             _ => None,
         }
     }
@@ -436,6 +441,8 @@ pub struct ListLayout {
     pub needs_card: Option<Rect>,
     /// Its header line: the title on the left, the counts on the right.
     pub needs_header: Option<Rect>,
+    /// The Asks list's cards, when `view` is `SidebarList::Asks`.
+    pub asks: AsksLayout,
 }
 
 /// The one line the list draws under its rows, in the empty-state slot: the
@@ -457,9 +464,16 @@ impl ListLayout {
         let mut rows = Vec::new();
         let mut groups = Vec::with_capacity(model.groups.len());
         let mut y = LIST_TOP;
-        if matches!(model.view, SidebarList::Asks | SidebarList::Agents) {
-            // Neither list has rows yet: one centred line, in the hint slot
-            // the empty routines list already borrows.
+        if model.view == SidebarList::Asks {
+            // The cards carry their own geometry: padding, wrapped message,
+            // the action row's buttons and the folded snoozed section.
+            let asks = sidebar_asks::layout(&model.asks, width, m);
+            let content_h = asks.content_h;
+            return ListLayout { width, asks, content_h, ..Default::default() };
+        }
+        if model.view == SidebarList::Agents {
+            // No rows yet: one centred line in the hint slot the empty
+            // routines list already borrows.
             y += HINT_H;
             y += LIST_BOTTOM;
             return ListLayout { width, rows, groups, hint_y: Some(LIST_TOP), content_h: y, ..Default::default() };
@@ -571,7 +585,7 @@ impl ListLayout {
             hy
         });
         y += LIST_BOTTOM;
-        ListLayout { width, rows, groups, hint_y, content_h: y, needs_card, needs_header }
+        ListLayout { width, rows, groups, hint_y, content_h: y, needs_card, needs_header, asks: AsksLayout::default() }
     }
 
     /// The `+` button of a header row.
@@ -603,6 +617,9 @@ impl ListLayout {
     }
 
     pub fn hit(&self, x: f64, y: f64) -> ListHit {
+        if self.asks.shown {
+            return self.asks.hit(x, y).map_or(ListHit::Empty, ListHit::Ask);
+        }
         for row in &self.rows {
             if !row.frame.contains(x, y) {
                 continue;
@@ -1028,7 +1045,7 @@ struct PaneDrag {
     to: usize,
 }
 
-struct Shared {
+pub(super) struct Shared {
     model: SidebarModel,
     layout: ListLayout,
     chrome: ChromeLayout,
@@ -1054,7 +1071,7 @@ impl Shared {
 }
 
 /// Text measurement through AppKit.
-struct AppKitMetrics<'a>(&'a Shared);
+pub(super) struct AppKitMetrics<'a>(pub(super) &'a Shared);
 
 impl TextMetrics for AppKitMetrics<'_> {
     fn width(&self, text: &str, style: Style) -> f64 {
@@ -1089,12 +1106,12 @@ fn color(c: [f32; 3], alpha: f64) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(c[0] as f64, c[1] as f64, c[2] as f64, alpha)
 }
 
-fn fill_round(r: &Rect, radius: f64, c: [f32; 3], alpha: f64) {
+pub(super) fn fill_round(r: &Rect, radius: f64, c: [f32; 3], alpha: f64) {
     color(c, alpha).setFill();
     NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r.cg(), radius, radius).fill();
 }
 
-fn stroke_round(r: &Rect, radius: f64, width: f64, c: [f32; 3], alpha: f64) {
+pub(super) fn stroke_round(r: &Rect, radius: f64, width: f64, c: [f32; 3], alpha: f64) {
     color(c, alpha).setStroke();
     let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(r.inset(width / 2.0).cg(), radius, radius);
     path.setLineWidth(width);
@@ -1106,7 +1123,7 @@ fn fill_rect(r: &Rect, c: [f32; 3], alpha: f64) {
     NSBezierPath::bezierPathWithRect(r.cg()).fill();
 }
 
-fn fill_dot(cx: f64, cy: f64, d: f64, c: [f32; 3], alpha: f64) {
+pub(super) fn fill_dot(cx: f64, cy: f64, d: f64, c: [f32; 3], alpha: f64) {
     color(c, alpha).setFill();
     NSBezierPath::bezierPathWithOvalInRect(Rect::new(cx - d / 2.0, cy - d / 2.0, d, d).cg()).fill();
 }
@@ -1119,7 +1136,7 @@ fn stroke_ring(cx: f64, cy: f64, d: f64, width: f64, c: [f32; 3], alpha: f64) {
 }
 
 /// A Feather icon stroked in a `size` box centred in `r`.
-fn stroke_icon(icon: Icon, r: &Rect, size: f64, c: [f32; 3], alpha: f64) {
+pub(super) fn stroke_icon(icon: Icon, r: &Rect, size: f64, c: [f32; 3], alpha: f64) {
     color(c, alpha).setStroke();
     feather::path(icon, feather::centred_box((r.x, r.y, r.w, r.h), size)).stroke();
 }
@@ -1189,7 +1206,7 @@ fn attrs(font: &NSFont, c: [f32; 3], alpha: f64, mode: NSLineBreakMode) -> Retai
 
 /// Horizontal alignment of a one-line text inside its box.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Align {
+pub(super) enum Align {
     Left,
     Right,
     Center,
@@ -1198,7 +1215,7 @@ enum Align {
 /// Draw one line of text vertically centred in `r`, truncated with an
 /// ellipsis (at the tail; at the head for rename edit buffers, so the cursor
 /// stays visible). Returns the drawn width.
-fn draw_text(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha: f64, align: Align, head: bool) -> f64 {
+pub(super) fn draw_text(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha: f64, align: Align, head: bool) -> f64 {
     let mode = if head { NSLineBreakMode::ByTruncatingHead } else { NSLineBreakMode::ByTruncatingTail };
     let a = attrs(sh.font(style), c, alpha, mode);
     let ns = NSString::from_str(text);
@@ -1216,7 +1233,7 @@ fn draw_text(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha
 
 /// Draw a wrapped text of at most `lines` lines in `r`, the last line ending
 /// with an ellipsis when cut.
-fn draw_wrapped(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha: f64) {
+pub(super) fn draw_wrapped(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha: f64) {
     let a = attrs(sh.font(style), c, alpha, NSLineBreakMode::ByWordWrapping);
     unsafe {
         NSString::from_str(text).drawWithRect_options_attributes_context(
@@ -1558,6 +1575,7 @@ impl SidebarView {
                 groups: Vec::new(),
                 needs: Vec::new(),
                 needs_all: false,
+                asks: Default::default(),
                 show_hint: false,
             },
             layout: ListLayout::default(),
@@ -1635,6 +1653,16 @@ impl SidebarView {
             });
             row.map(|r| sh.layout.rows[r].frame)
         };
+        if let Some(f) = frame {
+            list.scrollRectToVisible(Rect::new(f.x, f.y - GROUP_GAP, f.w, f.h + 2.0 * GROUP_GAP).cg());
+        }
+    }
+
+    /// Scroll the least that shows the Asks card `id`, for a need row that
+    /// walked to it.
+    pub fn reveal_ask(&self, id: &str) {
+        let Some(list) = self.ivars().list.get() else { return };
+        let frame = self.ivars().shared.borrow().layout.asks.card_frame(id);
         if let Some(f) = frame {
             list.scrollRectToVisible(Rect::new(f.x, f.y - GROUP_GAP, f.w, f.h + 2.0 * GROUP_GAP).cg());
         }
@@ -1877,7 +1905,9 @@ define_class!(
             // Bind the rects first: adding a cursor rect is an AppKit call.
             let panels: Vec<CGRect> = {
                 let sh = self.ivars().shared.borrow();
-                if sh.model.view == SidebarList::Scheduled {
+                if sh.layout.asks.shown {
+                    sh.layout.asks.button_rects().iter().map(|r| r.cg()).collect()
+                } else if sh.model.view == SidebarList::Scheduled {
                     sh.layout.rows.iter().map(|r| r.frame.cg()).collect()
                 } else {
                     // The needs card is clickable row by row, like a panel.
@@ -2186,6 +2216,7 @@ impl SidebarListView {
                     kova.sidebar_open_need(&key);
                 }
             }
+            ListHit::Ask(hit) => kova.sidebar_ask_hit(hit),
             ListHit::Empty => {}
         }
     }
@@ -2268,6 +2299,10 @@ impl SidebarListView {
 
     fn draw_list(&self, dirty: CGRect) {
         let sh = self.ivars().shared.borrow();
+        if sh.layout.asks.shown {
+            sidebar_asks::draw(&sh, &sh.model.asks, &sh.layout.asks, sh.hovered, sh.pressed);
+            return;
+        }
         let dirty_top = dirty.origin.y;
         let dirty_bottom = dirty.origin.y + dirty.size.height;
         let visible = |r: &Rect| r.bottom() >= dirty_top && r.y <= dirty_bottom;
@@ -2713,6 +2748,7 @@ mod tests {
             ListHit::Need(0),
             ListHit::NeedAll,
             ListHit::NeedAnswer(1),
+            ListHit::Ask(AsksHit::ToggleSnoozed),
         ] {
             assert!(arms_press(hit), "{hit:?} would never reach activate()");
         }
@@ -2787,6 +2823,7 @@ mod tests {
             ],
             needs: Vec::new(),
             needs_all: false,
+            asks: Default::default(),
             show_hint: false,
         }
     }
@@ -3112,18 +3149,22 @@ mod tests {
     }
 
     #[test]
-    fn the_two_empty_lists_say_so_in_the_hint_slot() {
-        for (view, text) in
-            [(SidebarList::Asks, "No open questions"), (SidebarList::Agents, "Agents view coming next")]
-        {
-            let mut m = model();
-            m.view = view;
-            let l = ListLayout::new(&m, 260.0, &FakeMetrics);
-            assert!(l.rows.is_empty());
-            assert!(l.groups.is_empty());
-            assert_eq!(l.hint_y, Some(LIST_TOP));
-            assert_eq!(hint_text(&m), text);
-        }
+    fn the_agents_empty_list_says_so_in_the_hint_slot() {
+        let mut m = model();
+        m.view = SidebarList::Agents;
+        let l = ListLayout::new(&m, 260.0, &FakeMetrics);
+        assert!(l.rows.is_empty());
+        assert!(l.groups.is_empty());
+        assert_eq!(l.hint_y, Some(LIST_TOP));
+        assert_eq!(hint_text(&m), "Agents view coming next");
+
+        // Asks draws its own empty state, not the hint line.
+        m.view = SidebarList::Asks;
+        let asks = ListLayout::new(&m, 260.0, &FakeMetrics);
+        assert_eq!(asks.hint_y, None);
+        assert!(asks.asks.shown);
+        assert!(asks.asks.empty.is_some());
+        assert!(asks.asks.cards.is_empty());
     }
 
     #[test]

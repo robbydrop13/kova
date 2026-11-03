@@ -6,8 +6,9 @@
 //! and the mouse live in `sidebar_view.rs`.
 
 use super::*;
-use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
+use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort, SummaryRun};
 use super::needs::{self, AskNeed, NeedInput, NeedItem, NeedKind, PaneNeed, RoutineNeed};
+use super::sidebar_asks::{self, AskCardVm, AsksHit, AsksState, Highlight};
 use super::sidebar_model::{header_title, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
@@ -139,10 +140,14 @@ pub(super) struct SidebarState {
     /// `Show all` on the `Needs you` block: every row rather than the four
     /// it folds to.
     pub(super) needs_all: bool,
-    /// The ask a need row landed on: the Asks list draws that card lit. K11
-    /// reads it; nothing paints it yet.
-    #[allow(dead_code)]
-    pub(super) highlight_ask: Option<String>,
+    /// The Asks list's cards and transient state, read from the board while
+    /// the Asks list is up.
+    pub(super) asks: AsksState,
+    /// The question whose Brief overlay is open. K12 draws the field; this
+    /// only records the choice.
+    pub(super) brief_open: Option<String>,
+    /// The ask a highlight already scrolled to, so it reveals its card once.
+    last_revealed_ask: Option<String>,
     /// The failed routine Cmd+J already showed, so it shows it once rather
     /// than on every press until the routine runs clean again.
     pub(super) routine_shown: Option<String>,
@@ -161,7 +166,9 @@ impl SidebarState {
             waits_on_you: 0,
             routine_failed: false,
             needs_all: false,
-            highlight_ask: None,
+            asks: AsksState::default(),
+            brief_open: None,
+            last_revealed_ask: None,
             routine_shown: None,
         }
     }
@@ -348,11 +355,62 @@ impl KovaView {
         NeedInput { panes, routines, asks, now }
     }
 
+    /// The Asks cards at `now`: every question the board holds, with the tab
+    /// it came from (across every window, like `need_input`) and whether its
+    /// conversation is still alive somewhere.
+    fn ask_cards(&self, now: u64) -> Vec<AskCardVm> {
+        let mut panes: std::collections::HashMap<PaneId, String> = std::collections::HashMap::new();
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let app = NSApplication::sharedApplication(mtm);
+        let ns_windows = app.windows();
+        for i in 0..ns_windows.count() {
+            let win = ns_windows.objectAtIndex(i);
+            let Some(view) = crate::app::kova_view(&win) else { continue };
+            let tabs = view.ivars().tabs.borrow();
+            for tab in tabs.iter() {
+                let title = tab.title();
+                tab.for_each_pane(&mut |pane| {
+                    panes.insert(pane.id, title.clone());
+                });
+            }
+        }
+        let live = crate::claude_session::live_session_ids();
+        let mut cards = Vec::new();
+        crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|question| {
+            let pane = question
+                .from
+                .pane_id
+                .and_then(|id| PaneId::try_from(id).ok())
+                .and_then(|id| panes.get(&id).map(|tab| (id, tab.clone())));
+            let alive = question.from.agent == crate::agent_session::Agent::Claude
+                && question
+                    .from
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|session| live.iter().any(|id| id == session));
+            cards.push(AskCardVm::from_question(question, pane, alive, now));
+        });
+        cards
+    }
+
+    /// Clear what the Asks view only keeps for a moment, and notice a card
+    /// the board has just let go of. Runs whether or not the list is up: the
+    /// transient card must not outlive a view switch.
+    fn sync_sidebar_asks_state(&self) {
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let mut waiting = Vec::new();
+        crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|question| {
+            waiting.push(sidebar_asks::ask_key(&question.id));
+        });
+        self.ivars().sidebar.borrow_mut().asks.prune(&waiting, sidebar_asks::now_ms());
+    }
+
     /// Read the tabs into a model and hand it to the sidebar view, which
     /// redraws only when something changed. Also where the list follows a
     /// focus change. Runs once per tick.
     pub(super) fn sync_sidebar(&self) {
         self.sync_needs();
+        self.sync_sidebar_asks_state();
         let Some(view) = self.ivars().sidebar_view.get() else { return };
         if !self.sidebar_active() {
             return;
@@ -380,7 +438,38 @@ impl KovaView {
         model.asks_waiting = waits_on_you;
         model.routine_failed = routine_failed;
         model.apply_needs(&needs, now, needs_all);
+        if list == SidebarList::Asks {
+            let cards = self.ask_cards(now);
+            let mut st = self.ivars().sidebar.borrow_mut();
+            st.asks.set_cards(cards);
+            model.asks = st.asks.clone();
+            let open = model.asks.open_count();
+            model.summary = vec![
+                (format!("{open} need you"), SummaryRun::Waiting),
+                (" \u{b7} newest first".to_string(), SummaryRun::Dot),
+            ];
+        }
         view.set_model(model);
+
+        // A need row that walked to an ask scrolls its card into view, once.
+        let reveal = {
+            let mut st = self.ivars().sidebar.borrow_mut();
+            let highlighted = st.asks.highlight.as_ref().map(|h| h.id.clone());
+            match highlighted {
+                Some(id) if st.last_revealed_ask.as_deref() != Some(id.as_str()) => {
+                    st.last_revealed_ask = Some(id.clone());
+                    Some(id)
+                }
+                Some(_) => None,
+                None => {
+                    st.last_revealed_ask = None;
+                    None
+                }
+            }
+        };
+        if let Some(id) = reveal {
+            view.reveal_ask(&id);
+        }
 
         // Follow the focus: reveal the focused pane's tile (its header when
         // the group is folded), once per focus change.
@@ -547,11 +636,40 @@ impl KovaView {
             NeedKind::Ask | NeedKind::Permission => {
                 let mut st = self.ivars().sidebar.borrow_mut();
                 st.list = SidebarList::Asks;
-                st.highlight_ask = match item.kind {
-                    NeedKind::Ask => item.key.strip_prefix("ask:").map(str::to_string),
+                st.asks.highlight = match item.kind {
+                    NeedKind::Ask => item.key.strip_prefix("ask:").map(|id| Highlight {
+                        id: id.to_string(),
+                        until_ms: sidebar_asks::now_ms() + sidebar_asks::HIGHLIGHT_MS,
+                    }),
                     _ => None,
                 };
+                st.last_revealed_ask = None;
             }
+        }
+    }
+
+    /// A click on an Asks card: run the card's state machine, queue the board
+    /// action, and land the view where the button says.
+    pub(super) fn sidebar_ask_hit(&self, hit: AsksHit) {
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let now = sidebar_asks::now_ms();
+        let (action, brief) = {
+            let mut st = self.ivars().sidebar.borrow_mut();
+            let action = sidebar_asks::click(&mut st.asks, hit, now);
+            let brief = match hit {
+                AsksHit::Brief(key) => st.asks.card(key).map(|card| card.id.clone()),
+                _ => None,
+            };
+            (action, brief)
+        };
+        if let Some(id) = brief {
+            self.ivars().sidebar.borrow_mut().brief_open = Some(id);
+        }
+        if let Some(action) = action {
+            crate::app::app_delegate(mtm).ivars().queue_ask_action(action);
+        }
+        if let AsksHit::Open(pane_id) = hit {
+            focus_pane_anywhere(pane_id);
         }
     }
 

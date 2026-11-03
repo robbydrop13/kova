@@ -1113,6 +1113,22 @@ impl Board {
         Ok(())
     }
 
+    /// The user cancelled a snooze from the sidebar: the question is open
+    /// now. The same field, set back to zero, so the card comes back now.
+    pub fn unsnooze(&mut self, id: &str) -> Result<(), String> {
+        let Some((question, _)) = self.pending.iter_mut().find(|(q, _)| q.id == id) else {
+            return Err(format!("no question {}", id));
+        };
+        question.snoozed_until = 0;
+        let saved = question.clone();
+        log::info!("ask {}: snooze cancelled, back on the card", id);
+        if self.owns_store() {
+            self.store.save_question(&saved);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
     /// The questions waiting, as `list-asks` hands them to KovaLink: the
     /// snoozed ones too, with the time they come back, since the phone shows
     /// and cancels them.
