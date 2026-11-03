@@ -1,0 +1,39 @@
+{
+  "managers": [
+    {
+      "name": "alpha-manager",
+      "role": "alpha-manager",
+      "tab": "Alpha",
+      "state": "open",
+      "reopen": ["team", "reopen", "alpha-manager"]
+    },
+    {
+      "name": "beta-coach",
+      "role": "beta-coach",
+      "tab": "Beta",
+      "state": "closed",
+      "reopen": ["team", "reopen", "beta-coach"]
+    }
+  ],
+  "dedicated": [
+    {
+      "name": "gamma-project",
+      "role": "gamma",
+      "by": "alpha-manager",
+      "project": "gamma",
+      "created": "2026-10-04T07:33:24",
+      "state": "open",
+      "reopen": ["team", "reopen", "gamma-project"]
+    },
+    {
+      "name": "delta-project",
+      "role": "delta",
+      "by": "alpha-manager",
+      "project": "delta",
+      "created": "2026-10-04T07:33:24",
+      "state": "closed",
+      "reopen": ["team", "reopen", "delta-project"]
+    }
+  ],
+  "other_open": ["epsilon-open"]
+}

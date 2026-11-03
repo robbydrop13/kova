@@ -15,6 +15,7 @@ mod resize;
 mod search_palette;
 use search_palette::{SearchPaletteState, SearchRow, is_shortcut, is_typed_char, typed_text};
 pub mod sidebar;
+pub(super) mod sidebar_agents;
 pub(super) mod sidebar_asks;
 #[allow(dead_code)]
 pub mod ds_tokens;

@@ -6,6 +6,7 @@
 
 use super::needs::{NeedItem, NeedKind};
 use super::sidebar_asks::AsksState;
+use super::sidebar_agents::{AgentsState, AgentsVm};
 use super::sidebar_sched::SchedState;
 use super::sidebar::{
     display_order, format_age, summary_runs, CollapsedSummary, NextPill, PaneFlags, SidebarSort,
@@ -217,6 +218,11 @@ pub struct SidebarModel {
     /// The Scheduled list's meta row, each run with whether it reads as a
     /// failure. Empty for every other list.
     pub sched_meta: Vec<(String, bool)>,
+    /// The Agents list's panes, tabs and roster. Empty for every other list.
+    pub agents: AgentsVm,
+    /// The Agents view's selected stat tile and folding, in flight reopens
+    /// included; default for every other list.
+    pub agent_state: AgentsState,
     /// The word the meta row keeps at its right. Only the Scheduled list has
     /// one (`now 18:45`); the panes draw the sort button there instead.
     pub meta_right: Option<String>,
@@ -545,6 +551,8 @@ impl SidebarModel {
             show_hint: total_panes < 3,
             sched: SchedState::default(),
             sched_meta: Vec::new(),
+            agents: AgentsVm::default(),
+            agent_state: AgentsState::default(),
             meta_right: None,
         }
     }

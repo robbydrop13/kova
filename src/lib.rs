@@ -40,6 +40,7 @@ mod surface;
 mod tab_colors;
 mod terminal;
 mod update_check;
+mod team;
 mod window;
 
 /// `kova ask …` (see `ask::USAGE`): returns the exit code.

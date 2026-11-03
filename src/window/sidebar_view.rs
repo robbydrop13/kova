@@ -39,6 +39,7 @@ use super::sidebar_model::{need_rows_shown, GroupVm, NeedRowVm, SidebarList, Sid
 #[cfg(test)]
 use super::sidebar_model::RoutineVm;
 use super::sidebar_sched::{self, SchedButton, SchedHit, SchedLayout, SchedSpot};
+use super::sidebar_agents::{self, AgentsHit, AgentsLayout};
 use super::sidebar_ui::{PaneAction, TabAction};
 use super::KovaView;
 use crate::pane::{PaneId, TabId};
@@ -205,6 +206,8 @@ pub enum Style {
     Link,
     Hint,
     Number,
+    /// The Agents stat tile's 20 pt value: the one size above the scale.
+    StatValue,
 }
 
 /// Font weight, mapped to `NSFontWeight*`.
@@ -217,7 +220,7 @@ pub enum Weight {
 }
 
 impl Style {
-    pub const ALL: [Style; 14] = [
+    pub const ALL: [Style; 15] = [
         Style::ViewTitle,
         Style::Title,
         Style::Secondary,
@@ -232,6 +235,7 @@ impl Style {
         Style::Link,
         Style::Hint,
         Style::Number,
+        Style::StatValue,
     ];
 
     pub fn size(self) -> f64 {
@@ -241,12 +245,13 @@ impl Style {
             Style::Secondary | Style::Question | Style::Detail | Style::Link | Style::Pill => 12.0,
             Style::Chip | Style::ChipStrong | Style::Summary | Style::Hint | Style::Number | Style::Sort => 11.0,
             Style::PillBadge => 10.0,
+            Style::StatValue => 20.0,
         }
     }
 
     pub fn weight(self) -> Weight {
         match self {
-            Style::ViewTitle | Style::Pill | Style::ChipStrong => Weight::Semibold,
+            Style::ViewTitle | Style::Pill | Style::ChipStrong | Style::StatValue => Weight::Semibold,
             Style::Title | Style::Chip | Style::Link | Style::Sort => Weight::Medium,
             Style::PillBadge => Weight::Bold,
             _ => Weight::Regular,
@@ -315,6 +320,20 @@ pub enum RowKind {
     Need { index: usize },
     /// The block's `Show all` / `Show less` ghost button.
     NeedAll,
+    /// One of the Agents view's four stat tiles.
+    AgentStat(sidebar_agents::AgentSection),
+    /// A section header of the Agents view, and how many rows it holds.
+    AgentHeader { kind: sidebar_agents::SectionKind, count: usize },
+    /// One pane row of the Agents view, by its index in `AgentsVm::panes`.
+    AgentPane { index: usize, pane_id: PaneId, need: bool },
+    /// One `By tab` row, by its index in `AgentsVm::tabs`.
+    AgentTab { index: usize, tab_idx: usize },
+    /// One manager of the roster, by its index in `AgentsVm::team`.
+    AgentTeam { index: usize, pane_id: Option<PaneId> },
+    /// One dedicated session, by its index in `AgentsVm::dedicated`.
+    AgentDedicated { index: usize, pane_id: Option<PaneId> },
+    /// The `None` row of an empty Agents section.
+    AgentEmpty,
 }
 
 /// One laid-out row, in list (document) coordinates.
@@ -368,6 +387,8 @@ pub enum ListHit {
     NeedAnswer(PaneId),
     /// A button of the Asks list: an answer, Brief, the pane, a snooze.
     Ask(AsksHit),
+    /// A row or button of the Agents list.
+    Agent(AgentsHit),
     Empty,
 }
 
@@ -388,7 +409,8 @@ fn arms_press(hit: ListHit) -> bool {
         | ListHit::Need(_)
         | ListHit::NeedAll
         | ListHit::NeedAnswer(_)
-        | ListHit::Ask(_) => true,
+        | ListHit::Ask(_)
+        | ListHit::Agent(_) => true,
         // Headers and tiles arm themselves: they may become a drag instead.
         ListHit::Header(_) | ListHit::Tile(_) | ListHit::Empty => false,
     }
@@ -431,6 +453,9 @@ pub struct ListLayout {
     /// The Scheduled list's sections and rows, when `view` is
     /// `SidebarList::Scheduled`.
     pub sched: SchedLayout,
+    /// The Agents list's tiles, sections and rows, when `view` is
+    /// `SidebarList::Agents`.
+    pub agents: AgentsLayout,
 }
 
 /// The one line the list draws under its rows, in the empty-state slot: the
@@ -440,7 +465,8 @@ fn hint_text(model: &SidebarModel) -> &'static str {
         SidebarList::Scheduled if !model.routines_loaded => "reading routines\u{2026}",
         SidebarList::Scheduled => "no routines scheduled",
         SidebarList::Asks => "No open questions",
-        SidebarList::Agents => "Agents view coming next",
+        SidebarList::Agents if model.agents.panes.is_empty() => "No agents in this window",
+        SidebarList::Agents => "",
         SidebarList::Panes => "\u{2318}T new tab \u{b7} \u{2318}D split",
     }
 }
@@ -460,11 +486,12 @@ impl ListLayout {
             return ListLayout { width, asks, content_h, ..Default::default() };
         }
         if model.view == SidebarList::Agents {
-            // No rows yet: one centred line in the hint slot the empty
-            // routines list already borrows.
-            y += HINT_H;
-            y += LIST_BOTTOM;
-            return ListLayout { width, rows, groups, hint_y: Some(LIST_TOP), content_h: y, ..Default::default() };
+            // Tiles, sections and rows all come from `sidebar_agents`: one
+            // place lays out and draws the view, so the two agree.
+            let (agents, rows) = sidebar_agents::layout(&model.agents, &model.agent_state, width, m);
+            let hint_y = agents.hint_y;
+            let content_h = agents.content_h;
+            return ListLayout { width, rows, agents, hint_y, content_h, ..Default::default() };
         }
         if model.view == SidebarList::Scheduled {
             // Sections, rows and their buttons all come from `sidebar_sched`:
@@ -558,6 +585,7 @@ impl ListLayout {
             needs_header,
             asks: AsksLayout::default(),
             sched: SchedLayout::default(),
+            agents: AgentsLayout::default(),
         }
     }
 
@@ -608,6 +636,17 @@ impl ListLayout {
                 // the ask card.
                 RowKind::Need { index } => ListHit::Need(index),
                 RowKind::NeedAll => ListHit::NeedAll,
+                // The Agents list's rows carry their own buttons (the
+                // `Open` of a closed roster entry) and their own landing.
+                RowKind::AgentStat(_)
+                | RowKind::AgentHeader { .. }
+                | RowKind::AgentPane { .. }
+                | RowKind::AgentTab { .. }
+                | RowKind::AgentTeam { .. }
+                | RowKind::AgentDedicated { .. }
+                | RowKind::AgentEmpty => {
+                    sidebar_agents::hit(row, x, y, &self.agents.open_buttons).map_or(ListHit::Empty, ListHit::Agent)
+                }
                 RowKind::Header { group } => {
                     if x < row.frame.x + CHEVRON_ZONE_W {
                         ListHit::Chevron(group)
@@ -1119,7 +1158,7 @@ pub(super) fn fill_dot(cx: f64, cy: f64, d: f64, c: [f32; 3], alpha: f64) {
     NSBezierPath::bezierPathWithOvalInRect(Rect::new(cx - d / 2.0, cy - d / 2.0, d, d).cg()).fill();
 }
 
-fn stroke_ring(cx: f64, cy: f64, d: f64, width: f64, c: [f32; 3], alpha: f64) {
+pub(super) fn stroke_ring(cx: f64, cy: f64, d: f64, width: f64, c: [f32; 3], alpha: f64) {
     color(c, alpha).setStroke();
     let path = NSBezierPath::bezierPathWithOvalInRect(Rect::new(cx - d / 2.0, cy - d / 2.0, d, d).inset(width / 2.0).cg());
     path.setLineWidth(width);
@@ -1569,6 +1608,8 @@ impl SidebarView {
                 show_hint: false,
                 sched: Default::default(),
                 sched_meta: Vec::new(),
+                agents: Default::default(),
+                agent_state: Default::default(),
                 meta_right: None,
             },
             layout: ListLayout::default(),
@@ -2106,7 +2147,7 @@ define_class!(
                 let sh = self.ivars().shared.borrow();
                 if sh.layout.asks.shown {
                     sh.layout.asks.button_rects().iter().map(|r| r.cg()).collect()
-                } else if sh.model.view == SidebarList::Scheduled {
+                } else if matches!(sh.model.view, SidebarList::Scheduled | SidebarList::Agents) {
                     sh.layout.rows.iter().map(|r| r.frame.cg()).collect()
                 } else {
                     // The needs card is clickable row by row, like a panel.
@@ -2411,6 +2452,34 @@ impl SidebarListView {
                 }
             }
             ListHit::NeedAll => kova.sidebar_toggle_needs_all(),
+            ListHit::Agent(hit) => match hit {
+                AgentsHit::Filter(section) => kova.sidebar_agents_filter(section),
+                AgentsHit::Pane(pane_id) => {
+                    kova.focus_pane_in_window(pane_id);
+                }
+                AgentsHit::Need(index) => {
+                    let key = self.ivars().shared.borrow().model.agents.panes.get(index).and_then(|p| p.key.clone());
+                    if let Some(key) = key {
+                        kova.sidebar_open_need(&key);
+                    }
+                }
+                AgentsHit::Tab(tab_idx) => kova.sidebar_agents_tab(tab_idx),
+                AgentsHit::Open(reference) => {
+                    let name = {
+                        let sh = self.ivars().shared.borrow();
+                        match reference {
+                            sidebar_agents::RosterRef::Manager(i) => sh.model.agents.team.get(i).map(|r| r.name.clone()),
+                            sidebar_agents::RosterRef::Dedicated(i) => {
+                                sh.model.agents.dedicated.get(i).map(|r| r.name.clone())
+                            }
+                        }
+                    };
+                    if let Some(name) = name {
+                        kova.sidebar_agents_open(&name);
+                    }
+                }
+                AgentsHit::ToggleClosed => kova.sidebar_agents_toggle_closed(),
+            },
             ListHit::NeedAnswer(pane_id) => {
                 // The pane's ask row: the same landing, wherever the click
                 // came from.
@@ -2564,7 +2633,17 @@ impl SidebarListView {
             let lifted = match row.kind {
                 RowKind::Header { group } => lifted_group == Some(group),
                 RowKind::Tile { .. } => lifted_row == Some(ri),
-                RowKind::SchedHeader { .. } | RowKind::Routine { .. } | RowKind::Need { .. } | RowKind::NeedAll => false,
+                RowKind::SchedHeader { .. }
+                | RowKind::Routine { .. }
+                | RowKind::Need { .. }
+                | RowKind::NeedAll
+                | RowKind::AgentStat(_)
+                | RowKind::AgentHeader { .. }
+                | RowKind::AgentPane { .. }
+                | RowKind::AgentTab { .. }
+                | RowKind::AgentTeam { .. }
+                | RowKind::AgentDedicated { .. }
+                | RowKind::AgentEmpty => false,
             };
             // The held tile is drawn later, floating; its skeleton takes
             // its place. The rows of its run step aside.
@@ -2645,6 +2724,25 @@ impl SidebarListView {
             }
             RowKind::NeedAll => {
                 self.draw_need_all(sh, &frame, alpha);
+            }
+            RowKind::AgentStat(_)
+            | RowKind::AgentHeader { .. }
+            | RowKind::AgentPane { .. }
+            | RowKind::AgentTab { .. }
+            | RowKind::AgentTeam { .. }
+            | RowKind::AgentDedicated { .. }
+            | RowKind::AgentEmpty => {
+                sidebar_agents::draw(
+                    sh,
+                    &sh.model.agents,
+                    &sh.model.agent_state,
+                    row,
+                    &frame,
+                    &sh.layout.agents.open_buttons,
+                    sh.hovered,
+                    sh.pressed,
+                    alpha,
+                );
             }
         }
     }
@@ -2973,6 +3071,12 @@ mod tests {
             ListHit::NeedAll,
             ListHit::NeedAnswer(1),
             ListHit::Ask(AsksHit::ToggleSnoozed),
+            ListHit::Agent(AgentsHit::Filter(sidebar_agents::AgentSection::Working)),
+            ListHit::Agent(AgentsHit::Pane(1)),
+            ListHit::Agent(AgentsHit::Need(0)),
+            ListHit::Agent(AgentsHit::Tab(0)),
+            ListHit::Agent(AgentsHit::Open(sidebar_agents::RosterRef::Manager(0))),
+            ListHit::Agent(AgentsHit::ToggleClosed),
         ] {
             assert!(arms_press(hit), "{hit:?} would never reach activate()");
         }
@@ -3055,6 +3159,8 @@ mod tests {
             show_hint: false,
             sched: Default::default(),
             sched_meta: Vec::new(),
+            agents: Default::default(),
+            agent_state: Default::default(),
             meta_right: None,
         }
     }
@@ -3390,14 +3496,17 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_empty_list_says_so_in_the_hint_slot() {
+    fn the_agents_list_lays_its_tiles_and_empty_sections_out() {
         let mut m = model();
         m.view = SidebarList::Agents;
         let l = ListLayout::new(&m, 260.0, &FakeMetrics);
-        assert!(l.rows.is_empty());
+        // The empty list is still a layout: four stat tiles, the filtered
+        // section's `None`, the empty `By tab`. It borrows no hint slot.
+        assert!(!l.rows.is_empty());
+        assert_eq!(l.agents.stats.len(), 4);
         assert!(l.groups.is_empty());
-        assert_eq!(l.hint_y, Some(LIST_TOP));
-        assert_eq!(hint_text(&m), "Agents view coming next");
+        assert_eq!(l.hint_y, None);
+        assert_eq!(hint_text(&m), "No agents in this window");
 
         // Asks draws its own empty state, not the hint line.
         m.view = SidebarList::Asks;
@@ -3421,7 +3530,8 @@ mod tests {
 
     #[test]
     fn styles_match_the_design_system_scale() {
-        // 10 to 15 with the weights Claap's design system pins.
+        // 10 to 15 with the weights Claap's design system pins, plus the
+        // Agents stat tile's 20 pt value.
         assert_eq!(Style::ViewTitle.size(), 15.0);
         assert_eq!(Style::ViewTitle.weight(), Weight::Semibold);
         assert_eq!(Style::Title.size(), 13.0);
@@ -3441,7 +3551,9 @@ mod tests {
         // The filled button's label: the chip at 11, one step heavier.
         assert_eq!(Style::ChipStrong.size(), 11.0);
         assert_eq!(Style::ChipStrong.weight(), Weight::Semibold);
-        assert_eq!(Style::ALL.len(), 14);
+        assert_eq!(Style::StatValue.size(), 20.0);
+        assert_eq!(Style::StatValue.weight(), Weight::Semibold);
+        assert_eq!(Style::ALL.len(), 15);
         let _ = PaneFlags::default();
     }
 

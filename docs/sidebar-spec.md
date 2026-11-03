@@ -513,10 +513,77 @@ view once; the card's border takes `sel.rail` for two seconds
 its own empty state, not the hint line: a check-circle, `No open questions`
 and `Agents ask here when they need you`, both tertiary and centred.
 
-The Agents list still has no rows: it keeps the centred `Agents view coming
-next` line in the hint slot.
+### 3.7.4 Agents list (`SidebarList::Agents`)
 
-### 3.7.4 `Needs you` block (`SidebarList::Panes`)
+`src/window/sidebar_agents.rs` owns this list: the view state, the pure model
+(`build`), the layout, the hit test and the drawing. The panes come from the
+window's own facts; the roster comes from `crate::team` (`team list --json`),
+cached and refreshed on a background thread every 60 s while the list is up,
+never on the tick.
+
+The meta row reads `N sessions in M tabs`.
+
+#### Stat tiles
+
+Four DS cards, a 2 x 2 grid below 360 pt of list width and four in a row from
+360 up (`STAT_WIDE`): `bg1`, 1 pt `b3`, radius 8, 8 pt vertical and 10 pt
+horizontal padding. The value is `Style::StatValue` (20 pt semibold); the
+label is the 11 pt chip in `text.secondary`, after a 6 pt dot: `info` for
+Working, `warn` for Need you (`waits_on_you`), tertiary for Idle, `crit` for
+Error. A tile is a filter, and the selected one takes a `sel.rail` border.
+The default is Working.
+
+#### Sections
+
+The selected filter's section comes first, then the shared sections, in this
+order:
+
+| Section | Holds | Note |
+|---|---|---|
+| `Working now` | `flags.working` or `flags.starting` | `longest first` |
+| `Need you` | a pane with an open ask or permission, oldest first | |
+| `Idle` | idle agents and bare shells, with their age | |
+| `Error` | a turn that died on a provider error | |
+| `By tab` | one row per Kova tab | four-dot legend |
+| `Team` | the roster's managers | hidden without a roster |
+| `Dedicated sessions` | the open ones, then `Closed N` | closed folded |
+
+A section header is 24 pt: the label (11 medium) and its count in tertiary,
+with the note right-aligned. An empty section draws one 22 pt `None` row. A
+pane row is 40 pt, radius 6, `bg.hover` under the mouse: the state dot in a
+16 pt box, the title (13 medium, primary), line 2 `<tab> · <detail>` (12,
+tertiary), and the right meta, an age in `info` for working, the wait's age
+in `warn` for need you, an age in tertiary for idle, `error` in `crit`. A
+pane row focuses its pane; a need row opens the Asks list on its card
+(`sidebar_open_need`).
+
+A `By tab` row is 26 pt: the tab's 3 x 10 colour bar, its name, then four
+22 pt right-aligned count columns (need you, working, error, idle), blank at
+zero. Clicking it switches to Panes on that tab.
+
+#### Team and reopening
+
+A roster entry (`crate::team::Team`) matches a pane by its agent session
+name, or a pane or tab title, case-insensitively. Its row shows the pane's
+state dot when matched, a dimmed ring when closed, the name, the role in
+tertiary (`· not open` when closed), and on the right the pane's meta or a
+22 pt `Open` button.
+
+The closed dedicated sessions fold under a `Closed N` header, folded at
+start (`AgentsState::closed_folded`); every closed row has its own `Open`.
+
+`Open` runs the entry's `reopen` argv only when it is exactly
+`team reopen <valid-name>` for that entry, resolved to
+`~/AI directory/claude-config/team/team`: anything else is refused before a
+`Command`. The run happens on a background thread, then the roster refreshes.
+The button says `Opening…` and ignores clicks until the roster shows the
+entry open or 20 s pass (`OPEN_TIMEOUT_MS`); a failure says `Could not open`
+in `crit` for 10 s (`ERROR_MS`).
+
+`tests/fixtures/team/list.json` holds the made-up roster the parsing and
+matching tests use; no real name is tracked.
+
+### 3.7.5 `Needs you` block (`SidebarList::Panes`)
 
 The first thing in the Panes list, above the groups, scrolls with them, and
 is left out entirely while `model.needs` is empty. A card on the tile ground

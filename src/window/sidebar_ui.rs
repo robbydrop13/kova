@@ -9,6 +9,7 @@ use super::*;
 use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
 use super::needs::{self, AskNeed, NeedInput, NeedItem, NeedKind, PaneNeed, RoutineNeed};
 use super::sidebar_asks::{self, AskCardVm, AsksHit, AsksState, Highlight};
+use super::sidebar_agents;
 use super::sidebar_model::{asks_summary, header_title, next_pill, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
 use super::sidebar_sched::{self, SchedButton, SchedHit, SchedState};
 use crate::config::LayoutMode;
@@ -152,6 +153,10 @@ pub(super) struct SidebarState {
     /// The Scheduled view: folded sections, the delete confirmation, the
     /// actions in flight and the words of the ones that failed.
     pub(super) sched: SchedState,
+    /// The Agents view's selected stat tile, folding and reopens in flight.
+    pub(super) agents: sidebar_agents::AgentsState,
+    /// When each pane entered the state it is in now, the view's own clock.
+    pub(super) agents_clock: sidebar_agents::AgentsClock,
 }
 
 impl SidebarState {
@@ -171,6 +176,8 @@ impl SidebarState {
             last_revealed_ask: None,
             routine_shown: None,
             sched: SchedState::default(),
+            agents: sidebar_agents::AgentsState::default(),
+            agents_clock: sidebar_agents::AgentsClock::default(),
         }
     }
 }
@@ -288,6 +295,21 @@ impl KovaView {
         let mut state = self.ivars().sidebar.borrow_mut();
         for result in &results {
             state.sched.finish(result, now);
+        }
+    }
+
+    /// What the background reopens finished since the last tick: the row
+    /// stops saying `Opening…`, or keeps `Could not open` for a while. Runs
+    /// before every early-out, like the scheduled actions' outcomes.
+    fn sync_team_results(&self) {
+        let results = crate::team::drain_results();
+        if results.is_empty() {
+            return;
+        }
+        let now = sidebar_asks::now_ms();
+        let mut state = self.ivars().sidebar.borrow_mut();
+        for result in &results {
+            state.agents.finish(result, now);
         }
     }
 
@@ -432,6 +454,7 @@ impl KovaView {
     /// focus change. Runs once per tick.
     pub(super) fn sync_sidebar(&self) {
         self.sync_sched_results();
+        self.sync_team_results();
         self.sync_needs();
         self.sync_sidebar_asks_state();
         let Some(view) = self.ivars().sidebar_view.get() else { return };
@@ -477,6 +500,19 @@ impl KovaView {
             st.asks.set_cards(cards);
             model.asks = st.asks.clone();
             model.summary = asks_summary(model.asks.open_count());
+        }
+        if list == SidebarList::Agents {
+            // The roster is read only while this list is up; the clock marks
+            // panes as they change state, so `Working now` can say how long.
+            let roster = crate::team::snapshot();
+            let mut st = self.ivars().sidebar.borrow_mut();
+            st.agents_clock.observe(&facts, now);
+            let agents = sidebar_agents::build(&facts, &needs, &st.agents_clock, now, roster.as_deref());
+            st.agents.prune(sidebar_asks::now_ms(), &agents.open_names());
+            model.agents = agents;
+            model.agent_state = st.agents.clone();
+            model.summary = vec![(sidebar_agents::summary_words(&model.agents), sidebar::SummaryRun::Dot)];
+            model.meta_right = None;
         }
         view.set_model(model);
 
@@ -712,6 +748,40 @@ impl KovaView {
     pub(super) fn sidebar_toggle_needs_all(&self) {
         let mut st = self.ivars().sidebar.borrow_mut();
         st.needs_all = !st.needs_all;
+    }
+
+    /// A stat tile of the Agents list: its section replaces the one under it.
+    pub(super) fn sidebar_agents_filter(&self, section: sidebar_agents::AgentSection) {
+        self.ivars().sidebar.borrow_mut().agents.set_filter(section);
+    }
+
+    /// A `By tab` row: switch to the Panes list on that tab.
+    pub(super) fn sidebar_agents_tab(&self, tab_idx: usize) {
+        self.ivars().sidebar.borrow_mut().list = SidebarList::Panes;
+        self.do_switch_tab(tab_idx);
+    }
+
+    /// The folded `Closed N` of the dedicated sessions.
+    pub(super) fn sidebar_agents_toggle_closed(&self) {
+        self.ivars().sidebar.borrow_mut().agents.toggle_closed();
+    }
+
+    /// The `Open` button of a closed roster entry: validate its argv, say
+    /// `Opening…`, and let `crate::team` run it on a background thread.
+    pub(super) fn sidebar_agents_open(&self, name: &str) {
+        let now = sidebar_asks::now_ms();
+        if self.ivars().sidebar.borrow().agents.busy(name) {
+            return;
+        }
+        let roster = crate::team::snapshot();
+        let Some(entry) = roster.as_deref().and_then(|r| r.entry(name)) else { return };
+        let argv = entry.reopen.clone();
+        if let Err(why) = crate::team::reopen(name, &argv) {
+            log::warn!("agents: {why}");
+            self.ivars().sidebar.borrow_mut().agents.failed(name, now);
+            return;
+        }
+        self.ivars().sidebar.borrow_mut().agents.start(name, now);
     }
 
     /// A row of the `Needs you` block, by its stable key: an error focuses
