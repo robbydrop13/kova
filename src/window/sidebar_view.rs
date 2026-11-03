@@ -1090,6 +1090,10 @@ fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, prompt_lines: usize, h
     y += 16.0;
 
     let (last_fg, last) = match (r.failed, r.last_run.is_empty()) {
+        // A run still going says so instead of a date that does not exist yet.
+        _ if r.last_status == crate::routines::LastStatus::Running => {
+            (tokens::TEXT_SECONDARY, "running now".to_string())
+        }
         (_, true) => (tokens::TEXT_TERTIARY, "never run".to_string()),
         (Some(code), false) => (tokens::ERROR, format!("{} \u{b7} exit {code}", r.last_run)),
         (None, false) => (tokens::TEXT_TERTIARY, r.last_run.clone()),
@@ -1115,7 +1119,7 @@ fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, prompt_lines: usize, h
             *y += ROUTINE_LINE_H;
         }
     };
-    section(sh, &mut y, "WHERE", std::slice::from_ref(&r.workdir), tokens::TEXT_SECONDARY);
+    section(sh, &mut y, "WHERE", std::slice::from_ref(&r.cwd), tokens::TEXT_SECONDARY);
     section(sh, &mut y, "TOOLS", &r.tools, tokens::TEXT_SECONDARY);
     section(sh, &mut y, "WRITES TO", &r.dirs, tokens::TEXT_SECONDARY);
 
@@ -2417,8 +2421,8 @@ mod tests {
         m.view = SidebarList::Scheduled;
         m.routines_loaded = true;
         m.routines = vec![
-            RoutineVm { name: "tri-inbox".into(), ..RoutineVm::default() },
-            RoutineVm { name: "etat-des-lieux".into(), ..RoutineVm::default() },
+            RoutineVm { name: "alpha-digest".into(), ..RoutineVm::default() },
+            RoutineVm { name: "beta-weekly".into(), ..RoutineVm::default() },
         ];
         let l = ListLayout::new(&m, 260.0, &FakeMetrics);
         assert_eq!(l.rows.len(), 2);
@@ -2436,7 +2440,7 @@ mod tests {
         // The open row grows by its body and pushes the next one down; the
         // others keep their closed height.
         m.routines[0].expanded = true;
-        m.routines[0].workdir = "/Users/me/Perso".into();
+        m.routines[0].cwd = "/Users/me/Perso".into();
         m.routines[0].tools = vec!["mcp__gmail__search".into(), "mcp__drive__read".into()];
         m.routines[0].prompt = "a prompt of some length".into();
         let open = ListLayout::new(&m, 260.0, &FakeMetrics);
@@ -2448,7 +2452,7 @@ mod tests {
         // Its whole height is the hit region, body included.
         let br = &open.rows[0].frame;
         assert_eq!(open.hit(br.x + 5.0, br.bottom() - 2.0), ListHit::Routine(0));
-        m.routines[0] = RoutineVm { name: "tri-inbox".into(), ..RoutineVm::default() };
+        m.routines[0] = RoutineVm { name: "alpha-digest".into(), ..RoutineVm::default() };
 
         // With no routines at all, the empty line takes the hint's slot.
         m.routines.clear();

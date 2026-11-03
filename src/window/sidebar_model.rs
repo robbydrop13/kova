@@ -43,7 +43,8 @@ impl SidebarList {
 
 
 /// One routine as the sidebar shows it: its name, when it runs (or what stops
-/// it from running), and how the last run ended.
+/// it from running), how the last run ended, and the words the grouped
+/// redesign will draw.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RoutineVm {
     pub name: String,
@@ -53,27 +54,53 @@ pub struct RoutineVm {
     pub broken: bool,
     /// Neutralised by its `.done` marker: it stays listed, dimmed.
     pub done: bool,
-    /// `2026-09-26 10:04:34`, empty when it has never run.
+    /// `2026-09-26 10:04`, empty when it has never run.
     pub last_run: String,
     /// The last run failed: its exit code.
     pub failed: Option<i32>,
     /// Clicked open: the row also shows where it runs, the extra tools and
     /// directories it is granted, and the prompt it is handed.
     pub expanded: bool,
-    pub workdir: String,
+    pub cwd: String,
     pub tools: Vec<String>,
     pub dirs: Vec<String>,
     pub prompt: String,
+    /// Where it belongs in the Scheduled list, from `routines::group`.
+    pub group: crate::routines::Group,
+    /// The schedule as routinectl phrases it ("once, 6 Nov 09:47").
+    pub schedule_words: String,
+    /// When it next runs: `19:05`, `Wed 09:03`, `9 Nov`.
+    pub next_words: String,
+    /// How long until then: `in 20 min`.
+    pub in_words: String,
+    /// How the last run ended, running included.
+    pub last_status: crate::routines::LastStatus,
+    /// How long ago it ended: `10 min ago`.
+    pub ago_words: String,
 }
 
 impl RoutineVm {
+    /// The row at the current clock. The clock is only read once per row, so
+    /// a list built on one tick phrases every routine against the same now.
     pub fn of(r: &crate::routines::Routine, expanded: bool) -> Self {
+        Self::at(r, expanded, crate::routines::When::now())
+    }
+
+    pub fn at(r: &crate::routines::Routine, expanded: bool, now: crate::routines::When) -> Self {
+        use crate::routines::{ago_words, group, in_words, next_words, LastStatus};
         let problem = r.problem();
+        let last_status = match &r.last {
+            _ if r.running => LastStatus::Running,
+            Some(l) if l.code != 0 => LastStatus::Failed(l.code),
+            Some(_) => LastStatus::Ok,
+            None => LastStatus::Never,
+        };
+        let last_at = r.last.as_ref().and_then(|l| l.at());
         RoutineVm {
             expanded,
             // The body is only read when it is open, so an unexpanded list
             // stays as cheap to compare as it was.
-            workdir: if expanded { r.workdir.clone() } else { String::new() },
+            cwd: if expanded { r.cwd.clone() } else { String::new() },
             tools: if expanded { r.tools.clone() } else { Vec::new() },
             dirs: if expanded { r.dirs.clone() } else { Vec::new() },
             prompt: if expanded { r.prompt.clone() } else { String::new() },
@@ -81,8 +108,14 @@ impl RoutineVm {
             detail: problem.map(String::from).unwrap_or_else(|| r.schedule.clone()),
             broken: problem.is_some(),
             done: r.done,
-            last_run: r.last_run.as_ref().map(|(w, _)| w.clone()).unwrap_or_default(),
-            failed: r.last_run.as_ref().map(|&(_, c)| c).filter(|&c| c != 0),
+            last_run: last_at.map(|w| w.words()).unwrap_or_default(),
+            failed: r.last.as_ref().map(|l| l.code).filter(|&c| c != 0),
+            group: group(r, now),
+            schedule_words: if r.schedule_words.is_empty() { r.schedule.clone() } else { r.schedule_words.clone() },
+            next_words: r.next_run.map(|n| next_words(n, now)).unwrap_or_default(),
+            in_words: r.next_run.map(|n| in_words(n, now)).unwrap_or_default(),
+            last_status,
+            ago_words: last_at.map(|w| ago_words(w, now)).unwrap_or_default(),
         }
     }
 }
@@ -433,42 +466,74 @@ mod tests {
 
     #[test]
     fn a_routine_shows_its_schedule_until_something_stops_it_from_running() {
+        use crate::routines::{LastRun, LastStatus, When};
+        let now = When::parse("2026-09-26T10:20").expect("a clock");
         let ok = crate::routines::Routine {
-            name: "tri-inbox".into(),
-            schedule: "every day 10:02".into(),
+            name: "alpha-digest".into(),
+            schedule: "daily 10:02".into(),
+            schedule_words: "daily 10:02".into(),
             loaded: true,
-            last_run: Some(("2026-09-26 10:04:34".into(), 0)),
+            next_run: Some(When::parse("2026-10-03T10:20").expect("a date")),
+            last: Some(LastRun {
+                start: None,
+                end: Some(When::parse("2026-09-26T10:04:34").expect("a date")),
+                code: 0,
+            }),
             ..Default::default()
         };
-        let vm = RoutineVm::of(&ok, false);
-        assert_eq!(vm.detail, "every day 10:02");
+        let vm = RoutineVm::at(&ok, false, now);
+        assert_eq!(vm.detail, "daily 10:02");
         assert!(!vm.broken);
-        assert_eq!(vm.last_run, "2026-09-26 10:04:34");
+        assert_eq!(vm.schedule_words, "daily 10:02");
+        assert_eq!(vm.last_run, "2026-09-26 10:04");
+        assert_eq!(vm.last_status, LastStatus::Ok);
+        assert_eq!(vm.ago_words, "16 min ago");
         assert_eq!(vm.failed, None);
+        assert_eq!(vm.group, crate::routines::Group::ThisWeek);
+        assert_eq!(vm.next_words, "Sat 10:20");
+        assert_eq!(vm.in_words, "in 7 d");
 
         // A plist launchd never loaded: the schedule is a lie, say so instead.
         let never = crate::routines::Routine { loaded: false, ..ok.clone() };
-        let vm = RoutineVm::of(&never, false);
+        let vm = RoutineVm::at(&never, false, now);
         assert_eq!(vm.detail, "not loaded");
         assert!(vm.broken);
 
         // A non-zero exit is worth surfacing next to the date.
-        let failed = crate::routines::Routine { last_run: Some(("2026-09-26 10:05:12".into(), 2)), ..ok.clone() };
-        assert_eq!(RoutineVm::of(&failed, false).failed, Some(2));
+        let failed = crate::routines::Routine {
+            last: Some(LastRun { start: None, end: Some(now), code: 2 }),
+            ..ok.clone()
+        };
+        let vm = RoutineVm::at(&failed, false, now);
+        assert_eq!(vm.failed, Some(2));
+        assert_eq!(vm.last_status, LastStatus::Failed(2));
+        assert_eq!(vm.group, crate::routines::Group::NeedsAttention);
+
+        // A run still going has no end: it is running, not failed, and the
+        // row counts from its start.
+        let running = crate::routines::Routine {
+            running: true,
+            last: Some(LastRun { start: Some(When::parse("2026-09-26T10:15").expect("a date")), end: None, code: 0 }),
+            ..ok.clone()
+        };
+        let vm = RoutineVm::at(&running, false, now);
+        assert_eq!(vm.last_status, LastStatus::Running);
+        assert_eq!(vm.last_run, "2026-09-26 10:15");
+        assert_eq!(vm.ago_words, "5 min ago");
 
         // Closed, the body is not even carried: the model stays small and
         // cheap to compare on every tick.
         let fat = crate::routines::Routine {
             prompt: "a long prompt".into(),
             tools: vec!["mcp__gmail__search".into()],
-            workdir: "/Users/x/Perso".into(),
+            cwd: "/Users/x/Perso".into(),
             ..ok.clone()
         };
-        assert_eq!(RoutineVm::of(&fat, false).prompt, "");
-        assert!(RoutineVm::of(&fat, false).tools.is_empty());
-        let open = RoutineVm::of(&fat, true);
+        assert_eq!(RoutineVm::at(&fat, false, now).prompt, "");
+        assert!(RoutineVm::at(&fat, false, now).tools.is_empty());
+        let open = RoutineVm::at(&fat, true, now);
         assert_eq!(open.prompt, "a long prompt");
-        assert_eq!(open.workdir, "/Users/x/Perso");
+        assert_eq!(open.cwd, "/Users/x/Perso");
     }
 
     #[test]

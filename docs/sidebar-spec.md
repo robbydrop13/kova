@@ -331,9 +331,18 @@ schedule, and reports no problem: off on purpose is not broken, and a
 routine switched off and forgotten is exactly what this view is for. An
 empty list borrows the hint slot: `reading routines…` until the first
 background read lands, `no routines scheduled` after it. The rows come from
-`routines::snapshot`, which serves a cache and refreshes on a thread at
-most every 30 s, and only while this view is up — the panes list never
-shells out to `launchctl`.
+`routines::snapshot` (a cache, refreshed on a thread at most every 30 s, and
+only while this view is up; the panes list never shells out): it parses
+`~/.claude/routines/routinectl list --json`, drops routines marked
+`done`, and keeps the plist plus `launchctl` reader as `read_from_disk`, the
+fallback when routinectl is missing or prints something else than JSON,
+logged once.
+
+The model also carries the group (`NeedsAttention`, `Today`, `ThisWeek`,
+`Later`, `Off`) and the words `schedule_words`, `next_words`, `in_words`
+and `ago_words` for the grouped redesign. Grouping and phrasing are pure
+functions with the clock passed in, tested against
+`tests/fixtures/routines/list.json`.
 
 ### 3.7.3 Asks and Agents, still empty
 
