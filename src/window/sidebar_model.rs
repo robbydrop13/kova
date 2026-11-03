@@ -262,8 +262,10 @@ pub struct TileVm {
     /// The session name, else the pane's own title, else the agent, else
     /// `Shell` (`tile_title`); already the edit buffer while renaming.
     pub title: String,
-    /// `project · claude`, the agent left out when it is the title.
-    pub secondary: String,
+    /// What the row used to say under the name, now its tooltip:
+    /// `project · agent` (the agent left out when it is the title), or an
+    /// errored pane's `kind · text`.
+    pub tooltip: String,
     /// The live or restored agent, for the chip.
     pub agent: Option<String>,
     pub bookmarked: bool,
@@ -428,7 +430,7 @@ impl TileVm {
             f.process.as_deref(),
             &f.cwd,
         );
-        let secondary = match (state, f.preview.as_ref()) {
+        let tooltip = match (state, f.preview.as_ref()) {
             (TileState::Error, Some(PromptPreview::ApiError { kind, text, .. })) => error_subtitle(kind, text),
             _ => subtitle(&project_name(&f.cwd), f.agent.as_deref(), &title),
         };
@@ -441,7 +443,7 @@ impl TileVm {
             bare_shell: f.bare_shell && !f.resumable,
             resumable: f.bare_shell && f.resumable,
             title: f.edit.clone().unwrap_or(title),
-            secondary,
+            tooltip,
             agent: f.agent.clone(),
             bookmarked: f.bookmarked,
             focused: f.focused,
@@ -683,7 +685,7 @@ mod tests {
         let t = TileVm::from_facts(&f);
         assert_eq!(t.state, TileState::Awaiting);
         assert_eq!(t.title, "pane 1");
-        assert_eq!(t.secondary, "link");
+        assert_eq!(t.tooltip, "link");
         assert_eq!(t.question.as_deref(), Some("Run it?"));
         // No detail: the header stands in.
         assert_eq!(t.detail.as_deref(), Some("Bash command"));
@@ -725,14 +727,14 @@ mod tests {
         let t = TileVm::from_facts(&f);
         assert_eq!(t.state, TileState::Error);
         assert_eq!(t.title, "pane 6");
-        assert_eq!(t.secondary, "Limit reached · You've hit your session limit");
+        assert_eq!(t.tooltip, "Limit reached · You've hit your session limit");
         assert_eq!(t.meta(), None);
         // A turn in flight hides it, subtitle and all.
         let mut busy = f.clone();
         busy.flags.working = true;
         let t = TileVm::from_facts(&busy);
         assert_eq!(t.state, TileState::Working);
-        assert_eq!(t.secondary, "link");
+        assert_eq!(t.tooltip, "link");
     }
 
     #[test]
@@ -800,7 +802,7 @@ mod tests {
         assert!(!t.bare_shell);
         assert_eq!(t.meta(), None);
         assert_eq!(t.title, "claude");
-        assert_eq!(t.secondary, "Acme");
+        assert_eq!(t.tooltip, "Acme");
 
         // A plain shell: `shell` chip and `Start Claude`.
         let bare = PaneFacts { pane_id: 2, bare_shell: true, cwd: "/Users/me/link".into(), ..PaneFacts::default() };
@@ -809,7 +811,7 @@ mod tests {
         assert!(!t.resumable);
         assert_eq!(t.meta(), None);
         assert_eq!(t.title, "Shell");
-        assert_eq!(t.secondary, "link");
+        assert_eq!(t.tooltip, "link");
 
         // A live idle session keeps its state chip.
         let live = PaneFacts {
@@ -823,7 +825,7 @@ mod tests {
         let t = TileVm::from_facts(&live);
         assert_eq!(t.meta(), None);
         assert_eq!(t.title, "Sidebar identity");
-        assert_eq!(t.secondary, "kova");
+        assert_eq!(t.tooltip, "kova");
         assert!(!t.bare_shell && !t.resumable);
 
         // Renaming: the edit buffer is the title.

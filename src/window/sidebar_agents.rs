@@ -61,11 +61,11 @@ const DOT: f64 = 8.0;
 const DOT_BOX: f64 = 16.0;
 pub const EMPTY_H: f64 = 22.0;
 
-/// A `By tab` row: the tab's 3 x 10 colour bar, its name, and four 22 pt
-/// count columns against the right edge.
+/// A `By tab` row: the tab's colour dot, its name, and four 22 pt count
+/// columns against the right edge.
 pub const TAB_ROW_H: f64 = 26.0;
-const TAB_BAR_W: f64 = 3.0;
-const TAB_BAR_H: f64 = 10.0;
+/// The tab's colour dot, the marker the group headers carry too.
+const TAB_DOT_D: f64 = 8.0;
 const TAB_TEXT_X: f64 = 18.0;
 const TAB_COL_W: f64 = 22.0;
 const TAB_END_PAD: f64 = 6.0;
@@ -389,17 +389,17 @@ pub fn build(tabs: &[TabFacts], items: &[NeedItem], clock: &AgentsClock, now: u6
             let (title, detail, meta, since, key) = match (section, need) {
                 (AgentSection::Need, Some(item)) => {
                     let title = if item.title.trim().is_empty() { tile.title.clone() } else { item.title.clone() };
-                    let detail = if item.detail.trim().is_empty() { tile.secondary.clone() } else { item.detail.clone() };
+                    let detail = if item.detail.trim().is_empty() { tile.tooltip.clone() } else { item.detail.clone() };
                     (title, detail, format_age(now.saturating_sub(item.since)), Some(item.since), Some(item.key.clone()))
                 }
-                (AgentSection::Error, _) => (tile.title.clone(), tile.secondary.clone(), "error".to_string(), None, None),
+                (AgentSection::Error, _) => (tile.title.clone(), tile.tooltip.clone(), "error".to_string(), None, None),
                 (AgentSection::Working, _) => {
                     let meta = age_secs.map(format_age).unwrap_or_else(|| section.label().to_lowercase());
-                    (tile.title.clone(), tile.secondary.clone(), meta, None, None)
+                    (tile.title.clone(), tile.tooltip.clone(), meta, None, None)
                 }
                 _ => {
                     let meta = age_secs.map(format_age).unwrap_or_default();
-                    (tile.title.clone(), tile.secondary.clone(), meta, None, None)
+                    (tile.title.clone(), tile.tooltip.clone(), meta, None, None)
                 }
             };
             if let Some(t) = tabs_vm.get_mut(ti) {
@@ -1061,8 +1061,8 @@ fn draw_tab(sh: &Shared, tab: &AgentTab, frame: &Rect, hovered: bool, pressed: b
         fill_round(frame, ROW_RADIUS, tokens::get().tile_hover, alpha);
     }
     let cy = frame.y + frame.h / 2.0;
-    let bar = Rect::new(frame.x + ROW_PAD_X, cy - TAB_BAR_H / 2.0, TAB_BAR_W, TAB_BAR_H);
-    fill_round(&bar, TAB_BAR_W / 2.0, tab_tint(tab.color), alpha);
+    // The tab's colour, a filled dot: the marker the group headers use.
+    fill_dot(frame.x + ROW_PAD_X + TAB_DOT_D / 2.0, cy, TAB_DOT_D, tab_tint(tab.color), alpha);
     let mut right = frame.right() - TAB_END_PAD;
     for section in TAB_COLUMNS.iter().rev() {
         let n = tab.count(*section);

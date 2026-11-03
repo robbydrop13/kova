@@ -126,36 +126,40 @@ visible), the question wrapped to two lines with an ellipsis on the last
 
 ### 3.4 Group (one block per tab)
 
-Content inset 12 on each side; groups 4 apart (`GROUP_GAP`). A group draws
+Content inset 12 on each side; groups 8 apart (`GROUP_GAP`). A group draws
 nothing of its own: the selected one is a `bg1` card, radius 8, with a 1 pt
-`border.subtle` stroke, and it pads 2 pt above its header and under its last
+`border.subtle` stroke, and it pads 4 pt above its header and under its last
 tile (`GROUP_PAD_V`). The whole block is one click target: a click inside it
-but outside a row (that 2 pt padding, the gaps, the 14 pt side insets, the
+but outside a row (that 4 pt padding, the gaps, the 8 pt side insets, the
 empty bottom) is `ListHit::Panel` and selects the tab, and the hand cursor
 covers every block (cursor rects on the list view, refreshed on relayout).
-The header runs edge to edge at the top of the block; the tiles are 2 pt
-apart (`ROW_GAP`), 14 pt in from the group's edges, under the chevron. No
+Every row of a group is inset by the same `ROW_INSET` (8 pt) from the card's
+edges, the header included, so their grounds line up; the tiles are 4 pt
+apart (`ROW_GAP`). No
 tint bar in the panel: the tab's colour is the bar in the header, drawn from
 `TAB_COLORS[c]` (twelve colours: red, orange, yellow, green, blue, violet,
 pink, coral, lime, teal, cyan, indigo) or `tabNone` grey.
 
 Header 28 tall, its hover ground a rounded row (radius 6), no ground of its
 own otherwise (the card shows through): the `chevron-down` / `chevron-right`
-icon (12 pt, in a 24 pt zone from the group's left edge), the tab's colour as
-a vertical bar 3 wide x 10 tall (radius 1.5), the title (`Style::Title`, 13
+icon (12 pt, in a 16 pt zone from the row's left edge), the tab's colour as
+a filled dot 8 pt across (`DOT_D`, `ListLayout::dot_rect`) in the tab's
+colour 0..11, the title (`Style::Title`, 13
 medium, primary), then at the right the pane count (`Style::Number`, 11,
 tertiary) and, when folded, the 6 pt amber / blue dots of the panes that wait
 or work, left of the count. Row hover: white 5 %; pressed 10 %. The `+` (24
-pt, radius 8) takes the count's place while the mouse is anywhere on the
-header row (bar and `+` included); it has no ground of its own, and white
-14 % (radius 8) appears under it only while the mouse is on the `+` itself
-(20 % pressed). The colour bar is a button (section 4.3, colour picker): its
-16 pt box (`ListLayout::dot_button`, the bar itself in
-`ListLayout::tint_bar`, both centred 30 pt into the row by
+pt, radius 8, 8 pt in from the row's right edge) takes the count's place
+while the mouse is anywhere on the header row (dot and `+` included): the
+count is not drawn then, so the two never share the column, whose right edge
+is the tiles' one. The `+` has no ground of its own, and white 14 % (radius
+8) appears under it only while the mouse is on the `+` itself (20 %
+pressed). The colour dot is a button (section 4.3, colour picker): its
+16 pt box (`ListLayout::dot_button`, the dot itself in
+`ListLayout::dot_rect`, both centred 22 pt into the row by
 `ListLayout::dot_centre`) is its hit (`ListHit::HeaderDot`), between the
-chevron zone and the title, and a 1 pt white ring at 20 % (35 % pressed)
-appears around it under the mouse. `ListLayout::header_chevron` is the
-chevron's 12 pt box.
+chevron zone and the title, and a 1 pt white ring 12 pt across at 20 %
+(35 % pressed) appears around it under the mouse. `ListLayout::header_chevron`
+is the chevron's 12 pt box.
 
 #### 3.4.1 Selected tab
 
@@ -165,43 +169,48 @@ The selected tab's card differs by its fill and border, and by its text:
   (secondary / tertiary elsewhere). The `+` is white when shown (primary
   elsewhere).
 - Tiles: no ground of their own, they sit on the card; under the mouse a
-  `bg.hover` ground (`tokens::get().tile_hover`), radius 6, and `btn2.hover`
-  pressed. The focused pane is a `SEL_BG` ground (`tokens::get().sel_bg`,
-  radius 6) with its title, subtitle and meta column in `SEL_TEXT`
-  (`tokens::get().sel_text`); its idle / shell ring follows the same ink.
+  `bg.hover` ground (`tokens::get().tile_hover`, `gray.1400` `#3A3A3A`),
+  radius 6, and `btn2.hover` pressed. The focused pane is a **neutral**
+  `gray.1500` ground (`#2F2F2F`, `tokens::get().sel_row_bg`), never a filled
+  blue row, with a 2 x 16 pt `blue.400` rail (`#7498FF`,
+  `tokens::get().sel_row_rail`) 4 pt in from its left edge as the selection
+  marker; its title, subtitle and meta column are `gray.25` (`#FAFAFA`,
+  `tokens::get().sel_row_text`) and its idle / shell ring follows the same
+  ink. The state dot keeps its own colour, and the unread dot stays the
+  accent blue. In the light set the ground is `gray.100` (`#E9E9E9`), the ink
+  `gray.1600` (`#242424`) and the rail `blue.500` (`#4C74FF`).
 
-### 3.5 Tile, radius 6, no fill, padding 5 v / 6 h
+### 3.5 Tile, radius 6, no fill, padding 4 v / 8 h
 
-A 44 pt row (5 + an 18 pt title line + a 16 pt subtitle line + 5, floored at
-`TILE_MIN_H` 40), inset 14 pt from the group's edges:
+One line: a 26 pt row (`TILE_HEIGHT`: 4 + the 18 pt name line + 4, the same
+for every pane whatever it holds), inset `ROW_INSET` 8 pt from the group's
+edges like the header:
 
-- Left: a 16 x 18 box at 6 pt from the tile's edge (`TILE_PAD_H`) holding the
+- Left: a 16 pt box at 8 pt from the tile's edge (`TILE_PAD_H`) holding the
   8 pt state dot in the state colour; idle and shell draw a 1.5 pt
   `text.tertiary` ring instead of a fill.
-- From 26 pt into the tile (`TEXT_X`; 40 pt into the group, aligned with the
-  header's title): the title (`Style::Title`, 13 medium, one line,
-  tail-truncated, `⊟ ` prefix when minimized) over the subtitle
-  (`Style::Secondary`, 12, one line, tail-truncated). A `★` in amber comes
-  first when bookmarked; a bare shell shows `Start Claude` and a restored
-  session `Resume`, each after a filled 11 pt `play` (accent link;
-  `text.primary`, the same weight, once the tile is focused or under the
-  mouse: accent on the selected blue is blue on blue) right-aligned at the
-  end of the subtitle line, never on a waiting tile: the wait takes that
-  line.
-- A pane with an open ask or permission prompt (`TileVm::waiting`, filled by
-  `SidebarModel::apply_needs`) says `waiting 4m · Answer` at the start of the
-  subtitle instead: the age in `warn.text`, `Answer` an accent link hit
-  target (`ListHit::NeedAnswer`) that lands where that pane's ask row does,
-  `text.primary` on the focused tile like the other links.
-- Right, 6 pt in: the meta column (`Style::Number`, 11, right-aligned):
-  `working` (or `starting`) while it works; empty for an awaiting pane, whose
-  subtitle carries the wait; a 6 pt accent dot comes before it on an unread
-  tile.
+- From 32 pt into the tile (`TEXT_X`; 40 pt into the group, aligned with the
+  header's title): the session name (`Style::Title`, 13 medium, one line,
+  tail-truncated, `⊟ ` prefix when minimized, a `★` in amber first when
+  bookmarked). The folder and the agent are no longer printed under it: the
+  name line's tooltip carries what the subtitle said (`TileVm::tooltip`), so
+  `install_tooltips` puts a zone over it.
+- Right, 8 pt in (`TILE_PAD_H`, the same edge as the header's count and `+`):
+  the right column (`tile_column`), one of three, the first that applies:
+  the wait (`waiting 4m` in `warn.text`, then `· Answer`, an accent link hit
+  target `ListHit::NeedAnswer`), the call to action (`Start Claude` on a bare
+  shell, `Resume` on a restored session, each after a filled 11 pt `play`,
+  accent link, `text.primary` on the focused tile), or the state word
+  (`Style::Number`, 11: `working` / `starting`). A 6 pt accent dot comes
+  before it on an unread tile.
+- The hover buttons (`close`, `minimize`, `mark unread`, `stop`) sit
+  `COLUMN_GAP` (8 pt) left of the column, never over it: a call to action or
+  an `Answer` link stays clickable while the mouse is on the row.
 
-The awaiting pane is no longer a tall card: same tile, amber dot and the
-`waiting 4m · Answer` subtitle. Its question is not drawn in the row (the
-`Needs you` block takes it), and neither is the turn-end summary: title and
-subtitle, one line each.
+The awaiting pane is no longer a tall card: same 26 pt row, amber dot and
+the `waiting 4m · Answer` column. Its question is not drawn in the row (the
+`Needs you` block takes it), and neither is the turn-end summary.
+
 
 Under the mouse the meta column gives way to the hover actions, right to
 left: `x` close (error red on hover), `minimize-2` / `maximize-2` minimize /
@@ -369,16 +378,19 @@ Clicking the row opens its body (one at a time, `open_routine`), indented 24:
 | `Where` | the working directory, its home written `~` |
 | `Prompt` | `prompts/<name>.md` |
 
-Then a row of real small buttons, the same actions with their labels: 24 pt
-high, radius 6, `bg.hover` ground (`bg.pressed` under the mouse and the
-press), an 11 medium `text.primary` label led by its 12 pt glyph with a 6 pt
-gap, 6 pt of padding either side, 6 pt between buttons. `Delete` is the
-exception: no ground, crit glyph and label, so the button that only opens the
-confirmation does not wear the colour of the one that deletes. The buttons
-wrap onto as many lines as the width needs. `body_height` is shared by the
-layout and the draw so the two cannot disagree; the body is carried in the
-model only while the row is open (`cwd` is emptied otherwise), so a closed
-list stays as cheap to compare on the tick as it was.
+Then the same actions as icon buttons, on the hover row's metrics: 22 pt,
+radius 6, a 14 pt glyph (`Run now` play, `Open log` file-text, `Pause`
+pause, `Edit prompt` edit, `Delete` trash), `bg.hover` ground at rest, white
+16 % under the mouse and the press, 2 pt between buttons, wrapped onto as
+many lines as the width needs. The words ride on the tooltip
+(`SchedButton::tip`, answered by `stringForToolTip`) instead of being
+printed: `Run now`, `Open log`, `Pause`, `Resume`, `Edit prompt`, `Delete
+routine`. `Delete` is the exception: no ground and crit glyph, so the button
+that only opens the confirmation does not wear the colour of the one that
+deletes. `body_height` is shared by the layout and the draw so the two
+cannot disagree; the body is carried in the model only while the row is open
+(`cwd` is emptied otherwise), so a closed list stays as cheap to compare on
+the tick as it was.
 
 #### 3.7.2.1 Deleting
 
@@ -687,7 +699,7 @@ hit target (`ListHit::NeedAnswer`) lands where that pane's ask row would.
 | Target                     | Click                                                  | Double click       | Right click  |
 |----------------------------|--------------------------------------------------------|--------------------|--------------|
 | Panel padding, gaps, bottom| `do_switch_tab(idx)`                                   |                    | header menu  |
-| Header chevron zone (24 pt)| toggle collapse, no tab switch                         | same               | header menu  |
+| Header chevron zone (16 pt)| toggle collapse, no tab switch                         | same               | header menu  |
 | Header colour dot (16 pt)  | colour picker (4.3), no tab switch                     |                    | header menu  |
 | Header body                | `do_switch_tab(idx)`; on the active tab: toggle collapse | `start_rename_tab` | header menu |
 | Header `+`                 | add a pane (4.4)                                       |                    | header menu  |
@@ -898,9 +910,12 @@ tile              bg1
 tile.hover        hover
 tile.pressed      btn2.hover
 bg2               bg2
-sel.bg            selBg
-sel.text          selText
-sel.rail          selRail
+sel.row.bg        gray.1500 #2F2F2F dark / gray.100 #E9E9E9 light (spelled
+                  out in `sidebar.rs`: a selected row's ground)
+sel.row.text      gray.25 #FAFAFA dark / gray.1600 #242424 light
+sel.row.rail      blue.400 #7498FF dark / blue.500 #4C74FF light
+sel.bg            sel.bg (the icon switcher's selected box, never a row)
+sel.rail          blue.400 dark / blue.500 light (stat cards, ask highlight)
 border.subtle     b3   (= separator, hairlines)
 border.strong     b2
 accent            accent   (= unread, focus ring, links)

@@ -76,28 +76,33 @@ const PILL_BADGE_H: f64 = 16.0;
 pub(super) const PAD_H: f64 = 12.0;
 pub(super) const LIST_TOP: f64 = 6.0;
 pub(super) const LIST_BOTTOM: f64 = 12.0;
-const GROUP_GAP: f64 = 4.0;
-/// The selected group's card padding, above the header and under the last
-/// tile.
-const GROUP_PAD_V: f64 = 2.0;
+const GROUP_GAP: f64 = 8.0;
+/// A group's card padding, above the header and under the last tile.
+const GROUP_PAD_V: f64 = 4.0;
 /// The gap between two rows of a group: header to first tile, tile to tile.
-const ROW_GAP: f64 = 2.0;
+const ROW_GAP: f64 = 4.0;
 const HEADER_H: f64 = 28.0;
+/// Every row of a group, header included, is inset this far from the card's
+/// edges: their grounds line up, hovered or selected.
+const ROW_INSET: f64 = 8.0;
 /// The header's hover ground: a rounded row, not a full pill.
 const HEADER_RADIUS: f64 = 6.0;
 /// The active group's card radius.
 const PANEL_RADIUS: f64 = 8.0;
-/// The chevron at the left of a header, then the tab colour's bar and its
-/// click box (the old dot's).
-const CHEVRON_ZONE_W: f64 = 24.0;
+/// The chevron at the left of a header, then the tab's colour dot (filled,
+/// the tab's colour 0..11) and its click box. The zone holds the 12 pt
+/// chevron, 2 pt in.
+const CHEVRON_ZONE_W: f64 = 16.0;
 const CHEVRON_D: f64 = 12.0;
 const DOT_BOX_D: f64 = 16.0;
-const TINT_BAR_W: f64 = 3.0;
-const TINT_BAR_H: f64 = 10.0;
-const TINT_BAR_RADIUS: f64 = 1.5;
-/// The header's `+` button and its hover ground.
+/// The colour dot, and the ring the mouse draws around it.
+const DOT_D: f64 = 8.0;
+const DOT_RING_D: f64 = 12.0;
+/// The header's `+` button, its hover ground, and the padding that keeps it
+/// flush with the tiles' content column.
 const ADD_D: f64 = 24.0;
 const ADD_RADIUS: f64 = 8.0;
+const ADD_INSET: f64 = 8.0;
 /// Feather icons: the box of a button icon, of a link icon, of the pill's.
 const ICON_D: f64 = 16.0;
 const LINK_ICON_D: f64 = 11.0;
@@ -129,21 +134,29 @@ const SORT_ICON_GAP: f64 = 4.0;
 const SORT_PAD: f64 = 4.0;
 /// The sort button's padding inside the list content inset.
 const META_PAD: f64 = 6.0;
-/// A pane tile's vertical padding: 5 above the title, 5 under the subtitle.
-const TILE_PAD_V: f64 = 5.0;
-/// A pane tile: the hover ground's radius, its horizontal padding, the inset
-/// that puts it under the header's chevron, and its height floor.
+/// A pane tile's vertical padding: 4 above the title, 4 under the subtitle.
+const TILE_PAD_V: f64 = 4.0;
+/// A pane tile: the row ground's radius and its horizontal padding. The
+/// header and the tiles share `ROW_INSET`; this one is the padding inside a
+/// tile, from its ground to the dot's box and to the closing column.
 const TILE_RADIUS: f64 = 6.0;
-const TILE_PAD_H: f64 = 6.0;
-const TILE_INSET: f64 = 14.0;
-const TILE_MIN_H: f64 = 40.0;
-/// Line boxes inside a tile: the title's and the subtitle's, one line each.
+const TILE_PAD_H: f64 = 8.0;
+/// The one line of a tile: the session name.
 const LINE_TITLE_H: f64 = 18.0;
-const LINE_SEC_H: f64 = 16.0;
-/// The state glyph's box (the 8 pt dot centred in it) and the text column.
+/// A tile's height: 4 + the 18 pt name line + 4, the same whatever the pane
+/// holds, so every row of a group is the same size.
+const TILE_HEIGHT: f64 = 2.0 * TILE_PAD_V + LINE_TITLE_H;
+/// The gap between a tile's right column and the hover buttons beside it.
+const COLUMN_GAP: f64 = 8.0;
+/// The state glyph's box (the 8 pt dot centred in it) and the text column,
+/// which starts on the header's title (`CHEVRON_ZONE_W + 16`).
 const GLYPH_BOX_W: f64 = 16.0;
 const GLYPH_D: f64 = 8.0;
-const TEXT_X: f64 = 26.0;
+const TEXT_X: f64 = TILE_PAD_H + GLYPH_BOX_W + 8.0;
+/// The selected row's rail, at its left edge: 2 pt wide, 16 pt tall, 4 pt in.
+const RAIL_W: f64 = 2.0;
+const RAIL_H: f64 = 16.0;
+const RAIL_INSET: f64 = 4.0;
 /// The hover buttons (22 pt, radius 6) and the unread dot before the meta.
 const BUTTON_D: f64 = 22.0;
 const BUTTON_GAP: f64 = 2.0;
@@ -537,18 +550,22 @@ impl ListLayout {
             needs_header = Some(header);
             y += NEED_MARGIN_B;
         }
+        // Every row of a group, header included, sits on the same inset, so
+        // their grounds line up under the mouse and when selected; the card
+        // itself runs from `x0` to `x1`.
+        let row_x = x0 + ROW_INSET;
+        let row_w = (x1 - x0) - 2.0 * ROW_INSET;
         for (gi, g) in model.groups.iter().enumerate() {
             if gi > 0 {
                 y += GROUP_GAP;
             }
             let top = y;
-            // No card around the group unless it is selected: the header runs
-            // edge to edge with `GROUP_PAD_V` above it, and the tiles are
-            // inset under the chevron, `ROW_GAP` apart.
+            // No card around the group unless it is selected: the rows run
+            // `GROUP_PAD_V` under the card's top edge, `ROW_GAP` apart.
             y += GROUP_PAD_V;
             rows.push(Row {
                 kind: RowKind::Header { group: gi },
-                frame: Rect::new(x0, y, x1 - x0, HEADER_H),
+                frame: Rect::new(row_x, y, row_w, HEADER_H),
                 glyphs: Vec::new(),
                 actions: Vec::new(),
                 detail: Rect::default(),
@@ -559,7 +576,7 @@ impl ListLayout {
             y += HEADER_H;
             for (ti, tile) in g.tiles.iter().enumerate() {
                 y += ROW_GAP;
-                let row = tile_row(gi, ti, tile, x0 + TILE_INSET, y, x1 - x0 - 2.0 * TILE_INSET, m);
+                let row = tile_row(gi, ti, tile, row_x, y, row_w, m);
                 y += row.frame.h;
                 rows.push(row);
             }
@@ -589,9 +606,9 @@ impl ListLayout {
         }
     }
 
-    /// The `+` button of a header row.
+    /// The `+` button of a header row, flush with the tiles' closing column.
     pub fn add_button(frame: &Rect) -> Rect {
-        Rect::new(frame.right() - 4.0 - ADD_D, frame.y + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D)
+        Rect::new(frame.right() - ADD_INSET - ADD_D, frame.y + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D)
     }
 
     /// The colour menu's box in a header row: 16 pt, what the round dot's
@@ -606,10 +623,11 @@ impl ListLayout {
         (frame.x + CHEVRON_ZONE_W + 6.0, frame.y + frame.h / 2.0)
     }
 
-    /// The tab colour's bar: 3 x 10, radius 1.5, in the colour menu's box.
-    pub fn tint_bar(frame: &Rect) -> Rect {
+    /// The header's colour dot: a filled circle of the tab's colour, centred
+    /// in the colour menu's box (`DOT_D` wide).
+    pub fn dot_rect(frame: &Rect) -> Rect {
         let (cx, cy) = Self::dot_centre(frame);
-        Rect::new(cx - TINT_BAR_W / 2.0, cy - TINT_BAR_H / 2.0, TINT_BAR_W, TINT_BAR_H)
+        Rect::new(cx - DOT_D / 2.0, cy - DOT_D / 2.0, DOT_D, DOT_D)
     }
 
     /// The chevron's 12 pt box, centred in the chevron zone.
@@ -698,6 +716,13 @@ impl ListLayout {
 
     pub fn row_for_group(&self, group: usize) -> Option<usize> {
         self.rows.iter().position(|r| matches!(r.kind, RowKind::Header { group: g } if g == group))
+    }
+    /// The name line of a pane's tile: the tooltip zone that carries the
+    /// folder and the agent the row no longer prints.
+    pub fn pane_name_rect(&self, pane_id: PaneId) -> Option<Rect> {
+        let row = &self.rows[self.row_for_pane(pane_id)?];
+        let x = row.frame.x + TEXT_X;
+        Some(Rect::new(x, row.frame.y + TILE_PAD_V, (row.frame.right() - TILE_PAD_H - x).max(0.0), LINE_TITLE_H))
     }
 
     // --- tab drag ---
@@ -803,54 +828,87 @@ impl PaneDragFrame {
     }
 }
 
+/// A tile's right column: what the row says beside its name. At most one of
+/// the three, the first that applies.
+struct TileColumn {
+    /// Its left edge, and the room it takes from it to the row's content edge.
+    x: f64,
+    w: f64,
+    /// A waiting pane: `waiting 4m`, then its `Answer` link.
+    wait: Option<(String, Rect)>,
+    answer: Option<Rect>,
+    /// The call to action: `Resume` / `Start Claude`.
+    link: Option<(TileButton, &'static str, Rect)>,
+    /// The state word of a pane that works.
+    meta: Option<(String, Rect)>,
+}
+
+/// The call to action a tile offers, if any. A waiting pane has none: its
+/// right column ends on its `Answer` link.
+fn tile_call(tile: &TileVm) -> Option<(TileButton, &'static str)> {
+    if tile.waiting.is_some() {
+        None
+    } else if tile.bare_shell {
+        Some((TileButton::StartClaude, START_CLAUDE_LABEL))
+    } else if tile.resumable {
+        Some((TileButton::Resume, RESUME_LABEL))
+    } else {
+        None
+    }
+}
+
+/// Lay out a tile's right column, right aligned at `right` on the line at
+/// `y`: the wait, else the call to action, else the state word.
+fn tile_column(tile: &TileVm, right: f64, y: f64, h: f64, m: &dyn TextMetrics) -> TileColumn {
+    let mut col = TileColumn { x: right, w: 0.0, wait: None, answer: None, link: None, meta: None };
+    if let Some(age) = &tile.waiting {
+        // `waiting 4m · Answer`: the age in warn, the link after it, its hit
+        // rect exactly where the word is drawn.
+        let answer_w = m.width(NEED_ANSWER, Style::Link);
+        let answer = Rect::new(right - answer_w, y, answer_w, h);
+        let label = format!("waiting {age}");
+        let wait_w = m.width(&label, Style::Secondary);
+        col.x = answer.x - ANSWER_GAP - wait_w;
+        col.wait = Some((label, Rect::new(col.x, y, wait_w, h)));
+        col.answer = Some(answer);
+    } else if let Some((button, label)) = tile_call(tile) {
+        let w = link_w(m, label);
+        col.x = right - w;
+        col.link = Some((button, label, Rect::new(col.x, y, w, h)));
+    } else if let Some(text) = tile.meta() {
+        let w = m.width(&text, Style::Number);
+        col.x = right - w;
+        col.meta = Some((text, Rect::new(col.x, y, w, h)));
+    }
+    col.w = right - col.x;
+    col
+}
+
 /// Lay out one tile at `y`.
 fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m: &dyn TextMetrics) -> Row {
     let right = x + w - TILE_PAD_H;
-    let h = (2.0 * TILE_PAD_V + LINE_TITLE_H + LINE_SEC_H).max(TILE_MIN_H);
+    let h = TILE_HEIGHT;
+    let line = Rect::new(x + TEXT_X, y + TILE_PAD_V, (right - (x + TEXT_X)).max(0.0), LINE_TITLE_H);
+    let col = tile_column(tile, right, line.y, LINE_TITLE_H, m);
+    // The hover buttons sit left of the column, so a call to action or an
+    // `Answer` link stays clickable while the mouse is on the row.
+    let glyph_right = if col.w > 0.0 { col.x - COLUMN_GAP } else { right };
     let glyphs = TileButton::hover_glyphs(tile.state, tile.minimized, tile.unread)
         .into_iter()
         .enumerate()
         .map(|(k, b)| {
-            let bx = right - (k as f64 + 1.0) * BUTTON_D - k as f64 * BUTTON_GAP;
-            // On the title line, where the meta column sits when the mouse
-            // is away.
+            let bx = glyph_right - (k as f64 + 1.0) * BUTTON_D - k as f64 * BUTTON_GAP;
             (b, Rect::new(bx, y + TILE_PAD_V + (LINE_TITLE_H - BUTTON_D) / 2.0, BUTTON_D, BUTTON_D))
         })
         .collect();
-    let mut actions = Vec::new();
-    // The resume / start link is the subtitle line's right end. A waiting
-    // pane has no call there: its subtitle is `waiting 4m · Answer`, and a
-    // link pinned to the right would land on top of the Answer link.
-    if tile.waiting.is_none() {
-        let call = if tile.bare_shell {
-            Some((TileButton::StartClaude, START_CLAUDE_LABEL))
-        } else if tile.resumable {
-            Some((TileButton::Resume, RESUME_LABEL))
-        } else {
-            None
-        };
-        if let Some((button, label)) = call {
-            let call_w = link_w(m, label);
-            actions.push((button, Rect::new(right - call_w, y + TILE_PAD_V + LINE_TITLE_H, call_w, LINE_SEC_H)));
-        }
-    }
-    // A waiting pane's `Answer` link, left aligned right after `waiting 4m`
-    // and its dot: the hit rect is exactly where the word is drawn.
-    let answer = tile.waiting.as_ref().map(|age| {
-        let mut text_x = x + TEXT_X;
-        if tile.bookmarked {
-            text_x += m.width("\u{2605}", Style::Secondary) + 4.0;
-        }
-        let waiting_w = m.width(&format!("waiting {age}"), Style::Secondary);
-        Rect::new(text_x + waiting_w + ANSWER_GAP, y + TILE_PAD_V + LINE_TITLE_H, m.width(NEED_ANSWER, Style::Link), LINE_SEC_H)
-    });
+    let actions: Vec<(TileButton, Rect)> = col.link.iter().map(|(b, _, r)| (*b, *r)).collect();
     Row {
         kind: RowKind::Tile { group, index, pane_id: tile.pane_id, column: tile.column },
         frame: Rect::new(x, y, w, h),
         glyphs,
         actions,
         detail: Rect::default(),
-        answer,
+        answer: col.answer,
         sched: Vec::new(),
         sched_confirm: None,
     }
@@ -2169,15 +2227,23 @@ define_class!(
             }
         }
 
-        /// `NSToolTipOwner`: the tooltip of the glyph button under the mouse.
+        /// `NSToolTipOwner`: the tooltip of whatever sits under the pointer.
+        /// A pane's name carries the folder and agent that used to be its
+        /// subtitle; a button carries what it does.
         #[unsafe(method_id(view:stringForToolTip:point:userData:))]
         #[unsafe(method_family = none)]
         unsafe fn tooltip_string(&self, _view: &NSView, _tag: isize, point: CGPoint, _data: *mut std::ffi::c_void) -> Retained<NSString> {
-            let text = match self.ivars().shared.borrow().layout.hit(point.x, point.y) {
-                ListHit::TileButton(_, b) => b.tooltip(),
-                _ => "",
+            let sh = self.ivars().shared.borrow();
+            let text = match sh.layout.hit(point.x, point.y) {
+                ListHit::TileButton(_, b) => b.tooltip().to_string(),
+                ListHit::Sched(SchedHit::Button(_, b)) => b.tip().to_string(),
+                // The pane's own name line, where the folder rides.
+                ListHit::Tile(id) if sh.layout.pane_name_rect(id).is_some_and(|r| r.contains(point.x, point.y)) => {
+                    sh.model.groups.iter().flat_map(|g| g.tiles.iter()).find(|t| t.pane_id == id).map_or(String::new(), |t| t.tooltip.clone())
+                }
+                _ => String::new(),
             };
-            NSString::from_str(text)
+            NSString::from_str(&text)
         }
 
         #[unsafe(method(mouseMoved:))]
@@ -2369,12 +2435,21 @@ impl SidebarListView {
         }
     }
 
-    /// One tooltip zone per glyph button, answered by `tooltip_string`.
+    /// One tooltip zone per pane name and per action button, answered by
+    /// `tooltip_string`. The buttons come last, so they win where a zone of
+    /// theirs overlaps anything else.
     fn install_tooltips(&self) {
         // Collect first: the tooltip manager may call back into this view.
         let rects: Vec<CGRect> = {
             let sh = self.ivars().shared.borrow();
-            sh.layout.rows.iter().flat_map(|row| row.glyphs.iter().map(|(_, r)| r.cg())).collect()
+            let names = sh.layout.rows.iter().filter_map(|row| match row.kind {
+                RowKind::Tile { pane_id, .. } => sh.layout.pane_name_rect(pane_id).map(|r| r.cg()),
+                _ => None,
+            });
+            let buttons = sh.layout.rows.iter().flat_map(|row| {
+                row.glyphs.iter().map(|(_, r)| r.cg()).chain(row.sched.iter().map(|(_, r, _)| r.cg()))
+            });
+            names.chain(buttons).collect()
         };
         self.removeAllToolTips();
         for r in rects {
@@ -2780,20 +2855,21 @@ impl SidebarListView {
         let cy = frame.y + frame.h / 2.0;
         let chevron = if g.collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
         stroke_icon(chevron, &ListLayout::header_chevron(frame), CHEVRON_D, muted, muted_alpha * alpha);
-        // The tab's colour: a bar in the dot's old box, which stays the
-        // colour menu's target.
-        let (bar_cx, _) = ListLayout::dot_centre(frame);
-        fill_round(&ListLayout::tint_bar(frame), TINT_BAR_RADIUS, tint, alpha);
+        // The tab's colour: a filled dot in the colour menu's box, which
+        // stays the colour picker's target.
+        let (dot_cx, _) = ListLayout::dot_centre(frame);
+        fill_dot(dot_cx, cy, DOT_D, tint, alpha);
         if dot_hovered || dot_pressed {
             // The colour is a button: a thin white ring says so under the mouse.
-            stroke_ring(bar_cx, cy, DOT_BOX_D, 1.0, tokens::get().white, if dot_pressed { 0.35 } else { 0.20 } * alpha);
+            stroke_ring(dot_cx, cy, DOT_RING_D, 1.0, tokens::get().white, if dot_pressed { 0.35 } else { 0.20 } * alpha);
         }
         let x = frame.x + CHEVRON_ZONE_W + 16.0;
 
         // Right side: the pane count, or the `+` that takes its place while
-        // the row is hovered.
+        // the row is hovered. Its column ends where a tile's content does.
         let add = ListLayout::add_button(frame);
-        if row_hovered || add_pressed {
+        let show_add = row_hovered || add_pressed;
+        if show_add {
             if add_pressed {
                 fill_round(&add, ADD_RADIUS, tokens::get().white, 0.20 * alpha);
             } else if add_hovered {
@@ -2802,19 +2878,24 @@ impl SidebarListView {
             let plus_fg = if selected { tokens::get().white } else { tokens::get().text_primary };
             stroke_icon(Icon::Plus, &add, ICON_D, plus_fg, alpha);
         }
-        let count_right = add.right() - 4.0;
-        let count = g.summary.count.to_string();
-        let w = draw_text(sh, &count, &Rect::new(x, frame.y, (count_right - x).max(0.0), frame.h), Style::Number, number_fg, number_alpha * alpha, Align::Right, false);
-        let mut right = count_right - w - 6.0;
-        if g.collapsed {
-            // Folded: a dot per pane that waits or works, left of the count.
-            if g.summary.working > 0 {
-                fill_dot(right - 3.0, cy, 6.0, tokens::get().working, alpha);
-                right -= 10.0;
-            }
-            if g.summary.awaiting > 0 {
-                fill_dot(right - 3.0, cy, 6.0, tokens::get().awaiting, alpha);
-                right -= 10.0;
+        let count_right = add.right();
+        // The title never runs under the `+` icon while that one is up.
+        let mut right = if show_add { add.x - 4.0 } else { count_right };
+        if !show_add {
+            // The `+` takes the count's place: the two never share the column.
+            let count = g.summary.count.to_string();
+            let w = draw_text(sh, &count, &Rect::new(x, frame.y, (count_right - x).max(0.0), frame.h), Style::Number, number_fg, number_alpha * alpha, Align::Right, false);
+            right = count_right - w - 6.0;
+            if g.collapsed {
+                // Folded: a dot per pane that waits or works, left of the count.
+                if g.summary.working > 0 {
+                    fill_dot(right - 3.0, cy, 6.0, tokens::get().working, alpha);
+                    right -= 10.0;
+                }
+                if g.summary.awaiting > 0 {
+                    fill_dot(right - 3.0, cy, 6.0, tokens::get().awaiting, alpha);
+                    right -= 10.0;
+                }
             }
         }
         let title_fg = if selected { tokens::get().white } else { tokens::get().text_primary };
@@ -2904,35 +2985,72 @@ impl SidebarListView {
         let shifted = |r: &Rect| Rect::new(r.x, r.y + dy, r.w, r.h);
 
         // A tile has no ground of its own: the group's card shows through.
-        // The mouse lights a hover ground; the focused pane keeps a solid one.
+        // The mouse lights a hover ground; the focused pane keeps a neutral
+        // one, one step off the hover, and the rail at its left edge is what
+        // marks the selection (no filled blue row).
         if tile.focused {
-            fill_round(frame, TILE_RADIUS, tokens::get().sel_bg, alpha);
+            fill_round(frame, TILE_RADIUS, tokens::get().sel_row_bg, alpha);
+            let rail = Rect::new(
+                frame.x + RAIL_INSET,
+                frame.y + (frame.h - RAIL_H) / 2.0,
+                RAIL_W,
+                RAIL_H,
+            );
+            fill_round(&rail, RAIL_W / 2.0, tokens::get().sel_row_rail, alpha);
         } else if pressed {
             fill_round(frame, TILE_RADIUS, tokens::get().tile_pressed, alpha);
         } else if hovered {
             fill_round(frame, TILE_RADIUS, tokens::get().tile_hover, alpha);
         }
         let (title_fg, sec_fg, meta_fg) = if tile.focused {
-            (tokens::get().sel_text, tokens::get().sel_text, tokens::get().sel_text)
+            (tokens::get().sel_row_text, tokens::get().sel_row_text, tokens::get().sel_row_text)
         } else {
             (tokens::get().text_primary, tokens::get().text_secondary, tokens::get().text_tertiary)
         };
 
-        // Row 1: the state dot in its box, the title, and the meta column
-        // (or the hover buttons that replace it).
+        // One line: the state dot in its box, the session name, and the right
+        // column (the wait, the call to action, the state word).
         let text_x = frame.x + TEXT_X;
         let right = frame.right() - TILE_PAD_H;
-        let line1 = Rect::new(text_x, frame.y + TILE_PAD_V, right - text_x, LINE_TITLE_H);
+        let line = Rect::new(text_x, frame.y + TILE_PAD_V, (right - text_x).max(0.0), LINE_TITLE_H);
         let dot_cx = frame.x + TILE_PAD_H + GLYPH_BOX_W / 2.0;
-        let dot_cy = line1.y + LINE_TITLE_H / 2.0;
+        let cy = line.y + LINE_TITLE_H / 2.0;
         if tile.state.neutral() {
-            let ring = if tile.focused { tokens::get().sel_text } else { tokens::get().text_tertiary };
-            stroke_ring(dot_cx, dot_cy, GLYPH_D, 1.5, ring, alpha);
+            let ring = if tile.focused { tokens::get().sel_row_text } else { tokens::get().text_tertiary };
+            stroke_ring(dot_cx, cy, GLYPH_D, 1.5, ring, alpha);
         } else {
-            fill_dot(dot_cx, dot_cy, GLYPH_D, tile.state.color(), alpha);
+            fill_dot(dot_cx, cy, GLYPH_D, tile.state.color(), alpha);
         }
-        let mut title_right = right;
-        if hovered && !row.glyphs.is_empty() {
+
+        // The right column, laid out right to left, then the name in what is
+        // left of it. The unread dot comes before the column.
+        let col = tile_column(tile, right, line.y, LINE_TITLE_H, &AppKitMetrics(sh));
+        let mut name_right = col.x;
+        if let Some((label, r)) = &col.wait {
+            draw_text(sh, label, &shifted(r), Style::Secondary, tokens::get().warn_text, alpha, Align::Left, false);
+        }
+        if let Some(area) = col.answer {
+            let area = shifted(&area);
+            draw_text(sh, "\u{b7}", &Rect::new(area.x - 9.0, area.y, 8.0, LINE_TITLE_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
+            let link_hovered = sh.hovered == ListHit::NeedAnswer(tile.pane_id);
+            draw_text(sh, NEED_ANSWER, &area, Style::Link, link_ink(tile.focused, link_hovered), alpha, Align::Left, false);
+        }
+        if let Some((button, label, r)) = &col.link {
+            let r = shifted(r);
+            let link_hovered = sh.hovered == ListHit::TileButton(tile.pane_id, *button);
+            draw_link(sh, button.icon(), label, &r, link_ink(tile.focused, link_hovered), alpha);
+        }
+        if let Some((text, r)) = &col.meta {
+            draw_text(sh, text, &shifted(r), Style::Number, meta_fg, alpha, Align::Right, false);
+        }
+        if matches!(tile.state, TileState::Unread(_)) {
+            let x = col.x - 8.0 - UNREAD_DOT_D / 2.0;
+            fill_dot(x, cy, UNREAD_DOT_D, tokens::get().accent, alpha);
+            name_right = x - UNREAD_DOT_D / 2.0 - 4.0;
+        }
+
+        // The hover buttons sit left of the column, never over it.
+        if hovered {
             for (b, r) in &row.glyphs {
                 let r = shifted(r);
                 let b_hovered = sh.hovered == ListHit::TileButton(tile.pane_id, *b);
@@ -2950,65 +3068,19 @@ impl SidebarListView {
                     _ => (sec_fg, 1.0),
                 };
                 stroke_icon(b.icon(), &r, ICON_D, fg, fg_alpha * alpha);
-                title_right = title_right.min(r.x - 4.0);
-            }
-        } else {
-            // The meta column: what the pane is doing, or its age, with the
-            // unread dot before it. Nothing to say leaves the title the room.
-            let meta = tile.meta();
-            let meta_w = meta.as_deref().map_or(0.0, |t| AppKitMetrics(sh).width(t, Style::Number));
-            let unread = matches!(tile.state, TileState::Unread(_));
-            let dot_w = if unread { UNREAD_DOT_D + 3.0 } else { 0.0 };
-            if unread {
-                let dot = if tile.focused { tokens::get().sel_text } else { tokens::get().accent };
-                fill_dot(right - meta_w - 3.0 - UNREAD_DOT_D / 2.0, dot_cy, UNREAD_DOT_D, dot, alpha);
-            }
-            if let Some(text) = &meta {
-                draw_text(sh, text, &Rect::new(right - meta_w, line1.y, meta_w, LINE_TITLE_H), Style::Number, meta_fg, alpha, Align::Right, false);
-            }
-            let block_w = meta_w + dot_w;
-            if block_w > 0.0 {
-                title_right = right - block_w - 8.0;
+                name_right = name_right.min(r.x - 4.0);
             }
         }
-        let title = if tile.minimized { format!("\u{229f} {}", tile.title) } else { tile.title.clone() };
-        draw_text(sh, &title, &Rect::new(text_x, line1.y, (title_right - text_x).max(0.0), LINE_TITLE_H), Style::Title, title_fg, alpha, Align::Left, tile.renaming);
 
-        // Row 2: the subtitle, with the resume / start link at its right end.
-        let line2 = Rect::new(text_x, line1.bottom(), right - text_x, LINE_SEC_H);
-        let mut sec_right = right;
-        for (b, r) in &row.actions {
-            let label = match b {
-                TileButton::StartClaude => START_CLAUDE_LABEL,
-                TileButton::Resume => RESUME_LABEL,
-                _ => continue,
-            };
-            let r = shifted(r);
-            let b_hovered = sh.hovered == ListHit::TileButton(tile.pane_id, *b);
-            draw_link(sh, b.icon(), label, &r, link_ink(tile.focused, b_hovered), alpha);
-            sec_right = r.x - 6.0;
-        }
+        // The name: the session name, one line, `⊟ ` when minimized and `★`
+        // when bookmarked.
         let mut sx = text_x;
         if tile.bookmarked {
-            let w = draw_text(sh, "\u{2605}", &Rect::new(sx, line2.y, 14.0, LINE_SEC_H), Style::Secondary, tokens::get().awaiting, alpha, Align::Left, false);
+            let w = draw_text(sh, "\u{2605}", &Rect::new(sx, line.y, 14.0, LINE_TITLE_H), Style::Secondary, tokens::get().awaiting, alpha, Align::Left, false);
             sx += w + 4.0;
         }
-        if let Some(waiting) = &tile.waiting {
-            // `waiting 4m · Answer`: the age in warn, the link landing where
-            // the pane's ask row does.
-            let answer = row.answer.map(|r| shifted(&r));
-            let text_right = answer.map_or(sec_right, |a| a.x - ANSWER_GAP);
-            let label = format!("waiting {waiting}");
-            draw_text(sh, &label, &Rect::new(sx, line2.y, (text_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, tokens::get().warn_text, alpha, Align::Left, false);
-            if let Some(area) = answer {
-                draw_text(sh, "\u{b7}", &Rect::new(area.x - 9.0, line2.y, 8.0, LINE_SEC_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
-                let hovered_answer = sh.hovered == ListHit::NeedAnswer(tile.pane_id);
-                let fg = link_ink(tile.focused, hovered_answer);
-                draw_text(sh, NEED_ANSWER, &area, Style::Link, fg, alpha, Align::Left, false);
-            }
-        } else {
-            draw_text(sh, &tile.secondary, &Rect::new(sx, line2.y, (sec_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
-        }
+        let title = if tile.minimized { format!("\u{229f} {}", tile.title) } else { tile.title.clone() };
+        draw_text(sh, &title, &Rect::new(sx, line.y, (name_right - sx).max(0.0), LINE_TITLE_H), Style::Title, title_fg, alpha, Align::Left, tile.renaming);
     }
 }
 
@@ -3040,7 +3112,7 @@ mod tests {
             bare_shell: state == TileState::Shell,
             resumable: false,
             title: format!("pane {pane_id}"),
-            secondary: "link \u{b7} claude".into(),
+            tooltip: "link \u{b7} claude".into(),
             agent: Some("claude".into()),
             bookmarked: false,
             focused: false,
@@ -3176,38 +3248,37 @@ mod tests {
     }
 
     const W: f64 = 280.0;
-    /// Left edge of a group: its header runs from there to `SR`.
+    /// Left edge of a group's card.
     const SX: f64 = 12.0;
-    /// Right edge of a group's header: the list's edge, 8 in.
+    /// Right edge of a group's card: the list's edge, 8 in.
     const SR: f64 = W - 8.0;
-    /// Left edge of a tile: 14 under the group's edge, under the chevron.
-    const TX: f64 = SX + TILE_INSET;
-    /// Right edge of a tile, inset like the left one.
-    const TR: f64 = SR - TILE_INSET;
+    /// Left edge of a row: the header and the tiles share it, 8 under the
+    /// card's edge.
+    const TX: f64 = SX + ROW_INSET;
+    /// Right edge of a row, inset like the left one.
+    const TR: f64 = SR - ROW_INSET;
 
     #[test]
     fn rows_stack_in_group_blocks() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
         let ys: Vec<f64> = l.rows.iter().map(|r| r.frame.y).collect();
-        // Group from 6: 2 pt padding, header 8..36, 2 pt, tile 38..82, 2 pt,
-        // tile 84..128, 2 pt (the group ends at 130); 4 pt gap, group 134:
-        // header 136..164 (folded, 2 pt under it, ends 166); 4 pt gap, group
-        // 170: header 172..200, 2 pt, tile 202..246, 2 pt (ends 248); 12 pt
+        // Group from 6: 4 pt padding, header 10..38, 4 pt, tile 42..68, 4 pt,
+        // tile 72..98, 4 pt (the group ends at 102); 8 pt gap, group 110:
+        // header 114..142 (folded, 4 pt under it, ends 146); 8 pt gap, group
+        // 154: header 158..186, 4 pt, tile 190..216, 4 pt (ends 220); 12 pt
         // under the list.
-        assert_eq!(ys, vec![8.0, 38.0, 84.0, 136.0, 172.0, 202.0]);
-        assert_eq!(l.rows[1].frame.h, 44.0);
-        // The header runs edge to edge, the tiles are inset under the
-        // chevron, selected or not.
-        assert_eq!(l.rows[0].frame.x, SX);
-        assert_eq!(l.rows[0].frame.right(), SR);
-        for row in l.rows.iter().filter(|r| matches!(r.kind, RowKind::Tile { .. })) {
+        assert_eq!(ys, vec![10.0, 42.0, 72.0, 114.0, 158.0, 190.0]);
+        assert_eq!(l.rows[1].frame.h, TILE_HEIGHT);
+        // Every row of a group, header included, sits on the same inset:
+        // their grounds line up, selected or not.
+        for row in &l.rows {
             assert_eq!(row.frame.x, TX);
             assert_eq!(row.frame.right(), TR);
         }
-        assert_eq!(l.groups[0], Rect::new(SX, 6.0, SR - SX, 124.0));
-        assert_eq!(l.groups[1], Rect::new(SX, 134.0, SR - SX, 32.0));
-        assert_eq!(l.groups[2], Rect::new(SX, 170.0, SR - SX, 78.0));
-        assert_eq!(l.content_h, 248.0 + 12.0);
+        assert_eq!(l.groups[0], Rect::new(SX, 6.0, SR - SX, 96.0));
+        assert_eq!(l.groups[1], Rect::new(SX, 110.0, SR - SX, 36.0));
+        assert_eq!(l.groups[2], Rect::new(SX, 154.0, SR - SX, 66.0));
+        assert_eq!(l.content_h, 220.0 + 12.0);
         assert_eq!(l.hint_y, None);
         // The selection changes the card, not the geometry.
         let mut m = model();
@@ -3217,7 +3288,7 @@ mod tests {
     }
 
     #[test]
-    fn every_tile_is_two_lines_with_a_floor() {
+    fn every_tile_is_one_line_of_the_same_height() {
         let mut m = model();
         let mut awaiting = tile(1, 0, TileState::Awaiting);
         awaiting.question = Some("Should I overwrite hello.txt with the new content?".into());
@@ -3228,12 +3299,10 @@ mod tests {
         m.groups = vec![group(0, false, vec![awaiting, unread, tile(4, 0, TileState::Working)])];
         let l = ListLayout::new(&m, W, &FakeMetrics);
         let hs: Vec<f64> = l.rows.iter().map(|r| r.frame.h).collect();
-        // A 18 pt title over a 16 pt subtitle, 5 pt either side: 44 for
-        // every state, the waiting one included: its question is not part of
-        // the row any more, and neither is a third summary line.
-        assert_eq!(hs, vec![HEADER_H, 44.0, 44.0, 44.0]);
-        assert_eq!(l.rows[1].frame.h, 2.0 * TILE_PAD_V + LINE_TITLE_H + LINE_SEC_H);
-        assert!(l.rows[1].frame.h >= TILE_MIN_H);
+        // One 18 pt name line, 4 pt either side: 26 for every state, the
+        // waiting one included. Nothing rides under the name any more.
+        assert_eq!(hs, vec![HEADER_H, TILE_HEIGHT, TILE_HEIGHT, TILE_HEIGHT]);
+        assert_eq!(l.rows[1].frame.h, 26.0);
         assert!(l.rows[1].actions.is_empty());
     }
 
@@ -3242,8 +3311,8 @@ mod tests {
         let mut m = model();
         m.show_hint = true;
         let l = ListLayout::new(&m, W, &FakeMetrics);
-        assert_eq!(l.hint_y, Some(248.0 + GROUP_GAP));
-        assert_eq!(l.content_h, 248.0 + GROUP_GAP + 20.0 + 12.0);
+        assert_eq!(l.hint_y, Some(220.0 + GROUP_GAP));
+        assert_eq!(l.content_h, 220.0 + GROUP_GAP + 20.0 + 12.0);
         // An empty window still lays out.
         m.groups.clear();
         let l = ListLayout::new(&m, W, &FakeMetrics);
@@ -3254,22 +3323,22 @@ mod tests {
     #[test]
     fn hit_tells_the_rows_and_their_buttons_apart() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
-        // Header (12, 8, 260, 28): the chevron, the colour bar, the body,
+        // Header (20, 10, 244, 28): the chevron, the colour dot, the body,
         // the `+`.
-        assert_eq!(ListLayout::header_chevron(&l.rows[0].frame), Rect::new(SX + 6.0, 16.0, 12.0, 12.0));
-        assert_eq!(l.hit(SX + 5.0, 22.0), ListHit::Chevron(0));
-        assert_eq!(l.hit(SX + 40.0, 22.0), ListHit::Header(0));
-        // The bar is 3 x 10, centred in the old dot's 16 pt box: that box is
-        // still the colour menu's target, right after the chevron zone.
-        assert_eq!(ListLayout::dot_centre(&l.rows[0].frame), (SX + 30.0, 22.0));
-        assert_eq!(ListLayout::dot_button(&l.rows[0].frame), Rect::new(SX + 22.0, 14.0, 16.0, 16.0));
-        assert_eq!(ListLayout::tint_bar(&l.rows[0].frame), Rect::new(SX + 28.5, 17.0, 3.0, 10.0));
-        assert_eq!(l.hit(SX + 30.0, 22.0), ListHit::HeaderDot(0));
-        assert_eq!(l.hit(SX + 24.0, 15.0), ListHit::HeaderDot(0));
-        assert_eq!(l.hit(SX + 30.0, 13.0), ListHit::Header(0));
-        assert_eq!(l.hit(SX + 38.0, 22.0), ListHit::Header(0));
+        assert_eq!(ListLayout::header_chevron(&l.rows[0].frame), Rect::new(TX + 2.0, 18.0, 12.0, 12.0));
+        assert_eq!(l.hit(TX + 5.0, 22.0), ListHit::Chevron(0));
+        assert_eq!(l.hit(TX + 40.0, 22.0), ListHit::Header(0));
+        // The dot is 8 pt, centred in its 16 pt box: that box is the colour
+        // menu's target, right after the chevron zone.
+        assert_eq!(ListLayout::dot_centre(&l.rows[0].frame), (TX + 22.0, 24.0));
+        assert_eq!(ListLayout::dot_button(&l.rows[0].frame), Rect::new(TX + 14.0, 16.0, 16.0, 16.0));
+        assert_eq!(ListLayout::dot_rect(&l.rows[0].frame), Rect::new(TX + 18.0, 20.0, DOT_D, DOT_D));
+        assert_eq!(l.hit(TX + 22.0, 24.0), ListHit::HeaderDot(0));
+        assert_eq!(l.hit(TX + 16.0, 18.0), ListHit::HeaderDot(0));
+        assert_eq!(l.hit(TX + 22.0, 12.0), ListHit::Header(0));
+        assert_eq!(l.hit(TX + 32.0, 24.0), ListHit::Header(0));
         let add = ListLayout::add_button(&l.rows[0].frame);
-        assert_eq!(add, Rect::new(SR - 4.0 - ADD_D, 8.0 + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D));
+        assert_eq!(add, Rect::new(TR - ADD_INSET - ADD_D, 10.0 + (HEADER_H - ADD_D) / 2.0, ADD_D, ADD_D));
         assert_eq!(l.hit(add.x + 3.0, add.y + 3.0), ListHit::HeaderAdd(0));
         // Hovering the `+` or the bar still counts as hovering the header
         // row (the `+` shows while the mouse is anywhere on the row), and
@@ -3281,20 +3350,20 @@ mod tests {
         assert_eq!(ListHit::Tile(10).group(), None);
         assert_ne!(l.hit(add.x + 3.0, add.y + 3.0), l.hit(add.x - 3.0, add.y + 3.0));
         assert_eq!(l.hit(add.x - 3.0, add.y + 3.0), ListHit::Header(0));
-        // The group's 2 pt padding, the 2 pt between two rows and the 14 pt
+        // The group's 4 pt padding, the 4 pt between two rows and the 8 pt
         // side inset are the panel; the body is the pane.
         assert_eq!(l.hit(100.0, 7.0), ListHit::Panel(0));
-        assert_eq!(l.hit(100.0, 37.0), ListHit::Panel(0));
-        assert_eq!(l.hit(100.0, 39.0), ListHit::Tile(10));
-        assert_eq!(l.hit(100.0, 85.0), ListHit::Tile(11));
+        assert_eq!(l.hit(100.0, 39.0), ListHit::Panel(0));
+        assert_eq!(l.hit(100.0, 43.0), ListHit::Tile(10));
+        assert_eq!(l.hit(100.0, 91.0), ListHit::Tile(11));
         assert_eq!(l.hit(15.0, 60.0), ListHit::Panel(0));
-        assert_eq!(l.hit(100.0, 129.0), ListHit::Panel(0));
-        assert_eq!(l.hit(100.0, 135.0), ListHit::Panel(1));
-        assert_eq!(l.hit(100.0, 150.0), ListHit::Header(1));
-        assert_eq!(l.hit(100.0, 210.0), ListHit::Tile(30));
+        assert_eq!(l.hit(100.0, 100.0), ListHit::Panel(0));
+        assert_eq!(l.hit(100.0, 112.0), ListHit::Panel(1));
+        assert_eq!(l.hit(100.0, 130.0), ListHit::Header(1));
+        assert_eq!(l.hit(25.0, 200.0), ListHit::Tile(30));
         // Left of the groups, between two of them, past the last: nothing.
         assert_eq!(l.hit(5.0, 60.0), ListHit::Empty);
-        assert_eq!(l.hit(100.0, 132.0), ListHit::Empty);
+        assert_eq!(l.hit(100.0, 150.0), ListHit::Empty);
         assert_eq!(l.hit(100.0, 1000.0), ListHit::Empty);
         // Every hit on a panel names its group, a tile's through its row;
         // only the header parts count as the header row.
@@ -3305,13 +3374,14 @@ mod tests {
         assert_eq!(l.group_of(ListHit::Tile(99)), None);
         assert_eq!(l.group_of(ListHit::Empty), None);
         assert_eq!(ListHit::Panel(1).group(), None);
-        // Working tile: close, minimize, mark unread, stop, 22 pt boxes from
-        // the right of the tile, centred on its height.
+        // Working tile: close, minimize, mark unread, stop, 22 pt boxes left
+        // of its `working` column, centred on the row.
         let row = &l.rows[2];
         let boxes: Vec<TileButton> = row.glyphs.iter().map(|(b, _)| *b).collect();
         assert_eq!(boxes, vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread, TileButton::Stop]);
+        let column_w = FakeMetrics.width("working", Style::Number);
         let (_, close) = row.glyphs[0];
-        assert_eq!(close.right(), TR - TILE_PAD_H);
+        assert_eq!(close.right(), TR - TILE_PAD_H - COLUMN_GAP - column_w);
         assert_eq!(close.w, BUTTON_D);
         assert_eq!(close.y, row.frame.y + TILE_PAD_V + (LINE_TITLE_H - BUTTON_D) / 2.0);
         assert_eq!(l.hit(close.x + 5.0, close.y + 5.0), ListHit::TileButton(11, TileButton::Close));
@@ -3321,12 +3391,11 @@ mod tests {
         assert_eq!(l.hit(mark.x + 5.0, mark.y + 5.0), ListHit::TileButton(11, TileButton::MarkUnread));
         let (_, stop) = row.glyphs[3];
         assert_eq!(l.hit(stop.x + 5.0, stop.y + 5.0), ListHit::TileButton(11, TileButton::Stop));
-        // The subtitle line carries no glyphs.
-        assert_eq!(l.hit(close.x + 5.0, close.y + 30.0), ListHit::Tile(11));
-        // The bare shell's `▶ Start Claude` sits on the subtitle line.
+        // The bare shell's `▶ Start Claude` is the right end of its one line.
         let shell = &l.rows[5];
         let (b, start) = shell.actions[0];
         assert_eq!(b, TileButton::StartClaude);
+        assert_eq!(start.right(), TR - TILE_PAD_H);
         assert_eq!(l.hit(start.x + 5.0, start.y + 5.0), ListHit::TileButton(30, TileButton::StartClaude));
         assert_eq!(ListHit::TileButton(30, TileButton::Stop).pane(), Some(30));
         assert_eq!(ListHit::HeaderAdd(2).group(), Some(2));
@@ -3355,15 +3424,14 @@ mod tests {
     #[test]
     fn insertion_index_follows_the_midpoint_rule() {
         let l = ListLayout::new(&model(), W, &FakeMetrics);
-        // Headers at 8..36, 136..164, 172..200; groups at 6, 134, 170.
+        // Headers at 10..38, 114..142, 158..186; groups at 6, 110, 154.
         assert_eq!(l.insertion_index(10.0), 0);
         assert_eq!(l.insertion_index(100.0), 1);
-        assert_eq!(l.insertion_index(149.0), 1);
-        assert_eq!(l.insertion_index(150.0), 2);
-        assert_eq!(l.insertion_index(190.0), 3);
+        assert_eq!(l.insertion_index(130.0), 2);
+        assert_eq!(l.insertion_index(200.0), 3);
         assert_eq!(l.insertion_line_y(0), 6.0 - GROUP_GAP / 2.0);
-        assert_eq!(l.insertion_line_y(1), 134.0 - GROUP_GAP / 2.0);
-        assert_eq!(l.insertion_line_y(3), 248.0 + GROUP_GAP / 2.0);
+        assert_eq!(l.insertion_line_y(1), 110.0 - GROUP_GAP / 2.0);
+        assert_eq!(l.insertion_line_y(3), 220.0 + GROUP_GAP / 2.0);
     }
 
     #[test]
@@ -3383,35 +3451,36 @@ mod tests {
         // A row that is gone or no longer a tile (the list was re-laid out
         // mid-drag) has an empty run.
         assert_eq!(l.pane_run(99), 99..99);
-        // Tile 1 spans 38..82, tile 2 84..128: the run's slots.
-        assert_eq!(l.pane_slots(&(1..3)), vec![Slot { y: 38.0, h: 44.0 }, Slot { y: 84.0, h: 44.0 }]);
+        // Tile 1 spans 42..68, tile 2 72..98: the run's slots.
+        assert_eq!(l.pane_slots(&(1..3)), vec![Slot { y: 42.0, h: 26.0 }, Slot { y: 72.0, h: 26.0 }]);
         assert_eq!(l.pane_slots(&(99..100)), Vec::<Slot>::new());
-        // Lifting pane 1 and pulling it 24 down: its bottom (82 + 24) sits on
-        // tile 2's middle (106), nothing crossed, the skeleton stays at its
-        // origin; at 25 the bottom passes it: tile 2 steps up by 44 + 2 and
+        // Lifting pane 1 and pulling it 17 down: its bottom (68 + 17) sits on
+        // tile 2's middle (85), nothing crossed, the skeleton stays at its
+        // origin; at 18 the bottom passes it: tile 2 steps up by 26 + 4 and
         // the skeleton takes its old top.
-        let f = l.pane_drag_frame(1, 24.0, 0).unwrap();
-        assert_eq!((f.run.clone(), f.from, f.to, f.dy), (1..3, 0, 0, 24.0));
-        assert_eq!(f.next_to(24.0), 0);
-        assert_eq!(f.next_to(25.0), 1);
-        let f = l.pane_drag_frame(1, 25.0, 1).unwrap();
-        assert_eq!(f.moves, vec![0.0, -46.0]);
-        assert_eq!(f.placeholder_y, 84.0);
-        // Hysteresis: tile 2 now sits 46 higher (its middle at 60), the held
-        // one goes back under it only once its top (38 + dy) is above that.
-        assert_eq!(f.next_to(22.0), 1);
-        assert_eq!(f.next_to(21.0), 0);
+        let f = l.pane_drag_frame(1, 17.0, 0).unwrap();
+        assert_eq!((f.run.clone(), f.from, f.to, f.dy), (1..3, 0, 0, 17.0));
+        assert_eq!(f.next_to(17.0), 0);
+        assert_eq!(f.next_to(18.0), 1);
+        let f = l.pane_drag_frame(1, 18.0, 1).unwrap();
+        assert_eq!(f.moves, vec![0.0, -30.0]);
+        assert_eq!(f.placeholder_y, 72.0);
+        // Hysteresis: tile 2 now sits 30 higher (its middle at 55), the held
+        // one goes back under it only once its top (42 + dy) is above that.
+        assert_eq!(f.next_to(13.0), 1);
+        assert_eq!(f.next_to(12.0), 0);
         // The travel is clamped to the run: pane 1 cannot go above its own
         // top nor below tile 2's bottom; a stale rank is clamped too.
         let f = l.pane_drag_frame(1, -500.0, 5).unwrap();
         assert_eq!((f.dy, f.to), (0.0, 1));
-        assert_eq!(l.pane_drag_frame(1, 500.0, 0).unwrap().dy, 46.0);
-        // Pane 2 pulled up 25: it aims at rank 0, tile 1 steps down.
-        let f = l.pane_drag_frame(2, -25.0, 1).unwrap();
-        assert_eq!(f.next_to(-25.0), 0);
-        let f = l.pane_drag_frame(2, -25.0, 0).unwrap();
-        assert_eq!(f.moves, vec![46.0, 0.0]);
-        assert_eq!(f.placeholder_y, 38.0);
+        assert_eq!(l.pane_drag_frame(1, 500.0, 0).unwrap().dy, 30.0);
+        // Pane 2 pulled up 18: its top (72 - 18) is above tile 1's middle
+        // (55), so it aims at rank 0 and tile 1 steps down.
+        let f = l.pane_drag_frame(2, -18.0, 1).unwrap();
+        assert_eq!(f.next_to(-18.0), 0);
+        let f = l.pane_drag_frame(2, -18.0, 0).unwrap();
+        assert_eq!(f.moves, vec![30.0, 0.0]);
+        assert_eq!(f.placeholder_y, 42.0);
         // A lone pane in its column has nowhere to go; a gone pane no frame.
         let f = l.pane_drag_frame(3, 30.0, 0).unwrap();
         assert_eq!((f.dy, f.to, f.moves.clone()), (0.0, 0, vec![0.0]));
@@ -3584,7 +3653,7 @@ mod tests {
         let mut m = model();
         let none = ListLayout::new(&m, W, &FakeMetrics);
         assert_eq!(none.needs_card, None);
-        assert_eq!(none.rows[0].frame.y, 8.0);
+        assert_eq!(none.rows[0].frame.y, LIST_TOP + GROUP_PAD_V);
 
         // Three asks: three rows, no button, the card above the first group.
         m.needs = (0..3).map(|i| need(NeedKind::Ask, i)).collect();
@@ -3704,15 +3773,19 @@ mod tests {
         assert_eq!(l.hit(row.frame.x + 4.0, row.frame.y + 4.0), ListHit::Need(1));
         let button = l.rows.iter().find(|r| r.kind == RowKind::NeedAll).expect("the button");
         assert_eq!(l.hit(button.frame.x + 4.0, button.frame.y + 4.0), ListHit::NeedAll);
-        // The waiting tile's subtitle carries `Answer`, its own hit target.
+        // The waiting tile's right column ends on its `Answer` hit target.
         let tile = l.rows.iter().find(|r| matches!(r.kind, RowKind::Tile { pane_id: 10, .. })).expect("pane 10");
         let answer = tile.answer.expect("a waiting tile carries the link");
         assert!(tile.actions.is_empty(), "no Start Claude link next to the wait");
-        // Left aligned right after `waiting 4m`, not pinned to the right.
-        assert_eq!(answer.x, tile.frame.x + TEXT_X + "waiting 4m".len() as f64 * 6.0 + ANSWER_GAP);
+        // the one-line row has no subtitle left to carry it.
+        assert_eq!(answer.right(), tile.frame.right() - TILE_PAD_H);
+        let wait_w = "waiting 4m".len() as f64 * 6.0;
+        let wait_x = answer.x - ANSWER_GAP - wait_w;
+        assert!(wait_x > tile.frame.x + TEXT_X + 40.0, "the wait leaves the name its room");
+        assert_eq!(tile.frame.h, TILE_HEIGHT);
         assert_eq!(l.hit(answer.x + 2.0, answer.y + 2.0), ListHit::NeedAnswer(10));
-        // The rest of the subtitle line is still the tile.
-        assert_eq!(l.hit(tile.frame.x + 40.0, answer.y + 2.0), ListHit::Tile(10));
+        // Left of the column the name line is still the tile.
+        assert_eq!(l.hit(tile.frame.x + TEXT_X, answer.y + 2.0), ListHit::Tile(10));
         // A tile with nothing waiting has no link at all.
         assert_eq!(l.rows.iter().find(|r| matches!(r.kind, RowKind::Tile { pane_id: 11, .. })).and_then(|r| r.answer), None);
     }

@@ -48,19 +48,14 @@ const SECTION_LABEL_X: f64 = 24.0;
 const SECTION_COUNT_GAP: f64 = 6.0;
 const CHEVRON: f64 = 12.0;
 /// The open row's body, indented 24 from the row's left edge: a key/value
-/// grid (72 pt of label), then a row of small buttons.
+/// grid (72 pt of label), then a row of icon buttons on the hover row's
+/// `BTN` metrics - the same glyphs, so a routine acts the same folded or
+/// open, and the words ride on the tooltip.
 pub const BODY_INDENT: f64 = 24.0;
 const BODY_GAP: f64 = 4.0;
 const KV_H: f64 = 17.0;
 const KV_LABEL_W: f64 = 72.0;
 const BODY_BTN_TOP_GAP: f64 = 4.0;
-/// A body button: a real 24 pt button, its 12 pt glyph, the gap after it,
-/// 6 pt of padding either side (the snooze chips'), 6 pt between buttons.
-const BODY_BTN_H: f64 = 24.0;
-const BODY_BTN_ICON: f64 = 12.0;
-const BODY_BTN_ICON_GAP: f64 = 6.0;
-const BODY_BTN_PAD: f64 = 6.0;
-const BODY_BTN_GAP: f64 = 6.0;
 /// The confirmation's buttons keep the wider padding they had.
 const CONFIRM_BTN_PAD: f64 = 8.0;
 const BODY_PAD_B: f64 = 8.0;
@@ -97,7 +92,8 @@ pub enum SchedButton {
 }
 
 impl SchedButton {
-    /// The words a labelled button shows (the body's row, the confirmation).
+    /// The words of the confirmation's buttons, the only labelled ones left:
+    /// everything else is an icon with a tooltip.
     pub fn label(self) -> &'static str {
         match self {
             SchedButton::Run => "Run now",
@@ -106,6 +102,21 @@ impl SchedButton {
             SchedButton::Resume => "Resume",
             SchedButton::Edit => "Edit prompt",
             SchedButton::Delete | SchedButton::ConfirmDelete => "Delete",
+            SchedButton::ConfirmCancel => "Cancel",
+        }
+    }
+
+    /// What the icon says on hover (and to VoiceOver): the action in words,
+    /// since the button itself has none.
+    pub fn tip(self) -> &'static str {
+        match self {
+            SchedButton::Run => "Run now",
+            SchedButton::Log => "Open log",
+            SchedButton::Pause => "Pause",
+            SchedButton::Resume => "Resume",
+            SchedButton::Edit => "Edit prompt",
+            SchedButton::Delete => "Delete routine",
+            SchedButton::ConfirmDelete => "Delete",
             SchedButton::ConfirmCancel => "Cancel",
         }
     }
@@ -470,7 +481,7 @@ pub fn layout(routines: &[RoutineVm], state: &SchedState, width: f64, m: &dyn Te
             let r = &routines[index];
             let confirm = state.confirm.as_deref() == Some(r.name.as_str());
             let buttons_h =
-                if r.expanded { body_buttons(r, 0.0, 0.0, body_width(&Rect::new(x0, y, x1 - x0, 0.0)), m).1 } else { 0.0 };
+                if r.expanded { body_buttons(r, 0.0, 0.0, body_width(&Rect::new(x0, y, x1 - x0, 0.0))).1 } else { 0.0 };
             let h = ROW_H + if r.expanded { body_height(confirm, buttons_h) } else { 0.0 };
             let frame = Rect::new(x0, y, x1 - x0, h);
             let mut row = Row {
@@ -493,8 +504,8 @@ pub fn layout(routines: &[RoutineVm], state: &SchedState, width: f64, m: &dyn Te
 }
 
 /// The clickable boxes of one row: the hover strip (always laid out, so the
-/// text can stop before it and the hit test knows it), the body's labelled
-/// row, and the confirmation's two buttons.
+/// text can stop before it and the hit test knows it), the body's icon row,
+/// and the confirmation's two buttons.
 fn place_buttons(row: &mut Row, r: &RoutineVm, confirm: bool, m: &dyn TextMetrics) {
     let frame = row.frame;
     let mut x = frame.right() - ROW_PAD_X;
@@ -512,7 +523,7 @@ fn place_buttons(row: &mut Row, r: &RoutineVm, confirm: bool, m: &dyn TextMetric
     let body_x = frame.x + BODY_INDENT;
     let body_w = body_width(&frame);
     let y = frame.y + ROW_H + BODY_GAP + 5.0 * KV_H + BODY_BTN_TOP_GAP;
-    let (body, buttons_h) = body_buttons(r, body_x, y, body_w, m);
+    let (body, buttons_h) = body_buttons(r, body_x, y, body_w);
     row.sched.extend(body.into_iter().map(|(button, rect)| (button, rect, SchedSpot::Body)));
     if !confirm {
         return;
@@ -530,32 +541,23 @@ fn place_buttons(row: &mut Row, r: &RoutineVm, confirm: bool, m: &dyn TextMetric
     }
 }
 
-/// The body's labelled buttons, wrapped onto as many lines as `width` needs,
-/// and the height those lines take: a narrow sidebar has no room for five
-/// labels on one line.
-fn body_buttons(r: &RoutineVm, x: f64, y: f64, width: f64, m: &dyn TextMetrics) -> (Vec<(SchedButton, Rect)>, f64) {
+/// The body's icon buttons, wrapped onto as many lines as `width` needs, and
+/// the height those lines take.
+fn body_buttons(r: &RoutineVm, x: f64, y: f64, width: f64) -> (Vec<(SchedButton, Rect)>, f64) {
     let mut out: Vec<(SchedButton, Rect)> = Vec::with_capacity(5);
     let mut bx = x;
     let mut by = y;
     let mut lines = 1.0;
     for &button in buttons(r) {
-        let w = body_button_width(button, m);
-        if !out.is_empty() && bx + w > x + width {
+        if !out.is_empty() && bx + BTN > x + width {
             bx = x;
-            by += BODY_BTN_H + BODY_BTN_GAP;
+            by += BTN + BTN_GAP;
             lines += 1.0;
         }
-        out.push((button, Rect::new(bx, by, w, BODY_BTN_H)));
-        bx += w + BODY_BTN_GAP;
+        out.push((button, Rect::new(bx, by, BTN, BTN)));
+        bx += BTN + BTN_GAP;
     }
-    (out, lines * BODY_BTN_H + (lines - 1.0) * BODY_BTN_GAP)
-}
-
-/// The width one body button needs: its padding, its glyph, the gap after it
-/// and its label. `draw_body_button` lays the same boxes out.
-fn body_button_width(button: SchedButton, m: &dyn TextMetrics) -> f64 {
-    let lead = if button.icon().is_some() { BODY_BTN_ICON + BODY_BTN_ICON_GAP } else { 0.0 };
-    2.0 * BODY_BTN_PAD + lead + m.width(button.label(), Style::Chip)
+    (out, lines * BTN + (lines - 1.0) * BTN_GAP)
 }
 
 /// What a point inside a scheduled row lands on: one of its buttons, the
@@ -738,25 +740,23 @@ fn draw_glyph(r: &RoutineVm, cx: f64, cy: f64, a: f64) {
     stroke_icon(icon, &box_, GLYPH_D, c, a);
 }
 
-/// One of the body's labelled buttons: a 24 pt ground, its 12 pt glyph and
-/// its label, the pair left-aligned like the ask card's action buttons.
-/// `Delete` is the exception: no ground and crit ink, so the button that only
-/// opens the confirmation does not wear the colour of the one that deletes.
-fn draw_body_button(sh: &Shared, button: SchedButton, r: &Rect, hovered: bool, pressed: bool, a: f64) {
-    let crit = button.crit();
+/// One of the body's icon buttons: a 22 pt ground, its 14 pt glyph, the
+/// words on the tooltip (`SchedButton::tip`). `Delete` is the exception: no
+/// ground and crit ink, so the button that only opens the confirmation does
+/// not wear the colour of the one that deletes.
+fn draw_body_button(button: SchedButton, r: &Rect, hovered: bool, pressed: bool, a: f64) {
+    let crit = button == SchedButton::Delete;
     if !crit {
-        let ground = if hovered || pressed { tokens::get().tile_pressed } else { tokens::get().tile_hover };
-        fill_round(r, BTN_RADIUS, ground, a);
+        if hovered || pressed {
+            fill_round(r, BTN_RADIUS, tokens::get().white, 0.16 * a);
+        } else {
+            fill_round(r, BTN_RADIUS, tokens::get().tile_hover, a);
+        }
     }
-    let fg = if crit { tokens::get().crit_text } else { tokens::get().text_primary };
-    let mut x = r.x + BODY_BTN_PAD;
     if let Some(icon) = button.icon() {
-        let icon_box = Rect::new(x, r.y + (r.h - BODY_BTN_ICON) / 2.0, BODY_BTN_ICON, BODY_BTN_ICON);
-        stroke_icon(icon, &icon_box, BODY_BTN_ICON, fg, a);
-        x = icon_box.right() + BODY_BTN_ICON_GAP;
+        let fg = if crit { tokens::get().crit_text } else { tokens::get().text_primary };
+        stroke_icon(icon, r, BTN_ICON, fg, a);
     }
-    let w = (r.right() - BODY_BTN_PAD - x).max(0.0);
-    draw_text(sh, button.label(), &Rect::new(x, r.y, w, r.h), Style::Chip, fg, a, Align::Left, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -784,7 +784,7 @@ fn draw_body(
         if *spot != SchedSpot::Body {
             continue;
         }
-        draw_body_button(sh, *button, rect, hovered == hit(*button), pressed == hit(*button), a);
+        draw_body_button(*button, rect, hovered == hit(*button), pressed == hit(*button), a);
     }
     let Some(box_) = row.sched_confirm else { return };
     // The confirmation: a crit wash, the question in bold, what it removes,
@@ -934,15 +934,11 @@ mod tests {
         let row = row_of(&rows, alpha);
         assert_eq!(row.frame.h, ROW_H + body_height(false, buttons_h(row)));
         // Five key/value lines, the button row, and the padding around them.
-        assert_eq!(
-            body_height(false, BODY_BTN_H),
-            BODY_GAP + 5.0 * KV_H + BODY_BTN_TOP_GAP + BODY_BTN_H + BODY_PAD_B
-        );
-        // Five labelled buttons, glyph included, do not fit one line in a
-        // narrow sidebar: two lines at 280, one at 520.
-        assert_eq!(buttons_h(row), 2.0 * BODY_BTN_H + BODY_BTN_GAP);
+        assert_eq!(body_height(false, BTN), BODY_GAP + 5.0 * KV_H + BODY_BTN_TOP_GAP + BTN + BODY_PAD_B);
+        // Five 22 pt icon buttons fit one line, narrow or wide.
+        assert_eq!(buttons_h(row), BTN);
         let (_, wide) = layout(&routines, &SchedState::default(), 520.0, &FakeMetrics);
-        assert_eq!(buttons_h(row_of(&wide, alpha)), BODY_BTN_H);
+        assert_eq!(buttons_h(row_of(&wide, alpha)), BTN);
 
         // The confirmation adds its box to the open row.
         let mut state = SchedState::default();
@@ -950,7 +946,7 @@ mod tests {
         let (_, rows) = layout(&routines, &state, 280.0, &FakeMetrics);
         let row = row_of(&rows, alpha);
         assert_eq!(row.frame.h, ROW_H + body_height(true, buttons_h(row)));
-        assert!(body_height(true, BODY_BTN_H) > body_height(false, BODY_BTN_H));
+        assert!(body_height(true, BTN) > body_height(false, BTN));
     }
 
     #[test]
@@ -1018,40 +1014,29 @@ mod tests {
     }
 
     #[test]
-    fn a_body_button_holds_its_glyph_and_its_label() {
+    fn a_body_button_is_an_icon_with_its_words_on_the_tooltip() {
         let mut routines = fixture();
         let alpha = index_of(&routines, "alpha-digest");
         routines[alpha].expanded = true;
         let (_, rows) = layout(&routines, &SchedState::default(), 280.0, &FakeMetrics);
         let row = row_of(&rows, alpha);
-        let body: Vec<(SchedButton, Rect)> =
-            row.sched.iter().filter(|(_, _, s)| *s == SchedSpot::Body).map(|(b, r, _)| (*b, *r)).collect();
+        let body: Vec<(SchedButton, Rect)> = row
+            .sched
+            .iter()
+            .filter(|(_, _, s)| *s == SchedSpot::Body)
+            .map(|(b, r, _)| (*b, *r))
+            .collect();
         assert_eq!(body.len(), 5);
         for (button, rect) in &body {
-            assert_eq!(rect.h, BODY_BTN_H);
-            assert_eq!(rect.w, body_button_width(*button, &FakeMetrics));
-            let icon = Rect::new(
-                rect.x + BODY_BTN_PAD,
-                rect.y + (rect.h - BODY_BTN_ICON) / 2.0,
-                BODY_BTN_ICON,
-                BODY_BTN_ICON,
-            );
-            assert!(icon.right() <= rect.right(), "{button:?}: the glyph leaves its button");
-            assert!(rect.y <= icon.y && icon.bottom() <= rect.bottom(), "{button:?}: the glyph spills out");
-            let label_x = icon.right() + BODY_BTN_ICON_GAP;
-            let label_w = FakeMetrics.width(button.label(), Style::Chip);
-            assert!(
-                label_x + label_w <= rect.right() - BODY_BTN_PAD + 1e-9,
-                "{button:?}: {} does not fit its button",
-                button.label()
-            );
+            assert_eq!((rect.w, rect.h), (BTN, BTN));
+            assert!(button.icon().is_some(), "{button:?}: no glyph");
+            assert!(!button.tip().is_empty(), "{button:?}: nothing to say on hover");
         }
-        // 6 pt between two buttons on a line, the same left edge on the next
-        // (FakeMetrics fits Run, Log and Pause on the first line at 280).
         let first = body[0].1;
-        assert_eq!(body[1].1.x, first.right() + BODY_BTN_GAP);
-        assert_eq!(body[3].1.x, first.x);
-        assert!(body[3].1.y >= first.bottom() + BODY_BTN_GAP);
+        for (k, (_, rect)) in body.iter().enumerate().skip(1) {
+            assert_eq!(rect.x, first.x + k as f64 * (BTN + BTN_GAP));
+            assert_eq!(rect.y, first.y);
+        }
     }
 
     #[test]

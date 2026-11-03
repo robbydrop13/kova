@@ -95,8 +95,17 @@ pub mod tokens {
         pub tile: [f32; 3],
         pub tile_hover: [f32; 3],
         pub tile_pressed: [f32; 3],
+        /// A selected row's ground: neutral, one step off the hover one.
+        pub sel_row_bg: [f32; 3],
+        /// A selected row's ink.
+        pub sel_row_text: [f32; 3],
+        /// The 2 pt selection rail at a selected row's left edge.
+        pub sel_row_rail: [f32; 3],
+        /// The filled ground of a selected control (`SEL_BG`): the view
+        /// switcher's icon, the chips. A row never uses it.
         pub sel_bg: [f32; 3],
         pub sel_text: [f32; 3],
+        /// The accent rail of the stat cards and a highlighted ask.
         pub sel_rail: [f32; 3],
         pub border_subtle: [f32; 3],
         pub border_strong: [f32; 3],
@@ -137,6 +146,14 @@ pub mod tokens {
     /// The white every translucent layer of the selected group is cut from.
     const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
     const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
+    /// `gray.25` (`#FAFAFA`): a selected row's ink in the dark set. The
+    /// generated table stops at `text.primary` (`gray.100`, `#E9E9E9`), and a
+    /// selected row reads one step above the rows around it.
+    const SEL_ROW_TEXT_DARK: [f32; 3] = [0.980, 0.980, 0.980];
+    /// `gray.100` (`#E9E9E9`): a selected row's ground in the light set. One
+    /// step under `bg.hover` (`gray.50`, `#F3F3F3`), so hover and selection
+    /// never read the same; no generated light token carries it either.
+    const SEL_ROW_BG_LIGHT: [f32; 3] = [0.914, 0.914, 0.914];
 
     pub const DARK: Palette = Palette {
         bg2: rgb(dark::BG2),
@@ -144,6 +161,12 @@ pub mod tokens {
         tile: rgb(dark::BG1),
         tile_hover: rgb(dark::HOVER),
         tile_pressed: rgb(dark::BTN2_HOVER),
+        // `gray.1500` (`#2F2F2F`), the dark set's raised surface: a selected
+        // row is neutral, the rail is what marks it.
+        sel_row_bg: rgb(dark::BG_ELEV),
+        sel_row_text: SEL_ROW_TEXT_DARK,
+        // `blue.400` (`#7498FF`).
+        sel_row_rail: rgb(dark::SEL_RAIL),
         sel_bg: rgb(dark::SEL_BG),
         sel_text: rgb(dark::SEL_TEXT),
         sel_rail: rgb(dark::SEL_RAIL),
@@ -177,6 +200,10 @@ pub mod tokens {
         tile: rgb(light::BG1),
         tile_hover: rgb(light::HOVER),
         tile_pressed: rgb(light::BTN2_HOVER),
+        sel_row_bg: SEL_ROW_BG_LIGHT,
+        sel_row_text: rgb(light::T1),
+        // `blue.500` (`#4C74FF`).
+        sel_row_rail: rgb(light::SEL_RAIL),
         sel_bg: rgb(light::SEL_BG),
         sel_text: rgb(light::SEL_TEXT),
         sel_rail: rgb(light::SEL_RAIL),
