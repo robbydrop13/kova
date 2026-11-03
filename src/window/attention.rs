@@ -7,6 +7,18 @@ use super::sidebar::SidebarSort;
 use super::sidebar_model::{pane_order, SidebarList};
 use super::*;
 
+/// The need panes Cmd+J already landed on, app-wide: the jump hops between
+/// windows, so a per-window walk would start over on every hop and never
+/// reach unread output behind two need panes in different windows.
+static NEED_WALK: std::sync::Mutex<needs::NeedWalk> =
+    std::sync::Mutex::new(needs::NeedWalk::new());
+
+/// The pane this press lands on, from the walk the whole app shares.
+fn next_need(items: &[needs::NeedItem], current: Option<u64>) -> Option<u64> {
+    let mut walk = NEED_WALK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    walk.next(items, current)
+}
+
 /// Show the tier banner in whichever window owns `pane_id` — the jump may have
 /// crossed windows, and the banner belongs on the pane it landed on.
 fn show_attention_banner(pane_id: PaneId, tier: AttentionTier) {
@@ -279,11 +291,12 @@ impl KovaView {
 
         // What waits on the user comes before unread output: a pane whose
         // turn died, or that sits on a permission prompt or an open question,
-        // cannot clear that by itself. `sync_needs` rebuilt the list on this
+        // cannot clear that by itself. The app timer built the list on this
         // tick, whether or not the sidebar is on screen.
+        // `next_need` visits each need pane once, then answers `None` so the
+        // walk below (unread, then idle) gets the key.
         let needs = self.ivars().sidebar.borrow().needs.clone();
-        let target = needs::next_need_pane(&needs, current.map(u64::from))
-            .and_then(|id| PaneId::try_from(id).ok());
+        let target = next_need(&needs, current.map(u64::from)).and_then(|id| PaneId::try_from(id).ok());
         if let Some(pane_id) = target {
             log::info!("Cmd+J: waiting on you, from pane {:?} to pane {}", current, pane_id);
             focus_pane_in_any_window(pane_id);
@@ -472,6 +485,47 @@ mod tests {
         assert_eq!(jump_to(&mut here(&[(9, 4)]), &mut here(&[(9, 6)]), Some(4)), Some(6));
         // The last idle session being the focused one: the tour is over.
         assert_eq!(jump_to(&mut nothing(), &mut here(&[(9, 4)]), Some(4)), None);
+    }
+
+    #[test]
+    fn next_visits_each_need_pane_once_then_unread_output() {
+        // Two panes whose turn died and one pane with unread output: the two
+        // errors are visited once each, then the walk hands over to the
+        // output, then starts over at the first error.
+        let input = needs::NeedInput {
+            panes: vec![
+                needs::PaneNeed {
+                    id: 1,
+                    error_since: Some(10),
+                    permission_since: None,
+                    title: "a".into(),
+                    from: None,
+                    detail: None,
+                },
+                needs::PaneNeed {
+                    id: 2,
+                    error_since: Some(11),
+                    permission_since: None,
+                    title: "b".into(),
+                    from: None,
+                    detail: None,
+                },
+            ],
+            routines: Vec::new(),
+            asks: Vec::new(),
+            now: 100,
+        };
+        let items = needs::need_items(&input);
+        let mut walk = needs::NeedWalk::new();
+        assert_eq!(walk.next(&items, None), Some(1));
+        assert_eq!(walk.next(&items, Some(1)), Some(2));
+        // The need tier has had its turn: unread output is what Cmd+J walks
+        // next, and the walk resets behind it.
+        assert_eq!(walk.next(&items, Some(2)), None);
+        // The press that gets `None` lands on the unread pane instead, and the
+        // next one starts the need walk over.
+        assert_eq!(jump_to(&mut here(&[(0, 7)]), &mut nothing(), Some(2)), Some(7));
+        assert_eq!(walk.next(&items, Some(7)), Some(1));
     }
 
     #[test]

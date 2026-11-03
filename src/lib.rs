@@ -20,6 +20,7 @@ mod claude_session;
 mod codex_session;
 mod embed;
 mod events;
+mod exec;
 mod input;
 mod ipc;
 mod keybindings;

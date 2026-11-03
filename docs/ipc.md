@@ -388,6 +388,13 @@ is over as if it were new (sound, Dock badge), and keeps its snooze across a
 restart. The asker is never told: it keeps waiting and times out as it would
 have anyway, so a snooze costs nothing but the late path.
 
+**Brief** (in the Asks view) puts an instruction on a question: the answer
+carries it as `text`, so `kova ask` prints
+`"<button>: text"` when a button was picked and `"Other: text"` when none was.
+That works on a buttons-only question too (`--no-input`): the instruction rides
+on the button the user picks, and `question.input` only decides whether the
+card shows a text field of its own.
+
 ---
 
 ### `list-asks`: the questions waiting on the card

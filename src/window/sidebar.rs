@@ -73,11 +73,11 @@ pub fn persist() {
 }
 
 // ---------------------------------------------------------------
-// Colour tokens (Claap design system, light and dark sets)
+// Colour tokens (the design system, light and dark sets)
 // ---------------------------------------------------------------
 
-/// The palette the sidebar is painted with: the Claap design system,
-/// generated into `src/window/ds_tokens.rs` from KovaLink's
+/// The palette the sidebar is painted with: the design system, generated
+/// into `src/window/ds_tokens.rs` from KovaLink's
 /// `packages/protocol/tokens/ds.json`. Both sets are generated; the one in
 /// use follows the terminal background (see `set_background`), and every call
 /// site reads it through `get()`. RGB floats.

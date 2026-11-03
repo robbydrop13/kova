@@ -115,9 +115,39 @@ static CHANGED: AtomicU64 = AtomicU64::new(0);
 static READ_AT: AtomicU64 = AtomicU64::new(0);
 /// Set while a refresh thread runs, so a tick never starts a second one.
 static REFRESHING: AtomicBool = AtomicBool::new(false);
+/// The reopens in flight, by session name: a second click while the first one
+/// runs is refused instead of starting a second `team reopen`.
+static REOPENING: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// How long a roster read may take: `team list --json` answers in
+/// milliseconds on a working machine, and a hung one must not hold the refresh
+/// flag for good.
+const LIST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a reopen may take: it starts a session, slower than a read but
+/// still bounded.
+const REOPEN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Clears `REFRESHING` however the read thread ends, a panic included: a flag
+/// left set would keep every later tick from refreshing again.
+struct RefreshDone;
+
+impl Drop for RefreshDone {
+    fn drop(&mut self) {
+        REFRESHING.store(false, Ordering::Release);
+    }
+}
+
+/// Removes a name from `REOPENING` when its thread ends, timeout or panic.
+struct ReopenDone(String);
+
+impl Drop for ReopenDone {
+    fn drop(&mut self) {
+        REOPENING.lock().retain(|name| name != &self.0);
+    }
 }
 
 /// The roster as last read, and a refresh in the background when the snapshot
@@ -130,12 +160,12 @@ pub fn snapshot() -> Option<Arc<Team>> {
     let due = age >= MAX_AGE_SECS || READ_AT.load(Ordering::Relaxed) < CHANGED.load(Ordering::Relaxed);
     if due && !REFRESHING.swap(true, Ordering::AcqRel) {
         std::thread::spawn(|| {
+            let _done = RefreshDone;
             let generation = CHANGED.load(Ordering::Relaxed);
             let team = read(&command());
             *CACHE.write() = Some(Arc::new(team));
             FILLED_AT.store(now_secs(), Ordering::Relaxed);
             READ_AT.store(generation, Ordering::Relaxed);
-            REFRESHING.store(false, Ordering::Release);
         });
     }
     CACHE.read().clone()
@@ -174,7 +204,15 @@ pub fn reopen(name: &str, argv: &[String]) -> Result<(), String> {
         return Err("no roster command configured".to_string());
     };
     let name = name.to_string();
+    {
+        let mut in_flight = REOPENING.lock();
+        if in_flight.contains(&name) {
+            return Err(format!("a reopen of {name} is already in flight"));
+        }
+        in_flight.push(name.clone());
+    }
     std::thread::spawn(move || {
+        let _done = ReopenDone(name.clone());
         let result = run(&bin, &args);
         if let Err(why) = &result {
             log::warn!("team reopen {name}: {why}");
@@ -200,10 +238,10 @@ fn reopen_command(name: &str, argv: &[String], roster: &[String]) -> Option<(Str
 }
 
 fn run(bin: &str, args: &[String]) -> Result<(), String> {
-    let out = std::process::Command::new(bin)
-        .args(args)
-        .output()
-        .map_err(|e| format!("cannot run {bin}: {e}"))?;
+    let out = crate::exec::run_with_deadline(
+        std::process::Command::new(bin).args(args),
+        REOPEN_DEADLINE,
+    )?;
     if out.status.success() {
         return Ok(());
     }
@@ -247,10 +285,13 @@ fn read(argv: &[String]) -> Team {
     if !bin.is_file() {
         return Team::default();
     }
-    let out = match std::process::Command::new(bin).args(args).output() {
+    let out = match crate::exec::run_with_deadline(
+        std::process::Command::new(bin).args(args),
+        LIST_DEADLINE,
+    ) {
         Ok(out) => out,
         Err(e) => {
-            log::warn!("roster: cannot run {}: {e}", bin.display());
+            log::warn!("roster: {e}");
             return Team::default();
         }
     };

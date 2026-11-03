@@ -188,7 +188,7 @@ const ANSWER_GAP: f64 = 12.0;
 // Text styles
 // ---------------------------------------------------------------
 
-/// The Claap design system type scale, Inter.
+/// The design system's type scale, Inter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Style {
     ViewTitle,
@@ -3540,8 +3540,8 @@ mod tests {
 
     #[test]
     fn styles_match_the_design_system_scale() {
-        // 10 to 15 with the weights Claap's design system pins, plus the
-        // Agents stat tile's 20 pt value.
+        // 10 to 15 with the weights the design system pins, plus the Agents
+        // stat tile's 20 pt value.
         assert_eq!(Style::ViewTitle.size(), 15.0);
         assert_eq!(Style::ViewTitle.weight(), Weight::Semibold);
         assert_eq!(Style::Title.size(), 13.0);

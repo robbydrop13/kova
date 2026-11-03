@@ -299,6 +299,16 @@ impl AppDelegate {
                     // before the NSWindow/KovaView is deallocated.
                     ivars.pending_close.borrow_mut().clear();
 
+
+                    // The need list scans every window's panes: build it once
+                    // per tick and let each window read the same one.
+                    {
+                        let windows = ivars.windows.borrow();
+                        if let Some(view) = windows.iter().find_map(|win| kova_view(win)) {
+                            view.refresh_needs_shared();
+                        }
+                    }
+
                     // Tick all windows, collect indices of dead ones
                     let mut dead_indices: Vec<usize> = Vec::new();
                     {

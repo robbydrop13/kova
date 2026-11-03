@@ -30,9 +30,9 @@
 //! screen) is still a permission prompt, with no options: its card offers
 //! only `Open`, and nothing may be typed into it.
 //!
-//! A `fingerprint` of the header, the question, the detail and the option
-//! labels lets a click answer only the screen it was shown for: the card
-//! holds the hash, the click reads the pane again and compares.
+//! A `fingerprint` of every body line of the frame, the question and the
+//! option labels lets a click answer only the screen it was shown for: the
+//! card holds the hash, the click reads the pane again and compares.
 //!
 //! Any other deviation yields `None`: a stale prompt higher up the screen does
 //! not parse either, because the footer has to be the last non-empty line.
@@ -78,6 +78,11 @@ pub struct ParsedPrompt {
     pub question: String,
     /// First detail line under the header (the command, the file name).
     pub detail: Option<String>,
+    /// Every body line of the frame, header included, normalized: trimmed
+    /// with runs of spaces collapsed. The fingerprint hashes all of them: a
+    /// wrapped command or a diff block is as much what the answer approves as
+    /// its first line.
+    pub lines: Vec<String>,
     /// The numbered options, in order: `(1, "Yes")`, ... Empty when the block
     /// on screen does not number from 1 (a prompt scrolled partway): its card
     /// then offers only `Open`.
@@ -137,14 +142,16 @@ impl ParsedPrompt {
         out
     }
 
-    /// A stable hash of the header, the question, the detail and the option
-    /// labels, trimmed (FNV-1a): two reads of the same screen give the same
-    /// number, a screen with another command or another prompt another one.
+    /// A stable hash of every body line of the frame, the question and the
+    /// option labels (FNV-1a): two reads of the same screen give the same
+    /// number, a screen with another command, another detail block or another
+    /// prompt another one.
     pub fn fingerprint(&self) -> u64 {
         let mut h = Fingerprint::new();
-        h.text(&self.header);
+        for line in &self.lines {
+            h.text(line);
+        }
         h.text(&self.question);
-        h.text(self.detail.as_deref().unwrap_or(""));
         for (number, label) in &self.options {
             h.number(*number);
             h.text(label);
@@ -261,6 +268,26 @@ fn is_tip(line: &str) -> bool {
     line.trim_start().starts_with("Tip: ")
 }
 
+/// A line as the fingerprint sees it: trimmed, with every run of spaces
+/// inside turned into one. A terminal that rewraps a command, or pads it
+/// differently, is still the same screen.
+fn normalize(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut space = false;
+    for ch in line.trim().chars() {
+        if ch.is_whitespace() {
+            space = true;
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        out.push(ch);
+    }
+    out
+}
+
 /// Parse the visible text of a pane. `None` when the screen is not a
 /// permission prompt at all; a prompt whose option block strays from the
 /// numbering keeps its header and question, with no options.
@@ -336,10 +363,14 @@ pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
         return None;
     }
 
+    // Every body line, not just the first detail one: the whole command or
+    // detail frame is what the fingerprint covers.
+    let body_lines: Vec<String> = body.iter().map(|&line| normalize(line)).collect();
     Some(ParsedPrompt {
-        header: body[0].to_string(),
-        question: question.to_string(),
-        detail: body.get(1).map(|s| s.to_string()),
+        header: body_lines[0].clone(),
+        question: normalize(question),
+        detail: body_lines.get(1).cloned(),
+        lines: body_lines,
         options,
     })
 }
@@ -598,6 +629,7 @@ mod tests {
             header: "Bash command".into(),
             question: "Do you want to proceed?".into(),
             detail: None,
+            lines: vec!["Bash command".into()],
             options: vec![(1, "Sure".into()), (2, "Later".into())],
         };
         assert_eq!(unseen.choices(), PermissionChoices::default());
@@ -609,6 +641,19 @@ mod tests {
         let b = parse_permission_prompt(BASH_2).expect("second");
         assert_eq!(a.fingerprint(), parse_permission_prompt(BASH_1).expect("again").fingerprint());
         assert_ne!(a.fingerprint(), b.fingerprint(), "another command is another prompt");
+
+        // A prompt whose third body line differs (a second line of a wrapped
+        // command, a second file in the block) is a different prompt: the card
+        // would otherwise answer something the user never saw.
+        let mut other_block = a.clone();
+        assert!(other_block.lines.len() >= 3, "the fixture keeps a multi-line block");
+        other_block.lines[2] = "Write \"un\" to another file".into();
+        assert_ne!(a.fingerprint(), other_block.fingerprint());
+        // The same screen with another padding, as a reflow can give: same
+        // prompt, same hash.
+        let padded = BASH_1.replace("   echo un > un.txt", "  echo    un   >   un.txt");
+        let reflowed = parse_permission_prompt(&padded).expect("the same prompt");
+        assert_eq!(a.fingerprint(), reflowed.fingerprint());
 
         let mut other_question = a.clone();
         other_question.question = "Do you still want to proceed?".into();

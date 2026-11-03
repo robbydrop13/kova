@@ -1244,7 +1244,9 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
 
   --actions     buttons, comma-separated (default: a single \"Reply\" button). With a text field, the
                 card adds an \"Other\" button after them, and text sent with Enter answers \"Other: text\"
-  --no-input    no text field, buttons only
+  --no-input    no text field, buttons only. Brief (in the Asks view) can still attach an
+                instruction to the answer: \"<button>: text\" with the button it names, or
+                \"Other: text\" when none was picked
   --from        the name shown on the card (default: the working directory's name)
   --timeout     seconds to wait. Default: 540 inside a Claude Code conversation (under the Bash tool's
                 600 s limit; run kova ask with the Bash timeout set to 600000), no limit anywhere else,

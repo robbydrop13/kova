@@ -246,33 +246,71 @@ fn pane_items(
 }
 
 /// What a human has to answer right now, across the app: permission prompts
-/// and open questions, counted the way `need_items` dedupes them. Errors and
-/// failed runs are not in it: they want a look, not an answer.
-pub fn waits_on_you(input: &NeedInput) -> u32 {
-    need_items(input)
+/// and open questions, counted from the list the tick already built (asking
+/// `need_items` a second time per window was pure waste). Errors and failed
+/// runs are not in it: they want a look, not an answer.
+pub fn waits_on_you(items: &[NeedItem]) -> u32 {
+    items
         .iter()
         .filter(|item| matches!(item.kind, NeedKind::Permission | NeedKind::Ask))
         .count() as u32
 }
 
-/// The pane Next lands on: the need pane after the one under the eye, in
-/// need order, wrapping, so repeated presses visit every waiting pane. From
-/// anywhere else, the first one. A failed routine carries no pane, so the
-/// walk steps over it here. `None` when the only need pane is the current one.
-pub fn next_need_pane(items: &[NeedItem], current: Option<u64>) -> Option<u64> {
-    let mut panes: Vec<u64> = Vec::new();
-    for id in items.iter().filter_map(|item| item.pane_id) {
-        if !panes.contains(&id) {
-            panes.push(id);
+/// The need panes `Cmd+J` has already landed on since the walk started: each
+/// is visited once, then the key moves on to unread output. The walk resets
+/// here when it reaches the end, and a need list that changed (another set of
+/// keys) resets it too, so a prompt that just appeared is visited at once.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NeedWalk {
+    /// The keys of the list the walk started on.
+    keys: Vec<String>,
+    /// The need panes it already landed on.
+    seen: Vec<u64>,
+}
+
+impl NeedWalk {
+    /// A walk that has not started, for the static that holds the running one.
+    pub const fn new() -> Self {
+        Self { keys: Vec::new(), seen: Vec::new() }
+    }
+
+    /// The need pane to visit on this press, in list order; `None` once every
+    /// one has been visited, which is what lets Cmd+J fall through to the
+    /// unread and idle tiers. That `None` also starts a new walk, so the next
+    /// press goes back to the first pane. A failed routine has no pane and is
+    /// stepped over.
+    pub fn next(&mut self, items: &[NeedItem], current: Option<u64>) -> Option<u64> {
+        let keys: Vec<String> = items.iter().map(|item| item.key.clone()).collect();
+        if keys != self.keys {
+            self.keys = keys;
+            self.seen.clear();
+        }
+        let mut panes: Vec<u64> = Vec::new();
+        for id in items.iter().filter_map(|item| item.pane_id) {
+            if !panes.contains(&id) {
+                panes.push(id);
+            }
+        }
+        // From the pane under the eye forward, wrapping: the next need pane in
+        // the list, never the one just left, and never one already visited.
+        let start = match current.and_then(|c| panes.iter().position(|id| *id == c)) {
+            Some(at) => at + 1,
+            None => 0,
+        };
+        let next = (0..panes.len())
+            .map(|step| panes[(start + step) % panes.len()])
+            .find(|id| Some(*id) != current && !self.seen.contains(id));
+        match next {
+            Some(id) => {
+                self.seen.push(id);
+                Some(id)
+            }
+            None => {
+                self.seen.clear();
+                None
+            }
         }
     }
-    let start = match current.and_then(|c| panes.iter().position(|id| *id == c)) {
-        Some(at) => at + 1,
-        None => 0,
-    };
-    (0..panes.len())
-        .map(|step| panes[(start + step) % panes.len()])
-        .find(|id| Some(*id) != current)
 }
 
 /// The oldest failed routine, for the sidebar's Scheduled list: the list is
@@ -311,11 +349,12 @@ mod tests {
         // sides drift on the cases nobody wrote down.
         assert!(cases.len() >= 8, "the shared fixture keeps its cases");
         for case in cases {
-            let keys: Vec<String> =
-                need_items(&case.input).into_iter().map(|item| item.key).collect();
+            // One list, read once: the order and the badge both come from it.
+            let items = need_items(&case.input);
+            let keys: Vec<String> = items.iter().map(|item| item.key.clone()).collect();
             assert_eq!(keys, case.expect.order, "{}: order", case.name);
             assert_eq!(
-                waits_on_you(&case.input),
+                waits_on_you(&items),
                 case.expect.waits_on_you,
                 "{}: waits_on_you",
                 case.name
@@ -340,15 +379,19 @@ mod tests {
         };
         let items = need_items(&input);
         assert_eq!(first_failed_routine(&items), Some("nightly"));
-        assert_eq!(next_need_pane(&items, None), Some(3));
+        let mut walk = NeedWalk::new();
+        assert_eq!(walk.next(&items, None), Some(3));
         // Standing on one, the other comes up rather than itself.
-        assert_eq!(next_need_pane(&items, Some(3)), Some(4));
-        assert_eq!(next_need_pane(&items, Some(4)), Some(3));
-        assert_eq!(next_need_pane(&[], None), None);
+        assert_eq!(walk.next(&items, Some(3)), Some(4));
+        // Both had their turn: the walk ends (unread output gets the key) and
+        // the press after that starts over.
+        assert_eq!(walk.next(&items, Some(4)), None);
+        assert_eq!(walk.next(&items, Some(4)), Some(3));
+        assert_eq!(NeedWalk::new().next(&[], None), None);
     }
 
     #[test]
-    fn next_visits_every_need_pane_in_turn() {
+    fn next_visits_every_need_pane_once_then_starts_over() {
         let item = |pane: u64| NeedItem {
             kind: NeedKind::Ask,
             key: format!("ask:{pane}"),
@@ -358,11 +401,23 @@ mod tests {
             detail: String::new(),
         };
         let items = vec![item(1), item(2), item(3)];
-        assert_eq!(next_need_pane(&items, Some(1)), Some(2));
-        assert_eq!(next_need_pane(&items, Some(2)), Some(3));
-        assert_eq!(next_need_pane(&items, Some(3)), Some(1));
-        assert_eq!(next_need_pane(&items, Some(9)), Some(1));
-        assert_eq!(next_need_pane(&items[..1], Some(1)), None);
+        let mut walk = NeedWalk::new();
+        assert_eq!(walk.next(&items, Some(1)), Some(2));
+        assert_eq!(walk.next(&items, Some(2)), Some(3));
+        // 1 was where the walk started, so it is the last one to get a turn;
+        // only then does the tier end and give the key to unread output.
+        assert_eq!(walk.next(&items, Some(3)), Some(1));
+        assert_eq!(walk.next(&items, Some(1)), None, "every need pane was visited once");
+        assert_eq!(walk.next(&items, Some(1)), Some(2), "a new walk starts where the eye is");
+
+        // Another list (a fourth pane asks): the walk restarts instead of
+        // resuming in the middle of the old one.
+        let mut walk = NeedWalk::new();
+        assert_eq!(walk.next(&items, None), Some(1));
+        assert_eq!(walk.next(&items, Some(1)), Some(2));
+        let mut grown = items.clone();
+        grown.push(item(4));
+        assert_eq!(walk.next(&grown, Some(1)), Some(2));
     }
 
     #[test]

@@ -48,7 +48,7 @@ use std::sync::Arc;
 use crate::appkit_input::{self, AppKitInput, PaneOrigin, ScrollAxisLock, copy_to_pasteboard};
 use crate::config::{Config, TerminalConfig};
 use crate::input::{self, MouseAction, MouseResult};
-use crate::keybindings::{Action, KeyCombo, Keybindings};
+use crate::keybindings::{Action, KeyCombo, Keybindings, text_edit};
 use crate::pane::{NavDirection, Pane, PaneId, SplitDirection, Tab, TabId, alloc_tab_id};
 use crate::renderer::{PaneViewport, Renderer};
 use crate::resize_repair::ResizeRepair;
@@ -525,19 +525,32 @@ define_class!(
 
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
+            let combo = KeyCombo::from_event(event);
             // A native text field has the keyboard (the sidebar's Brief
-            // field): Cmd+A/C/V/X/Z are its own, and the terminal's map must
-            // not take them first. AppKit hands them to the field editor once
-            // no view claims them as a key equivalent.
+            // field, the card's answer field). Kova builds no Edit menu, so
+            // nothing would turn Cmd+A/C/V/X/Z into an action and the field
+            // editor would beep on every one of them: those go down the
+            // responder chain from here. Every other combo falls through to
+            // the normal map, so Cmd+J and the rest still work in the field.
             if self
                 .window()
                 .and_then(|win| win.firstResponder())
                 .is_some_and(|responder| responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())
+                && let Some(edit) = text_edit(&combo)
             {
-                return objc2::runtime::Bool::NO;
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                let app = NSApplication::sharedApplication(mtm);
+                let action = edit.selector();
+                unsafe {
+                    let _: objc2::runtime::Bool = msg_send![
+                        &app,
+                        sendAction: action,
+                        to: None::<&objc2::runtime::AnyObject>,
+                        from: None::<&objc2::runtime::AnyObject>,
+                    ];
+                }
+                return objc2::runtime::Bool::YES;
             }
-            let combo = KeyCombo::from_event(event);
-
             let keybindings = match self.ivars().keybindings.get() {
                 Some(kb) => kb,
                 None => return objc2::runtime::Bool::NO,

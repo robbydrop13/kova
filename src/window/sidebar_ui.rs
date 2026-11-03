@@ -15,6 +15,21 @@ use super::sidebar_sched::{self, SchedButton, SchedHit, SchedState};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
 
+/// The tick's need list, built once and shared by every window: building it
+/// scans every window's panes, so a window that redid it made the frame cost
+/// grow with the square of the window count.
+static NEEDS_NOW: std::sync::Mutex<Option<std::sync::Arc<NeedsNow>>> = std::sync::Mutex::new(None);
+
+/// One tick's need list, and what the badges and Cmd+J derive from it.
+struct NeedsNow {
+    /// Bumped only when the list changes: a window whose copy carries the same
+    /// number has nothing to copy or redraw.
+    generation: u64,
+    items: Vec<NeedItem>,
+    waits_on_you: u32,
+    routine_failed: bool,
+}
+
 /// What a tile's context menu can do, dispatched by the item's tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PaneAction {
@@ -132,9 +147,13 @@ pub(super) struct SidebarState {
     /// The tab a context menu is open for.
     menu_tab: usize,
     /// What waits on the user, in the order `Next` walks it
-    /// (`needs::need_items`), rebuilt once per tick whether the sidebar is on
-    /// screen or not: the badges and Cmd+J read the same list.
+    /// (`needs::need_items`), built once per app tick and shared by every
+    /// window, whether the sidebar is on screen or not: the badges and Cmd+J
+    /// read the same list.
     pub(super) needs: Vec<NeedItem>,
+    /// Which build of the shared list `needs` holds, so a tick that changed
+    /// nothing copies nothing.
+    needs_generation: u64,
     /// `needs::waits_on_you`, the badge on the Asks icon.
     pub(super) waits_on_you: u32,
     /// A scheduled routine's last run failed, the badge on the Scheduled icon.
@@ -169,6 +188,7 @@ impl SidebarState {
             menu_pane: 0,
             menu_tab: 0,
             needs: Vec::new(),
+            needs_generation: 0,
             waits_on_you: 0,
             routine_failed: false,
             needs_all: false,
@@ -265,19 +285,48 @@ impl KovaView {
     // ---------------------------------------------------------------
     // Per-tick sync
     // ---------------------------------------------------------------
-    /// What waits on the user, once per tick: the order Cmd+J walks and the
-    /// two badges on the switcher. Runs before the sidebar early-outs below,
-    /// and so whether or not the sidebar is on screen: `routines::snapshot`
-    /// only reads on this path, and the jump must not depend on the view.
-    fn sync_needs(&self) {
+    /// Build the need list for this tick and publish it for every window: the
+    /// list scans every window's panes, so a window that rebuilt it made the
+    /// frame cost grow with the square of the window count. The app timer
+    /// calls this once, before ticking the windows.
+    pub(crate) fn refresh_needs_shared(&self) {
         let input = self.need_input(now_epoch_secs());
         let items = needs::need_items(&input);
+        let waits_on_you = needs::waits_on_you(&items);
         let routine_failed = items.iter().any(|item| item.kind == NeedKind::FailedRoutine);
+        let mut slot = NEEDS_NOW.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Another list bumps the generation, so each window copies it once; an
+        // unchanged one keeps the same number and the windows do nothing.
+        let generation = match slot.as_ref() {
+            Some(prev)
+                if prev.items == items
+                    && prev.waits_on_you == waits_on_you
+                    && prev.routine_failed == routine_failed =>
+            {
+                prev.generation
+            }
+            Some(prev) => prev.generation.wrapping_add(1),
+            None => 1,
+        };
+        *slot = Some(Arc::new(NeedsNow { generation, items, waits_on_you, routine_failed }));
+    }
+
+    /// What waits on the user, once per app tick: the order Cmd+J walks and
+    /// the two badges on the switcher. Runs before the sidebar early-outs
+    /// below, and so whether or not the sidebar is on screen: `routines::
+    /// snapshot` only reads on this path, and the jump must not depend on the
+    /// view.
+    fn sync_needs(&self) {
+        let shared = NEEDS_NOW.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let Some(shared) = shared else { return };
         let mut st = self.ivars().sidebar.borrow_mut();
-        st.needs = items;
-        st.waits_on_you = needs::waits_on_you(&input);
-        st.routine_failed = routine_failed;
-        if !routine_failed {
+        if st.needs_generation != shared.generation {
+            st.needs_generation = shared.generation;
+            st.needs = shared.items.clone();
+            st.waits_on_you = shared.waits_on_you;
+            st.routine_failed = shared.routine_failed;
+        }
+        if !st.routine_failed {
             st.routine_shown = None;
         }
     }

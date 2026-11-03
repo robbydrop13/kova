@@ -2162,6 +2162,7 @@ mod tests {
             header: "Bash command".into(),
             question: "Do you want to proceed?".into(),
             detail: Some(command.into()),
+            lines: vec!["Bash command".into(), command.into()],
             options: vec![
                 (1, "Yes".into()),
                 (2, "Yes, and don't ask again for this command".into()),

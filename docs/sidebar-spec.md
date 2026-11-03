@@ -106,7 +106,7 @@ No footer: the way back to the tab bar is View > Show Tab Bar and ⌥⌘S
 
 ### 3.3 Typography (`sidebar_view::Style`, `fonts::inter_name`, `NSFont::fontWithName_size`)
 
-The Claap design system type scale, in Inter: the chrome's view title 15
+The design system's type scale, in Inter: the chrome's view title 15
 semibold; header and tile titles 13 medium; secondary line, question, detail
 and pill label 12 (detail regular, pill semibold); links 12 medium; chips,
 summary, hint, number and sort ghost 11 (chips and sort medium); pill badge
@@ -493,7 +493,9 @@ is off screen) keeps its card, with only Open.
 
 A click re-reads the pane's screen right then (`Pane::answer_permission`)
 and compares `prompt_preview::permission_answer`'s fingerprint with the one
-the card was built from. Equal: the option's digit alone goes to the pane's
+the card was built from. The hash covers the whole body block, every line of
+a wrapped command or a diff (spacing normalized), not only its first line.
+Equal: the option's digit alone goes to the pane's
 PTY, the way Claude Code takes a numbered choice, and the card goes to
 `Sending` like an asked answer. Different or gone: nothing is typed, the card
 says `Prompt changed, open the pane` in `crit.text` for 5 s
@@ -856,12 +858,15 @@ never the focused pane itself
 Before that order, `Cmd+J` walks what waits on the user
 (`src/window/needs.rs`): errors oldest first, failed routines oldest first,
 then permission prompts and open questions merged by age, with a pane's own
-prompt and open question collapsed into one item. `KovaView::sync_needs`
-rebuilds that list every tick and the key, the Asks badge (`waits_on_you`:
-permissions and asks only, never errors or failed runs) and the Scheduled
-badge all read it. A failed routine has no pane to land on, so it switches
-the sidebar to Scheduled once, and the next press falls through to the
-unread order above.
+prompt and open question collapsed into one item. The app timer builds that
+list once per tick (`KovaView::refresh_needs_shared`) and every window reads
+the same one, as do the Asks badge (`waits_on_you`: permissions and asks
+only, never errors or failed runs) and the Scheduled badge. A failed routine
+has no pane to land on, so it switches the sidebar to Scheduled once, and
+the next press falls through to the unread order above. `needs::NeedWalk`,
+shared by the windows, lands on each need pane once per walk and then hands
+the key to the unread order, so two failed turns cannot pin `Cmd+J` between
+them; the walk starts over once it has visited them all or the list changes.
 
 ### 5.1 Where the question text comes from
 
@@ -876,10 +881,10 @@ one a permission click goes through. Cleared on a rising edge of
 assistant text of the transcript (`~/.claude/projects/<slug>/<id>.jsonl`)
 into a `TurnEnd { summary }`. Fixtures under `tests/fixtures/prompt/`.
 
-## 6. Tokens (`sidebar::tokens`, RGB floats, Claap design system)
+## 6. Tokens (`sidebar::tokens`, RGB floats, the design system)
 
 The palette comes from KovaLink `packages/protocol/tokens/ds.json`, the
-Claap design system, generated into `src/window/ds_tokens.rs`. `sidebar::tokens`
+design system, generated into `src/window/ds_tokens.rs`. `sidebar::tokens`
 holds both generated sets as `Palette` values (`DARK`, `LIGHT`) with the
 alpha channel dropped, and every call site reads the one in use through
 `get()`. The set follows the terminal background (`[colors] background`, its

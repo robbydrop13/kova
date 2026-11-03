@@ -399,6 +399,23 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// How long a read may take. `routinectl list` answers in milliseconds on a
+/// working machine; past ten seconds it is hung, and the disk reader behind
+/// it is a better answer than waiting.
+const LIST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long an action may take: `delete` moves files, `run` starts a job.
+const ACTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Clears `REFRESHING` however the read thread ends, a panic included: a flag
+/// left set would keep every later tick from refreshing again.
+struct RefreshDone;
+
+impl Drop for RefreshDone {
+    fn drop(&mut self) {
+        REFRESHING.store(false, Ordering::Release);
+    }
+}
+
 /// The routines as last read, and a refresh in the background when the
 /// snapshot has aged out. Returns at once, and `None` until the first read
 /// lands: reading them shells out, which has no business on the tick, and
@@ -408,12 +425,12 @@ pub fn snapshot() -> Option<Arc<Vec<Routine>>> {
     let due = age >= MAX_AGE_SECS || READ_AT.load(Ordering::Relaxed) < CHANGED.load(Ordering::Relaxed);
     if due && !REFRESHING.swap(true, Ordering::AcqRel) {
         std::thread::spawn(|| {
+            let _done = RefreshDone;
             let generation = CHANGED.load(Ordering::Relaxed);
             let list = read_all();
             *CACHE.write() = Some(Arc::new(list));
             FILLED_AT.store(now_secs(), Ordering::Relaxed);
             READ_AT.store(generation, Ordering::Relaxed);
-            REFRESHING.store(false, Ordering::Release);
         });
     }
     CACHE.read().clone()
@@ -469,10 +486,10 @@ fn serve_action(home: &Path, action: RoutineAction, name: &str) -> Result<(), St
         return Err(format!("invalid routine name: {name}"));
     }
     let bin = home.join(".claude/routines/routinectl");
-    let out = std::process::Command::new(&bin)
-        .args([action.arg(), name])
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    let out = crate::exec::run_with_deadline(
+        std::process::Command::new(&bin).args([action.arg(), name]),
+        ACTION_DEADLINE,
+    )?;
     if out.status.success() {
         return Ok(());
     }
@@ -493,26 +510,30 @@ fn inside_routines(dir: &Path, path: &Path) -> Option<PathBuf> {
     file.starts_with(&dir).then_some(file)
 }
 
+/// Start a viewer without waiting for it: `open` answers at once, but a slow
+/// LaunchServices has no business holding the main thread. The child is
+/// reaped on its own thread, so it leaves no zombie either.
+fn launch(cmd: &mut std::process::Command, what: &str) -> Result<(), String> {
+    let mut child = cmd.spawn().map_err(|e| format!("cannot {what}: {e}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Open a routine's log in Console, argv only.
 pub fn open_log(path: &str) -> Result<(), String> {
     let file = inside_routines(&routines_dir(), Path::new(path)).ok_or_else(|| format!("not a routine log: {path}"))?;
-    std::process::Command::new("open")
-        .args(["-a", "Console"])
-        .arg(file)
-        .status()
-        .map(|_| ())
-        .map_err(|e| format!("cannot open Console: {e}"))
+    launch(
+        std::process::Command::new("open").args(["-a", "Console"]).arg(file),
+        "open Console",
+    )
 }
 
 /// Open a routine's prompt in its default editor, argv only.
 pub fn edit_prompt(path: &str) -> Result<(), String> {
     let file = inside_routines(&routines_dir(), Path::new(path)).ok_or_else(|| format!("not a routine prompt: {path}"))?;
-    std::process::Command::new("open")
-        .arg("-t")
-        .arg(file)
-        .status()
-        .map(|_| ())
-        .map_err(|e| format!("cannot open the prompt: {e}"))
+    launch(std::process::Command::new("open").arg("-t").arg(file), "open the prompt")
 }
 
 /// `prompts/<name>.md`, where a routine's prompt lives.
@@ -550,10 +571,10 @@ pub fn fixture_list() -> Vec<Routine> {
 /// shell is involved.
 fn read_from_routinectl() -> Result<Vec<Routine>, String> {
     let bin = routines_dir().join("routinectl");
-    let out = std::process::Command::new(&bin)
-        .args(["list", "--json"])
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    let out = crate::exec::run_with_deadline(
+        std::process::Command::new(&bin).args(["list", "--json"]),
+        LIST_DEADLINE,
+    )?;
     if !out.status.success() {
         return Err(format!("{} list --json exited with {}", bin.display(), out.status));
     }

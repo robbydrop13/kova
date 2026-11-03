@@ -140,6 +140,54 @@ impl KeyCombo {
     }
 }
 
+/// The Edit commands a focused native text view has to get from Kova itself.
+/// Kova builds no Edit menu (`app.rs` makes App, View and Pane only), so
+/// AppKit turns none of Cmd+A/C/V/X/Z into an action and the field editor
+/// would beep on every one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextEdit {
+    SelectAll,
+    Copy,
+    Paste,
+    Cut,
+    Undo,
+    Redo,
+}
+
+impl TextEdit {
+    /// The action AppKit answers with, sent down the responder chain.
+    pub fn selector(self) -> objc2::runtime::Sel {
+        match self {
+            TextEdit::SelectAll => objc2::sel!(selectAll:),
+            TextEdit::Copy => objc2::sel!(copy:),
+            TextEdit::Paste => objc2::sel!(paste:),
+            TextEdit::Cut => objc2::sel!(cut:),
+            TextEdit::Undo => objc2::sel!(undo:),
+            TextEdit::Redo => objc2::sel!(redo:),
+        }
+    }
+}
+
+/// The text-editing command a combo means while a field has the keyboard:
+/// Cmd+A, Cmd+C, Cmd+V, Cmd+X, Cmd+Z and Cmd+Shift+Z, and nothing else.
+/// Control and Option stay out (Option+arrows move by word, and a Control
+/// combo belongs to the terminal map), and a combo without Cmd is typing.
+pub fn text_edit(combo: &KeyCombo) -> Option<TextEdit> {
+    if !combo.cmd || combo.ctrl || combo.option {
+        return None;
+    }
+    let Key::Char(key) = combo.key else { return None };
+    match (key, combo.shift) {
+        ('a', false) => Some(TextEdit::SelectAll),
+        ('c', false) => Some(TextEdit::Copy),
+        ('v', false) => Some(TextEdit::Paste),
+        ('x', false) => Some(TextEdit::Cut),
+        ('z', false) => Some(TextEdit::Undo),
+        ('z', true) => Some(TextEdit::Redo),
+        _ => None,
+    }
+}
+
 /// Map macOS virtual keycodes to Key for special keys only (arrows, enter,
 /// backspace). Character keys are resolved via charactersIgnoringModifiers
 /// to respect the active keyboard layout.
@@ -466,6 +514,28 @@ mod tests {
         assert!(matches!(bindings.window_map.get(&combo), Some(Action::ToggleUnread)));
         assert!(matches!(bindings.window_map.get(&parse_key_combo("cmd+j")), Some(Action::NextAttention)));
         assert!(matches!(action_from_ipc_name("toggle-unread"), Some(Action::ToggleUnread)));
+    }
+
+    #[test]
+    fn a_focused_field_gets_the_edit_commands_and_nothing_else_from_kova() {
+        let combo = |key, shift| KeyCombo {
+            cmd: true, ctrl: false, option: false, shift, key: Key::Char(key),
+        };
+        assert_eq!(text_edit(&combo('a', false)), Some(TextEdit::SelectAll));
+        assert_eq!(text_edit(&combo('c', false)), Some(TextEdit::Copy));
+        assert_eq!(text_edit(&combo('v', false)), Some(TextEdit::Paste));
+        assert_eq!(text_edit(&combo('x', false)), Some(TextEdit::Cut));
+        assert_eq!(text_edit(&combo('z', false)), Some(TextEdit::Undo));
+        // Cmd+Shift+Z is redo; the other Edit letters with Shift stay out, so
+        // they reach the normal map like every other combo.
+        assert_eq!(text_edit(&combo('z', true)), Some(TextEdit::Redo));
+        assert_eq!(text_edit(&combo('c', true)), None);
+        assert_eq!(text_edit(&combo('j', false)), None, "Cmd+J is still the jump");
+        // A letter without Cmd is typing, not an Edit command, and Control or
+        // Option keeps the combo for the rest of the app.
+        assert_eq!(text_edit(&KeyCombo { cmd: false, ..combo('a', false) }), None);
+        assert_eq!(text_edit(&KeyCombo { ctrl: true, ..combo('a', false) }), None);
+        assert_eq!(text_edit(&KeyCombo { option: true, ..combo('a', false) }), None);
     }
 
     /// Keycodes of the letter and punctuation keys: their position moves with
