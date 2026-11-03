@@ -10,6 +10,7 @@ use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
 use super::needs::{self, AskNeed, NeedInput, NeedItem, NeedKind, PaneNeed, RoutineNeed};
 use super::sidebar_asks::{self, AskCardVm, AsksHit, AsksState, Highlight};
 use super::sidebar_model::{asks_summary, header_title, next_pill, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
+use super::sidebar_sched::{self, SchedButton, SchedHit, SchedState};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
 
@@ -148,6 +149,9 @@ pub(super) struct SidebarState {
     /// The failed routine Cmd+J already showed, so it shows it once rather
     /// than on every press until the routine runs clean again.
     pub(super) routine_shown: Option<String>,
+    /// The Scheduled view: folded sections, the delete confirmation, the
+    /// actions in flight and the words of the ones that failed.
+    pub(super) sched: SchedState,
 }
 
 impl SidebarState {
@@ -166,6 +170,7 @@ impl SidebarState {
             asks: AsksState::default(),
             last_revealed_ask: None,
             routine_shown: None,
+            sched: SchedState::default(),
         }
     }
 }
@@ -267,6 +272,22 @@ impl KovaView {
         st.routine_failed = routine_failed;
         if !routine_failed {
             st.routine_shown = None;
+        }
+    }
+
+    /// What the background actions finished since the last tick: the row
+    /// stops saying what it is doing, or keeps the failure's words for a
+    /// while. Runs before every early-out, so a queued outcome is never
+    /// stranded while the sidebar is hidden.
+    fn sync_sched_results(&self) {
+        let results = crate::routines::drain_results();
+        if results.is_empty() {
+            return;
+        }
+        let now = sidebar_asks::now_ms();
+        let mut state = self.ivars().sidebar.borrow_mut();
+        for result in &results {
+            state.sched.finish(result, now);
         }
     }
 
@@ -410,6 +431,7 @@ impl KovaView {
     /// redraws only when something changed. Also where the list follows a
     /// focus change. Runs once per tick.
     pub(super) fn sync_sidebar(&self) {
+        self.sync_sched_results();
         self.sync_needs();
         self.sync_sidebar_asks_state();
         let Some(view) = self.ivars().sidebar_view.get() else { return };
@@ -439,6 +461,16 @@ impl KovaView {
         model.asks_waiting = waits_on_you;
         model.routine_failed = routine_failed;
         model.apply_needs(&needs, now, needs_all);
+        if list == SidebarList::Scheduled {
+            // The rows' own state: folding, the row being confirmed, the
+            // actions in flight, and the clock the meta row reads.
+            let mut st = self.ivars().sidebar.borrow_mut();
+            st.sched.now = Some(crate::routines::When::now());
+            st.sched.prune(sidebar_asks::now_ms());
+            model.sched = st.sched.clone();
+            model.sched_meta = sidebar_sched::meta_left(&model.routines);
+            model.meta_right = sidebar_sched::clock_words(&st.sched);
+        }
         if list == SidebarList::Asks {
             let cards = self.ask_cards(now);
             let mut st = self.ivars().sidebar.borrow_mut();
@@ -608,6 +640,72 @@ impl KovaView {
             Some(open) if open == name => None,
             _ => Some(name.to_string()),
         };
+    }
+
+    /// A click on a section header of the Scheduled list: fold or unfold it.
+    pub(super) fn sidebar_sched_section(&self, group: crate::routines::Group) {
+        self.ivars().sidebar.borrow_mut().sched.toggle(group);
+    }
+
+    /// A click on a Scheduled row or one of its buttons. `log` is the path
+    /// routinectl reported for the routine; `Open log` falls back to
+    /// `logs/<name>.log` when it reported none.
+    pub(super) fn sidebar_sched_hit(&self, hit: SchedHit, name: &str, log: &str) {
+        let mut run = None;
+        let mut open_log = false;
+        let mut edit = false;
+        {
+            let mut st = self.ivars().sidebar.borrow_mut();
+            let SchedHit::Button(_, button) = hit else {
+                // The row itself opens its body. A section never reaches here:
+                // the view sends that one to `sidebar_sched_section`.
+                st.sched.close_confirm();
+                drop(st);
+                if let SchedHit::Row(_) = hit {
+                    self.sidebar_toggle_routine(name);
+                }
+                return;
+            };
+            // An action in flight owns the row: its buttons do nothing until
+            // it reports back.
+            if st.sched.busy_action(name).is_some() {
+                return;
+            }
+            match button {
+                SchedButton::Run | SchedButton::Pause | SchedButton::Resume | SchedButton::ConfirmDelete => {
+                    let action = button.action().expect("a button that runs a verb");
+                    st.sched.start(name, action);
+                    st.sched.close_confirm();
+                    run = Some(action);
+                }
+                // Deleting asks first, inline.
+                SchedButton::Delete => st.sched.open_confirm(name),
+                SchedButton::ConfirmCancel => st.sched.close_confirm(),
+                SchedButton::Log => open_log = true,
+                SchedButton::Edit => edit = true,
+            }
+        }
+        if let Some(action) = run {
+            crate::routines::run_action(action, name);
+            return;
+        }
+        let opened = if open_log {
+            let path = if log.is_empty() { crate::routines::log_path(name).display().to_string() } else { log.to_string() };
+            crate::routines::open_log(&path).map_err(|why| format!("Could not open: {why}"))
+        } else if edit {
+            let path = crate::routines::prompt_path(name).display().to_string();
+            crate::routines::edit_prompt(&path).map_err(|why| format!("Could not open: {why}"))
+        } else {
+            return;
+        };
+        if let Err(words) = opened {
+            self.ivars().sidebar.borrow_mut().sched.failed(name, words, sidebar_asks::now_ms());
+        }
+    }
+
+    /// Escape or `Cancel` on the inline delete confirmation.
+    pub(super) fn sidebar_sched_cancel_confirm(&self) {
+        self.ivars().sidebar.borrow_mut().sched.close_confirm();
     }
 
     /// `Show all` / `Show less` on the `Needs you` block.

@@ -35,7 +35,10 @@ use super::sidebar::{
     SummaryRun, TileButton, TileState, RESUME_LABEL, START_CLAUDE_LABEL,
 };
 use super::sidebar_asks::{self, AsksHit, AsksLayout};
-use super::sidebar_model::{need_rows_shown, GroupVm, NeedRowVm, RoutineVm, SidebarList, SidebarModel, TileVm};
+use super::sidebar_model::{need_rows_shown, GroupVm, NeedRowVm, SidebarList, SidebarModel, TileVm};
+#[cfg(test)]
+use super::sidebar_model::RoutineVm;
+use super::sidebar_sched::{self, SchedButton, SchedHit, SchedLayout, SchedSpot};
 use super::sidebar_ui::{PaneAction, TabAction};
 use super::KovaView;
 use crate::pane::{PaneId, TabId};
@@ -81,10 +84,8 @@ const ROW_GAP: f64 = 2.0;
 const HEADER_H: f64 = 28.0;
 /// The header's hover ground: a rounded row, not a full pill.
 const HEADER_RADIUS: f64 = 6.0;
-/// The active group's card radius. The routines list keeps `PANEL_PAD`
-/// around its text.
+/// The active group's card radius.
 const PANEL_RADIUS: f64 = 8.0;
-const PANEL_PAD: f64 = 12.0;
 /// The chevron at the left of a header, then the tab colour's bar and its
 /// click box (the old dot's).
 const CHEVRON_ZONE_W: f64 = 24.0;
@@ -129,35 +130,6 @@ const SORT_PAD: f64 = 4.0;
 const META_PAD: f64 = 6.0;
 /// A pane tile's vertical padding: 5 above the title, 5 under the subtitle.
 const TILE_PAD_V: f64 = 5.0;
-/// A routine row: two lines (name over schedule) and the last run under
-/// them, on the same rounded ground as a pane tile.
-const ROUTINE_H: f64 = 58.0;
-const ROUTINE_GAP: f64 = 6.0;
-/// The open row's body: a `where` line, one line per tool and per extra
-/// directory, and the prompt. The prompt is capped because a row taller than
-/// the screen is a scroll trap, not a reading pane — the file is on disk for
-/// the rest.
-const PROMPT_MAX_LINES: usize = 40;
-const ROUTINE_SECTION_GAP: f64 = 8.0;
-const ROUTINE_LINE_H: f64 = 15.0;
-
-/// The height the body of an open routine needs, `prompt_lines` already
-/// measured. Shared by the layout and the draw so they cannot disagree.
-fn body_height(r: &RoutineVm, prompt_lines: usize) -> f64 {
-    let mut h = ROUTINE_SECTION_GAP + ROUTINE_LINE_H; // the `where` line
-    for list in [&r.tools, &r.dirs] {
-        if !list.is_empty() {
-            h += ROUTINE_SECTION_GAP + ROUTINE_LINE_H * (1.0 + list.len() as f64);
-        }
-    }
-    if prompt_lines > 0 {
-        h += ROUTINE_SECTION_GAP + ROUTINE_LINE_H + prompt_lines as f64 * ROUTINE_LINE_H;
-    }
-    h + ROUTINE_PAD_H
-}
-
-/// The routines list keeps its card inset.
-const ROUTINE_PAD_H: f64 = 10.0;
 /// A pane tile: the hover ground's radius, its horizontal padding, the inset
 /// that puts it under the header's chevron, and its height floor.
 const TILE_RADIUS: f64 = 6.0;
@@ -331,7 +303,10 @@ impl Rect {
 pub enum RowKind {
     Header { group: usize },
     Tile { group: usize, index: usize, pane_id: PaneId, column: usize },
-    /// One routine of the scheduled view.
+    /// One section header of the Scheduled view, with how many rows it holds
+    /// (the header says so, folded or not).
+    SchedHeader { group: crate::routines::Group, count: usize },
+    /// One routine of the scheduled view, by its index in `model.routines`.
     Routine { index: usize },
     /// One row of the `Needs you` block, by its index in `model.needs`.
     Need { index: usize },
@@ -349,14 +324,16 @@ pub struct Row {
     /// Tile: the link buttons, on the subtitle line (`Start Claude`,
     /// `Resume`).
     pub actions: Vec<(TileButton, Rect)>,
-    /// Routine: lines the open prompt takes. Tiles carry none: their
-    /// question is not part of the row any more.
-    pub question_lines: usize,
     /// Need: the detail column, zero width when the list is too narrow.
     pub detail: Rect,
     /// Tile of a pane with an open ask or permission prompt: the `Answer`
     /// link on its subtitle line.
     pub answer: Option<Rect>,
+    /// Scheduled: the row's clickable boxes, by spot (the hover strip, the
+    /// body's labelled row, the confirmation), in no particular order.
+    pub sched: Vec<(SchedButton, Rect, SchedSpot)>,
+    /// Scheduled: the inline delete confirmation's box, when it is open.
+    pub sched_confirm: Option<Rect>,
 }
 
 /// What a point of the list lands on.
@@ -376,8 +353,9 @@ pub enum ListHit {
     /// The rest of a group's panel (its padding, the gaps, the empty
     /// bottom): select the tab.
     Panel(usize),
-    /// A routine row: open it, or close it when it is already open.
-    Routine(usize),
+    /// A row of the Scheduled list: a section header, the row itself, or one
+    /// of its buttons.
+    Sched(SchedHit),
     /// One row of the `Needs you` block: land on what it names.
     Need(usize),
     /// The block's `Show all` / `Show less` button.
@@ -403,7 +381,7 @@ fn arms_press(hit: ListHit) -> bool {
         | ListHit::HeaderAdd(_)
         | ListHit::TileButton(..)
         | ListHit::Panel(_)
-        | ListHit::Routine(_)
+        | ListHit::Sched(_)
         | ListHit::Need(_)
         | ListHit::NeedAll
         | ListHit::NeedAnswer(_)
@@ -447,6 +425,9 @@ pub struct ListLayout {
     pub needs_header: Option<Rect>,
     /// The Asks list's cards, when `view` is `SidebarList::Asks`.
     pub asks: AsksLayout,
+    /// The Scheduled list's sections and rows, when `view` is
+    /// `SidebarList::Scheduled`.
+    pub sched: SchedLayout,
 }
 
 /// The one line the list draws under its rows, in the empty-state slot: the
@@ -483,39 +464,12 @@ impl ListLayout {
             return ListLayout { width, rows, groups, hint_y: Some(LIST_TOP), content_h: y, ..Default::default() };
         }
         if model.view == SidebarList::Scheduled {
-            // A flat list: no groups, no drag, no tint bars. The empty case
-            // draws its own line, so an empty list still has room for it.
-            let content_x = x0 + PANEL_PAD;
-            let content_w = x1 - content_x - PANEL_PAD;
-            for (i, r) in model.routines.iter().enumerate() {
-                if i > 0 {
-                    y += ROUTINE_GAP;
-                }
-                // Closed rows are three lines; the open one carries its body
-                // under them, and `question_lines` counts the prompt's wrap
-                // so the draw and the layout agree on the height.
-                let text_w = (content_w - 2.0 * ROUTINE_PAD_H).max(40.0);
-                let prompt_lines =
-                    if r.expanded && !r.prompt.is_empty() { m.lines(&r.prompt, Style::Detail, text_w, PROMPT_MAX_LINES).max(1) } else { 0 };
-                let h = ROUTINE_H + if r.expanded { body_height(r, prompt_lines) } else { 0.0 };
-                rows.push(Row {
-                    kind: RowKind::Routine { index: i },
-                    frame: Rect::new(content_x, y, content_w, h),
-                    glyphs: Vec::new(),
-                    actions: Vec::new(),
-                    question_lines: prompt_lines,
-                    detail: Rect::default(),
-                    answer: None,
-                });
-                y += h;
-            }
-            let hint_y = model.routines.is_empty().then(|| {
-                let hy = y;
-                y += HINT_H;
-                hy
-            });
-            y += LIST_BOTTOM;
-            return ListLayout { width, rows, groups, hint_y, content_h: y, ..Default::default() };
+            // Sections, rows and their buttons all come from `sidebar_sched`:
+            // one place lays out and draws the view, so the two agree.
+            let (sched, rows) = sidebar_sched::layout(&model.routines, &model.sched, width, m);
+            let hint_y = sched.hint_y;
+            let content_h = sched.content_h;
+            return ListLayout { width, rows, sched, hint_y, content_h, ..Default::default() };
         }
         // The `Needs you` block: the first thing in the list, above the
         // groups, and it scrolls with them.
@@ -541,9 +495,10 @@ impl ListLayout {
                     frame: Rect::new(inner_x, y, inner_w, NEED_BUTTON_H),
                     glyphs: Vec::new(),
                     actions: Vec::new(),
-                    question_lines: 0,
                     detail: Rect::default(),
                     answer: None,
+                    sched: Vec::new(),
+                    sched_confirm: None,
                 });
                 y += NEED_BUTTON_H;
             }
@@ -566,9 +521,10 @@ impl ListLayout {
                 frame: Rect::new(x0, y, x1 - x0, HEADER_H),
                 glyphs: Vec::new(),
                 actions: Vec::new(),
-                question_lines: 0,
                 detail: Rect::default(),
                 answer: None,
+                sched: Vec::new(),
+                sched_confirm: None,
             });
             y += HEADER_H;
             for (ti, tile) in g.tiles.iter().enumerate() {
@@ -589,7 +545,17 @@ impl ListLayout {
             hy
         });
         y += LIST_BOTTOM;
-        ListLayout { width, rows, groups, hint_y, content_h: y, needs_card, needs_header, asks: AsksLayout::default() }
+        ListLayout {
+            width,
+            rows,
+            groups,
+            hint_y,
+            content_h: y,
+            needs_card,
+            needs_header,
+            asks: AsksLayout::default(),
+            sched: SchedLayout::default(),
+        }
     }
 
     /// The `+` button of a header row.
@@ -629,9 +595,12 @@ impl ListLayout {
                 continue;
             }
             return match row.kind {
-                // The only thing a routine row does: open its body. It never
-                // runs or stops anything — launchctl stays that door.
-                RowKind::Routine { index } => ListHit::Routine(index),
+                // A scheduled row: its own buttons first (the hover strip,
+                // the body's row, the confirmation), then the row itself,
+                // which opens its body, or its section header.
+                RowKind::SchedHeader { .. } | RowKind::Routine { .. } => {
+                    sidebar_sched::hit(row, x, y).map_or(ListHit::Empty, ListHit::Sched)
+                }
                 // A need row lands on what it names: the pane, the routine,
                 // the ask card.
                 RowKind::Need { index } => ListHit::Need(index),
@@ -838,9 +807,10 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
         frame: Rect::new(x, y, w, h),
         glyphs,
         actions,
-        question_lines: 0,
         detail: Rect::default(),
         answer,
+        sched: Vec::new(),
+        sched_confirm: None,
     }
 }
 
@@ -866,9 +836,10 @@ fn need_row(index: usize, need: &NeedRowVm, x: f64, y: f64, w: f64, list_w: f64,
         frame: Rect::new(x, y, w, NEED_ROW_H),
         glyphs: Vec::new(),
         actions: Vec::new(),
-        question_lines: 0,
         detail,
         answer: None,
+        sched: Vec::new(),
+        sched_confirm: None,
     }
 }
 
@@ -1261,82 +1232,8 @@ pub(super) fn draw_wrapped(sh: &Shared, text: &str, r: &Rect, style: Style, c: [
         )
     };
 }
+
 /// A link: a filled Feather icon, a gap, the word, the pair centred in `r`.
-/// One routine: its name, then the schedule (or what keeps it from running),
-/// then the last run. Read-only, so no hover ground and no buttons — the row
-/// says what is true, `launchctl` is still where it changes.
-fn draw_routine(sh: &Shared, r: &RoutineVm, frame: &Rect, prompt_lines: usize, hovered: bool, alpha: f64) {
-    // A neutralised routine still belongs on the list, faded: it is not gone,
-    // it is switched off, and that is exactly what is easy to forget.
-    let alpha = if r.done { alpha * 0.55 } else { alpha };
-    let ground = if r.expanded {
-        tokens::TILE_PRESSED
-    } else if hovered {
-        tokens::TILE_HOVER
-    } else {
-        tokens::TILE
-    };
-    fill_round(frame, 10.0, ground, alpha);
-    let x = frame.x + ROUTINE_PAD_H;
-    let w = (frame.w - 2.0 * ROUTINE_PAD_H).max(0.0);
-    let mut y = frame.y + 8.0;
-
-    draw_text(sh, &r.name, &Rect::new(x, y, w, 16.0), Style::Title, tokens::TEXT_PRIMARY, alpha, Align::Left, true);
-    y += 17.0;
-
-    let (detail_fg, detail) = if r.done {
-        (tokens::TEXT_TERTIARY, format!("{} \u{b7} disabled", r.detail))
-    } else if r.broken {
-        (tokens::ERROR, r.detail.clone())
-    } else {
-        (tokens::TEXT_SECONDARY, r.detail.clone())
-    };
-    draw_text(sh, &detail, &Rect::new(x, y, w, 15.0), Style::Secondary, detail_fg, alpha, Align::Left, false);
-    y += 16.0;
-
-    let (last_fg, last) = match (r.failed, r.last_run.is_empty()) {
-        // A run still going says so instead of a date that does not exist yet.
-        _ if r.last_status == crate::routines::LastStatus::Running => {
-            (tokens::TEXT_SECONDARY, "running now".to_string())
-        }
-        (_, true) => (tokens::TEXT_TERTIARY, "never run".to_string()),
-        (Some(code), false) => (tokens::ERROR, format!("{} \u{b7} exit {code}", r.last_run)),
-        (None, false) => (tokens::TEXT_TERTIARY, r.last_run.clone()),
-    };
-    draw_text(sh, &last, &Rect::new(x, y, w, 15.0), Style::Detail, last_fg, alpha, Align::Left, false);
-    if !r.expanded {
-        return;
-    }
-    y += 15.0;
-
-    // The body, in the order that answers "what will this thing actually do":
-    // where it runs (which accounts it speaks with), what it is allowed to
-    // reach beyond the defaults, then the prompt itself.
-    let mut section = |sh: &Shared, y: &mut f64, heading: &str, body: &[String], fg: [f32; 3]| {
-        if body.is_empty() {
-            return;
-        }
-        *y += ROUTINE_SECTION_GAP;
-        draw_text(sh, heading, &Rect::new(x, *y, w, ROUTINE_LINE_H), Style::Chip, tokens::TEXT_TERTIARY, alpha, Align::Left, false);
-        *y += ROUTINE_LINE_H;
-        for line in body {
-            draw_text(sh, line, &Rect::new(x, *y, w, ROUTINE_LINE_H), Style::Detail, fg, alpha, Align::Left, true);
-            *y += ROUTINE_LINE_H;
-        }
-    };
-    section(sh, &mut y, "WHERE", std::slice::from_ref(&r.cwd), tokens::TEXT_SECONDARY);
-    section(sh, &mut y, "TOOLS", &r.tools, tokens::TEXT_SECONDARY);
-    section(sh, &mut y, "WRITES TO", &r.dirs, tokens::TEXT_SECONDARY);
-
-    if prompt_lines > 0 {
-        y += ROUTINE_SECTION_GAP;
-        draw_text(sh, "PROMPT", &Rect::new(x, y, w, ROUTINE_LINE_H), Style::Chip, tokens::TEXT_TERTIARY, alpha, Align::Left, false);
-        y += ROUTINE_LINE_H;
-        let h = prompt_lines as f64 * ROUTINE_LINE_H;
-        draw_wrapped(sh, &r.prompt, &Rect::new(x, y, w, h), Style::Detail, tokens::TEXT_SECONDARY, alpha);
-    }
-}
-
 fn draw_link(sh: &Shared, icon: Icon, label: &str, r: &Rect, c: [f32; 3], alpha: f64) {
     let text_w = AppKitMetrics(sh).width(label, Style::Link).min(r.w - LINK_ICON_D - LINK_ICON_GAP).max(0.0);
     let w = LINK_ICON_D + LINK_ICON_GAP + text_w;
@@ -1661,6 +1558,9 @@ impl SidebarView {
                 needs_all: false,
                 asks: Default::default(),
                 show_hint: false,
+                sched: Default::default(),
+                sched_meta: Vec::new(),
+                meta_right: None,
             },
             layout: ListLayout::default(),
             chrome: ChromeLayout::default(),
@@ -2069,16 +1969,33 @@ impl SidebarView {
         }
         let mut x = c.summary.x;
         let max_x = if has_sort { c.sort.x - 8.0 } else { c.summary.right() };
-        for (text, run) in &sh.model.summary {
-            let fg = match run {
-                SummaryRun::Working => tokens::INFO_TEXT,
-                SummaryRun::Waiting | SummaryRun::Idle | SummaryRun::Dot => tokens::TEXT_TERTIARY,
-            };
-            if x >= max_x {
-                break;
+        if sh.model.view == SidebarList::Scheduled {
+            // `N active · K failed` on the left, the clock it is phrased
+            // against on the right.
+            for (text, crit) in &sh.model.sched_meta {
+                if x >= max_x {
+                    break;
+                }
+                let fg = if *crit { tokens::CRIT_TEXT } else { tokens::TEXT_TERTIARY };
+                let w = draw_text(&sh, text, &Rect::new(x, c.summary.y, max_x - x, c.summary.h), Style::Summary, fg, 1.0, Align::Left, false);
+                x += w;
             }
-            let w = draw_text(&sh, text, &Rect::new(x, c.summary.y, max_x - x, c.summary.h), Style::Summary, fg, 1.0, Align::Left, false);
-            x += w;
+            if let Some(clock) = &sh.model.meta_right {
+                let w = AppKitMetrics(&sh).width(clock, Style::Summary);
+                draw_text(&sh, clock, &Rect::new(c.summary.right() - w, c.summary.y, w, c.summary.h), Style::Summary, tokens::TEXT_TERTIARY, 1.0, Align::Right, false);
+            }
+        } else {
+            for (text, run) in &sh.model.summary {
+                let fg = match run {
+                    SummaryRun::Working => tokens::INFO_TEXT,
+                    SummaryRun::Waiting | SummaryRun::Idle | SummaryRun::Dot => tokens::TEXT_TERTIARY,
+                };
+                if x >= max_x {
+                    break;
+                }
+                let w = draw_text(&sh, text, &Rect::new(x, c.summary.y, max_x - x, c.summary.h), Style::Summary, fg, 1.0, Align::Left, false);
+                x += w;
+            }
         }
 
         // Next pill.
@@ -2411,12 +2328,25 @@ impl SidebarListView {
         let Some(kova) = kova_of(self) else { return };
         let tab_of = |g: usize| self.ivars().shared.borrow().model.groups.get(g).map(|g| g.tab_idx);
         match hit {
-            ListHit::Routine(index) => {
-                // Bind the name before calling out: the borrow must be gone,
+            ListHit::Sched(SchedHit::Section(group)) => kova.sidebar_sched_section(group),
+            ListHit::Sched(hit) => {
+                // Bind the row before calling out: the borrow must be gone,
                 // and the tick may re-lay the list out meanwhile.
-                let name = self.ivars().shared.borrow().model.routines.get(index).map(|r| r.name.clone());
-                if let Some(name) = name {
-                    kova.sidebar_toggle_routine(&name);
+                let row = {
+                    let sh = self.ivars().shared.borrow();
+                    let index = match hit {
+                        SchedHit::Row(i) | SchedHit::Button(i, _) => i,
+                        SchedHit::Section(_) => return,
+                    };
+                    sh.model.routines.get(index).map(|r| (r.name.clone(), r.log.clone()))
+                };
+                if let Some((name, log)) = row {
+                    kova.sidebar_sched_hit(hit, &name, &log);
+                    // The inline confirmation takes Escape, which the list
+                    // never receives: it watches for the key itself.
+                    if matches!(hit, SchedHit::Button(_, SchedButton::Delete)) {
+                        self.install_escape_monitor();
+                    }
                 }
             }
             ListHit::Chevron(g) => {
@@ -2545,6 +2475,17 @@ impl SidebarListView {
         }
     }
 
+    /// Escape while a delete is being confirmed: nothing is deleted.
+    fn cancel_sched_confirm(&self) {
+        let open = self.ivars().shared.borrow().model.sched.confirm.is_some();
+        self.remove_escape_monitor();
+        if open
+            && let Some(kova) = kova_of(self)
+        {
+            kova.sidebar_sched_cancel_confirm();
+        }
+    }
+
     /// Watch for Escape while a tile is lifted. The list never becomes
     /// first responder, so the key would otherwise reach the terminal.
     fn install_escape_monitor(&self) {
@@ -2555,6 +2496,7 @@ impl SidebarListView {
             let key = unsafe { event.as_ref() }.keyCode();
             if key == 53 {
                 view.cancel_pane_drag();
+                view.cancel_sched_confirm();
                 std::ptr::null_mut()
             } else {
                 event.as_ptr()
@@ -2613,7 +2555,7 @@ impl SidebarListView {
             let lifted = match row.kind {
                 RowKind::Header { group } => lifted_group == Some(group),
                 RowKind::Tile { .. } => lifted_row == Some(ri),
-                RowKind::Routine { .. } | RowKind::Need { .. } | RowKind::NeedAll => false,
+                RowKind::SchedHeader { .. } | RowKind::Routine { .. } | RowKind::Need { .. } | RowKind::NeedAll => false,
             };
             // The held tile is drawn later, floating; its skeleton takes
             // its place. The rows of its run step aside.
@@ -2674,10 +2616,8 @@ impl SidebarListView {
         let dy = y - row.frame.y;
         let frame = Rect::new(row.frame.x, y, row.frame.w, row.frame.h);
         match row.kind {
-            RowKind::Routine { index } => {
-                if let Some(r) = sh.model.routines.get(index) {
-                    draw_routine(sh, r, &frame, row.question_lines, sh.hovered == ListHit::Routine(index), alpha);
-                }
+            RowKind::SchedHeader { .. } | RowKind::Routine { .. } => {
+                sidebar_sched::draw(sh, &sh.model.routines, &sh.model.sched, row, &frame, sh.hovered, sh.pressed, alpha);
             }
             RowKind::Header { group } => {
                 if let Some(g) = sh.model.groups.get(group) {
@@ -3019,7 +2959,7 @@ mod tests {
             ListHit::HeaderAdd(0),
             ListHit::TileButton(1, TileButton::Stop),
             ListHit::Panel(0),
-            ListHit::Routine(0),
+            ListHit::Sched(SchedHit::Row(0)),
             ListHit::Need(0),
             ListHit::NeedAll,
             ListHit::NeedAnswer(1),
@@ -3035,43 +2975,47 @@ mod tests {
     }
 
     #[test]
-    fn the_scheduled_view_is_a_flat_list_with_no_groups_to_drag() {
+    fn the_scheduled_view_lays_out_through_its_sections() {
         let mut m = model();
         m.view = SidebarList::Scheduled;
         m.routines_loaded = true;
         m.routines = vec![
-            RoutineVm { name: "alpha-digest".into(), ..RoutineVm::default() },
-            RoutineVm { name: "beta-weekly".into(), ..RoutineVm::default() },
+            RoutineVm { name: "alpha-digest".into(), group: crate::routines::Group::Today, ..RoutineVm::default() },
+            RoutineVm { name: "beta-weekly".into(), group: crate::routines::Group::Today, ..RoutineVm::default() },
         ];
         let l = ListLayout::new(&m, 260.0, &FakeMetrics);
-        assert_eq!(l.rows.len(), 2);
-        assert_eq!(l.rows[0].kind, RowKind::Routine { index: 0 });
-        assert_eq!(l.rows[1].kind, RowKind::Routine { index: 1 });
-        // Stacked one gap apart, and the panes' groups and hint stay out.
-        assert_eq!(l.rows[1].frame.y, l.rows[0].frame.bottom() + ROUTINE_GAP);
+        // One header per non-empty section, then its rows.
+        assert_eq!(l.sched.sections.len(), 1);
+        assert_eq!(l.sched.sections[0].group, crate::routines::Group::Today);
+        assert_eq!(l.sched.sections[0].count, 2);
+        assert_eq!(l.rows[0].kind, RowKind::SchedHeader { group: crate::routines::Group::Today, count: 2 });
+        assert_eq!(l.rows[1].kind, RowKind::Routine { index: 0 });
+        assert_eq!(l.rows[2].kind, RowKind::Routine { index: 1 });
         assert!(l.groups.is_empty());
         assert_eq!(l.hint_y, None);
-        // A click opens the row, and that is all it does.
-        let r = &l.rows[0].frame;
-        assert_eq!(l.hit(r.x + 5.0, r.y + 5.0), ListHit::Routine(0));
-        assert_eq!(l.rows[0].frame.h, ROUTINE_H);
+        assert_eq!(l.rows[1].frame.h, sidebar_sched::ROW_H);
+        // A click on the header folds the section; a click on the row opens
+        // it, and that is all it does.
+        let h = &l.rows[0].frame;
+        assert_eq!(l.hit(h.x + 5.0, h.y + 5.0), ListHit::Sched(SchedHit::Section(crate::routines::Group::Today)));
+        let r = &l.rows[1].frame;
+        assert_eq!(l.hit(r.x + 5.0, r.y + 5.0), ListHit::Sched(SchedHit::Row(0)));
 
-        // The open row grows by its body and pushes the next one down; the
-        // others keep their closed height.
+        // The open row grows by its body and pushes the next one down.
         m.routines[0].expanded = true;
-        m.routines[0].cwd = "/Users/me/Perso".into();
-        m.routines[0].tools = vec!["mcp__gmail__search".into(), "mcp__drive__read".into()];
-        m.routines[0].prompt = "a prompt of some length".into();
         let open = ListLayout::new(&m, 260.0, &FakeMetrics);
-        assert!(open.rows[0].frame.h > ROUTINE_H);
-        assert!(open.rows[0].question_lines >= 1);
-        assert_eq!(open.rows[1].frame.h, ROUTINE_H);
-        assert_eq!(open.rows[1].frame.y, open.rows[0].frame.bottom() + ROUTINE_GAP);
+        assert!(open.rows[1].frame.h > sidebar_sched::ROW_H);
+        assert_eq!(open.rows[2].frame.h, sidebar_sched::ROW_H);
         assert!(open.content_h > l.content_h);
         // Its whole height is the hit region, body included.
-        let br = &open.rows[0].frame;
-        assert_eq!(open.hit(br.x + 5.0, br.bottom() - 2.0), ListHit::Routine(0));
-        m.routines[0] = RoutineVm { name: "alpha-digest".into(), ..RoutineVm::default() };
+        let br = &open.rows[1].frame;
+        assert_eq!(open.hit(br.x + 5.0, br.bottom() - 2.0), ListHit::Sched(SchedHit::Row(0)));
+
+        // Folded, the section keeps its header and drops its rows.
+        m.sched.toggle(crate::routines::Group::Today);
+        let folded = ListLayout::new(&m, 260.0, &FakeMetrics);
+        assert_eq!(folded.rows.len(), 1);
+        assert!(folded.sched.sections[0].folded);
 
         // With no routines at all, the empty line takes the hint's slot.
         m.routines.clear();
@@ -3100,6 +3044,9 @@ mod tests {
             needs_all: false,
             asks: Default::default(),
             show_hint: false,
+            sched: Default::default(),
+            sched_meta: Vec::new(),
+            meta_right: None,
         }
     }
 
@@ -3163,7 +3110,6 @@ mod tests {
         assert_eq!(l.rows[1].frame.h, 2.0 * TILE_PAD_V + LINE_TITLE_H + LINE_SEC_H);
         assert!(l.rows[1].frame.h >= TILE_MIN_H);
         assert!(l.rows[1].actions.is_empty());
-        assert_eq!(l.rows[1].question_lines, 0);
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub(super) mod sidebar_asks;
 pub mod ds_tokens;
 mod sidebar_model;
 mod sidebar_ui;
+pub(super) mod sidebar_sched;
 mod sidebar_view;
 use sidebar_ui::SidebarState;
 mod switcher;

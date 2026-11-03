@@ -74,6 +74,8 @@ pub enum Icon {
     Trash,
     /// `slash`: an action that is off, a disabled row.
     Off,
+    /// `power`: a routine switched off, and the button that switches it back.
+    Power,
     /// `chevrons-up-down`: the sort order of a list.
     Sort,
     /// `send`: send a typed answer from the ask card.
@@ -84,7 +86,7 @@ pub enum Icon {
 
 /// Every icon, walked by the grid test so a new variant is never forgotten.
 #[cfg(test)]
-pub const ALL: [Icon; 29] = [
+pub const ALL: [Icon; 30] = [
     Icon::ChevronDown,
     Icon::ChevronRight,
     Icon::Plus,
@@ -111,6 +113,7 @@ pub const ALL: [Icon; 29] = [
     Icon::Info,
     Icon::Trash,
     Icon::Off,
+    Icon::Power,
     Icon::Sort,
     Icon::Send,
     Icon::Mic,
@@ -267,6 +270,10 @@ impl Icon {
             Icon::Off => vec![
                 Circle(12.0, 12.0, 10.0),
                 Polyline(vec![(4.93, 4.93), (19.07, 19.07)]),
+            ],
+            Icon::Power => vec![
+                svg_arc((18.36, 6.64), (5.64, 6.64), 9.0, true, true),
+                Polyline(vec![(12.0, 2.0), (12.0, 12.0)]),
             ],
             Icon::Sort => vec![
                 Polyline(vec![(7.0, 15.0), (12.0, 20.0), (17.0, 15.0)]),
@@ -449,7 +456,7 @@ mod tests {
 
     #[test]
     fn every_icon_stays_on_the_grid() {
-        assert_eq!(ALL.len(), 29);
+        assert_eq!(ALL.len(), 30);
         for icon in ALL {
             let segments = icon.segments();
             assert!(!segments.is_empty(), "{icon:?} draws nothing");

@@ -13,8 +13,10 @@
 //! instead, and is logged once, when routinectl is missing or prints
 //! something else than JSON.
 //!
-//! Nothing here is written back: the view is read-only, and `routinectl`
-//! stays the way to change anything.
+//! Reading is all this module does by itself. The view's four actions (run,
+//! pause, resume, delete) go through `routinectl` on a background thread,
+//! argv only, and leave their outcome for the tick to drain; Kova never
+//! writes a plist or a prompt itself.
 
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
@@ -74,11 +76,6 @@ impl When {
             return None;
         }
         Some(When { year, month, day, hour, minute })
-    }
-
-    /// `2026-09-26 10:04`, the date and time a row shows.
-    pub fn words(&self) -> String {
-        format!("{:04}-{:02}-{:02} {:02}:{:02}", self.year, self.month, self.day, self.hour, self.minute)
     }
 
     /// Days since 1970-01-01, the calendar day arithmetic these words need.
@@ -162,6 +159,32 @@ pub enum Group {
     Off,
 }
 
+impl Group {
+    /// The sections in display order: a failure first, the switched-off last.
+    pub const ALL: [Group; 5] =
+        [Group::NeedsAttention, Group::Today, Group::ThisWeek, Group::Later, Group::Off];
+
+    /// The section's header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::NeedsAttention => "Needs attention",
+            Group::Today => "Today",
+            Group::ThisWeek => "This week",
+            Group::Later => "Later",
+            Group::Off => "Off",
+        }
+    }
+
+    /// The word the header keeps at its right, when it has one.
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Group::Today => Some("next first"),
+            Group::Off => Some("paused"),
+            Group::NeedsAttention | Group::ThisWeek | Group::Later => None,
+        }
+    }
+}
+
 /// One scheduled routine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Routine {
@@ -194,20 +217,16 @@ pub struct Routine {
     /// Where it runs, which decides, for a Claude routine, whose accounts it
     /// speaks with.
     pub cwd: String,
-    /// The prompt it is handed, verbatim; empty when the file is gone.
-    pub prompt: String,
     /// The log file routinectl reports.
     pub log: String,
-    /// Extra MCP tools granted to it, one per line of `prompts/<name>.tools`.
-    pub tools: Vec<String>,
-    /// Extra writable directories, from `prompts/<name>.dirs`.
-    pub dirs: Vec<String>,
 }
 
 impl Routine {
-    /// What is wrong with this routine, if anything: the line the view shows
-    /// in place of the schedule. A routine switched off on purpose (`.done`,
-    /// paused, or manual) has no problem: its state already says so.
+    /// What is wrong with this routine, if anything: the plist reader's
+    /// vocabulary for "it will never fire". The sections decide where a row
+    /// sits and the row no longer prints this, but `read_from_disk` keeps
+    /// filling what it needs.
+    #[allow(dead_code)]
     pub fn problem(&self) -> Option<&'static str> {
         if self.done || self.paused || self.manual {
             None
@@ -295,6 +314,61 @@ pub fn ago_words(then: When, now: When) -> String {
     }
 }
 
+/// What the Scheduled view can do to a routine: the four verbs `routinectl`
+/// already serves, and nothing else. Kova never writes a plist or a prompt
+/// itself; it asks the tool, and reads the result back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutineAction {
+    /// `routinectl run`: kick it off now, in the background.
+    Run,
+    /// `routinectl disable`: `enabled: false` in its prompt.
+    Pause,
+    /// `routinectl enable`.
+    Resume,
+    /// `routinectl delete`: moves the prompt and the plist to its trash.
+    Delete,
+}
+
+impl RoutineAction {
+    /// The `routinectl` subcommand this action runs.
+    pub fn arg(self) -> &'static str {
+        match self {
+            RoutineAction::Run => "run",
+            RoutineAction::Pause => "disable",
+            RoutineAction::Resume => "enable",
+            RoutineAction::Delete => "delete",
+        }
+    }
+
+    /// The verb a failure is reported with: `Could not <verb>: ...`.
+    pub fn verb(self) -> &'static str {
+        match self {
+            RoutineAction::Run => "run",
+            RoutineAction::Pause => "pause",
+            RoutineAction::Resume => "resume",
+            RoutineAction::Delete => "delete",
+        }
+    }
+}
+
+/// The routine names `routinectl` accepts: lowercase, digits, dashes, and a
+/// leading letter or digit. Anything else is refused before it reaches a
+/// `Command`, so a name is never an argument an argv can be escaped from.
+pub fn valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The first line of a tool's stderr, capped at 80 characters: enough for
+/// the row's second line, which is one line and truncated anyway.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").trim().chars().take(80).collect()
+}
+
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
@@ -306,6 +380,12 @@ fn routines_dir() -> PathBuf {
 static CACHE: RwLock<Option<Arc<Vec<Routine>>>> = RwLock::new(None);
 /// When the cache was last filled, epoch seconds. 0 means never.
 static FILLED_AT: AtomicU64 = AtomicU64::new(0);
+/// Bumped by every action: a read that started before the bump still shows
+/// the old state, so the list stays due for another one until a read that
+/// began after it lands.
+static CHANGED: AtomicU64 = AtomicU64::new(0);
+/// The generation the cache was last read at.
+static READ_AT: AtomicU64 = AtomicU64::new(0);
 /// Set while a refresh thread is running, so a tick never starts a second one.
 static REFRESHING: AtomicBool = AtomicBool::new(false);
 /// Set once the fallback to the disk reader has been logged, so a routinectl
@@ -325,15 +405,124 @@ fn now_secs() -> u64 {
 /// "not read yet" must not be shown as "nothing scheduled".
 pub fn snapshot() -> Option<Arc<Vec<Routine>>> {
     let age = now_secs().saturating_sub(FILLED_AT.load(Ordering::Relaxed));
-    if age >= MAX_AGE_SECS && !REFRESHING.swap(true, Ordering::AcqRel) {
+    let due = age >= MAX_AGE_SECS || READ_AT.load(Ordering::Relaxed) < CHANGED.load(Ordering::Relaxed);
+    if due && !REFRESHING.swap(true, Ordering::AcqRel) {
         std::thread::spawn(|| {
+            let generation = CHANGED.load(Ordering::Relaxed);
             let list = read_all();
             *CACHE.write() = Some(Arc::new(list));
             FILLED_AT.store(now_secs(), Ordering::Relaxed);
+            READ_AT.store(generation, Ordering::Relaxed);
             REFRESHING.store(false, Ordering::Release);
         });
     }
     CACHE.read().clone()
+}
+
+/// Force the next `snapshot()` to re-read: an action just changed what is on
+/// disk, and waiting out `MAX_AGE_SECS` would show the old state over it.
+pub fn refresh() {
+    CHANGED.fetch_add(1, Ordering::Relaxed);
+    FILLED_AT.store(0, Ordering::Relaxed);
+}
+
+/// One background action's outcome, waiting for the tick that owns the view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionResult {
+    pub name: String,
+    pub action: RoutineAction,
+    /// The tool's first stderr line when it failed.
+    pub result: Result<(), String>,
+}
+
+/// Where a background action leaves its outcome. The tick drains it, exactly
+/// like the Asks view's `AskQueue` between the card and the board.
+static RESULTS: parking_lot::Mutex<Vec<ActionResult>> = parking_lot::Mutex::new(Vec::new());
+
+/// Everything the actions finished since the last drain.
+pub fn drain_results() -> Vec<ActionResult> {
+    std::mem::take(&mut *RESULTS.lock())
+}
+
+/// Run one action on a background thread (a `delete` moves files, a `run`
+/// may take a while), then force a refresh and leave the outcome in
+/// `RESULTS`. The path comes from `$HOME` and no shell is involved.
+pub fn run_action(action: RoutineAction, name: &str) {
+    let home = home();
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        let _ = run_action_in(&home, action, &name);
+    });
+}
+
+/// The body of `run_action`, on this thread: what a test drives with a fake
+/// `routinectl` in a temporary home.
+fn run_action_in(home: &Path, action: RoutineAction, name: &str) -> Result<(), String> {
+    let result = serve_action(home, action, name);
+    RESULTS.lock().push(ActionResult { name: name.to_string(), action, result: result.clone() });
+    refresh();
+    result
+}
+
+fn serve_action(home: &Path, action: RoutineAction, name: &str) -> Result<(), String> {
+    if !valid_name(name) {
+        return Err(format!("invalid routine name: {name}"));
+    }
+    let bin = home.join(".claude/routines/routinectl");
+    let out = std::process::Command::new(&bin)
+        .args([action.arg(), name])
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.trim().is_empty() {
+        Err(format!("{} exited with {}", bin.display(), out.status))
+    } else {
+        Err(first_line(&err))
+    }
+}
+
+/// The canonical path when it exists under `dir`, `None` otherwise: the view
+/// opens a log or a prompt only inside the routines directory, whatever a
+/// routinectl output (or a fixture) claims.
+fn inside_routines(dir: &Path, path: &Path) -> Option<PathBuf> {
+    let dir = std::fs::canonicalize(dir).ok()?;
+    let file = std::fs::canonicalize(path).ok()?;
+    file.starts_with(&dir).then_some(file)
+}
+
+/// Open a routine's log in Console, argv only.
+pub fn open_log(path: &str) -> Result<(), String> {
+    let file = inside_routines(&routines_dir(), Path::new(path)).ok_or_else(|| format!("not a routine log: {path}"))?;
+    std::process::Command::new("open")
+        .args(["-a", "Console"])
+        .arg(file)
+        .status()
+        .map(|_| ())
+        .map_err(|e| format!("cannot open Console: {e}"))
+}
+
+/// Open a routine's prompt in its default editor, argv only.
+pub fn edit_prompt(path: &str) -> Result<(), String> {
+    let file = inside_routines(&routines_dir(), Path::new(path)).ok_or_else(|| format!("not a routine prompt: {path}"))?;
+    std::process::Command::new("open")
+        .arg("-t")
+        .arg(file)
+        .status()
+        .map(|_| ())
+        .map_err(|e| format!("cannot open the prompt: {e}"))
+}
+
+/// `prompts/<name>.md`, where a routine's prompt lives.
+pub fn prompt_path(name: &str) -> PathBuf {
+    routines_dir().join(format!("prompts/{name}.md"))
+}
+
+/// `logs/<name>.log`, the log a routine writes, when routinectl reported none.
+pub fn log_path(name: &str) -> PathBuf {
+    routines_dir().join(format!("logs/{name}.log"))
 }
 
 /// Read every routine, from routinectl when it can, from disk otherwise.
@@ -348,6 +537,13 @@ fn read_all() -> Vec<Routine> {
             read_from_disk()
         }
     }
+}
+
+/// The JSON fixture the routines tests read by hand, for the views that
+/// group the same list at the same fixed clock.
+#[cfg(test)]
+pub fn fixture_list() -> Vec<Routine> {
+    parse_list(include_str!("../tests/fixtures/routines/list.json")).expect("a valid fixture")
 }
 
 /// `routinectl list --json`, argv only: the path comes from `$HOME` and no
@@ -447,13 +643,10 @@ fn routine_from_wire(w: WireRoutine) -> Result<Option<Routine>, ()> {
         }),
         None => None,
     };
+    // The prompt's text is not read: the view names the file, it never shows
+    // it. Whether the file exists is all a row needs.
     let prompt_path = PathBuf::from(&w.prompt);
     let prompt_missing = w.prompt.is_empty() || !prompt_path.is_file();
-    let prompt = if prompt_missing {
-        String::new()
-    } else {
-        std::fs::read_to_string(&prompt_path).unwrap_or_default()
-    };
     Ok(Some(Routine {
         name: w.name,
         label: String::new(),
@@ -468,12 +661,7 @@ fn routine_from_wire(w: WireRoutine) -> Result<Option<Routine>, ()> {
         next_run,
         last,
         cwd: w.cwd,
-        prompt,
         log: w.log,
-        // The sidecars sit next to the prompt: `prompts/<name>.tools` and
-        // `prompts/<name>.dirs`.
-        tools: lines_of(&prompt_path.with_extension("tools")),
-        dirs: lines_of(&prompt_path.with_extension("dirs")),
     }))
 }
 
@@ -511,9 +699,6 @@ fn read_from_disk() -> Vec<Routine> {
             manual: false,
             next_run: None,
             last: std::fs::read_to_string(&log).ok().as_deref().and_then(last_from_log),
-            prompt: std::fs::read_to_string(&prompt_path).unwrap_or_default(),
-            tools: lines_of(&dir.join(format!("prompts/{name}.tools"))),
-            dirs: lines_of(&dir.join(format!("prompts/{name}.dirs"))),
             cwd: json
                 .get("ProgramArguments")
                 .and_then(|a| a.as_array())
@@ -530,18 +715,6 @@ fn read_from_disk() -> Vec<Routine> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
-}
-
-/// The meaningful lines of a sidecar file: the runner skips blanks and `#`
-/// comments, so the view must not show what the run will ignore.
-fn lines_of(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(String::from)
-        .collect()
 }
 
 /// `launchctl list`, reduced to the labels it knows.
@@ -870,18 +1043,6 @@ mod tests {
     }
 
     #[test]
-    fn a_sidecar_file_yields_only_the_lines_the_runner_would_use() {
-        let dir = std::env::temp_dir().join(format!("kova-routines-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("x.tools");
-        std::fs::write(&f, "# les outils\nmcp__gmail__search\n\n  mcp__drive__read  \n#mcp__off\n").unwrap();
-        assert_eq!(lines_of(&f), vec!["mcp__gmail__search", "mcp__drive__read"]);
-        // A routine with no sidecar simply has none.
-        assert!(lines_of(&dir.join("absent.tools")).is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn the_last_run_is_the_last_end_line_of_the_log() {
         let log = "=== 2026-09-25 10:02:01 démarrage de alpha-digest\n\
                    === 2026-09-25 10:04:34 fin de alpha-digest (code 0)\n\
@@ -915,4 +1076,115 @@ mod tests {
         assert_eq!(r.problem(), None);
     }
 
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A temporary home whose `routinectl` records the argv it is given in
+    /// `argv.txt`, one call per line.
+    fn fake_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kova-sched-{}-{tag}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let routines = dir.join(".claude/routines");
+        std::fs::create_dir_all(routines.join("prompts")).unwrap();
+        std::fs::create_dir_all(routines.join("logs")).unwrap();
+        let recorder = dir.join("argv.txt");
+        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", recorder.display());
+        let bin = routines.join("routinectl");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn each_action_names_its_routinectl_verb() {
+        assert_eq!(RoutineAction::Run.arg(), "run");
+        assert_eq!(RoutineAction::Pause.arg(), "disable");
+        assert_eq!(RoutineAction::Resume.arg(), "enable");
+        assert_eq!(RoutineAction::Delete.arg(), "delete");
+        assert_eq!(RoutineAction::Run.verb(), "run");
+        assert_eq!(RoutineAction::Delete.verb(), "delete");
+    }
+
+    #[test]
+    fn only_lowercase_routine_names_reach_the_runner() {
+        for good in ["alpha-digest", "x", "9-lives", "a1-b2", "a-"] {
+            assert!(valid_name(good), "{good} should be accepted");
+        }
+        for bad in ["", "-x", "Alpha", "a b", "a/b", "a\nb", "../x", "a;rm", "\u{e9}t\u{e9}"] {
+            assert!(!valid_name(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn an_action_records_its_argv_and_forces_a_refresh() {
+        let home = fake_home("argv");
+        let _ = drain_results();
+        FILLED_AT.store(now_secs(), Ordering::Relaxed);
+        let before = CHANGED.load(Ordering::Relaxed);
+        assert!(run_action_in(&home, RoutineAction::Run, "alpha-digest").is_ok());
+        // The outcome waits for the tick, and the cache is marked stale.
+        let done = RESULTS.lock().clone();
+        assert_eq!(done.len(), 1);
+        assert_eq!((done[0].name.as_str(), done[0].action), ("alpha-digest", RoutineAction::Run));
+        assert_eq!(done[0].result, Ok(()));
+        assert_eq!(FILLED_AT.load(Ordering::Relaxed), 0);
+        // A read that was already in flight is not enough: the generation is
+        // bumped, so the list stays due until a read that began after it lands.
+        assert!(CHANGED.load(Ordering::Relaxed) > before);
+        assert_eq!(drain_results().len(), 1);
+        assert!(drain_results().is_empty());
+
+        assert!(run_action_in(&home, RoutineAction::Delete, "alpha-digest").is_ok());
+        let argv = std::fs::read_to_string(home.join("argv.txt")).unwrap();
+        assert_eq!(argv, "run alpha-digest\ndelete alpha-digest\n");
+        let _ = drain_results();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_bad_name_never_reaches_the_runner() {
+        let home = fake_home("bad");
+        let _ = drain_results();
+        let err = run_action_in(&home, RoutineAction::Run, "a; rm -rf /").unwrap_err();
+        assert!(err.contains("invalid routine name"), "{err}");
+        // Nothing ran, and the failure is queued for the row all the same.
+        assert!(!home.join("argv.txt").exists());
+        assert_eq!(drain_results()[0].result, Err(err));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_failing_runner_reports_the_first_line_of_its_stderr() {
+        let home = fake_home("fail");
+        let bin = home.join(".claude/routines/routinectl");
+        std::fs::write(&bin, "#!/bin/sh\necho 'no such routine' >&2\nexit 3\n").unwrap();
+        let _ = drain_results();
+        assert_eq!(run_action_in(&home, RoutineAction::Pause, "alpha-digest"), Err("no such routine".to_string()));
+        let _ = drain_results();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_failure_keeps_the_first_line_of_stderr_capped() {
+        assert_eq!(first_line("boom\nrest"), "boom");
+        assert_eq!(first_line("   \n"), "");
+        assert_eq!(first_line(&"\u{e9}".repeat(200)).chars().count(), 80);
+    }
+
+    #[test]
+    fn only_paths_under_the_routines_directory_open() {
+        let home = fake_home("guard");
+        let dir = home.join(".claude/routines");
+        let log = dir.join("logs/alpha-digest.log");
+        std::fs::write(&log, "x").unwrap();
+        assert_eq!(inside_routines(&dir, &log), Some(std::fs::canonicalize(&log).unwrap()));
+        // A file outside, and a path that only looks inside through `..`.
+        let outside = home.join("notes.txt");
+        std::fs::write(&outside, "x").unwrap();
+        assert_eq!(inside_routines(&dir, &outside), None);
+        assert_eq!(inside_routines(&dir, &dir.join("../../notes.txt")), None);
+        // Neither door spawns anything for a path it refuses.
+        assert!(open_log("/etc/passwd").is_err());
+        assert!(edit_prompt("/etc/passwd").is_err());
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

@@ -6,6 +6,7 @@
 
 use super::needs::{NeedItem, NeedKind};
 use super::sidebar_asks::AsksState;
+use super::sidebar_sched::SchedState;
 use super::sidebar::{
     display_order, format_age, summary_runs, CollapsedSummary, NextPill, PaneFlags, SidebarSort,
     SummaryRun, TileState,
@@ -43,30 +44,18 @@ impl SidebarList {
     }
 }
 
-
-/// One routine as the sidebar shows it: its name, when it runs (or what stops
-/// it from running), how the last run ended, and the words the grouped
-/// redesign will draw.
+/// One routine as the Scheduled view shows it: its name, its section, the
+/// words its two lines and its body read, and where its log lives. The prompt
+/// is named by the view, never carried here: a full prompt in the model would
+/// be cloned on every tick.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RoutineVm {
     pub name: String,
-    /// The schedule, or the reason it will never fire.
-    pub detail: String,
-    /// The schedule is really a problem to fix: draw it in the warning colour.
-    pub broken: bool,
-    /// Neutralised by its `.done` marker: it stays listed, dimmed.
-    pub done: bool,
-    /// `2026-09-26 10:04`, empty when it has never run.
-    pub last_run: String,
-    /// The last run failed: its exit code.
-    pub failed: Option<i32>,
-    /// Clicked open: the row also shows where it runs, the extra tools and
-    /// directories it is granted, and the prompt it is handed.
+    /// Clicked open: the row also shows its body.
     pub expanded: bool,
+    /// Where it runs; empty while the row is closed, so an unopened list
+    /// stays as cheap to compare as it was.
     pub cwd: String,
-    pub tools: Vec<String>,
-    pub dirs: Vec<String>,
-    pub prompt: String,
     /// Where it belongs in the Scheduled list, from `routines::group`.
     pub group: crate::routines::Group,
     /// The schedule as routinectl phrases it ("once, 6 Nov 09:47").
@@ -79,6 +68,12 @@ pub struct RoutineVm {
     pub last_status: crate::routines::LastStatus,
     /// How long ago it ended: `10 min ago`.
     pub ago_words: String,
+    /// The next run itself, not only its words: a section lists its rows in
+    /// next-run order, and comparing words would compare "9 Nov" with "09:05".
+    pub next_at: Option<crate::routines::When>,
+    /// The log routinectl reports; empty when it reports none, the view then
+    /// falls back to `logs/<name>.log`.
+    pub log: String,
 }
 
 impl RoutineVm {
@@ -90,7 +85,6 @@ impl RoutineVm {
 
     pub fn at(r: &crate::routines::Routine, expanded: bool, now: crate::routines::When) -> Self {
         use crate::routines::{ago_words, group, in_words, next_words, LastStatus};
-        let problem = r.problem();
         let last_status = match &r.last {
             _ if r.running => LastStatus::Running,
             Some(l) if l.code != 0 => LastStatus::Failed(l.code),
@@ -100,24 +94,16 @@ impl RoutineVm {
         let last_at = r.last.as_ref().and_then(|l| l.at());
         RoutineVm {
             expanded,
-            // The body is only read when it is open, so an unexpanded list
-            // stays as cheap to compare as it was.
             cwd: if expanded { r.cwd.clone() } else { String::new() },
-            tools: if expanded { r.tools.clone() } else { Vec::new() },
-            dirs: if expanded { r.dirs.clone() } else { Vec::new() },
-            prompt: if expanded { r.prompt.clone() } else { String::new() },
             name: r.name.clone(),
-            detail: problem.map(String::from).unwrap_or_else(|| r.schedule.clone()),
-            broken: problem.is_some(),
-            done: r.done,
-            last_run: last_at.map(|w| w.words()).unwrap_or_default(),
-            failed: r.last.as_ref().map(|l| l.code).filter(|&c| c != 0),
             group: group(r, now),
             schedule_words: if r.schedule_words.is_empty() { r.schedule.clone() } else { r.schedule_words.clone() },
             next_words: r.next_run.map(|n| next_words(n, now)).unwrap_or_default(),
             in_words: r.next_run.map(|n| in_words(n, now)).unwrap_or_default(),
             last_status,
             ago_words: last_at.map(|w| ago_words(w, now)).unwrap_or_default(),
+            next_at: r.next_run,
+            log: r.log.clone(),
         }
     }
 }
@@ -225,6 +211,15 @@ pub struct SidebarModel {
     pub asks: AsksState,
     /// Fewer than three panes in the window: show the `⌘T new tab · ⌘D split` hint.
     pub show_hint: bool,
+    /// The Scheduled view's folding, in-flight actions and inline
+    /// confirmation; empty for every other list.
+    pub sched: SchedState,
+    /// The Scheduled list's meta row, each run with whether it reads as a
+    /// failure. Empty for every other list.
+    pub sched_meta: Vec<(String, bool)>,
+    /// The word the meta row keeps at its right. Only the Scheduled list has
+    /// one (`now 18:45`); the panes draw the sort button there instead.
+    pub meta_right: Option<String>,
 }
 
 /// One tab as a group header and its tiles.
@@ -548,6 +543,9 @@ impl SidebarModel {
             needs_all: false,
             asks: AsksState::default(),
             show_hint: total_panes < 3,
+            sched: SchedState::default(),
+            sched_meta: Vec::new(),
+            meta_right: None,
         }
     }
 
@@ -593,22 +591,20 @@ mod tests {
             ..Default::default()
         };
         let vm = RoutineVm::at(&ok, false, now);
-        assert_eq!(vm.detail, "daily 10:02");
-        assert!(!vm.broken);
+        assert!(!vm.schedule_words.is_empty());
         assert_eq!(vm.schedule_words, "daily 10:02");
-        assert_eq!(vm.last_run, "2026-09-26 10:04");
         assert_eq!(vm.last_status, LastStatus::Ok);
         assert_eq!(vm.ago_words, "16 min ago");
-        assert_eq!(vm.failed, None);
         assert_eq!(vm.group, crate::routines::Group::ThisWeek);
         assert_eq!(vm.next_words, "Sat 10:20");
         assert_eq!(vm.in_words, "in 7 d");
+        assert_eq!(vm.next_at, ok.next_run);
 
-        // A plist launchd never loaded: the schedule is a lie, say so instead.
+        // A plist launchd never loaded: its group still follows the schedule,
+        // and the row's second line keeps the schedule it was given.
         let never = crate::routines::Routine { loaded: false, ..ok.clone() };
-        let vm = RoutineVm::at(&never, false, now);
-        assert_eq!(vm.detail, "not loaded");
-        assert!(vm.broken);
+        assert_eq!(never.problem(), Some("not loaded"));
+        assert_eq!(RoutineVm::at(&never, false, now).schedule_words, "daily 10:02");
 
         // A non-zero exit is worth surfacing next to the date.
         let failed = crate::routines::Routine {
@@ -616,7 +612,6 @@ mod tests {
             ..ok.clone()
         };
         let vm = RoutineVm::at(&failed, false, now);
-        assert_eq!(vm.failed, Some(2));
         assert_eq!(vm.last_status, LastStatus::Failed(2));
         assert_eq!(vm.group, crate::routines::Group::NeedsAttention);
 
@@ -629,22 +624,13 @@ mod tests {
         };
         let vm = RoutineVm::at(&running, false, now);
         assert_eq!(vm.last_status, LastStatus::Running);
-        assert_eq!(vm.last_run, "2026-09-26 10:15");
         assert_eq!(vm.ago_words, "5 min ago");
 
         // Closed, the body is not even carried: the model stays small and
         // cheap to compare on every tick.
-        let fat = crate::routines::Routine {
-            prompt: "a long prompt".into(),
-            tools: vec!["mcp__gmail__search".into()],
-            cwd: "/Users/x/Perso".into(),
-            ..ok.clone()
-        };
-        assert_eq!(RoutineVm::at(&fat, false, now).prompt, "");
-        assert!(RoutineVm::at(&fat, false, now).tools.is_empty());
-        let open = RoutineVm::at(&fat, true, now);
-        assert_eq!(open.prompt, "a long prompt");
-        assert_eq!(open.cwd, "/Users/x/Perso");
+        let fat = crate::routines::Routine { cwd: "/Users/x/Perso".into(), ..ok.clone() };
+        assert_eq!(RoutineVm::at(&fat, false, now).cwd, "");
+        assert_eq!(RoutineVm::at(&fat, true, now).cwd, "/Users/x/Perso");
     }
 
     #[test]

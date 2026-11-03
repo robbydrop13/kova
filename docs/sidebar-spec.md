@@ -311,51 +311,108 @@ right edge, 5 pt above its top) with a 2 pt ring of the sidebar ground:
 
 ### 3.7.2 Scheduled list (`SidebarList::Scheduled`)
 
-A flat list of `crate::routines` rows, no groups, no drag, nothing
-clickable: `launchctl` stays the only way to change a routine. One row per
-routine, 58 pt, 6 pt apart, on the tile ground at radius 10:
+`src/window/sidebar_sched.rs` owns this list: the view state, the pure layout,
+the drawing and the hit test. The routines come from `crate::routines`; the
+rows are grouped into sections, next run first, and each row can run, pause,
+resume, edit or delete its routine through `routinectl` (3.7.2.3).
 
-| Line | Content | Colour |
+The meta row reads `N active · K failed` on the left (`failed` in `crit`,
+`K` counting `NeedsAttention`) and the clock the list is phrased against on
+the right, `now 18:45`.
+
+#### Sections
+
+| Section | Holds | Note | Folded at start |
+|---|---|---|---|
+| `Needs attention` | the last run failed, and it is not paused | | no |
+| `Today` | next run later today | `next first` | no |
+| `This week` | next run within seven days | | no |
+| `Later` | further out, and manual routines | | no |
+| `Off` | `enabled: false` | `paused` | **yes** |
+
+A header is 24 pt: the chevron (12), the label (11 medium, `crit` on
+`Needs attention`), the count in tertiary, and the note right-aligned.
+Clicking it folds or unfolds the section; the folded state lives in
+`SidebarState.sched` (`folded`, `Off` in it by default) and rides the model.
+An empty section is not drawn. Rows inside a section sort by next run, a
+manual routine having none and coming last, then by name.
+
+#### A row
+
+40 pt, 5 v / 6 h padding, radius 6, `bg.hover` under the mouse; the open row
+is `bg1` with a 1 pt `b3` border at radius 8. An `Off` row is drawn at alpha
+0.55: switched off on purpose is not broken, and a routine switched off and
+forgotten is exactly what this view is for.
+
+| Part | Content | Style |
 |---|---|---|
-| Title | the routine's name | primary |
-| Detail | the schedule in words (`every day 10:02 and 15:02`), or what stops it firing (`not loaded`, `no prompt`) | secondary, `error` when it is a problem |
-| Last run | `2026-09-26 10:04:34`, plus `· exit N` when it failed, `never run` when it has not | tertiary, `error` on a failure |
+| Glyph (16 wide) | ok `check` in `ok`; failed `x-circle` in `crit`; running an 8 pt `info` dot; never run a `ring` in tertiary; off `power` in tertiary | |
+| Name | the routine's name | `Title` (13 medium) primary, truncated |
+| Line 2 | `<schedule words> · ran 10 min ago` / `· failed 2 h ago` (crit) / `· running` (info) / `· never run`; off: `Paused · was <schedule words>` | `Secondary` (12) |
+| Meta | next run (`19:05`, `Wed 09:03`, `9 Nov`) over `in 20 min`; nothing for `Off` and manual | `Secondary` in secondary / `Number` (11) tertiary |
 
-Clicking a row opens it, and clicking it again closes it; one at a time,
-since the body is long. The open row keeps a `bg.pressed` ground and grows
-to carry, in the order that answers "what will this actually do":
+Under the mouse the meta gives way to the row's ghost icon buttons (22 pt,
+radius 6, icon 14): `Run now` (play), `Open log` (file-text), `Pause` (pause),
+`Edit prompt` (edit), `Delete` (trash, crit). An off row keeps two:
+`Resume` (play) and `Delete`.
 
-| Section | Content |
+Clicking the row opens its body (one at a time, `open_routine`), indented 24:
+
+| Key (72 pt) | Value |
 |---|---|
-| `WHERE` | the working directory, the plist's 4th argument — which decides whose accounts a Claude routine speaks with |
-| `TOOLS` | `prompts/<name>.tools`, the extra MCP tools it is granted, blanks and `#` comments dropped as the runner drops them |
-| `WRITES TO` | `prompts/<name>.dirs`, the extra `--add-dir` directories |
-| `PROMPT` | `prompts/<name>.md` verbatim, wrapped, capped at `PROMPT_MAX_LINES` (40) — a row taller than the screen is a scroll trap, and the file is on disk for the rest |
+| `Runs at` | the schedule in words (`2 times a day`) |
+| `Next` | `Wed 09:03 · in 2 d`, `Manual`, or `Paused` |
+| `Last run` | `Ok · 10 min ago`, `Failed 2 h ago · exit 1` (crit), `Never`, `Running` |
+| `Where` | the working directory, its home written `~` |
+| `Prompt` | `prompts/<name>.md` |
 
-`TOOLS` and `WRITES TO` are skipped when the routine has no such file. The
-body is carried in the model only while the row is open, so a closed list
-stays as cheap to compare on the tick as it was. Rows take the hand cursor
-and lift to `bg.hover` under the mouse; `body_height` is shared by the
-layout and the draw so the two cannot disagree on the height.
+Then a row of small ghost buttons, the same actions with their labels; the
+labels wrap onto a second line when the sidebar is too narrow. `body_height`
+is shared by the layout and the draw so the two cannot disagree; the body is
+carried in the model only while the row is open (`cwd` is emptied
+otherwise), so a closed list stays as cheap to compare on the tick as it was.
 
-A routine switched off — its `.done` marker, or a plist parked as
-`.plist.disabled` — keeps its row at alpha 0.55 with `· disabled` after the
-schedule, and reports no problem: off on purpose is not broken, and a
-routine switched off and forgotten is exactly what this view is for. An
-empty list borrows the hint slot: `reading routines…` until the first
-background read lands, `no routines scheduled` after it. The rows come from
-`routines::snapshot` (a cache, refreshed on a thread at most every 30 s, and
-only while this view is up; the panes list never shells out): it parses
-`~/.claude/routines/routinectl list --json`, drops routines marked
-`done`, and keeps the plist plus `launchctl` reader as `read_from_disk`, the
-fallback when routinectl is missing or prints something else than JSON,
-logged once.
+#### 3.7.2.1 Deleting
 
-The model also carries the group (`NeedsAttention`, `Today`, `ThisWeek`,
-`Later`, `Off`) and the words `schedule_words`, `next_words`, `in_words`
-and `ago_words` for the grouped redesign. Grouping and phrasing are pure
-functions with the clock passed in, tested against
-`tests/fixtures/routines/list.json`.
+`Delete` opens an inline confirmation in the body: a crit wash (radius 6,
+padding 8 10), `Delete <name>?` in bold over `Removes its schedule and its
+prompt`, then `Cancel` (ghost) and `Delete` (filled `crit`). Escape or
+`Cancel` closes it; a click on the row does too. Nothing is deleted until
+the filled button is clicked.
+
+#### 3.7.2.2 Running, failing
+
+While an action runs the row's second line says what it is doing
+(`Running now…`, `Pausing…`, `Resuming…`, `Deleting…`, tertiary) and its
+buttons ignore clicks until the outcome lands. A failure keeps
+`Could not <verb>: <first line of stderr, 80 chars>` in crit on the second
+line for 10 s (`ERROR_MS`), then it goes.
+
+#### 3.7.2.3 Actions
+
+`routines::run_action` runs `~/.claude/routines/routinectl run|disable|enable|
+delete <name>` on a background thread, argv only, no shell, and refuses any
+name outside `^[a-z0-9][a-z0-9-]*$`. When it ends it forces the snapshot
+stale (`refresh`) and leaves an `ActionResult` in a queue that the tick
+drains (`sync_sched_results`, the same shape as `AskQueue`).
+
+`Open log` runs `open -a Console <log>` and `Edit prompt` runs
+`open -t <prompt>`; both refuse a path that does not canonicalize inside
+`~/.claude/routines`, and report the refusal in the row's second line.
+
+The rows come from `routines::snapshot` (a cache refreshed on a thread at
+most every 30 s, and only while this view is up; the panes list never shells
+out): it parses `~/.claude/routines/routinectl list --json`, drops routines
+marked `done`, and keeps the plist plus `launchctl` reader as
+`read_from_disk`, the fallback when routinectl is missing or prints something
+else than JSON, logged once. An empty list borrows the hint slot:
+`reading routines…` until the first background read lands, `no routines
+scheduled` after it.
+
+Grouping and phrasing (`group`, `next_words`, `in_words`, `ago_words`) are
+pure functions with the clock passed in, tested against
+`tests/fixtures/routines/list.json` at the fixed clock the section tests
+share (`2026-11-03T20:30`).
 
 ### 3.7.3 Asks list (`SidebarList::Asks`)
 
@@ -517,7 +574,11 @@ the age in `warn.text`, `Answer` an accent link whose hit target
 | Next pill                  | `do_focus_next_attention()` (not when `nothing`)       |                    |              |
 | Sort toggle                | kova <-> activity (Panes list only)                     |                    |              |
 | View switcher              | show that list (`sidebar_show_list`)                   |                    |              |
-| Routine row                | open it, or close it when it is open (`sidebar_toggle_routine`) |            |              |
+| Section header             | fold or unfold that section (`sidebar_sched_section`)  |                    |              |
+| Routine row                | open it, or close it when it is open (`sidebar_toggle_routine`); a click also closes an open confirmation | | |
+| Routine hover/body buttons | `Run now` / `Pause` / `Resume`: `routines::run_action` (background, queued result); `Open log` / `Edit prompt`: argv `open`, path-guarded; `Delete`: the inline confirmation | | |
+| Inline confirmation        | filled `Delete`: `routinectl delete`; `Cancel`: close it |          |              |
+| Escape over the list       | close the inline confirmation, like a lifted tile       |                    |              |
 | `Needs you` row            | error: focus its pane (any window); failed routine: Scheduled, row open (`open_routine`); ask or permission: Asks, `highlight_ask` set | | |
 | `Show all` / `Show less`   | toggle `needs_all`                                     |                    |              |
 | Tile `Answer`              | same as that pane's ask row                            |                    | tile menu    |
