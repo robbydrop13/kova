@@ -39,10 +39,12 @@ pub struct NeedItem {
     pub pane_id: Option<u64>,
     /// Epoch seconds since when it waits: the oldest is the most urgent.
     pub since: u64,
-    /// What the row says: the pane's title, the routine's name, the question.
+    /// Who the row names: the pane's title for an error, the routine's name
+    /// for a failed run, the asker (agent or session) for an ask or a
+    /// permission. A question with no asker falls back to its own text.
     pub title: String,
-    /// The row's second line: the provider's words for an error, the command
-    /// a permission wants, the rest of a question. Empty when there is none.
+    /// The row's detail column: the provider's words for an error, the
+    /// command a permission wants, the question. Empty when there is none.
     pub detail: String,
 }
 
@@ -56,6 +58,11 @@ pub struct PaneNeed {
     #[serde(default)]
     pub permission_since: Option<u64>,
     pub title: String,
+    /// Who is asking, for a permission prompt: the pane's agent session.
+    /// Absent on older reports and in the shared fixture, where the pane's
+    /// own title stands in.
+    #[serde(default)]
+    pub from: Option<String>,
     /// The error's text, or the permission prompt's detail (the command, the
     /// file). Absent on older reports and in the shared fixture.
     #[serde(default)]
@@ -88,6 +95,10 @@ pub struct AskNeed {
     #[serde(default)]
     pub answered: bool,
     pub title: String,
+    /// Who asked (`Asker::name`: the agent or the session), shown as the
+    /// row's title. Absent in the shared fixture.
+    #[serde(default)]
+    pub from: Option<String>,
     /// What the question says after its first line.
     #[serde(default)]
     pub detail: Option<String>,
@@ -127,9 +138,12 @@ fn by_age(a: &NeedItem, b: &NeedItem) -> std::cmp::Ordering {
 /// tie. A pane with an error and an ask keeps both: two different problems,
 /// one ends the turn and the other blocks it.
 pub fn need_items(input: &NeedInput) -> Vec<NeedItem> {
-    let mut errors: Vec<NeedItem> = pane_items(&input.panes, NeedKind::Error, |pane| {
-        pane.error_since
-    });
+    let mut errors: Vec<NeedItem> = pane_items(
+        &input.panes,
+        NeedKind::Error,
+        |pane| pane.error_since,
+        |pane| pane.title.clone(),
+    );
     let mut routines: Vec<NeedItem> = input
         .routines
         .iter()
@@ -153,18 +167,29 @@ pub fn need_items(input: &NeedInput) -> Vec<NeedItem> {
         .asks
         .iter()
         .filter(|ask| open(ask, input.now))
-        .map(|ask| NeedItem {
-            kind: NeedKind::Ask,
-            detail: ask.detail.clone().unwrap_or_default(),
-            key: format!("ask:{}", ask.id),
-            pane_id: ask.pane_id,
-            since: ask.created_at,
-            title: ask.title.clone(),
+        .map(|ask| {
+            // The row names the asker; the question is its detail column.
+            let question = match ask.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                Some(rest) => format!("{} {}", ask.title.trim(), rest),
+                None => ask.title.clone(),
+            };
+            let from = ask.from.clone().filter(|from| !from.trim().is_empty());
+            NeedItem {
+                kind: NeedKind::Ask,
+                detail: question.clone(),
+                key: format!("ask:{}", ask.id),
+                pane_id: ask.pane_id,
+                since: ask.created_at,
+                title: from.unwrap_or(question),
+            }
         })
         .collect();
-    let permissions = pane_items(&input.panes, NeedKind::Permission, |pane| {
-        pane.permission_since
-    });
+    let permissions = pane_items(
+        &input.panes,
+        NeedKind::Permission,
+        |pane| pane.permission_since,
+        |pane| pane.from.clone().filter(|from| !from.trim().is_empty()).unwrap_or_else(|| pane.title.clone()),
+    );
 
     // One pane, one thing: its oldest open question and its permission prompt
     // collapse into whichever appeared first.
@@ -197,11 +222,13 @@ pub fn need_items(input: &NeedInput) -> Vec<NeedItem> {
     errors.into_iter().chain(routines).chain(merged).collect()
 }
 
-/// The pane items of one kind, in no particular order.
+/// The pane items of one kind, in no particular order. `title` is what the
+/// row names: the pane's own title, or the asker for a permission prompt.
 fn pane_items(
     panes: &[PaneNeed],
     kind: NeedKind,
     since: impl Fn(&PaneNeed) -> Option<u64>,
+    title: impl Fn(&PaneNeed) -> String,
 ) -> Vec<NeedItem> {
     panes
         .iter()
@@ -212,7 +239,7 @@ fn pane_items(
                 key: format!("pane:{}", pane.id),
                 pane_id: Some(pane.id),
                 since: since(pane)?,
-                title: pane.title.clone(),
+                title: title(pane),
             })
         })
         .collect()
@@ -300,8 +327,8 @@ mod tests {
     fn next_steps_over_failed_routines_and_the_pane_under_the_eye() {
         let input = NeedInput {
             panes: vec![
-                PaneNeed { id: 3, error_since: Some(10), permission_since: None, title: "a".into(), detail: None },
-                PaneNeed { id: 4, error_since: None, permission_since: Some(20), title: "b".into(), detail: None },
+                PaneNeed { id: 3, error_since: Some(10), permission_since: None, title: "a".into(), from: None, detail: None },
+                PaneNeed { id: 4, error_since: None, permission_since: Some(20), title: "b".into(), from: None, detail: None },
             ],
             routines: vec![RoutineNeed {
                 name: "nightly".into(),
@@ -336,5 +363,43 @@ mod tests {
         assert_eq!(next_need_pane(&items, Some(3)), Some(1));
         assert_eq!(next_need_pane(&items, Some(9)), Some(1));
         assert_eq!(next_need_pane(&items[..1], Some(1)), None);
+    }
+
+    #[test]
+    fn a_need_row_names_the_asker_and_puts_the_question_under_it() {
+        let input = NeedInput {
+            panes: vec![
+                PaneNeed { id: 3, error_since: Some(10), permission_since: None, title: "api".into(), from: None, detail: Some("session limit".into()) },
+                PaneNeed { id: 4, error_since: None, permission_since: Some(20), title: "Pane 4".into(), from: Some("Acme".into()), detail: Some("rm -rf build".into()) },
+            ],
+            routines: vec![RoutineNeed { name: "nightly".into(), failed_at: Some(5), paused: false }],
+            asks: vec![AskNeed {
+                id: "a1".into(),
+                pane_id: Some(7),
+                created_at: 30,
+                snoozed_until: None,
+                answered: false,
+                title: "Ship the draft?".into(),
+                from: Some("claude".into()),
+                detail: Some("The copy is ready.".into()),
+            }],
+            now: 100,
+        };
+        let items = need_items(&input);
+        let row = |kind: NeedKind, pane: Option<u64>| {
+            items
+                .iter()
+                .find(|item| item.kind == kind && item.pane_id == pane)
+                .map(|item| (item.title.as_str(), item.detail.as_str()))
+                .expect("the row exists")
+        };
+        // An error keeps the pane's name and says what the provider said.
+        assert_eq!(row(NeedKind::Error, Some(3)), ("api", "session limit"));
+        // A permission names the asker, the pane only when there is none.
+        assert_eq!(row(NeedKind::Permission, Some(4)), ("Acme", "rm -rf build"));
+        // A failed routine names itself and says the run failed.
+        assert_eq!(row(NeedKind::FailedRoutine, None), ("nightly", "Routine failed"));
+        // An ask names the agent, its question below.
+        assert_eq!(row(NeedKind::Ask, Some(7)), ("claude", "Ship the draft? The copy is ready."));
     }
 }

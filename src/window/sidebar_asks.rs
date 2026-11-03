@@ -62,7 +62,9 @@ const NOTE_GAP: f64 = 6.0;
 const NOTE_H: f64 = 14.0;
 const NOTE_ICON: f64 = 10.0;
 const NOTE_ICON_GAP: f64 = 4.0;
-const NOTE_OPTION_GAP: f64 = 10.0;
+/// From the end of the first option's label to the second icon: the pair
+/// reads as one line, not two columns.
+const NOTE_OPTION_GAP: f64 = 6.0;
 /// A sending or sent card's status line, where the actions used to be.
 const STATUS_H: f64 = 28.0;
 const STATUS_ICON: f64 = 13.0;
@@ -1112,14 +1114,30 @@ fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64
     draw_text(sh, &card.card.age, &age, Style::Number, age_fg, alpha, Align::Right, false);
 }
 
+/// The note line's two options, `[check icon, its label, x icon, its label]`:
+/// the second option starts 6 pt after the first label's text, so the pair
+/// reads as one line rather than two columns. Labels clip at `right`.
+fn note_options(note: Rect, right: f64, m: &dyn TextMetrics, options: &[String; 2]) -> [Rect; 4] {
+    let first_x = note.x + NOTE_ICON + NOTE_ICON_GAP;
+    let first_w = m.width(&options[0], Style::Hint);
+    let cross_x = first_x + first_w + NOTE_OPTION_GAP;
+    let second_x = cross_x + NOTE_ICON + NOTE_ICON_GAP;
+    [
+        Rect::new(note.x, note.y, NOTE_ICON, note.h),
+        Rect::new(first_x, note.y, first_w, note.h),
+        Rect::new(cross_x, note.y, NOTE_ICON, note.h),
+        Rect::new(second_x, note.y, (right - second_x).max(0.0), note.h),
+    ]
+}
+
 fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64) {
     let note = &card.note;
-    let mut right = note.right();
+    let mut options_right = note.right();
     if card.card.ended {
         let label = "Session ended";
         let text_w = m.width(label, Style::Hint);
         let width = NOTE_ICON + NOTE_ICON_GAP + text_w;
-        let x = (right - width).max(note.x);
+        let x = (note.right() - width).max(note.x);
         stroke_icon(
             super::feather::Icon::Info,
             &Rect::new(x, note.y, NOTE_ICON, note.h),
@@ -1137,40 +1155,25 @@ fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f6
             Align::Left,
             false,
         );
-        right = x - 8.0;
+        options_right = x - 8.0;
     }
-    let avail = (right - note.x).max(0.0);
-    let col = (avail - NOTE_OPTION_GAP) / 2.0;
-    let text_w = (col - NOTE_ICON - NOTE_ICON_GAP).max(0.0);
-    stroke_icon(
-        super::feather::Icon::Check,
-        &Rect::new(note.x, note.y, NOTE_ICON, note.h),
-        NOTE_ICON,
-        tokens::OK_DOT,
-        alpha,
-    );
+    let [check, first, cross, second] = note_options(*note, options_right, m, &card.card.options);
+    stroke_icon(super::feather::Icon::Check, &check, NOTE_ICON, tokens::OK_DOT, alpha);
     draw_text(
         sh,
         &card.card.options[0],
-        &Rect::new(note.x + NOTE_ICON + NOTE_ICON_GAP, note.y, text_w, note.h),
+        &first,
         Style::Hint,
         tokens::TEXT_TERTIARY,
         alpha,
         Align::Left,
         false,
     );
-    let second_x = note.x + col + NOTE_OPTION_GAP;
-    stroke_icon(
-        super::feather::Icon::X,
-        &Rect::new(second_x, note.y, NOTE_ICON, note.h),
-        NOTE_ICON,
-        tokens::INTERRUPT,
-        alpha,
-    );
+    stroke_icon(super::feather::Icon::X, &cross, NOTE_ICON, tokens::INTERRUPT, alpha);
     draw_text(
         sh,
         &card.card.options[1],
-        &Rect::new(second_x + NOTE_ICON + NOTE_ICON_GAP, note.y, text_w, note.h),
+        &second,
         Style::Hint,
         tokens::TEXT_TERTIARY,
         alpha,
@@ -1756,5 +1759,20 @@ mod tests {
         st.set_cards(Vec::new());
         assert!(st.brief.is_none());
         assert_eq!(st.drafts.get("a").map(String::as_str), Some("half typed"));
+    }
+
+    #[test]
+    fn the_ok_and_ko_options_sit_together_on_the_note_line() {
+        let note = Rect::new(10.0, 0.0, 200.0, NOTE_H);
+        let options = ["Yes".to_string(), "No".to_string()];
+        let [check, first, cross, second] = note_options(note, note.right(), &FakeMetrics, &options);
+        assert_eq!(check, Rect::new(10.0, 0.0, NOTE_ICON, NOTE_H));
+        assert_eq!(first.x, check.right() + NOTE_ICON_GAP);
+        assert_eq!(first.w, 3.0 * 6.0);
+        // Six points after the first label, not at the note's middle.
+        assert_eq!(cross.x, first.right() + NOTE_OPTION_GAP);
+        assert_eq!(cross.x, 10.0 + NOTE_ICON + NOTE_ICON_GAP + 18.0 + 6.0);
+        assert_eq!(second.x, cross.right() + NOTE_ICON_GAP);
+        assert_eq!(second.w, note.right() - second.x);
     }
 }

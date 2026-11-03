@@ -184,7 +184,8 @@ A 44 pt row (5 + an 18 pt title line + a 16 pt subtitle line + 5, floored at
   (`Style::Secondary`, 12, one line, tail-truncated). A `★` in amber comes
   first when bookmarked; a bare shell shows `Start Claude` and a restored
   session `Resume`, each after a filled 11 pt `play` (accent link, primary on
-  hover) right-aligned at the end of the subtitle line.
+  hover) right-aligned at the end of the subtitle line, never on a waiting
+  tile: the wait takes that line.
 - A pane with an open ask or permission prompt (`TileVm::waiting`, filled by
   `SidebarModel::apply_needs`) says `waiting 4m · Answer` at the start of the
   subtitle instead: the age in `warn.text`, `Answer` an accent link hit
@@ -268,7 +269,8 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
 - Sort ghost, at the meta row's right: the `sort` icon at 11 then the
   label, `Tab order` in the default order and `Activity` when the list is
   sorted by urgency. Tertiary, `ACCENT` while sorted by activity, primary
-  under the mouse, on a 10 % white ground (radius 4).
+  under the mouse, on a 10 % white ground (radius 4). The Panes list only:
+  Asks, Agents and Scheduled draw no ghost and have no sort hit target.
 - Next pill (`NextPill`, `sidebar.rs`), one state pair (section 5.2):
 
 | State   | Fill             | Text                                   | Badge |
@@ -283,7 +285,11 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
   edge; the row's title keeps an 8 pt gap, so a long name truncates before
   the two meet. `Nothing` draws no play and no badge, ignores hover, and
   its hit does nothing. `Next` darkens to `ACCENT_PRESSED` under the mouse;
-  pressed, its text and icon drop to 85 %.
+  pressed, its text and icon drop to 85 %. What it shows follows `Cmd+J`
+  (`sidebar_model::next_pill`): `Next` as soon as a need item has a pane to
+  land on, badged with what waits on you (`waits_on_you`: asks and
+  permissions, at least 1 while any need pane exists); otherwise `Next` with
+  the unread count; `Nothing to read` only when neither exists.
 
 ### 3.7.1 View switcher
 
@@ -358,8 +364,8 @@ the drawing and the hit test. The board (`ask::Board`) holds the questions;
 `sidebar_ui::ask_cards` turns them into `AskCardVm`s once per tick while this
 list is up, resolving each `pane_id` to its tab across every window and
 checking `claude_session::live_session_ids` for a conversation that outlived
-its pane. The meta line reads `N need you · newest first`; the open cards are
-newest first.
+its pane. The meta line reads `N need you · newest first` while N > 0 and
+stays empty at 0; the open cards are newest first.
 
 A card (radius 8, `bg1` `TILE`, 1 pt `b3` `BORDER_SUBTLE`, 10 v / 12 h
 padding, 8 pt apart):
@@ -369,7 +375,7 @@ padding, 8 pt apart):
 | Header (18 pt) | 8 pt `awaiting` dot, then `from` (the asker's name), the tab name, and the age at the right (`4m`, `2h`) | `Title` primary, tab `Summary` tertiary, age `Number`; `warn.text` from 2 h |
 | Message | the question, wrapped, six lines then an ellipsis | `Secondary` (12) primary |
 | Actions (28 pt) | OK 32 x 28 (check, `ok` colour), KO (cross, `crit`), Brief (pencil, primary), then at the right the ghost Open (only when the ask has a pane) and Moon, 26 wide | button ground `bg.hover` / `bg.pressed`; ghost icons tertiary, primary under the mouse |
-| Note (14 pt) | a small green check and the first option, a small red cross and the second, so the user knows what OK and KO send; right-aligned `Session ended` with an info icon when the ask has no pane and no live conversation | `Hint` (11) tertiary |
+| Note (14 pt) | a small green check and the first option, then a small red cross and the second 6 pt after the first label, so the pair sits together; right-aligned `Session ended` with an info icon when the ask has no pane and no live conversation | `Hint` (11) tertiary |
 
 OK answers with the question's first action, KO with its second (or `No`
 when it declared only one). The Board's answer path is the floating card's:
@@ -418,7 +424,9 @@ when the overlay closes or the question leaves the board. What was typed is
 kept in `AsksState.drafts`, so reopening Brief on the same ask restores it.
 Three lines (60 pt) at least, six (120 pt) at most, then the field scrolls;
 placeholder `Your instruction`, Inter 12. Enter starts a new line, Cmd+Enter
-sends, Escape cancels. Cmd+A/C/V/X/Z reach the field because
+sends (the view's `performKeyEquivalent`: AppKit routes the key equivalent
+before the field editor, logged `sidebar: brief send (cmd+enter)`), Escape
+cancels.
 `KovaView::perform_key_equivalent` (`src/window/mod.rs`) answers NO while the
 window's first responder is an `NSTextView`: the terminal's key map must not
 take them first. Opening and closing the field is logged
@@ -455,9 +463,11 @@ errors and failed runs in `crit.text`, the ` · ` in tertiary.
 One 28 pt row per need (`model.needs`, in `needs::need_items` order): a 16 pt
 glyph box at 6 pt from the row's edge (8 pt `awaiting` dot for an ask or a
 permission, `error` dot otherwise, the `x-circle` icon for a failed routine),
-then the title (`Style::Title`, primary, tail-truncated), the detail
-(`Style::Secondary`, tertiary: the provider's error, the command a permission
-wants, the rest of a question) and the age at the right (`Style::Number`,
+then the title (`Style::Title`, primary, tail-truncated): the asker's name
+for an ask or a permission, the pane's title for an error, the routine's
+name for a failed run; the detail (`Style::Secondary`, tertiary: the
+question, the command a permission wants, the provider's error,
+`Routine failed`) and the age at the right (`Style::Number`,
 `warn.text` for asks and permissions, `crit.text` otherwise). The title keeps
 at most half of the room so the detail always reads; below 280 pt of list
 width the detail column is dropped and the title takes it
@@ -505,7 +515,7 @@ the age in `warn.text`, `Answer` an accent link whose hit target
 | Shell `Start Claude`       | start Claude (4.4)                                     |                    | tile menu    |
 | Restored `Resume`          | resume (4.4)                                           |                    | tile menu    |
 | Next pill                  | `do_focus_next_attention()` (not when `nothing`)       |                    |              |
-| Sort toggle                | kova <-> activity                                      |                    |              |
+| Sort toggle                | kova <-> activity (Panes list only)                     |                    |              |
 | View switcher              | show that list (`sidebar_show_list`)                   |                    |              |
 | Routine row                | open it, or close it when it is open (`sidebar_toggle_routine`) |            |              |
 | `Needs you` row            | error: focus its pane (any window); failed routine: Scheduled, row open (`open_routine`); ask or permission: Asks, `highlight_ask` set | | |
@@ -650,10 +660,11 @@ detects by comparing the focused pane id with the one it saw last
 `KovaView::collect_unread` lists every pane with its unread bit across
 every window: this window's in the sidebar's display order
 (`sidebar_model::pane_order`: tabs in kova or activity order, panes in tab
-order, minimized panes left out), then the other windows' in tab order. The
-pill shows `sidebar::unread_count`; `Cmd+J` and the pill jump to
-`sidebar::next_unread(order, focused)`: the first unread pane after the
-focused pane's place in that order, wrapping, never the focused pane itself
+order, minimized panes left out), then the other windows' in tab order.
+`sidebar_model::next_pill` reads that count when no need item has a pane.
+`Cmd+J` and the pill jump to `sidebar::next_unread(order, focused)`: the
+first unread pane after the focused pane's place in that order, wrapping,
+never the focused pane itself
 (a status line says `Nothing to read` when nothing else is). IPC
 `list-panes` reports the same rule as `unread`.
 

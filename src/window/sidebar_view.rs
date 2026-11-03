@@ -207,6 +207,9 @@ const NEED_BUTTON_H: f64 = 22.0;
 const NEED_DETAIL_MIN_W: f64 = 280.0;
 const NEED_TITLE: &str = "Needs you";
 const NEED_ANSWER: &str = "Answer";
+/// From the end of `waiting 4m` to the `Answer` link: room for the dot
+/// separator and its breathing space.
+const ANSWER_GAP: f64 = 12.0;
 
 // ---------------------------------------------------------------
 // Text styles
@@ -804,22 +807,31 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
         })
         .collect();
     let mut actions = Vec::new();
-    // The resume / start link is the subtitle line's right end.
-    let call = if tile.bare_shell {
-        Some((TileButton::StartClaude, START_CLAUDE_LABEL))
-    } else if tile.resumable {
-        Some((TileButton::Resume, RESUME_LABEL))
-    } else {
-        None
-    };
-    if let Some((button, label)) = call {
-        let call_w = link_w(m, label);
-        actions.push((button, Rect::new(right - call_w, y + TILE_PAD_V + LINE_TITLE_H, call_w, LINE_SEC_H)));
+    // The resume / start link is the subtitle line's right end. A waiting
+    // pane has no call there: its subtitle is `waiting 4m · Answer`, and a
+    // link pinned to the right would land on top of the Answer link.
+    if tile.waiting.is_none() {
+        let call = if tile.bare_shell {
+            Some((TileButton::StartClaude, START_CLAUDE_LABEL))
+        } else if tile.resumable {
+            Some((TileButton::Resume, RESUME_LABEL))
+        } else {
+            None
+        };
+        if let Some((button, label)) = call {
+            let call_w = link_w(m, label);
+            actions.push((button, Rect::new(right - call_w, y + TILE_PAD_V + LINE_TITLE_H, call_w, LINE_SEC_H)));
+        }
     }
-    // A waiting pane's `Answer` link: the subtitle line's right end, where
-    // the row's need lands (the same target as its ask row).
-    let answer = tile.waiting.as_ref().map(|_| {
-        Rect::new(right - m.width(NEED_ANSWER, Style::Link), y + TILE_PAD_V + LINE_TITLE_H, m.width(NEED_ANSWER, Style::Link), LINE_SEC_H)
+    // A waiting pane's `Answer` link, left aligned right after `waiting 4m`
+    // and its dot: the hit rect is exactly where the word is drawn.
+    let answer = tile.waiting.as_ref().map(|age| {
+        let mut text_x = x + TEXT_X;
+        if tile.bookmarked {
+            text_x += m.width("\u{2605}", Style::Secondary) + 4.0;
+        }
+        let waiting_w = m.width(&format!("waiting {age}"), Style::Secondary);
+        Rect::new(text_x + waiting_w + ANSWER_GAP, y + TILE_PAD_V + LINE_TITLE_H, m.width(NEED_ANSWER, Style::Link), LINE_SEC_H)
     });
     Row {
         kind: RowKind::Tile { group, index, pane_id: tile.pane_id, column: tile.column },
@@ -965,7 +977,9 @@ fn switch_badge(btn: &Rect, w: f64, h: f64) -> Rect {
 }
 
 impl ChromeLayout {
-    pub fn new(width: f64, height: f64, sort_label_w: f64, pill_w: f64) -> Self {
+    /// `sort_label_w` is `None` on a list that has no sort control: the
+    /// ghost and its hit target are left out.
+    pub fn new(width: f64, height: f64, sort_label_w: Option<f64>, pill_w: f64) -> Self {
         let inner_w = width - SEP_W;
         // Right-aligned on the traffic-light row; the pill sits on the row
         // below, so the two never compete for the width.
@@ -983,8 +997,10 @@ impl ChromeLayout {
         // either side, so its text lines up with the tiles' content.
         let meta_x = PAD_H + META_PAD;
         let summary = Rect::new(meta_x, TOP_H + TITLE_H, inner_w - 2.0 * meta_x, META_H);
-        let sort_w = sort_label_w + SORT_ICON_D + SORT_ICON_GAP + 2.0 * SORT_PAD;
-        let sort = Rect::new(summary.right() - sort_w, summary.y + (META_H - SORT_H) / 2.0, sort_w, SORT_H);
+        let sort = sort_label_w.map_or_else(Rect::default, |label_w| {
+            let sort_w = label_w + SORT_ICON_D + SORT_ICON_GAP + 2.0 * SORT_PAD;
+            Rect::new(summary.right() - sort_w, summary.y + (META_H - SORT_H) / 2.0, sort_w, SORT_H)
+        });
         let list_y = TOP_H + TITLE_H + META_H;
         let list = Rect::new(0.0, list_y, inner_w - EDGE_TOLERANCE, (height - list_y).max(0.0));
         ChromeLayout { width, height, title, summary, sort, pill, switch, list }
@@ -1007,7 +1023,7 @@ impl ChromeLayout {
         if y < TOP_H {
             return ChromeHit::TopArea;
         }
-        if self.sort.contains(x, y) {
+        if self.sort.w > 0.0 && self.sort.contains(x, y) {
             return ChromeHit::SortToggle;
         }
         if self.pill.contains(x, y) {
@@ -1378,6 +1394,14 @@ struct BriefField {
     rect: Rect,
 }
 
+impl BriefField {
+    /// The field editor is open on this field: the keys go here, not to the
+    /// terminal. `currentEditor` is AppKit's own answer to that question.
+    fn current_editor(&self) -> bool {
+        self.field.currentEditor().is_some()
+    }
+}
+
 pub struct SidebarViewIvars {
     shared: Rc<RefCell<Shared>>,
     scroll: OnceCell<Retained<NSScrollView>>,
@@ -1424,6 +1448,32 @@ define_class!(
         #[unsafe(method(mouseDownCanMoveWindow))]
         fn mouse_down_can_move_window(&self) -> bool {
             false
+        }
+
+        /// Cmd+Enter in the Brief field sends it. AppKit routes a key
+        /// equivalent before the field editor turns it into a command, so the
+        /// delegate never sees this one: this is its door. Return alone stays
+        /// a newline (`brief_command`), and the field must be the one being
+        /// edited, or the terminal keeps its own keys.
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
+            // Whatever a subview claims stays its own.
+            let handled: objc2::runtime::Bool = unsafe { msg_send![super(self), performKeyEquivalent: event] };
+            if handled.as_bool() {
+                return handled;
+            }
+            let enter = event.keyCode() == 36 || event.keyCode() == 76;
+            if enter
+                && event.modifierFlags().contains(NSEventModifierFlags::Command)
+                && self.brief_field_editing()
+            {
+                if let Some(key) = self.brief_key() {
+                    log::info!("sidebar: brief send (cmd+enter)");
+                    self.activate_brief(AsksHit::BriefSend(key));
+                }
+                return objc2::runtime::Bool::YES;
+            }
+            objc2::runtime::Bool::NO
         }
 
         #[unsafe(method(isOpaque))]
@@ -1589,6 +1639,12 @@ fn install_tracking_area(view: &NSView) {
 }
 
 impl SidebarView {
+    /// The brief text field owns the keyboard: it is the field editor's
+    /// client right now, not just a field sitting in the view.
+    fn brief_field_editing(&self) -> bool {
+        self.ivars().brief_field.borrow().as_ref().is_some_and(|open| open.current_editor())
+    }
+
     pub fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
         let shared = Rc::new(RefCell::new(Shared {
             model: SidebarModel {
@@ -1655,7 +1711,7 @@ impl SidebarView {
         }
         let chrome_changed = {
             let mut sh = self.ivars().shared.borrow_mut();
-            let changed = sh.model.sort != model.sort || sh.model.pill != model.pill;
+            let changed = sh.model.sort != model.sort || sh.model.pill != model.pill || sh.model.view != model.view;
             sh.model = model;
             changed
         };
@@ -1703,7 +1759,9 @@ impl SidebarView {
         let (sort_w, pill_w) = {
             let sh = self.ivars().shared.borrow();
             let m = AppKitMetrics(&sh);
-            (m.width(sh.model.sort.label(), Style::Sort), pill_width(sh.model.pill, &m))
+            // The sort ghost is the Panes list's own control.
+            let sort_w = matches!(sh.model.view, SidebarList::Panes).then(|| m.width(sh.model.sort.label(), Style::Sort));
+            (sort_w, pill_width(sh.model.pill, &m))
         };
         let chrome = ChromeLayout::new(b.size.width, b.size.height, sort_w, pill_w);
         let list_rect = chrome.list;
@@ -1877,7 +1935,9 @@ impl SidebarView {
     }
 
     /// Enter, Cmd+Enter and Escape in the field. Enter is a new line in an
-    /// instruction; the card's own field keeps Enter for sending.
+    /// instruction; the card's own field keeps Enter for sending. The field
+    /// editor reports a Return under more than one selector, so all of them
+    /// are the same key here.
     fn brief_command(&self, text_view: &NSTextView, selector: Sel) -> bool {
         if selector == sel!(cancelOperation:) {
             if let Some(key) = self.brief_key() {
@@ -1885,21 +1945,25 @@ impl SidebarView {
             }
             return true;
         }
-        if selector == sel!(insertNewline:) {
-            let cmd = NSApplication::sharedApplication(MainThreadMarker::from(self))
-                .currentEvent()
-                .map(|event| event.modifierFlags().contains(NSEventModifierFlags::Command))
-                .unwrap_or(false);
-            if cmd {
-                if let Some(key) = self.brief_key() {
-                    self.activate_brief(AsksHit::BriefSend(key));
-                }
-            } else {
-                let _: () = unsafe { msg_send![text_view, insertNewlineIgnoringFieldEditor: None::<&AnyObject>] };
-            }
-            return true;
+        let newline = selector == sel!(insertNewline:)
+            || selector == sel!(insertNewlineIgnoringFieldEditor:)
+            || selector == sel!(insertLineBreak:);
+        if !newline {
+            return false;
         }
-        false
+        let cmd = NSApplication::sharedApplication(MainThreadMarker::from(self))
+            .currentEvent()
+            .map(|event| event.modifierFlags().contains(NSEventModifierFlags::Command))
+            .unwrap_or(false);
+        if cmd {
+            if let Some(key) = self.brief_key() {
+                log::info!("sidebar: brief send (cmd+enter)");
+                self.activate_brief(AsksHit::BriefSend(key));
+            }
+        } else {
+            let _: () = unsafe { msg_send![text_view, insertNewlineIgnoringFieldEditor: None::<&AnyObject>] };
+        }
+        true
     }
 
     fn brief_key(&self) -> Option<u64> {
@@ -1980,20 +2044,22 @@ impl SidebarView {
         // Title row: the list's name, then the Next pill at the right.
         draw_text(&sh, sh.model.view.title(), &c.title, Style::ViewTitle, tokens::TEXT_PRIMARY, 1.0, Align::Left, false);
 
-        // Meta row: the summary on the left, the sort ghost on the right.
-        let sort_hovered = sh.chrome_hovered == ChromeHit::SortToggle;
-        let sort_pressed = sh.chrome_pressed == ChromeHit::SortToggle;
+        // Meta row: the summary on the left, the sort ghost on the right
+        // (the Panes list only).
+        let has_sort = c.sort.w > 0.0;
+        let sort_hovered = has_sort && sh.chrome_hovered == ChromeHit::SortToggle;
+        let sort_pressed = has_sort && sh.chrome_pressed == ChromeHit::SortToggle;
         if sort_hovered || sort_pressed {
             fill_round(&c.sort, SORT_RADIUS, tokens::WHITE, if sort_pressed { 0.16 } else { 0.10 });
         }
-        let sort_fg = if sort_hovered {
-            tokens::TEXT_PRIMARY
-        } else if sh.model.sort == SidebarSort::Activity {
-            tokens::ACCENT
-        } else {
-            tokens::TEXT_TERTIARY
-        };
-        {
+        if has_sort {
+            let sort_fg = if sort_hovered {
+                tokens::TEXT_PRIMARY
+            } else if sh.model.sort == SidebarSort::Activity {
+                tokens::ACCENT
+            } else {
+                tokens::TEXT_TERTIARY
+            };
             let label = sh.model.sort.label();
             let text_w = AppKitMetrics(&sh).width(label, Style::Sort);
             let mut x = c.sort.x + (c.sort.w - (SORT_ICON_D + SORT_ICON_GAP + text_w)).max(0.0) / 2.0;
@@ -2002,7 +2068,7 @@ impl SidebarView {
             draw_text(&sh, label, &Rect::new(x, c.sort.y, text_w, c.sort.h), Style::Sort, sort_fg, 1.0, Align::Left, false);
         }
         let mut x = c.summary.x;
-        let max_x = c.sort.x - 8.0;
+        let max_x = if has_sort { c.sort.x - 8.0 } else { c.summary.right() };
         for (text, run) in &sh.model.summary {
             let fg = match run {
                 SummaryRun::Working => tokens::INFO_TEXT,
@@ -2874,7 +2940,7 @@ impl SidebarListView {
             // `waiting 4m · Answer`: the age in warn, the link landing where
             // the pane's ask row does.
             let answer = row.answer.map(|r| shifted(&r));
-            let text_right = answer.map_or(sec_right, |a| a.x - 12.0);
+            let text_right = answer.map_or(sec_right, |a| a.x - ANSWER_GAP);
             let label = format!("waiting {waiting}");
             draw_text(sh, &label, &Rect::new(sx, line2.y, (text_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, tokens::WARN_TEXT, alpha, Align::Left, false);
             if let Some(area) = answer {
@@ -3286,7 +3352,7 @@ mod tests {
 
     #[test]
     fn the_chrome_stacks_the_top_row_the_title_the_meta_row_and_the_list() {
-        let c = ChromeLayout::new(W, 600.0, 40.0, 130.0);
+        let c = ChromeLayout::new(W, 600.0, Some(40.0), 130.0);
         // Top row: four 26 pt buttons, 2 apart, 10 from the inner right
         // edge, on the traffic lights' own row.
         let switch_left = W - 1.0 - 10.0 - (4.0 * 26.0 + 3.0 * 2.0);
@@ -3336,7 +3402,7 @@ mod tests {
     #[test]
     fn the_chrome_fits_the_whole_width_range() {
         for w in [200.0, 300.0, 520.0] {
-            let c = ChromeLayout::new(w, 600.0, 40.0, 130.0);
+            let c = ChromeLayout::new(w, 600.0, Some(40.0), 130.0);
             let inner = w - 1.0;
             assert!(c.switch[0].x >= 0.0);
             assert_eq!(c.switch[3].right(), inner - 10.0);
@@ -3351,10 +3417,21 @@ mod tests {
         }
         // A pill wider than the row gives way: it stops at the title's gap,
         // which is squeezed out rather than overlapped.
-        let long = ChromeLayout::new(300.0, 600.0, 40.0, 400.0);
+        let long = ChromeLayout::new(300.0, 600.0, Some(40.0), 400.0);
         assert_eq!(long.pill.x, 22.0);
         assert_eq!(long.pill.w, 300.0 - 1.0 - 12.0 - 22.0);
         assert_eq!(long.title.w, 0.0);
+    }
+
+    #[test]
+    fn a_list_without_a_sort_control_has_no_ghost_and_no_hit() {
+        let c = ChromeLayout::new(W, 600.0, None, 130.0);
+        assert_eq!(c.sort, Rect::default());
+        // The meta row keeps its text, and the whole row is the summary's.
+        assert_eq!(c.hit(c.summary.right() - 5.0, 85.0), ChromeHit::Empty);
+        assert_eq!(c.hit(c.summary.x + 5.0, 85.0), ChromeHit::Empty);
+        // Everything else stays where it was.
+        assert_eq!(c.list, ChromeLayout::new(W, 600.0, Some(40.0), 130.0).list);
     }
 
     #[test]
@@ -3550,10 +3627,37 @@ mod tests {
         // The waiting tile's subtitle carries `Answer`, its own hit target.
         let tile = l.rows.iter().find(|r| matches!(r.kind, RowKind::Tile { pane_id: 10, .. })).expect("pane 10");
         let answer = tile.answer.expect("a waiting tile carries the link");
+        assert!(tile.actions.is_empty(), "no Start Claude link next to the wait");
+        // Left aligned right after `waiting 4m`, not pinned to the right.
+        assert_eq!(answer.x, tile.frame.x + TEXT_X + "waiting 4m".len() as f64 * 6.0 + ANSWER_GAP);
         assert_eq!(l.hit(answer.x + 2.0, answer.y + 2.0), ListHit::NeedAnswer(10));
         // The rest of the subtitle line is still the tile.
         assert_eq!(l.hit(tile.frame.x + 40.0, answer.y + 2.0), ListHit::Tile(10));
         // A tile with nothing waiting has no link at all.
         assert_eq!(l.rows.iter().find(|r| matches!(r.kind, RowKind::Tile { pane_id: 11, .. })).and_then(|r| r.answer), None);
+    }
+
+    #[test]
+    fn a_waiting_tile_never_lays_links_on_top_of_each_other() {
+        // A waiting bare shell is the worst case: Start Claude would land on
+        // the right end of the same line as the Answer link.
+        let mut m = model();
+        let mut waiting_shell = tile(30, 0, TileState::Shell);
+        waiting_shell.waiting = Some("14s".into());
+        m.groups[2].tiles = vec![waiting_shell];
+        let l = ListLayout::new(&m, W, &FakeMetrics);
+        let row = l.rows.iter().find(|r| matches!(r.kind, RowKind::Tile { pane_id: 30, .. })).expect("the shell");
+        let answer = row.answer.expect("the waiting shell carries the link");
+        assert!(row.actions.is_empty());
+        // Starts after `waiting 14s`, not over it.
+        let text_x = row.frame.x + TEXT_X;
+        assert!(answer.x >= text_x + "waiting 14s".len() as f64 * 6.0);
+        // And intersects no other link box of the list.
+        let overlaps = |a: &Rect, b: &Rect| a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+        for r in &l.rows {
+            for (_, link) in r.actions.iter().chain(r.glyphs.iter()) {
+                assert!(!overlaps(&answer, link), "the Answer link overlaps a link at {link:?}");
+            }
+        }
     }
 }

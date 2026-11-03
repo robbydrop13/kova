@@ -168,6 +168,32 @@ pub fn need_rows_shown(needs: &[NeedRowVm], all: bool) -> usize {
     head + tail.min(4usize.saturating_sub(head).max(2))
 }
 
+/// What the Next pill shows, the same rule as `Cmd+J`: a need item with a
+/// pane to land on comes first, then unread output. The count is what waits
+/// on you (asks and permissions, like the Asks badge), never zero while
+/// there is a stop, and the unread count when nothing needs an answer.
+pub fn next_pill(needs: &[NeedItem], unread: usize) -> NextPill {
+    if needs.iter().any(|item| item.pane_id.is_some()) {
+        let waiting =
+            needs.iter().filter(|item| matches!(item.kind, NeedKind::Ask | NeedKind::Permission)).count();
+        NextPill::Next(waiting.max(1))
+    } else {
+        NextPill::of(unread)
+    }
+}
+
+/// The Asks list's meta line: `N need you · newest first`, and nothing at all
+/// while no question waits.
+pub fn asks_summary(open: usize) -> Vec<(String, SummaryRun)> {
+    if open == 0 {
+        return Vec::new();
+    }
+    vec![
+        (format!("{open} need you"), SummaryRun::Waiting),
+        (" \u{b7} newest first".to_string(), SummaryRun::Dot),
+    ]
+}
+
 /// Everything the sidebar shows for one window.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarModel {
@@ -456,13 +482,14 @@ pub fn pane_order(tabs: &[TabFacts], sort: SidebarSort) -> Vec<(PaneId, bool)> {
 
 impl SidebarModel {
     /// Assemble the model. `unread` is the unread count across every window
-    /// (the pill).
+    /// and `needs` this tick's need items: together they decide the pill.
     pub fn build(
         tabs: &[TabFacts],
         sort: SidebarSort,
         unread: usize,
         view: SidebarList,
         routines: Option<Vec<RoutineVm>>,
+        needs: &[NeedItem],
     ) -> Self {
         let tab_states: Vec<TileState> = tabs
             .iter()
@@ -515,7 +542,7 @@ impl SidebarModel {
             routine_failed: false,
             summary: summary_runs(waiting, working, idle_here),
             sort,
-            pill: NextPill::of(unread),
+            pill: next_pill(needs, unread),
             groups,
             needs: Vec::new(),
             needs_all: false,
@@ -821,7 +848,7 @@ mod tests {
             tab(0, vec![pane(1, PaneFlags { permission_prompt: true, ..PaneFlags::default() }), pane(2, PaneFlags { idle_agent: true, ..PaneFlags::default() })]),
             folded,
         ];
-        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, SidebarList::default(), None);
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, SidebarList::default(), None, &[]);
         let text: String = m.summary.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(text, "1 waiting \u{b7} 1 working \u{b7} 1 idle");
         assert_eq!(m.pill, NextPill::Next(2));
@@ -841,11 +868,11 @@ mod tests {
             tab(0, vec![pane(1, PaneFlags::default())]),
             tab(1, vec![pane(2, PaneFlags { permission_prompt: true, ..PaneFlags::default() })]),
         ];
-        let m = SidebarModel::build(&tabs, SidebarSort::Activity, 0, SidebarList::default(), None);
+        let m = SidebarModel::build(&tabs, SidebarSort::Activity, 0, SidebarList::default(), None, &[]);
         assert_eq!(m.groups.iter().map(|g| g.tab_idx).collect::<Vec<_>>(), vec![1, 0]);
         assert_eq!(m.pill, NextPill::Nothing);
         assert!(m.show_hint);
-        let same = SidebarModel::build(&tabs, SidebarSort::Activity, 0, SidebarList::default(), None);
+        let same = SidebarModel::build(&tabs, SidebarSort::Activity, 0, SidebarList::default(), None, &[]);
         assert_eq!(m, same);
     }
 
@@ -867,8 +894,54 @@ mod tests {
         assert_eq!(unread(kova), vec![2, 5, 6]);
         // Activity order: the awaiting tab first.
         assert_eq!(unread(pane_order(&tabs, SidebarSort::Activity)), vec![5, 6, 2]);
-        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 3, SidebarList::default(), None);
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 3, SidebarList::default(), None, &[]);
         assert!(m.groups[0].tiles[1].unread && !m.groups[0].tiles[0].unread);
         assert!(m.groups[1].tiles[1].unread);
+    }
+
+    #[test]
+    fn the_next_pill_counts_what_waits_on_you_before_unread_output() {
+        let tabs = vec![tab(0, vec![pane(1, PaneFlags::default())])];
+        let item = |kind: NeedKind, pane: u64| NeedItem {
+            kind,
+            key: format!("pane:{pane}"),
+            pane_id: Some(pane),
+            since: pane,
+            title: String::new(),
+            detail: String::new(),
+        };
+        // Two asks waiting and unread output: the asks win, their own count.
+        let needs = vec![item(NeedKind::Ask, 1), item(NeedKind::Ask, 2)];
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 5, SidebarList::default(), None, &needs);
+        assert_eq!(m.pill, NextPill::Next(2));
+        // One permission prompt alone is already a stop.
+        let needs = vec![item(NeedKind::Permission, 3)];
+        assert_eq!(next_pill(&needs, 0), NextPill::Next(1));
+        // An error has a target but nobody to answer: still a stop, never 0.
+        let needs = vec![item(NeedKind::Error, 4)];
+        assert_eq!(next_pill(&needs, 0), NextPill::Next(1));
+        // Nothing waits on you: unread output, as before.
+        assert_eq!(next_pill(&[], 4), NextPill::Next(4));
+        // Neither: the pill is not a button.
+        assert_eq!(next_pill(&[], 0), NextPill::Nothing);
+        // A failed routine has no pane to land on: not a pill stop.
+        let routine = NeedItem {
+            kind: NeedKind::FailedRoutine,
+            key: "routine:nightly".into(),
+            pane_id: None,
+            since: 1,
+            title: "nightly".into(),
+            detail: "Routine failed".into(),
+        };
+        assert_eq!(next_pill(&[routine], 0), NextPill::Nothing);
+    }
+
+    #[test]
+    fn the_asks_meta_line_only_names_a_count_when_something_waits() {
+        assert!(asks_summary(0).is_empty());
+        let runs = asks_summary(2);
+        assert_eq!(runs.iter().map(|(t, _)| t.as_str()).collect::<String>(), "2 need you \u{b7} newest first");
+        assert_eq!(runs[0].1, SummaryRun::Waiting);
+        assert_eq!(runs[1].1, SummaryRun::Dot);
     }
 }

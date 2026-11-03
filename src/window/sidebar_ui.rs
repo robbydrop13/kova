@@ -6,10 +6,10 @@
 //! and the mouse live in `sidebar_view.rs`.
 
 use super::*;
-use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort, SummaryRun};
+use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
 use super::needs::{self, AskNeed, NeedInput, NeedItem, NeedKind, PaneNeed, RoutineNeed};
 use super::sidebar_asks::{self, AskCardVm, AsksHit, AsksState, Highlight};
-use super::sidebar_model::{header_title, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
+use super::sidebar_model::{asks_summary, header_title, next_pill, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
 
@@ -310,6 +310,9 @@ impl KovaView {
                         error_since,
                         permission_since,
                         title: pane.display_title("Shell"),
+                        // The permission row names who asks: the pane's
+                        // agent session, else its own title.
+                        from: pane.agent_session_name(),
                         detail,
                     });
                 });
@@ -344,6 +347,8 @@ impl KovaView {
                 snoozed_until: (question.snoozed_until > 0).then_some(question.snoozed_until),
                 // The board only holds what nobody answered.
                 answered: false,
+                // The row names the asker; the question is its detail.
+                from: Some(question.from.name.clone()),
                 title: first_line(&question.message),
                 detail: Some(rest_of(&question.message)),
             });
@@ -430,7 +435,7 @@ impl KovaView {
             }
             SidebarList::Panes | SidebarList::Asks | SidebarList::Agents => None,
         };
-        let mut model = SidebarModel::build(&facts, sort, unread, list, routines);
+        let mut model = SidebarModel::build(&facts, sort, unread, list, routines, &needs);
         model.asks_waiting = waits_on_you;
         model.routine_failed = routine_failed;
         model.apply_needs(&needs, now, needs_all);
@@ -439,11 +444,7 @@ impl KovaView {
             let mut st = self.ivars().sidebar.borrow_mut();
             st.asks.set_cards(cards);
             model.asks = st.asks.clone();
-            let open = model.asks.open_count();
-            model.summary = vec![
-                (format!("{open} need you"), SummaryRun::Waiting),
-                (" \u{b7} newest first".to_string(), SummaryRun::Dot),
-            ];
+            model.summary = asks_summary(model.asks.open_count());
         }
         view.set_model(model);
 
@@ -685,10 +686,13 @@ impl KovaView {
         }
     }
 
-    /// The Next pill: `Nothing to read` is not a button, only a pill with a
-    /// badge jumps.
+    /// The Next pill: `Nothing to read` is not a button; a pill with a stop
+    /// (a need item with a pane, else unread output) is, and does what
+    /// Cmd+J does.
     pub(super) fn sidebar_next_pill_clicked(&self) {
-        if sidebar::NextPill::of(sidebar::unread_count(&self.collect_unread())).clickable() {
+        let unread = sidebar::unread_count(&self.collect_unread());
+        let clickable = next_pill(&self.ivars().sidebar.borrow().needs, unread).clickable();
+        if clickable {
             self.do_focus_next_attention();
         }
     }
@@ -1078,18 +1082,19 @@ fn now_epoch_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The first non-empty line of a question, for the one-line row a need item
-/// draws: a markdown body would otherwise push everything else out.
+/// The first non-empty line of a question: the need row's title when the
+/// asker did not name itself. A markdown body would otherwise push
+/// everything else out.
 fn first_line(text: &str) -> String {
     text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_string()
 }
 
-/// What a question says after its first line: the row's detail under the
-/// title `first_line` takes. Empty when the question is one line.
+/// What a question says after its first line, on one line: the row's detail
+/// under the asker's name. Empty when the question is one line.
 fn rest_of(text: &str) -> String {
     let mut rest = text.lines().map(str::trim).filter(|line| !line.is_empty());
     rest.next();
-    rest.next().unwrap_or_default().to_string()
+    rest.collect::<Vec<_>>().join(" ")
 }
 
 /// Focus a pane wherever it lives. A need item belongs to the app, not to
