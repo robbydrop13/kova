@@ -1,4 +1,4 @@
-//! The sidebar as an AppKit view: KovaLink's home screen in SF Pro, rounded
+//! The sidebar as an AppKit view: KovaLink's home screen in Inter, rounded
 //! tiles and tinted chips, drawn with Cocoa (`drawRect:`) next to the Metal
 //! terminal view. Two classes: `SidebarView` owns the chrome (traffic-light
 //! strip, summary row, Next pill, resize edge) and an `NSScrollView`;
@@ -148,7 +148,7 @@ const GHOST_ALPHA: f64 = 0.94;
 // Text styles
 // ---------------------------------------------------------------
 
-/// The type scale, KovaLink's tokens two steps down for a Mac list.
+/// The Claap design system type scale, Inter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Style {
     Title,
@@ -192,18 +192,17 @@ impl Style {
 
     pub fn size(self) -> f64 {
         match self {
-            Style::Title => 15.0,
-            Style::Secondary | Style::Question => 13.0,
-            Style::Detail | Style::Link | Style::Pill => 12.0,
-            Style::Chip | Style::Summary | Style::Hint | Style::Number => 11.0,
-            Style::Sort | Style::PillBadge => 10.0,
+            Style::Title => 13.0,
+            Style::Secondary | Style::Question | Style::Detail | Style::Link | Style::Pill => 12.0,
+            Style::Chip | Style::Summary | Style::Hint | Style::Number | Style::Sort => 11.0,
+            Style::PillBadge => 10.0,
         }
     }
 
     pub fn weight(self) -> Weight {
         match self {
-            Style::Title | Style::Pill | Style::Link => Weight::Semibold,
-            Style::Chip | Style::Sort => Weight::Medium,
+            Style::Title | Style::Chip | Style::Link | Style::Sort => Weight::Medium,
+            Style::Pill => Weight::Semibold,
             Style::PillBadge => Weight::Bold,
             _ => Weight::Regular,
         }
@@ -1100,18 +1099,24 @@ fn local_point(view: &NSView, event: &NSEvent) -> (f64, f64) {
 }
 
 fn build_fonts() -> Vec<(Style, Retained<NSFont>)> {
+    super::fonts::register_inter();
     Style::ALL
         .iter()
         .map(|&s| {
-            let weight = unsafe {
-                match s.weight() {
-                    Weight::Regular => objc2_app_kit::NSFontWeightRegular,
-                    Weight::Medium => objc2_app_kit::NSFontWeightMedium,
-                    Weight::Semibold => objc2_app_kit::NSFontWeightSemibold,
-                    Weight::Bold => objc2_app_kit::NSFontWeightBold,
-                }
-            };
-            (s, NSFont::systemFontOfSize_weight(s.size(), weight))
+            let size = s.size();
+            let font = NSFont::fontWithName_size(&NSString::from_str(super::fonts::inter_name(s.weight())), size)
+                .unwrap_or_else(|| {
+                    let weight = unsafe {
+                        match s.weight() {
+                            Weight::Regular => objc2_app_kit::NSFontWeightRegular,
+                            Weight::Medium => objc2_app_kit::NSFontWeightMedium,
+                            Weight::Semibold => objc2_app_kit::NSFontWeightSemibold,
+                            Weight::Bold => objc2_app_kit::NSFontWeightBold,
+                        }
+                    };
+                    NSFont::systemFontOfSize_weight(size, weight)
+                });
+            (s, font)
         })
         .collect()
 }
@@ -2745,14 +2750,21 @@ mod tests {
     }
 
     #[test]
-    fn styles_match_the_phone_rows() {
-        // KovaLink's `calloutStrong`, `footnote` and `caption`.
-        assert_eq!(Style::Title.size(), 15.0);
-        assert_eq!(Style::Title.weight(), Weight::Semibold);
-        assert_eq!(Style::Secondary.size(), 13.0);
+    fn styles_match_the_design_system_scale() {
+        // 11, 12 and 13 with the weights Claap's design system pins.
+        assert_eq!(Style::Title.size(), 13.0);
+        assert_eq!(Style::Title.weight(), Weight::Medium);
+        assert_eq!(Style::Secondary.size(), 12.0);
         assert_eq!(Style::Secondary.weight(), Weight::Regular);
+        assert_eq!(Style::Link.size(), 12.0);
+        assert_eq!(Style::Link.weight(), Weight::Medium);
+        assert_eq!(Style::Pill.size(), 12.0);
+        assert_eq!(Style::Pill.weight(), Weight::Semibold);
         assert_eq!(Style::Chip.size(), 11.0);
         assert_eq!(Style::Chip.weight(), Weight::Medium);
+        assert_eq!(Style::Sort.size(), 11.0);
+        assert_eq!(Style::Sort.weight(), Weight::Medium);
+        assert_eq!(Style::PillBadge.size(), 10.0);
         assert_eq!(Style::PillBadge.weight(), Weight::Bold);
         assert_eq!(Style::ALL.len(), 12);
         let _ = PaneFlags::default();

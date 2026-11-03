@@ -1,5 +1,6 @@
 mod attention;
 mod feather;
+mod fonts;
 use attention::{do_history_step, pane_history_state};
 mod duplicates;
 mod geometry;

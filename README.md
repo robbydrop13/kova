@@ -177,3 +177,7 @@ Always use `./build.sh` — it builds the binary, copies it into the `.app` bund
 ## License
 
 MIT
+
+## Fonts
+
+Inter by Rasmus Andersson, SIL Open Font License 1.1, see assets/fonts/OFL.txt

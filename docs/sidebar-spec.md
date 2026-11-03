@@ -97,14 +97,21 @@ mouse up.
 No footer: the way back to the tab bar is View > Show Tab Bar and ⌥⌘S
 (section 7); the version label stays in the tab bar of tabs mode.
 
-### 3.3 Typography (`sidebar_view::Style`, `NSFont::systemFontOfSize_weight`)
+### 3.3 Typography (`sidebar_view::Style`, `fonts::inter_name`, `NSFont::fontWithName_size`)
 
-KovaLink's row scale, so the Mac reads like the phone: header and tile
-titles 15 semibold (`calloutStrong`); secondary line and question 13
-(`footnote`); detail, links and pill label 12 (links and pill semibold);
-chips, summary, hint, number 11 (chips medium, `caption`); sort toggle and
-pill badge 10 (sort medium, badge bold); `+` 14 medium. Text colours
-are the phone's: primary `#E8EAED`, secondary `#9BA3AF`, tertiary `#7C8593`.
+The Claap design system type scale, in Inter: header and tile titles 13
+medium; secondary line, question, detail and pill label 12 (detail regular,
+pill semibold); links 12 medium; chips, summary, hint, number and sort toggle
+11 (chips and sort medium); pill badge 10 bold. A plus sign drawn as a glyph
+stays at 14 medium.
+
+The four faces (Regular, Medium, SemiBold, Bold) are bundled in the binary
+(`assets/fonts/Inter-*.ttf`, SIL Open Font License 1.1) and registered with
+CoreText at launch (`src/window/fonts.rs`, once per process, already
+registered counting as success); every style asks CoreText for its PostScript
+name and falls back to the system font (`systemFontOfSize:weight:`) if the
+name does not resolve. Text colours are the phone's: primary `#E8EAED`,
+secondary `#9BA3AF`, tertiary `#7C8593`.
 Truncation is AppKit's: titles and subtitles at the tail (never a head-cut
 `..jects/Acme`), rename edit buffers at the head (so the `▏` cursor stays
 visible), the question wrapped to two lines with an ellipsis on the last

@@ -73,9 +73,9 @@ objc2-metal = { version = "0.3", features = [
     "MTLSampler",
 ] }
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAMetalLayer"] }
-objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFArray", "CFRunLoop"] }
-objc2-core-text = { version = "0.3", features = ["CTFont", "CTFontDescriptor", "CTFontTraits", "CTLine", "CTRun"] }
-objc2-core-graphics = { version = "0.3", features = ["CGContext", "CGColorSpace", "CGBitmapContext", "CGFont", "CGPath"] }
+objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFArray", "CFRunLoop", "CFData", "CFError"] }
+objc2-core-text = { version = "0.3", features = ["CTFont", "CTFontDescriptor", "CTFontTraits", "CTLine", "CTRun", "CTFontManager", "CTFontManagerErrors", "objc2-core-graphics"] }
+objc2-core-graphics = { version = "0.3", features = ["CGContext", "CGColorSpace", "CGBitmapContext", "CGFont", "CGPath", "CGDataProvider"] }
 vte = "0.15"
 rustix = { version = "1.0", features = ["termios", "process", "stdio"] }
 rustix-openpty = "0.2"
