@@ -131,20 +131,20 @@ impl AgentSection {
     /// The dot's fill; `Idle` is a ring, drawn by its caller.
     pub fn color(self) -> [f32; 3] {
         match self {
-            Self::Working => tokens::WORKING,
-            Self::Need => tokens::AWAITING,
-            Self::Error => tokens::ERROR,
-            Self::Idle => tokens::TEXT_TERTIARY,
+            Self::Working => tokens::get().working,
+            Self::Need => tokens::get().awaiting,
+            Self::Error => tokens::get().error,
+            Self::Idle => tokens::get().text_tertiary,
         }
     }
 
     /// The ink of the state word and of the count columns.
     pub fn ink(self) -> [f32; 3] {
         match self {
-            Self::Working => tokens::INFO_TEXT,
-            Self::Need => tokens::WARN_TEXT,
-            Self::Error => tokens::CRIT_TEXT,
-            Self::Idle => tokens::TEXT_TERTIARY,
+            Self::Working => tokens::get().info_text,
+            Self::Need => tokens::get().warn_text,
+            Self::Error => tokens::get().crit_text,
+            Self::Idle => tokens::get().text_tertiary,
         }
     }
 
@@ -629,6 +629,9 @@ pub struct AgentsLayout {
     /// The `Open` buttons of the closed roster rows: they sit inside their
     /// row, and the hit test tries them before the row itself.
     pub open_buttons: Vec<(AgentsHit, Rect)>,
+    /// The same box while a reopen runs, saying `Opening…`: drawn disabled,
+    /// never in the hit test.
+    pub open_waiting: Vec<(AgentsHit, Rect)>,
     pub hint_y: Option<f64>,
     pub content_h: f64,
 }
@@ -790,14 +793,19 @@ fn place_open(
     reference: RosterRef,
     m: &dyn TextMetrics,
 ) {
-    if entry.open || state.busy(&entry.name) || state.error(&entry.name).is_some() {
+    if entry.open || state.error(&entry.name).is_some() {
         return;
     }
-    let w = m.width(OPEN_LABEL, Style::Chip) + 2.0 * OPEN_PAD;
-    out.open_buttons.push((
-        AgentsHit::Open(reference),
-        Rect::new(frame.right() - ROW_PAD_X - w, frame.y + (ROW_H - OPEN_H) / 2.0, w, OPEN_H),
-    ));
+    let waiting = state.busy(&entry.name);
+    let label = if waiting { OPENING } else { OPEN_LABEL };
+    let w = m.width(label, Style::Chip) + 2.0 * OPEN_PAD;
+    let rect = Rect::new(frame.right() - ROW_PAD_X - w, frame.y + (ROW_H - OPEN_H) / 2.0, w, OPEN_H);
+    let hit = AgentsHit::Open(reference);
+    if waiting {
+        out.open_waiting.push((hit, rect));
+    } else {
+        out.open_buttons.push((hit, rect));
+    }
 }
 
 // ---------------------------------------------------------------
@@ -810,7 +818,7 @@ fn draw_text_sh(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], al
 
 fn state_dot(cx: f64, cy: f64, section: AgentSection, alpha: f64) {
     if section == AgentSection::Idle {
-        stroke_ring(cx, cy, 6.0, 1.5, tokens::TEXT_TERTIARY, alpha);
+        stroke_ring(cx, cy, 6.0, 1.5, tokens::get().text_tertiary, alpha);
     } else {
         fill_dot(cx, cy, DOT, section.color(), alpha);
     }
@@ -825,6 +833,7 @@ pub(super) fn draw(
     row: &Row,
     frame: &Rect,
     buttons: &[(AgentsHit, Rect)],
+    waiting: &[(AgentsHit, Rect)],
     hovered: ListHit,
     pressed: ListHit,
     alpha: f64,
@@ -838,7 +847,7 @@ pub(super) fn draw(
                 "None",
                 &Rect::new(frame.x + 12.0, frame.y, (frame.w - 24.0).max(0.0), EMPTY_H),
                 Style::Secondary,
-                tokens::TEXT_TERTIARY,
+                tokens::get().text_tertiary,
                 alpha,
             );
         }
@@ -861,6 +870,7 @@ pub(super) fn draw(
                     entry,
                     state,
                     open_button(buttons, RosterRef::Manager(index)),
+                    open_button(waiting, RosterRef::Manager(index)),
                     frame,
                     hovered,
                     pressed,
@@ -876,6 +886,7 @@ pub(super) fn draw(
                     entry,
                     state,
                     open_button(buttons, RosterRef::Dedicated(index)),
+                    open_button(waiting, RosterRef::Dedicated(index)),
                     frame,
                     hovered,
                     pressed,
@@ -907,16 +918,16 @@ fn row_hit(row: &Row) -> Option<AgentsHit> {
 }
 
 fn draw_stat(sh: &Shared, vm: &AgentsVm, state: &AgentsState, section: AgentSection, frame: &Rect, alpha: f64) {
-    fill_round(frame, STAT_RADIUS, tokens::TILE, alpha);
+    fill_round(frame, STAT_RADIUS, tokens::get().tile, alpha);
     let selected = state.filter == section;
-    stroke_round(frame, STAT_RADIUS, 1.0, if selected { tokens::SEL_RAIL } else { tokens::BORDER_SUBTLE }, alpha);
+    stroke_round(frame, STAT_RADIUS, 1.0, if selected { tokens::get().sel_rail } else { tokens::get().border_subtle }, alpha);
     let value = vm.stat(section).to_string();
     draw_text_sh(
         sh,
         &value,
         &Rect::new(frame.x + STAT_PAD_X, frame.y + STAT_PAD_Y, (frame.w - 2.0 * STAT_PAD_X).max(0.0), STAT_VALUE_H),
         Style::StatValue,
-        tokens::TEXT_PRIMARY,
+        tokens::get().text_primary,
         alpha,
     );
     let label_y = frame.bottom() - STAT_PAD_Y - STAT_LABEL_H;
@@ -932,14 +943,14 @@ fn draw_stat(sh: &Shared, vm: &AgentsVm, state: &AgentsState, section: AgentSect
             STAT_LABEL_H,
         ),
         Style::Chip,
-        tokens::TEXT_SECONDARY,
+        tokens::get().text_secondary,
         alpha,
     );
 }
 
 fn draw_header(sh: &Shared, kind: SectionKind, count: usize, state: &AgentsState, frame: &Rect, alpha: f64) {
     let mut x = frame.x + SECTION_LABEL_X;
-    let mut ink = tokens::TEXT_SECONDARY;
+    let mut ink = tokens::get().text_secondary;
     let label = match kind {
         SectionKind::Closed => {
             let chevron = if state.closed_folded { Icon::ChevronRight } else { Icon::ChevronDown };
@@ -947,18 +958,18 @@ fn draw_header(sh: &Shared, kind: SectionKind, count: usize, state: &AgentsState
                 chevron,
                 &Rect::new(frame.x + SECTION_CHEVRON_X, frame.y + (frame.h - CHEVRON) / 2.0, CHEVRON, CHEVRON),
                 CHEVRON,
-                tokens::TEXT_TERTIARY,
+                tokens::get().text_tertiary,
                 alpha,
             );
             x = frame.x + SECTION_FOLDED_X;
             format!("Closed {count}")
         }
         SectionKind::Filter(AgentSection::Need) => {
-            ink = tokens::WARN_TEXT;
+            ink = tokens::get().warn_text;
             kind.label().to_string()
         }
         SectionKind::Filter(AgentSection::Error) => {
-            ink = tokens::CRIT_TEXT;
+            ink = tokens::get().crit_text;
             kind.label().to_string()
         }
         _ => kind.label().to_string(),
@@ -970,7 +981,7 @@ fn draw_header(sh: &Shared, kind: SectionKind, count: usize, state: &AgentsState
             &count.to_string(),
             &Rect::new(x + w + SECTION_COUNT_GAP, frame.y, (frame.w - (x - frame.x) - w).max(0.0), SECTION_H),
             Style::Chip,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             alpha,
         );
     }
@@ -982,7 +993,7 @@ fn draw_header(sh: &Shared, kind: SectionKind, count: usize, state: &AgentsState
             note,
             &Rect::new(frame.right() - SECTION_PAD_X - note_w, frame.y, note_w, SECTION_H),
             Style::Hint,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             alpha,
             Align::Right,
             false,
@@ -1000,9 +1011,9 @@ fn draw_header(sh: &Shared, kind: SectionKind, count: usize, state: &AgentsState
 
 fn draw_pane(sh: &Shared, pane: &AgentPane, frame: &Rect, hovered: bool, pressed: bool, alpha: f64) {
     if pressed {
-        fill_round(frame, ROW_RADIUS, tokens::TILE_PRESSED, alpha);
+        fill_round(frame, ROW_RADIUS, tokens::get().tile_pressed, alpha);
     } else if hovered {
-        fill_round(frame, ROW_RADIUS, tokens::TILE_HOVER, alpha);
+        fill_round(frame, ROW_RADIUS, tokens::get().tile_hover, alpha);
     }
     let cy = frame.y + ROW_PAD_Y + LINE_H / 2.0;
     state_dot(frame.x + ROW_PAD_X + DOT_BOX / 2.0, cy, pane.section, alpha);
@@ -1027,7 +1038,7 @@ fn draw_pane(sh: &Shared, pane: &AgentPane, frame: &Rect, hovered: bool, pressed
         &pane.title,
         &Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y, text_w, LINE_H),
         Style::Title,
-        tokens::TEXT_PRIMARY,
+        tokens::get().text_primary,
         alpha,
     );
     let line = if pane.detail.trim().is_empty() { pane.tab.clone() } else { format!("{} \u{b7} {}", pane.tab, pane.detail) };
@@ -1036,7 +1047,7 @@ fn draw_pane(sh: &Shared, pane: &AgentPane, frame: &Rect, hovered: bool, pressed
         &line,
         &Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y + LINE_H, text_w, LINE_H),
         Style::Secondary,
-        tokens::TEXT_TERTIARY,
+        tokens::get().text_tertiary,
         alpha,
         Align::Left,
         false,
@@ -1045,9 +1056,9 @@ fn draw_pane(sh: &Shared, pane: &AgentPane, frame: &Rect, hovered: bool, pressed
 
 fn draw_tab(sh: &Shared, tab: &AgentTab, frame: &Rect, hovered: bool, pressed: bool, alpha: f64) {
     if pressed {
-        fill_round(frame, ROW_RADIUS, tokens::TILE_PRESSED, alpha);
+        fill_round(frame, ROW_RADIUS, tokens::get().tile_pressed, alpha);
     } else if hovered {
-        fill_round(frame, ROW_RADIUS, tokens::TILE_HOVER, alpha);
+        fill_round(frame, ROW_RADIUS, tokens::get().tile_hover, alpha);
     }
     let cy = frame.y + frame.h / 2.0;
     let bar = Rect::new(frame.x + ROW_PAD_X, cy - TAB_BAR_H / 2.0, TAB_BAR_W, TAB_BAR_H);
@@ -1066,7 +1077,7 @@ fn draw_tab(sh: &Shared, tab: &AgentTab, frame: &Rect, hovered: bool, pressed: b
         &tab.title,
         &Rect::new(frame.x + TAB_TEXT_X, frame.y, (right - frame.x - TAB_TEXT_X).max(20.0), frame.h),
         Style::Title,
-        tokens::TEXT_PRIMARY,
+        tokens::get().text_primary,
         alpha,
         Align::Left,
         false,
@@ -1079,6 +1090,7 @@ fn draw_team(
     entry: &TeamRow,
     state: &AgentsState,
     open_button: Option<Rect>,
+    open_waiting: Option<Rect>,
     frame: &Rect,
     hovered: ListHit,
     pressed: ListHit,
@@ -1089,15 +1101,15 @@ fn draw_team(
     let body_hovered = body_hit.is_some_and(|h| hovered == ListHit::Agent(h));
     let body_pressed = body_hit.is_some_and(|h| pressed == ListHit::Agent(h));
     if body_pressed {
-        fill_round(frame, ROW_RADIUS, tokens::TILE_PRESSED, alpha);
+        fill_round(frame, ROW_RADIUS, tokens::get().tile_pressed, alpha);
     } else if body_hovered {
-        fill_round(frame, ROW_RADIUS, tokens::TILE_HOVER, alpha);
+        fill_round(frame, ROW_RADIUS, tokens::get().tile_hover, alpha);
     }
     let cy = frame.y + ROW_PAD_Y + LINE_H / 2.0;
     let a = if entry.open { alpha } else { alpha * 0.55 };
     match entry.pane_state.filter(|_| entry.open) {
         Some(section) => state_dot(frame.x + ROW_PAD_X + DOT_BOX / 2.0, cy, section, a),
-        None => stroke_ring(frame.x + ROW_PAD_X + DOT_BOX / 2.0, cy, 6.0, 1.5, tokens::TEXT_TERTIARY, a),
+        None => stroke_ring(frame.x + ROW_PAD_X + DOT_BOX / 2.0, cy, 6.0, 1.5, tokens::get().text_tertiary, a),
     }
     let right = frame.right() - ROW_PAD_X;
     let this = AgentsHit::Open(reference);
@@ -1105,25 +1117,27 @@ fn draw_team(
     if let Some(button) = open_button {
         let hovered_here = hovered == ListHit::Agent(this);
         let pressed_here = pressed == ListHit::Agent(this);
-        if pressed_here {
-            fill_round(&button, OPEN_RADIUS, tokens::TILE_PRESSED, alpha);
-        } else if hovered_here {
-            fill_round(&button, OPEN_RADIUS, tokens::TILE_HOVER, alpha);
-        }
-        draw_text(sh, OPEN_LABEL, &button, Style::Chip, tokens::TEXT_PRIMARY, alpha, Align::Center, false);
+        // The Scheduled body's small button: a ground at rest, darker under
+        // the mouse and the press, an 11 pt Medium label on it.
+        let ground = if hovered_here || pressed_here { tokens::get().tile_pressed } else { tokens::get().tile_hover };
+        fill_round(&button, OPEN_RADIUS, ground, alpha);
+        draw_text(sh, OPEN_LABEL, &button, Style::Chip, tokens::get().text_primary, alpha, Align::Center, false);
         text_right = button.x - TEXT_GAP;
-    } else if state.busy(&entry.name) || state.error(&entry.name).is_some() {
-        let failed = state.error(&entry.name).is_some();
-        let words = state.error(&entry.name).unwrap_or(OPENING);
+    } else if let Some(button) = open_waiting {
+        // The same box, disabled: the reopen is in flight, a click would only
+        // start it twice.
+        fill_round(&button, OPEN_RADIUS, tokens::get().tile_hover, alpha);
+        draw_text(sh, OPENING, &button, Style::Chip, tokens::get().text_tertiary, alpha, Align::Center, false);
+        text_right = button.x - TEXT_GAP;
+    } else if let Some(words) = state.error(&entry.name) {
         let m = AppKitMetrics(sh);
         let w = m.width(words, Style::Chip);
-        let ink = if failed { tokens::CRIT_TEXT } else { tokens::TEXT_TERTIARY };
-        draw_text(sh, words, &Rect::new(right - w, frame.y, w, ROW_H), Style::Chip, ink, alpha, Align::Right, false);
+        draw_text(sh, words, &Rect::new(right - w, frame.y, w, ROW_H), Style::Chip, tokens::get().crit_text, alpha, Align::Right, false);
         text_right = right - w - TEXT_GAP;
     } else if entry.open && !entry.meta.is_empty() {
         let m = AppKitMetrics(sh);
         let w = m.width(&entry.meta, Style::Number);
-        let ink = entry.pane_state.map_or(tokens::TEXT_TERTIARY, |s| s.ink());
+        let ink = entry.pane_state.map_or(tokens::get().text_tertiary, |s| s.ink());
         draw_text(
             sh,
             &entry.meta,
@@ -1137,7 +1151,7 @@ fn draw_team(
         text_right = right - w - TEXT_GAP;
     }
     let text_w = (text_right - (frame.x + TEXT_X)).max(20.0);
-    draw_text_sh(sh, &entry.name, &Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y, text_w, LINE_H), Style::Title, tokens::TEXT_PRIMARY, alpha);
+    draw_text_sh(sh, &entry.name, &Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y, text_w, LINE_H), Style::Title, tokens::get().text_primary, alpha);
     let mut line = entry.role.clone();
     if let Some(project) = &entry.project {
         line = if line.is_empty() { project.clone() } else { format!("{line} \u{b7} {project}") };
@@ -1149,7 +1163,7 @@ fn draw_team(
             &words,
             &Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y + LINE_H, text_w, LINE_H),
             Style::Secondary,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             a,
         );
     } else {
@@ -1158,7 +1172,7 @@ fn draw_team(
             &line,
             &Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y + LINE_H, text_w, LINE_H),
             Style::Secondary,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             alpha,
             Align::Left,
             false,
@@ -1380,7 +1394,7 @@ mod tests {
     #[test]
     fn a_roster_entry_matches_a_pane_by_session_or_tab_name() {
         // The open manager is the pane's session name, in another case.
-        let facts = vec![tab(0, "Claap", vec![pane(7, "ALPHA-MANAGER", idle())])];
+        let facts = vec![tab(0, "Work", vec![pane(7, "ALPHA-MANAGER", idle())])];
         let vm = build(&facts, &[], &AgentsClock::default(), NOW, Some(&roster()));
         let alpha = vm.team.iter().find(|r| r.name == "alpha-manager").expect("the open manager");
         assert_eq!(alpha.pane_id, Some(7));
@@ -1443,6 +1457,33 @@ mod tests {
         let open = row_of(&rows, RowKind::AgentTeam { index: alpha, pane_id: Some(7) });
         assert!(l.open_buttons.iter().all(|(h, _)| *h != AgentsHit::Open(RosterRef::Manager(alpha))));
         assert_eq!(hit(open, open.frame.x + 4.0, open.frame.y + 4.0, &l.open_buttons), Some(AgentsHit::Pane(7)));
+    }
+
+    #[test]
+    fn an_opening_row_shows_the_open_box_disabled() {
+        let vm = built(Some(&roster()));
+        let mut state = AgentsState::default();
+        let beta = vm.team.iter().position(|r| r.name == "beta-coach").expect("the closed manager");
+        state.start("beta-coach", 1_000);
+        let (l, rows) = layouts(&vm, &state, 300.0);
+        // No clickable button while the reopen runs: a second click would
+        // start it twice.
+        assert!(l.open_buttons.iter().all(|(h, _)| *h != AgentsHit::Open(RosterRef::Manager(beta))));
+        let (_, rect) = *l
+            .open_waiting
+            .iter()
+            .find(|(h, _)| *h == AgentsHit::Open(RosterRef::Manager(beta)))
+            .expect("the disabled Opening box");
+        assert_eq!(rect.h, OPEN_H);
+        // It wears the same box, `Opening…` being wider than `Open`.
+        let plain = FakeMetrics.width(OPEN_LABEL, Style::Chip) + 2.0 * OPEN_PAD;
+        let words = FakeMetrics.width(OPENING, Style::Chip) + 2.0 * OPEN_PAD;
+        assert_eq!(rect.w, words);
+        assert!(words > plain);
+        // Inside the row, but never a target.
+        let row = row_of(&rows, RowKind::AgentTeam { index: beta, pane_id: None });
+        assert!(row.frame.contains(rect.x + 2.0, rect.y + 2.0));
+        assert_eq!(hit(row, rect.x + 2.0, rect.y + 2.0, &l.open_buttons), None);
     }
 
     #[test]

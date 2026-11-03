@@ -73,70 +73,172 @@ pub fn persist() {
 }
 
 // ---------------------------------------------------------------
-// Colour tokens (Claap design system, dark set)
+// Colour tokens (Claap design system, light and dark sets)
 // ---------------------------------------------------------------
 
-/// The palette the sidebar is painted with: the Claap design system, generated
-/// into `src/window/ds_tokens.rs` from KovaLink's `packages/protocol/tokens/
-/// ds.json`. RGB floats.
+/// The palette the sidebar is painted with: the Claap design system,
+/// generated into `src/window/ds_tokens.rs` from KovaLink's
+/// `packages/protocol/tokens/ds.json`. Both sets are generated; the one in
+/// use follows the terminal background (see `set_background`), and every call
+/// site reads it through `get()`. RGB floats.
 pub mod tokens {
-    use crate::window::ds_tokens::dark as ds;
+    use std::cell::Cell;
+
+    use crate::window::ds_tokens::{dark, light};
+
+    /// One set of the design system's colours, RGB.
+    #[allow(dead_code)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Palette {
+        pub bg2: [f32; 3],
+        pub ground: [f32; 3],
+        pub tile: [f32; 3],
+        pub tile_hover: [f32; 3],
+        pub tile_pressed: [f32; 3],
+        pub sel_bg: [f32; 3],
+        pub sel_text: [f32; 3],
+        pub sel_rail: [f32; 3],
+        pub border_subtle: [f32; 3],
+        pub border_strong: [f32; 3],
+        pub accent: [f32; 3],
+        pub accent_pressed: [f32; 3],
+        pub text_primary: [f32; 3],
+        pub text_secondary: [f32; 3],
+        pub text_tertiary: [f32; 3],
+        pub text_on_fill: [f32; 3],
+        pub awaiting: [f32; 3],
+        pub working: [f32; 3],
+        pub error: [f32; 3],
+        pub interrupt: [f32; 3],
+        pub tab_none: [f32; 3],
+        pub separator: [f32; 3],
+        pub ok_dot: [f32; 3],
+        pub warn_text: [f32; 3],
+        pub info_text: [f32; 3],
+        pub crit_text: [f32; 3],
+        pub crit_solid: [f32; 3],
+        pub crit_solid_hover: [f32; 3],
+        pub white: [f32; 3],
+        pub black: [f32; 3],
+    }
 
     /// The generated tokens carry alpha; the sidebar paints in RGB.
     const fn rgb(c: [f32; 4]) -> [f32; 3] {
         [c[0], c[1], c[2]]
     }
 
-    #[allow(dead_code)]
-    pub const BG2: [f32; 3] = rgb(ds::BG2);
-    pub const GROUND: [f32; 3] = rgb(ds::BG0);
-    pub const TILE: [f32; 3] = rgb(ds::BG1);
-    pub const TILE_HOVER: [f32; 3] = rgb(ds::HOVER);
-    pub const TILE_PRESSED: [f32; 3] = rgb(ds::BTN2_HOVER);
-    #[allow(dead_code)]
-    pub const SEL_BG: [f32; 3] = rgb(ds::SEL_BG);
-    #[allow(dead_code)]
-    pub const SEL_TEXT: [f32; 3] = rgb(ds::SEL_TEXT);
-    #[allow(dead_code)]
-    pub const SEL_RAIL: [f32; 3] = rgb(ds::SEL_RAIL);
-    pub const BORDER_SUBTLE: [f32; 3] = rgb(ds::B3);
-    pub const BORDER_STRONG: [f32; 3] = rgb(ds::B2);
-    pub const ACCENT: [f32; 3] = rgb(ds::ACCENT);
-    pub const ACCENT_PRESSED: [f32; 3] = rgb(ds::ACCENT_HOVER);
-    pub const TEXT_PRIMARY: [f32; 3] = rgb(ds::T1);
-    pub const TEXT_SECONDARY: [f32; 3] = rgb(ds::T2);
-    pub const TEXT_TERTIARY: [f32; 3] = rgb(ds::T3);
-    pub const TEXT_ON_FILL: [f32; 3] = [1.0, 1.0, 1.0];
-    pub const AWAITING: [f32; 3] = rgb(ds::WARN_DOT);
-    pub const WORKING: [f32; 3] = rgb(ds::INFO_DOT);
-    pub const ERROR: [f32; 3] = rgb(ds::CRIT_DOT);
-    pub const INTERRUPT: [f32; 3] = rgb(ds::CRIT);
-    pub const TAB_NONE: [f32; 3] = rgb(ds::T3);
-    pub const SEPARATOR: [f32; 3] = rgb(ds::B3);
-    #[allow(dead_code)]
-    pub const OK_DOT: [f32; 3] = rgb(ds::OK_DOT);
-    #[allow(dead_code)]
-    pub const WARN_TEXT: [f32; 3] = rgb(ds::WARN);
-    #[allow(dead_code)]
-    pub const INFO_TEXT: [f32; 3] = rgb(ds::INFO);
-    #[allow(dead_code)]
-    pub const CRIT_TEXT: [f32; 3] = rgb(ds::CRIT);
     /// The solid danger fill, `#ED3726` in both sets: the confirmation's
-    /// `Delete`, the one that really deletes. No generated token carries it in
-    /// the dark set (`crit.dot` is `#FF6551` there), so it is spelled out.
-    pub const CRIT_SOLID: [f32; 3] = [0.929, 0.216, 0.149];
+    /// `Delete`, the one that really deletes. No generated token carries it
+    /// in the dark set (`crit.dot` is `#FF6551` there), so it is spelled out
+    /// rather than read from either table.
+    const CRIT_SOLID: [f32; 3] = [0.929, 0.216, 0.149];
     /// `#CC2314`: the same fill under the mouse and under the press.
-    pub const CRIT_SOLID_HOVER: [f32; 3] = [0.800, 0.137, 0.078];
+    const CRIT_SOLID_HOVER: [f32; 3] = [0.800, 0.137, 0.078];
     /// The white every translucent layer of the selected group is cut from.
-    pub const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
-    pub const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
+    const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
+    const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
+
+    pub const DARK: Palette = Palette {
+        bg2: rgb(dark::BG2),
+        ground: rgb(dark::BG0),
+        tile: rgb(dark::BG1),
+        tile_hover: rgb(dark::HOVER),
+        tile_pressed: rgb(dark::BTN2_HOVER),
+        sel_bg: rgb(dark::SEL_BG),
+        sel_text: rgb(dark::SEL_TEXT),
+        sel_rail: rgb(dark::SEL_RAIL),
+        border_subtle: rgb(dark::B3),
+        border_strong: rgb(dark::B2),
+        accent: rgb(dark::ACCENT),
+        accent_pressed: rgb(dark::ACCENT_HOVER),
+        text_primary: rgb(dark::T1),
+        text_secondary: rgb(dark::T2),
+        text_tertiary: rgb(dark::T3),
+        text_on_fill: WHITE,
+        awaiting: rgb(dark::WARN_DOT),
+        working: rgb(dark::INFO_DOT),
+        error: rgb(dark::CRIT_DOT),
+        interrupt: rgb(dark::CRIT),
+        tab_none: rgb(dark::T3),
+        separator: rgb(dark::B3),
+        ok_dot: rgb(dark::OK_DOT),
+        warn_text: rgb(dark::WARN),
+        info_text: rgb(dark::INFO),
+        crit_text: rgb(dark::CRIT),
+        crit_solid: CRIT_SOLID,
+        crit_solid_hover: CRIT_SOLID_HOVER,
+        white: WHITE,
+        black: BLACK,
+    };
+
+    pub const LIGHT: Palette = Palette {
+        bg2: rgb(light::BG2),
+        ground: rgb(light::BG0),
+        tile: rgb(light::BG1),
+        tile_hover: rgb(light::HOVER),
+        tile_pressed: rgb(light::BTN2_HOVER),
+        sel_bg: rgb(light::SEL_BG),
+        sel_text: rgb(light::SEL_TEXT),
+        sel_rail: rgb(light::SEL_RAIL),
+        border_subtle: rgb(light::B3),
+        border_strong: rgb(light::B2),
+        accent: rgb(light::ACCENT),
+        accent_pressed: rgb(light::ACCENT_HOVER),
+        text_primary: rgb(light::T1),
+        text_secondary: rgb(light::T2),
+        text_tertiary: rgb(light::T3),
+        text_on_fill: WHITE,
+        awaiting: rgb(light::WARN_DOT),
+        working: rgb(light::INFO_DOT),
+        error: rgb(light::CRIT_DOT),
+        interrupt: rgb(light::CRIT),
+        tab_none: rgb(light::T3),
+        separator: rgb(light::B3),
+        ok_dot: rgb(light::OK_DOT),
+        warn_text: rgb(light::WARN),
+        info_text: rgb(light::INFO),
+        crit_text: rgb(light::CRIT),
+        crit_solid: CRIT_SOLID,
+        crit_solid_hover: CRIT_SOLID_HOVER,
+        white: WHITE,
+        black: BLACK,
+    };
+
+    // Which set is up. Thread-local rather than process-wide: every view that
+    // paints with these tokens is an AppKit view (`MainThreadOnly`), so the
+    // palette only ever changes on the thread that reads it, and a test that
+    // switches it cannot be seen by a test running beside it.
+    thread_local! {
+        static LIGHT_MODE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The set the sidebar paints with right now. A pointer pick: a draw call
+    /// pays one flag read, not a copy of the palette.
+    pub fn get() -> &'static Palette {
+        if LIGHT_MODE.with(Cell::get) { &LIGHT } else { &DARK }
+    }
+
+    /// Pick the set from the terminal background (`[colors] background`),
+    /// which is what the sidebar sits on. Returns whether it changed.
+    pub fn set_background(bg: [f32; 3]) -> bool {
+        let light = background_is_light(bg);
+        LIGHT_MODE.with(|mode| light != mode.replace(light))
+    }
+
+    /// Whether a background calls for the light set: the Rec. 709 luma of its
+    /// sRGB channels, strictly above 0.5 (`#808080` sits on the line and
+    /// stays dark).
+    pub fn background_is_light(bg: [f32; 3]) -> bool {
+        let [r, g, b] = bg.map(f64::from);
+        0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5
+    }
 }
 
 /// The tint of a tab: its Kova colour, or the neutral grey without one.
 pub fn tab_tint(color: Option<usize>) -> [f32; 3] {
     color
         .and_then(|c| crate::renderer::TAB_COLORS.get(c).copied())
-        .unwrap_or(tokens::TAB_NONE)
+        .unwrap_or(tokens::get().tab_none)
 }
 
 // ---------------------------------------------------------------
@@ -311,11 +413,11 @@ impl TileState {
     /// glyph ring.
     pub fn color(self) -> [f32; 3] {
         match self {
-            TileState::Awaiting => tokens::AWAITING,
-            TileState::Error => tokens::ERROR,
-            TileState::Unread(_) => tokens::ACCENT,
-            TileState::Working | TileState::Starting => tokens::WORKING,
-            TileState::Idle | TileState::Shell => tokens::BORDER_STRONG,
+            TileState::Awaiting => tokens::get().awaiting,
+            TileState::Error => tokens::get().error,
+            TileState::Unread(_) => tokens::get().accent,
+            TileState::Working | TileState::Starting => tokens::get().working,
+            TileState::Idle | TileState::Shell => tokens::get().border_strong,
         }
     }
 
@@ -807,7 +909,7 @@ mod tests {
         // It outranks unread output: the error is what the turn ended on.
         assert_eq!(TileState::from_flags(PaneFlags { turn_end_unseen: true, ..failed }), Error);
         assert_eq!(Error.chip(), "error");
-        assert_eq!(Error.color(), tokens::ERROR);
+        assert_eq!(Error.color(), tokens::get().error);
         assert!(Error.rank() < Unread(UnreadKind::Done).rank());
         // The pane being looked at never shows unread, unless marked by hand.
         assert_eq!(TileState::from_flags(PaneFlags { permission_prompt: false, seen: true, ..all }), Working);
@@ -819,8 +921,8 @@ mod tests {
         assert!(Idle.neutral() && Shell.neutral() && !Working.neutral());
         assert_eq!(Unread(UnreadKind::Bell).chip(), "bell");
         assert_eq!(Unread(UnreadKind::Manual).chip(), "unread");
-        assert_eq!(Working.color(), tokens::WORKING);
-        assert_eq!(Shell.color(), tokens::BORDER_STRONG);
+        assert_eq!(Working.color(), tokens::get().working);
+        assert_eq!(Shell.color(), tokens::get().border_strong);
     }
 
     #[test]
@@ -891,9 +993,39 @@ mod tests {
     }
 
     #[test]
+    fn the_background_luma_picks_the_palette() {
+        // White text on a light ground would be unreadable, so a light ground
+        // gets the light set; `#808080` sits exactly on the line and stays
+        // dark.
+        assert!(tokens::background_is_light([1.0, 1.0, 1.0]));
+        assert!(!tokens::background_is_light([0.118, 0.118, 0.118]));
+        assert!(!tokens::background_is_light([0.5, 0.5, 0.5]));
+        // The two sets are really different tables, not one read twice.
+        assert_ne!(tokens::LIGHT.ground, tokens::DARK.ground);
+        assert_ne!(tokens::LIGHT.text_primary, tokens::DARK.text_primary);
+    }
+
+    #[test]
+    fn a_config_reload_switches_the_palette_and_keeps_crit_solid() {
+        assert_eq!(tokens::get().ground, tokens::DARK.ground);
+        assert!(tokens::set_background([1.0, 1.0, 1.0]));
+        assert_eq!(tokens::get().ground, tokens::LIGHT.ground);
+        assert_eq!(tokens::get().text_primary, tokens::LIGHT.text_primary);
+        // `#ED3726` in both sets: the one that really deletes never moves.
+        assert_eq!(tokens::get().crit_solid, [0.929, 0.216, 0.149]);
+        // The same palette again changes nothing, and a dark background goes
+        // back to the dark set.
+        assert!(!tokens::set_background([1.0, 1.0, 1.0]));
+        assert!(tokens::set_background([0.1, 0.1, 0.12]));
+        assert_eq!(tokens::get().ground, tokens::DARK.ground);
+        assert_eq!(tokens::get().text_primary, tokens::DARK.text_primary);
+        assert_eq!(tokens::get().crit_solid, [0.929, 0.216, 0.149]);
+    }
+
+    #[test]
     fn tab_tint_falls_back_to_grey() {
-        assert_eq!(tab_tint(None), tokens::TAB_NONE);
-        assert_eq!(tab_tint(Some(99)), tokens::TAB_NONE);
+        assert_eq!(tab_tint(None), tokens::get().tab_none);
+        assert_eq!(tab_tint(Some(99)), tokens::get().tab_none);
         assert_eq!(tab_tint(Some(0)), crate::renderer::TAB_COLORS[0]);
     }
 }

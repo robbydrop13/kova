@@ -1105,7 +1105,7 @@ pub(super) struct AppKitMetrics<'a>(pub(super) &'a Shared);
 
 impl TextMetrics for AppKitMetrics<'_> {
     fn width(&self, text: &str, style: Style) -> f64 {
-        let attrs = attrs(self.0.font(style), tokens::TEXT_PRIMARY, 1.0, NSLineBreakMode::ByClipping);
+        let attrs = attrs(self.0.font(style), tokens::get().text_primary, 1.0, NSLineBreakMode::ByClipping);
         let size = unsafe { NSString::from_str(text).sizeWithAttributes(Some(&attrs)) };
         size.width.ceil()
     }
@@ -1114,7 +1114,7 @@ impl TextMetrics for AppKitMetrics<'_> {
         if text.is_empty() {
             return 1;
         }
-        let attrs = attrs(self.0.font(style), tokens::TEXT_PRIMARY, 1.0, NSLineBreakMode::ByWordWrapping);
+        let attrs = attrs(self.0.font(style), tokens::get().text_primary, 1.0, NSLineBreakMode::ByWordWrapping);
         let one = unsafe { NSString::from_str("X").sizeWithAttributes(Some(&attrs)) }.height.max(1.0);
         let rect = unsafe {
             NSString::from_str(text).boundingRectWithSize_options_attributes_context(
@@ -1186,7 +1186,7 @@ pub(super) fn swatch_image(c: Option<[f32; 3]>) -> Retained<NSImage> {
     let handler = block2::RcBlock::new(move |_rect: CGRect| -> objc2::runtime::Bool {
         match c {
             Some(c) => fill_dot(6.0, 6.0, 10.0, c, 1.0),
-            None => stroke_ring(6.0, 6.0, 10.0, 1.5, tokens::TAB_NONE, 1.0),
+            None => stroke_ring(6.0, 6.0, 10.0, 1.5, tokens::get().tab_none, 1.0),
         }
         objc2::runtime::Bool::YES
     });
@@ -1201,7 +1201,7 @@ fn fill_round_shadowed(r: &Rect, radius: f64, c: [f32; 3], alpha: f64, blur: f64
     // Shadow offsets are in the window's base space, y up: negative is down.
     shadow.setShadowOffset(CGSize { width: 0.0, height: -6.0 });
     shadow.setShadowBlurRadius(blur);
-    shadow.setShadowColor(Some(&color(tokens::BLACK, shadow_alpha * alpha)));
+    shadow.setShadowColor(Some(&color(tokens::get().black, shadow_alpha * alpha)));
     shadow.set();
     fill_round(r, radius, c, alpha);
     NSGraphicsContext::restoreGraphicsState_class();
@@ -1287,7 +1287,7 @@ fn draw_link(sh: &Shared, icon: Icon, label: &str, r: &Rect, c: [f32; 3], alpha:
 /// The ink of a tile's links: accent on the ground, t1 once the tile is
 /// focused (accent on the selected blue is blue on blue) and under the mouse.
 fn link_ink(focused: bool, hovered: bool) -> [f32; 3] {
-    if focused || hovered { tokens::TEXT_PRIMARY } else { tokens::ACCENT }
+    if focused || hovered { tokens::get().text_primary } else { tokens::get().accent }
 }
 
 /// The `KovaView` of the window a sidebar view sits in.
@@ -1676,6 +1676,15 @@ impl SidebarView {
         true
     }
 
+    /// Repaint everything after a change the model does not carry: a
+    /// `reload-config` can switch the palette under the same model.
+    pub fn repaint(&self) {
+        if let Some(list) = self.ivars().list.get() {
+            list.setNeedsDisplay(true);
+        }
+        self.setNeedsDisplay(true);
+    }
+
     /// Scroll the list the least that shows a pane's tile (or, when its
     /// group is folded, the header of tab `tab_idx`).
     pub fn reveal(&self, pane_id: PaneId, tab_idx: usize) {
@@ -1814,8 +1823,8 @@ impl SidebarView {
         if let Some(layer) = box_.layer() {
             layer.setCornerRadius(6.0);
             layer.setBorderWidth(1.0);
-            layer.setBackgroundColor(Some(&color(tokens::GROUND, 1.0).CGColor()));
-            layer.setBorderColor(Some(&color(tokens::BORDER_SUBTLE, 1.0).CGColor()));
+            layer.setBackgroundColor(Some(&color(tokens::get().ground, 1.0).CGColor()));
+            layer.setBorderColor(Some(&color(tokens::get().border_subtle, 1.0).CGColor()));
         }
         let font = self.ivars().shared.borrow().font(Style::Secondary).retain();
         let field = NSTextField::new(mtm);
@@ -1823,7 +1832,7 @@ impl SidebarView {
         field.setDrawsBackground(false);
         field.setFocusRingType(NSFocusRingType::None);
         field.setFont(Some(&font));
-        field.setTextColor(Some(&color(tokens::TEXT_PRIMARY, 1.0)));
+        field.setTextColor(Some(&color(tokens::get().text_primary, 1.0)));
         field.setUsesSingleLineMode(false);
         field.setMaximumNumberOfLines(0);
         if let Some(cell) = field.cell() {
@@ -1945,8 +1954,8 @@ impl SidebarView {
         let c = &sh.chrome;
         let b = self.bounds();
         // Ground and separator.
-        fill_rect(&Rect::new(0.0, 0.0, b.size.width, b.size.height), tokens::GROUND, 1.0);
-        fill_rect(&Rect::new(b.size.width - SEP_W, 0.0, SEP_W, b.size.height), tokens::SEPARATOR, 1.0);
+        fill_rect(&Rect::new(0.0, 0.0, b.size.width, b.size.height), tokens::get().ground, 1.0);
+        fill_rect(&Rect::new(b.size.width - SEP_W, 0.0, SEP_W, b.size.height), tokens::get().separator, 1.0);
 
         // Top row: the view switcher at its right end, beside the traffic
         // lights. The selected icon sits on `SEL_BG`, the others are
@@ -1956,11 +1965,11 @@ impl SidebarView {
             let hovered = sh.chrome_hovered == ChromeHit::ViewSwitch(list);
             let pressed = sh.chrome_pressed == ChromeHit::ViewSwitch(list);
             if selected {
-                fill_round(rect, SWITCH_RADIUS, tokens::SEL_BG, 1.0);
+                fill_round(rect, SWITCH_RADIUS, tokens::get().sel_bg, 1.0);
             } else if hovered || pressed {
-                fill_round(rect, SWITCH_RADIUS, tokens::WHITE, if pressed { 0.16 } else { 0.10 });
+                fill_round(rect, SWITCH_RADIUS, tokens::get().white, if pressed { 0.16 } else { 0.10 });
             }
-            let fg = if selected { tokens::SEL_TEXT } else { tokens::TEXT_TERTIARY };
+            let fg = if selected { tokens::get().sel_text } else { tokens::get().text_tertiary };
             let icon = match list {
                 SidebarList::Panes => Icon::Sidebar,
                 SidebarList::Asks => Icon::Message,
@@ -1971,7 +1980,7 @@ impl SidebarView {
             // The badge's ground ring first, then the badge: it has to read
             // over the selected ground as well as the sidebar's.
             let ring = |r: Rect, radius: f64| {
-                fill_round(&r.inset(-SWITCH_BADGE_RING), radius + SWITCH_BADGE_RING, tokens::GROUND, 1.0);
+                fill_round(&r.inset(-SWITCH_BADGE_RING), radius + SWITCH_BADGE_RING, tokens::get().ground, 1.0);
             };
             match list {
                 SidebarList::Asks if sh.model.asks_waiting > 0 => {
@@ -1979,20 +1988,20 @@ impl SidebarView {
                     let w = (AppKitMetrics(&sh).width(&label, Style::PillBadge) + 8.0).max(SWITCH_BADGE_H);
                     let r = switch_badge(rect, w, SWITCH_BADGE_H);
                     ring(r, SWITCH_BADGE_H / 2.0);
-                    fill_round(&r, SWITCH_BADGE_H / 2.0, tokens::ACCENT, 1.0);
-                    draw_text(&sh, &label, &r, Style::PillBadge, tokens::TEXT_ON_FILL, 1.0, Align::Center, false);
+                    fill_round(&r, SWITCH_BADGE_H / 2.0, tokens::get().accent, 1.0);
+                    draw_text(&sh, &label, &r, Style::PillBadge, tokens::get().text_on_fill, 1.0, Align::Center, false);
                 }
                 SidebarList::Scheduled if sh.model.routine_failed => {
                     let r = switch_badge(rect, SWITCH_DOT_D, SWITCH_DOT_D);
                     ring(r, SWITCH_DOT_D / 2.0);
-                    fill_round(&r, SWITCH_DOT_D / 2.0, tokens::ERROR, 1.0);
+                    fill_round(&r, SWITCH_DOT_D / 2.0, tokens::get().error, 1.0);
                 }
                 _ => {}
             }
         }
 
         // Title row: the list's name, then the Next pill at the right.
-        draw_text(&sh, sh.model.view.title(), &c.title, Style::ViewTitle, tokens::TEXT_PRIMARY, 1.0, Align::Left, false);
+        draw_text(&sh, sh.model.view.title(), &c.title, Style::ViewTitle, tokens::get().text_primary, 1.0, Align::Left, false);
 
         // Meta row: the summary on the left, the sort ghost on the right
         // (the Panes list only).
@@ -2000,15 +2009,15 @@ impl SidebarView {
         let sort_hovered = has_sort && sh.chrome_hovered == ChromeHit::SortToggle;
         let sort_pressed = has_sort && sh.chrome_pressed == ChromeHit::SortToggle;
         if sort_hovered || sort_pressed {
-            fill_round(&c.sort, SORT_RADIUS, tokens::WHITE, if sort_pressed { 0.16 } else { 0.10 });
+            fill_round(&c.sort, SORT_RADIUS, tokens::get().white, if sort_pressed { 0.16 } else { 0.10 });
         }
         if has_sort {
             let sort_fg = if sort_hovered {
-                tokens::TEXT_PRIMARY
+                tokens::get().text_primary
             } else if sh.model.sort == SidebarSort::Activity {
-                tokens::ACCENT
+                tokens::get().accent
             } else {
-                tokens::TEXT_TERTIARY
+                tokens::get().text_tertiary
             };
             let label = sh.model.sort.label();
             let text_w = AppKitMetrics(&sh).width(label, Style::Sort);
@@ -2026,19 +2035,19 @@ impl SidebarView {
                 if x >= max_x {
                     break;
                 }
-                let fg = if *crit { tokens::CRIT_TEXT } else { tokens::TEXT_TERTIARY };
+                let fg = if *crit { tokens::get().crit_text } else { tokens::get().text_tertiary };
                 let w = draw_text(&sh, text, &Rect::new(x, c.summary.y, max_x - x, c.summary.h), Style::Summary, fg, 1.0, Align::Left, false);
                 x += w;
             }
             if let Some(clock) = &sh.model.meta_right {
                 let w = AppKitMetrics(&sh).width(clock, Style::Summary);
-                draw_text(&sh, clock, &Rect::new(c.summary.right() - w, c.summary.y, w, c.summary.h), Style::Summary, tokens::TEXT_TERTIARY, 1.0, Align::Right, false);
+                draw_text(&sh, clock, &Rect::new(c.summary.right() - w, c.summary.y, w, c.summary.h), Style::Summary, tokens::get().text_tertiary, 1.0, Align::Right, false);
             }
         } else {
             for (text, run) in &sh.model.summary {
                 let fg = match run {
-                    SummaryRun::Working => tokens::INFO_TEXT,
-                    SummaryRun::Waiting | SummaryRun::Idle | SummaryRun::Dot => tokens::TEXT_TERTIARY,
+                    SummaryRun::Working => tokens::get().info_text,
+                    SummaryRun::Waiting | SummaryRun::Idle | SummaryRun::Dot => tokens::get().text_tertiary,
                 };
                 if x >= max_x {
                     break;
@@ -2058,11 +2067,11 @@ impl SidebarView {
             let clickable = sh.model.pill.clickable();
             let (fill, text, badge): ([f32; 3], [f32; 3], Option<([f32; 3], [f32; 3])>) = match sh.model.pill {
                 NextPill::Next(_) => (
-                    if hovered { tokens::ACCENT_PRESSED } else { tokens::ACCENT },
-                    tokens::TEXT_ON_FILL,
-                    Some((tokens::TEXT_ON_FILL, tokens::ACCENT)),
+                    if hovered { tokens::get().accent_pressed } else { tokens::get().accent },
+                    tokens::get().text_on_fill,
+                    Some((tokens::get().text_on_fill, tokens::get().accent)),
                 ),
-                NextPill::Nothing => (tokens::BG2, tokens::TEXT_TERTIARY, None),
+                NextPill::Nothing => (tokens::get().bg2, tokens::get().text_tertiary, None),
             };
             let text_alpha = if pressed && clickable { 0.85 } else { 1.0 };
             // Content-sized (`pill_width`), so the parts are laid end to
@@ -2606,8 +2615,8 @@ impl SidebarListView {
         if let (Some(card), Some(header)) = (sh.layout.needs_card, sh.layout.needs_header)
             && visible(&card)
         {
-            fill_round(&card, NEED_RADIUS, tokens::TILE, 1.0);
-            stroke_round(&card, NEED_RADIUS, 1.0, tokens::BORDER_SUBTLE, 1.0);
+            fill_round(&card, NEED_RADIUS, tokens::get().tile, 1.0);
+            stroke_round(&card, NEED_RADIUS, 1.0, tokens::get().border_subtle, 1.0);
             self.draw_needs_header(&sh, &header);
         }
 
@@ -2617,8 +2626,8 @@ impl SidebarListView {
                 continue;
             }
             if sh.model.groups.get(gi).is_some_and(|g| g.active) {
-                fill_round(block, PANEL_RADIUS, tokens::TILE, 1.0);
-                stroke_round(block, PANEL_RADIUS, 1.0, tokens::BORDER_SUBTLE, 1.0);
+                fill_round(block, PANEL_RADIUS, tokens::get().tile, 1.0);
+                stroke_round(block, PANEL_RADIUS, 1.0, tokens::get().border_subtle, 1.0);
             }
         }
 
@@ -2661,14 +2670,14 @@ impl SidebarListView {
 
         if let Some(hy) = sh.layout.hint_y {
             let r = Rect::new(PAD_H, hy, sh.layout.width - 2.0 * PAD_H, HINT_H);
-            draw_text(&sh, hint_text(&sh.model), &r, Style::Hint, tokens::TEXT_TERTIARY, 1.0, Align::Center, false);
+            draw_text(&sh, hint_text(&sh.model), &r, Style::Hint, tokens::get().text_tertiary, 1.0, Align::Center, false);
         }
 
         // Drag feedback: the insertion line, then the floating copy.
         if let (Some(d), Some(g)) = (lifted_tab, lifted_group) {
             let k = sh.layout.insertion_index(d.current_y);
             let ly = sh.layout.insertion_line_y(k);
-            fill_round(&Rect::new(PAD_H, ly - 1.0, sh.layout.width - 2.0 * PAD_H - (PAD_H - EDGE_TOLERANCE), 2.0), 1.0, tokens::ACCENT, 1.0);
+            fill_round(&Rect::new(PAD_H, ly - 1.0, sh.layout.width - 2.0 * PAD_H - (PAD_H - EDGE_TOLERANCE), 2.0), 1.0, tokens::get().accent, 1.0);
             if let Some(r) = sh.layout.row_for_group(g) {
                 let row = &sh.layout.rows[r];
                 self.draw_row(&sh, row, d.current_y - d.grab_offset, 0.9);
@@ -2680,7 +2689,7 @@ impl SidebarListView {
             // The skeleton: a dashed, empty outline the size of the tile
             // where it will land.
             let skeleton = Rect::new(row.frame.x, f.placeholder_y, row.frame.w, row.frame.h);
-            stroke_dashed_round(&skeleton, radius, 1.0, tokens::WHITE, 0.25);
+            stroke_dashed_round(&skeleton, radius, 1.0, tokens::get().white, 0.25);
             // The ghost: the tile lifted on a raised ground with a shadow,
             // a touch larger, following the cursor within its run.
             let y = row.frame.y + f.dy;
@@ -2692,7 +2701,7 @@ impl SidebarListView {
             lift.scaleBy(GHOST_SCALE);
             lift.translateXBy_yBy(-cx, -cy);
             lift.concat();
-            fill_round_shadowed(&ghost, radius, tokens::TILE, 1.0, 12.0, 0.35);
+            fill_round_shadowed(&ghost, radius, tokens::get().tile, 1.0, 12.0, 0.35);
             self.draw_row(&sh, row, y, GHOST_ALPHA);
             NSGraphicsContext::restoreGraphicsState_class();
         }
@@ -2739,6 +2748,7 @@ impl SidebarListView {
                     row,
                     &frame,
                     &sh.layout.agents.open_buttons,
+                    &sh.layout.agents.open_waiting,
                     sh.hovered,
                     sh.pressed,
                     alpha,
@@ -2761,12 +2771,12 @@ impl SidebarListView {
         // Ground: a header has none of its own (the card shows through) and
         // lights up white 5 % under the mouse, as a rounded row.
         if body_pressed {
-            fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.10 * alpha);
+            fill_round(frame, HEADER_RADIUS, tokens::get().white, 0.10 * alpha);
         } else if row_hovered {
-            fill_round(frame, HEADER_RADIUS, tokens::WHITE, 0.05 * alpha);
+            fill_round(frame, HEADER_RADIUS, tokens::get().white, 0.05 * alpha);
         }
-        let (muted, muted_alpha) = if selected { (tokens::WHITE, 0.72) } else { (tokens::TEXT_SECONDARY, 1.0) };
-        let (number_fg, number_alpha) = if selected { (tokens::WHITE, 0.72) } else { (tokens::TEXT_TERTIARY, 1.0) };
+        let (muted, muted_alpha) = if selected { (tokens::get().white, 0.72) } else { (tokens::get().text_secondary, 1.0) };
+        let (number_fg, number_alpha) = if selected { (tokens::get().white, 0.72) } else { (tokens::get().text_tertiary, 1.0) };
         let cy = frame.y + frame.h / 2.0;
         let chevron = if g.collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
         stroke_icon(chevron, &ListLayout::header_chevron(frame), CHEVRON_D, muted, muted_alpha * alpha);
@@ -2776,7 +2786,7 @@ impl SidebarListView {
         fill_round(&ListLayout::tint_bar(frame), TINT_BAR_RADIUS, tint, alpha);
         if dot_hovered || dot_pressed {
             // The colour is a button: a thin white ring says so under the mouse.
-            stroke_ring(bar_cx, cy, DOT_BOX_D, 1.0, tokens::WHITE, if dot_pressed { 0.35 } else { 0.20 } * alpha);
+            stroke_ring(bar_cx, cy, DOT_BOX_D, 1.0, tokens::get().white, if dot_pressed { 0.35 } else { 0.20 } * alpha);
         }
         let x = frame.x + CHEVRON_ZONE_W + 16.0;
 
@@ -2785,11 +2795,11 @@ impl SidebarListView {
         let add = ListLayout::add_button(frame);
         if row_hovered || add_pressed {
             if add_pressed {
-                fill_round(&add, ADD_RADIUS, tokens::WHITE, 0.20 * alpha);
+                fill_round(&add, ADD_RADIUS, tokens::get().white, 0.20 * alpha);
             } else if add_hovered {
-                fill_round(&add, ADD_RADIUS, tokens::WHITE, 0.14 * alpha);
+                fill_round(&add, ADD_RADIUS, tokens::get().white, 0.14 * alpha);
             }
-            let plus_fg = if selected { tokens::WHITE } else { tokens::TEXT_PRIMARY };
+            let plus_fg = if selected { tokens::get().white } else { tokens::get().text_primary };
             stroke_icon(Icon::Plus, &add, ICON_D, plus_fg, alpha);
         }
         let count_right = add.right() - 4.0;
@@ -2799,15 +2809,15 @@ impl SidebarListView {
         if g.collapsed {
             // Folded: a dot per pane that waits or works, left of the count.
             if g.summary.working > 0 {
-                fill_dot(right - 3.0, cy, 6.0, tokens::WORKING, alpha);
+                fill_dot(right - 3.0, cy, 6.0, tokens::get().working, alpha);
                 right -= 10.0;
             }
             if g.summary.awaiting > 0 {
-                fill_dot(right - 3.0, cy, 6.0, tokens::AWAITING, alpha);
+                fill_dot(right - 3.0, cy, 6.0, tokens::get().awaiting, alpha);
                 right -= 10.0;
             }
         }
-        let title_fg = if selected { tokens::WHITE } else { tokens::TEXT_PRIMARY };
+        let title_fg = if selected { tokens::get().white } else { tokens::get().text_primary };
         draw_text(sh, &g.title, &Rect::new(x, frame.y, (right - x).max(0.0), frame.h), Style::Title, title_fg, alpha, Align::Left, g.renaming);
     }
 
@@ -2816,7 +2826,7 @@ impl SidebarListView {
     fn draw_needs_header(&self, sh: &Shared, header: &Rect) {
         let m = AppKitMetrics(sh);
         let label_w =
-            draw_text(sh, NEED_TITLE, &Rect::new(header.x + NEED_ROW_PAD_H, header.y, header.w, header.h), Style::Sort, tokens::TEXT_SECONDARY, 1.0, Align::Left, false);
+            draw_text(sh, NEED_TITLE, &Rect::new(header.x + NEED_ROW_PAD_H, header.y, header.w, header.h), Style::Sort, tokens::get().text_secondary, 1.0, Align::Left, false);
         let runs = needs_summary(&sh.model.needs);
         let total: f64 = runs.iter().map(|(text, _)| m.width(text, Style::Sort)).sum();
         let min_x = header.x + NEED_ROW_PAD_H + label_w + NEED_GAP;
@@ -2827,9 +2837,9 @@ impl SidebarListView {
                 break;
             }
             let fg = match run {
-                NeedTally::You => tokens::WARN_TEXT,
-                NeedTally::Problem => tokens::CRIT_TEXT,
-                NeedTally::Dot => tokens::TEXT_TERTIARY,
+                NeedTally::You => tokens::get().warn_text,
+                NeedTally::Problem => tokens::get().crit_text,
+                NeedTally::Dot => tokens::get().text_tertiary,
             };
             draw_text(sh, &text, &Rect::new(x, header.y, (max_x - x).max(0.0), header.h), Style::Sort, fg, 1.0, Align::Left, false);
             x += m.width(&text, Style::Sort);
@@ -2843,9 +2853,9 @@ impl SidebarListView {
         let hovered = sh.hovered == ListHit::Need(index);
         let pressed = sh.pressed == ListHit::Need(index);
         if pressed {
-            fill_round(frame, NEED_ROW_RADIUS, tokens::TILE_PRESSED, alpha);
+            fill_round(frame, NEED_ROW_RADIUS, tokens::get().tile_pressed, alpha);
         } else if hovered {
-            fill_round(frame, NEED_ROW_RADIUS, tokens::TILE_HOVER, alpha);
+            fill_round(frame, NEED_ROW_RADIUS, tokens::get().tile_hover, alpha);
         }
         let cy = frame.y + frame.h / 2.0;
         let dot_cx = frame.x + NEED_ROW_PAD_H + GLYPH_BOX_W / 2.0;
@@ -2853,9 +2863,9 @@ impl SidebarListView {
         if need.kind == NeedKind::FailedRoutine {
             // A scheduled run has no pane: the x-circle says the run died.
             let box_ = Rect::new(dot_cx - ICON_D / 2.0, cy - ICON_D / 2.0, ICON_D, ICON_D);
-            stroke_icon(Icon::XCircle, &box_, ICON_D, tokens::ERROR, alpha);
+            stroke_icon(Icon::XCircle, &box_, ICON_D, tokens::get().error, alpha);
         } else {
-            fill_dot(dot_cx, cy, GLYPH_D, if waiting { tokens::AWAITING } else { tokens::ERROR }, alpha);
+            fill_dot(dot_cx, cy, GLYPH_D, if waiting { tokens::get().awaiting } else { tokens::get().error }, alpha);
         }
         let m = AppKitMetrics(sh);
         let text_x = frame.x + NEED_ROW_PAD_H + GLYPH_BOX_W;
@@ -2863,12 +2873,12 @@ impl SidebarListView {
         let age_w = m.width(&need.age, Style::Number);
         let age_x = right - age_w;
         let title_right = if row.detail.w > 0.0 { row.detail.x - NEED_GAP } else { age_x - NEED_GAP };
-        draw_text(sh, &need.title, &Rect::new(text_x, frame.y, (title_right - text_x).max(0.0), frame.h), Style::Title, tokens::TEXT_PRIMARY, alpha, Align::Left, false);
+        draw_text(sh, &need.title, &Rect::new(text_x, frame.y, (title_right - text_x).max(0.0), frame.h), Style::Title, tokens::get().text_primary, alpha, Align::Left, false);
         if row.detail.w > 0.0 {
             let detail = Rect::new(row.detail.x, row.detail.y + dy, row.detail.w, row.detail.h);
-            draw_text(sh, &need.detail, &detail, Style::Secondary, tokens::TEXT_TERTIARY, alpha, Align::Left, false);
+            draw_text(sh, &need.detail, &detail, Style::Secondary, tokens::get().text_tertiary, alpha, Align::Left, false);
         }
-        let age_fg = if waiting { tokens::WARN_TEXT } else { tokens::CRIT_TEXT };
+        let age_fg = if waiting { tokens::get().warn_text } else { tokens::get().crit_text };
         draw_text(sh, &need.age, &Rect::new(age_x, frame.y, age_w, frame.h), Style::Number, age_fg, alpha, Align::Right, false);
     }
 
@@ -2878,12 +2888,12 @@ impl SidebarListView {
         let hovered = sh.hovered == ListHit::NeedAll;
         let pressed = sh.pressed == ListHit::NeedAll;
         if pressed {
-            fill_round(frame, NEED_ROW_RADIUS, tokens::TILE_PRESSED, alpha);
+            fill_round(frame, NEED_ROW_RADIUS, tokens::get().tile_pressed, alpha);
         } else if hovered {
-            fill_round(frame, NEED_ROW_RADIUS, tokens::TILE_HOVER, alpha);
+            fill_round(frame, NEED_ROW_RADIUS, tokens::get().tile_hover, alpha);
         }
         let label = need_all_label(sh.model.needs.len(), sh.model.needs_all);
-        let fg = if hovered { tokens::TEXT_PRIMARY } else { tokens::TEXT_SECONDARY };
+        let fg = if hovered { tokens::get().text_primary } else { tokens::get().text_secondary };
         let inner = Rect::new(frame.x + NEED_ROW_PAD_H, frame.y, (frame.w - 2.0 * NEED_ROW_PAD_H).max(0.0), frame.h);
         draw_text(sh, &label, &inner, Style::Link, fg, alpha, Align::Left, false);
     }
@@ -2896,16 +2906,16 @@ impl SidebarListView {
         // A tile has no ground of its own: the group's card shows through.
         // The mouse lights a hover ground; the focused pane keeps a solid one.
         if tile.focused {
-            fill_round(frame, TILE_RADIUS, tokens::SEL_BG, alpha);
+            fill_round(frame, TILE_RADIUS, tokens::get().sel_bg, alpha);
         } else if pressed {
-            fill_round(frame, TILE_RADIUS, tokens::TILE_PRESSED, alpha);
+            fill_round(frame, TILE_RADIUS, tokens::get().tile_pressed, alpha);
         } else if hovered {
-            fill_round(frame, TILE_RADIUS, tokens::TILE_HOVER, alpha);
+            fill_round(frame, TILE_RADIUS, tokens::get().tile_hover, alpha);
         }
         let (title_fg, sec_fg, meta_fg) = if tile.focused {
-            (tokens::SEL_TEXT, tokens::SEL_TEXT, tokens::SEL_TEXT)
+            (tokens::get().sel_text, tokens::get().sel_text, tokens::get().sel_text)
         } else {
-            (tokens::TEXT_PRIMARY, tokens::TEXT_SECONDARY, tokens::TEXT_TERTIARY)
+            (tokens::get().text_primary, tokens::get().text_secondary, tokens::get().text_tertiary)
         };
 
         // Row 1: the state dot in its box, the title, and the meta column
@@ -2916,7 +2926,7 @@ impl SidebarListView {
         let dot_cx = frame.x + TILE_PAD_H + GLYPH_BOX_W / 2.0;
         let dot_cy = line1.y + LINE_TITLE_H / 2.0;
         if tile.state.neutral() {
-            let ring = if tile.focused { tokens::SEL_TEXT } else { tokens::TEXT_TERTIARY };
+            let ring = if tile.focused { tokens::get().sel_text } else { tokens::get().text_tertiary };
             stroke_ring(dot_cx, dot_cy, GLYPH_D, 1.5, ring, alpha);
         } else {
             fill_dot(dot_cx, dot_cy, GLYPH_D, tile.state.color(), alpha);
@@ -2929,14 +2939,14 @@ impl SidebarListView {
                 let b_pressed = sh.pressed == ListHit::TileButton(tile.pane_id, *b);
                 // Bare icons; a white ground only under the one the mouse is on.
                 if b_pressed {
-                    fill_round(&r, BUTTON_RADIUS, tokens::WHITE, 0.20 * alpha);
+                    fill_round(&r, BUTTON_RADIUS, tokens::get().white, 0.20 * alpha);
                 } else if b_hovered {
-                    fill_round(&r, BUTTON_RADIUS, tokens::WHITE, 0.12 * alpha);
+                    fill_round(&r, BUTTON_RADIUS, tokens::get().white, 0.12 * alpha);
                 }
                 let (fg, fg_alpha) = match b {
-                    TileButton::Close if b_hovered => (tokens::ERROR, 1.0),
-                    TileButton::Stop => (tokens::INTERRUPT, 1.0),
-                    _ if b_hovered => (tokens::TEXT_PRIMARY, 1.0),
+                    TileButton::Close if b_hovered => (tokens::get().error, 1.0),
+                    TileButton::Stop => (tokens::get().interrupt, 1.0),
+                    _ if b_hovered => (tokens::get().text_primary, 1.0),
                     _ => (sec_fg, 1.0),
                 };
                 stroke_icon(b.icon(), &r, ICON_D, fg, fg_alpha * alpha);
@@ -2950,7 +2960,7 @@ impl SidebarListView {
             let unread = matches!(tile.state, TileState::Unread(_));
             let dot_w = if unread { UNREAD_DOT_D + 3.0 } else { 0.0 };
             if unread {
-                let dot = if tile.focused { tokens::SEL_TEXT } else { tokens::ACCENT };
+                let dot = if tile.focused { tokens::get().sel_text } else { tokens::get().accent };
                 fill_dot(right - meta_w - 3.0 - UNREAD_DOT_D / 2.0, dot_cy, UNREAD_DOT_D, dot, alpha);
             }
             if let Some(text) = &meta {
@@ -2980,7 +2990,7 @@ impl SidebarListView {
         }
         let mut sx = text_x;
         if tile.bookmarked {
-            let w = draw_text(sh, "\u{2605}", &Rect::new(sx, line2.y, 14.0, LINE_SEC_H), Style::Secondary, tokens::AWAITING, alpha, Align::Left, false);
+            let w = draw_text(sh, "\u{2605}", &Rect::new(sx, line2.y, 14.0, LINE_SEC_H), Style::Secondary, tokens::get().awaiting, alpha, Align::Left, false);
             sx += w + 4.0;
         }
         if let Some(waiting) = &tile.waiting {
@@ -2989,7 +2999,7 @@ impl SidebarListView {
             let answer = row.answer.map(|r| shifted(&r));
             let text_right = answer.map_or(sec_right, |a| a.x - ANSWER_GAP);
             let label = format!("waiting {waiting}");
-            draw_text(sh, &label, &Rect::new(sx, line2.y, (text_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, tokens::WARN_TEXT, alpha, Align::Left, false);
+            draw_text(sh, &label, &Rect::new(sx, line2.y, (text_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, tokens::get().warn_text, alpha, Align::Left, false);
             if let Some(area) = answer {
                 draw_text(sh, "\u{b7}", &Rect::new(area.x - 9.0, line2.y, 8.0, LINE_SEC_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
                 let hovered_answer = sh.hovered == ListHit::NeedAnswer(tile.pane_id);

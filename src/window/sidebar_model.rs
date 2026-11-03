@@ -636,9 +636,9 @@ mod tests {
 
         // Closed, the body is not even carried: the model stays small and
         // cheap to compare on every tick.
-        let fat = crate::routines::Routine { cwd: "/Users/x/Perso".into(), ..ok.clone() };
+        let fat = crate::routines::Routine { cwd: "/Users/x/project".into(), ..ok.clone() };
         assert_eq!(RoutineVm::at(&fat, false, now).cwd, "");
-        assert_eq!(RoutineVm::at(&fat, true, now).cwd, "/Users/x/Perso");
+        assert_eq!(RoutineVm::at(&fat, true, now).cwd, "/Users/x/project");
     }
 
     #[test]

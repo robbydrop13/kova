@@ -17,6 +17,7 @@ pub struct Config {
     pub switcher: SwitcherConfig,
     pub keys: KeysConfig,
     pub agent: AgentConfig,
+    pub sidebar: SidebarConfig,
 }
 
 /// How Kova rebuilds an agent's command line when it puts a conversation back.
@@ -224,6 +225,17 @@ impl Default for LayoutConfig {
     }
 }
 
+/// What the sidebar reads from outside Kova's own state.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SidebarConfig {
+    /// The roster CLI, as argv: the program, then the words that print the
+    /// team roster as JSON (`["/usr/local/bin/team", "list", "--json"]`).
+    /// Absent or empty hides the Team and Dedicated sections: Kova never
+    /// guesses a path and never spawns a roster command nobody asked for.
+    pub roster_command: Vec<String>,
+}
+
 /// The layout settings Kova changes at runtime (View menu, the sidebar edge
 /// drag), kept in their own small file rather than written back into
 /// `config.toml`: rewriting the user's TOML would need a comment-preserving
@@ -327,6 +339,7 @@ impl Default for Config {
             switcher: SwitcherConfig::default(),
             keys: KeysConfig::default(),
             agent: AgentConfig::default(),
+            sidebar: SidebarConfig::default(),
         }
     }
 }
@@ -655,6 +668,18 @@ mod tests {
         config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(32) });
         assert_eq!(config.layout.sidebar_width, 256);
         assert_eq!(clamp_sidebar_width(4), 200);
+    }
+
+    #[test]
+    fn the_roster_command_parses_as_argv_and_defaults_to_none() {
+        let config: Config = toml::from_str(
+            "[sidebar]\nroster_command = [\"/usr/local/bin/team\", \"list\", \"--json\"]\n",
+        ).unwrap();
+        assert_eq!(config.sidebar.roster_command, ["/usr/local/bin/team", "list", "--json"]);
+        // No `[sidebar]` table, or an empty list: no roster, and nothing run.
+        assert!(Config::default().sidebar.roster_command.is_empty());
+        let empty: Config = toml::from_str("[sidebar]\nroster_command = []\n").unwrap();
+        assert!(empty.sidebar.roster_command.is_empty());
     }
 
     #[test]

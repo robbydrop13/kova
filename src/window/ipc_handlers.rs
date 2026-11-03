@@ -638,6 +638,11 @@ impl KovaView {
         if let Some(renderer) = self.ivars().renderer.get() {
             renderer.write().apply_config(config);
         }
+        // The palette can switch under an unchanged model: the sidebar only
+        // redraws when its model moves, so a reload asks for a repaint itself.
+        if let Some(sidebar) = self.ivars().sidebar_view.get() {
+            sidebar.repaint();
+        }
     }
 
     /// IPC: focus a pane by ID (switch tab if needed). Returns true if found.

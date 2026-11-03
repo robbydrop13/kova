@@ -8,7 +8,7 @@
 //! on the delegate. `sidebar_ui` builds the cards from `ask::Board` and the
 //! panes' previews, `sidebar_view` draws them and dispatches the clicks.
 //!
-//! The card is Robin's 3 Nov design: `bg1` ground, 1 pt `b3` border, radius 8,
+//! The card design: `bg1` ground, 1 pt `b3` border, radius 8,
 //! 10/12 padding, 8 pt apart. A highlighted card takes the selected rail's
 //! colour as its border. See `docs/sidebar-spec.md`.
 
@@ -1238,24 +1238,24 @@ pub(super) fn draw(
 
 fn draw_card(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, hovered: ListHit, pressed: ListHit) {
     let alpha = if card.faded { 0.55 } else { 1.0 };
-    fill_round(&card.frame, CARD_RADIUS, tokens::TILE, alpha);
+    fill_round(&card.frame, CARD_RADIUS, tokens::get().tile, alpha);
     let (border, width) =
-        if card.highlighted { (tokens::SEL_RAIL, 1.5) } else { (tokens::BORDER_SUBTLE, 1.0) };
+        if card.highlighted { (tokens::get().sel_rail, 1.5) } else { (tokens::get().border_subtle, 1.0) };
     stroke_round(&card.frame, CARD_RADIUS, width, border, alpha);
 
     draw_header(sh, m, card, alpha);
-    draw_wrapped(sh, &card.card.message, &card.message, Style::Secondary, tokens::TEXT_PRIMARY, alpha);
+    draw_wrapped(sh, &card.card.message, &card.message, Style::Secondary, tokens::get().text_primary, alpha);
     if let Some(block) = card.code {
         draw_code(&block, &card.code_lines, alpha);
     }
     if let Some(flash) = card.flash {
-        draw_text(sh, FLASH_TEXT, &flash, Style::Hint, tokens::CRIT_TEXT, alpha, Align::Left, false);
+        draw_text(sh, FLASH_TEXT, &flash, Style::Hint, tokens::get().crit_text, alpha, Align::Left, false);
     }
 
     if let (Some(status), Some(phase)) = (card.status, card.phase) {
         let (icon, fg, text) = match phase {
-            TransientPhase::Sending => (super::feather::Icon::Send, tokens::TEXT_TERTIARY, format!("Sending to {}...", card.card.from)),
-            TransientPhase::Sent => (super::feather::Icon::CheckCircle, tokens::OK_DOT, format!("Sent to {}", card.card.from)),
+            TransientPhase::Sending => (super::feather::Icon::Send, tokens::get().text_tertiary, format!("Sending to {}...", card.card.from)),
+            TransientPhase::Sent => (super::feather::Icon::CheckCircle, tokens::get().ok_dot, format!("Sent to {}", card.card.from)),
         };
         let icon_rect = Rect::new(status.x, status.y + (STATUS_H - STATUS_ICON) / 2.0, STATUS_ICON, STATUS_ICON);
         stroke_icon(icon, &icon_rect, STATUS_ICON, fg, alpha);
@@ -1278,7 +1278,7 @@ fn draw_card(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, hovered: Lis
             &format!("back at {}", card.card.back_at),
             &card.note,
             Style::Hint,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             alpha,
             Align::Left,
             false,
@@ -1301,28 +1301,28 @@ fn draw_overlay(
     hovered: ListHit,
     pressed: ListHit,
 ) {
-    fill_round(scrim, 0.0, tokens::BLACK, BRIEF_SCRIM);
-    fill_round(&brief.card, BRIEF_RADIUS, tokens::TILE, 1.0);
-    stroke_round(&brief.card, BRIEF_RADIUS, 1.0, tokens::BORDER_SUBTLE, 1.0);
+    fill_round(scrim, 0.0, tokens::get().black, BRIEF_SCRIM);
+    fill_round(&brief.card, BRIEF_RADIUS, tokens::get().tile, 1.0);
+    stroke_round(&brief.card, BRIEF_RADIUS, 1.0, tokens::get().border_subtle, 1.0);
 
     // Header: the warn dot, "Brief for <from>", the age at the right.
     let header = &brief.header;
-    fill_dot(header.x + 4.0, header.y + header.h / 2.0, STATE_DOT_D, tokens::AWAITING, 1.0);
+    fill_dot(header.x + 4.0, header.y + header.h / 2.0, STATE_DOT_D, tokens::get().awaiting, 1.0);
     let title = Rect::new(header.x + HEADER_TEXT_X, header.y, (header.w - HEADER_TEXT_X - 40.0).max(0.0), header.h);
-    draw_text(sh, &format!("Brief for {}", brief.from), &title, Style::Title, tokens::TEXT_PRIMARY, 1.0, Align::Left, false);
+    draw_text(sh, &format!("Brief for {}", brief.from), &title, Style::Title, tokens::get().text_primary, 1.0, Align::Left, false);
     let age_w = m.width(&brief.age, Style::Number);
     draw_text(
         sh,
         &brief.age,
         &Rect::new(header.right() - age_w, header.y, age_w, header.h),
         Style::Number,
-        tokens::TEXT_TERTIARY,
+        tokens::get().text_tertiary,
         1.0,
         Align::Right,
         false,
     );
 
-    draw_wrapped(sh, &brief.message, &brief.message_rect, Style::Secondary, tokens::TEXT_SECONDARY, 1.0);
+    draw_wrapped(sh, &brief.message, &brief.message_rect, Style::Secondary, tokens::get().text_secondary, 1.0);
 
     // The options: a picked one takes the accent ground and white text.
     for chip in &brief.choices {
@@ -1332,20 +1332,20 @@ fn draw_overlay(
         let down = matches!(pressed, ListHit::Ask(h) if h == hit);
         let radius = chip.rect.h / 2.0;
         if selected {
-            fill_round(&chip.rect, radius, if down { tokens::ACCENT_PRESSED } else { tokens::ACCENT }, 1.0);
+            fill_round(&chip.rect, radius, if down { tokens::get().accent_pressed } else { tokens::get().accent }, 1.0);
         } else {
             if hot || down {
-                fill_round(&chip.rect, radius, tokens::WHITE, if down { 0.12 } else { 0.08 });
+                fill_round(&chip.rect, radius, tokens::get().white, if down { 0.12 } else { 0.08 });
             }
-            stroke_round(&chip.rect, radius, 1.0, tokens::BORDER_SUBTLE, 1.0);
+            stroke_round(&chip.rect, radius, 1.0, tokens::get().border_subtle, 1.0);
         }
-        let fg = if selected { tokens::TEXT_ON_FILL } else { tokens::TEXT_SECONDARY };
+        let fg = if selected { tokens::get().text_on_fill } else { tokens::get().text_secondary };
         draw_text(sh, &chip.label, &chip.rect, Style::Chip, fg, 1.0, Align::Center, false);
     }
 
     // The field's box. The native field covers it while the overlay is open.
-    fill_round(&brief.field, 6.0, tokens::GROUND, 1.0);
-    stroke_round(&brief.field, 6.0, 1.0, tokens::BORDER_SUBTLE, 1.0);
+    fill_round(&brief.field, 6.0, tokens::get().ground, 1.0);
+    stroke_round(&brief.field, 6.0, 1.0, tokens::get().border_subtle, 1.0);
 
     // Cancel is a ghost; Send takes the accent, faded while it has nothing
     // to send.
@@ -1353,12 +1353,12 @@ fn draw_overlay(
     let cancel_down = matches!(pressed, ListHit::Ask(h) if h == cancel_hit);
     let cancel_hot = matches!(hovered, ListHit::Ask(h) if h == cancel_hit);
     if cancel_hot || cancel_down {
-        fill_round(&brief.cancel, SNOOZE_RADIUS, tokens::WHITE, if cancel_down { 0.12 } else { 0.08 });
+        fill_round(&brief.cancel, SNOOZE_RADIUS, tokens::get().white, if cancel_down { 0.12 } else { 0.08 });
     }
-    draw_text(sh, "Cancel", &brief.cancel, Style::Chip, tokens::TEXT_SECONDARY, 1.0, Align::Center, false);
+    draw_text(sh, "Cancel", &brief.cancel, Style::Chip, tokens::get().text_secondary, 1.0, Align::Center, false);
     let send_hit = AsksHit::BriefSend(brief.key);
     let send_down = matches!(pressed, ListHit::Ask(h) if h == send_hit);
-    let send_ground = if send_down { tokens::ACCENT_PRESSED } else { tokens::ACCENT };
+    let send_ground = if send_down { tokens::get().accent_pressed } else { tokens::get().accent };
     fill_round(&brief.send, SNOOZE_RADIUS, send_ground, if brief.send_enabled { 1.0 } else { 0.4 });
     let send_alpha = if brief.send_enabled { 1.0 } else { 0.6 };
     let text_w = m.width("Send", Style::Chip);
@@ -1368,7 +1368,7 @@ fn draw_overlay(
         super::feather::Icon::Send,
         &Rect::new(icon_x, brief.send.y + (brief.send.h - BRIEF_SEND_ICON) / 2.0, BRIEF_SEND_ICON, BRIEF_SEND_ICON),
         BRIEF_SEND_ICON,
-        tokens::TEXT_ON_FILL,
+        tokens::get().text_on_fill,
         send_alpha,
     );
     draw_text(
@@ -1376,7 +1376,7 @@ fn draw_overlay(
         "Send",
         &Rect::new(icon_x + BRIEF_SEND_ICON + BRIEF_SEND_ICON_GAP, brief.send.y, text_w, brief.send.h),
         Style::Chip,
-        tokens::TEXT_ON_FILL,
+        tokens::get().text_on_fill,
         send_alpha,
         Align::Left,
         false,
@@ -1387,14 +1387,14 @@ fn draw_overlay(
         "Pick an option or not, the instruction goes with it. Cmd+Enter sends",
         &brief.hint,
         Style::Hint,
-        tokens::TEXT_TERTIARY,
+        tokens::get().text_tertiary,
         1.0,
     );
 }
 
 fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64) {
     let header = card.header;
-    fill_dot(header.x + 4.0, header.y + header.h / 2.0, STATE_DOT_D, tokens::AWAITING, alpha);
+    fill_dot(header.x + 4.0, header.y + header.h / 2.0, STATE_DOT_D, tokens::get().awaiting, alpha);
     let age_w = m.width(&card.card.age, Style::Number);
     let age = Rect::new(header.right() - age_w, header.y, age_w, header.h);
     let text_x = header.x + HEADER_TEXT_X;
@@ -1404,16 +1404,16 @@ fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64
         &card.card.from,
         &Rect::new(text_x, header.y, from_w, header.h),
         Style::Title,
-        tokens::TEXT_PRIMARY,
+        tokens::get().text_primary,
         alpha,
         Align::Left,
         false,
     );
     let tab_x = match tag {
         Some(tag) => {
-            fill_round(&tag, TAG_RADIUS, tokens::WHITE, 0.08 * alpha);
-            stroke_round(&tag, TAG_RADIUS, 1.0, tokens::BORDER_SUBTLE, alpha);
-            draw_text(sh, TAG_TEXT, &tag, Style::Hint, tokens::TEXT_TERTIARY, alpha, Align::Center, false);
+            fill_round(&tag, TAG_RADIUS, tokens::get().white, 0.08 * alpha);
+            stroke_round(&tag, TAG_RADIUS, 1.0, tokens::get().border_subtle, alpha);
+            draw_text(sh, TAG_TEXT, &tag, Style::Hint, tokens::get().text_tertiary, alpha, Align::Center, false);
             tag.right() + HEADER_TAB_GAP
         }
         None => text_x + from_w + HEADER_TAB_GAP,
@@ -1424,22 +1424,22 @@ fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64
             &card.card.tab,
             &Rect::new(tab_x, header.y, tab_w, header.h),
             Style::Summary,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             alpha,
             Align::Left,
             false,
         );
     }
-    let age_fg = if card.card.urgent { tokens::WARN_TEXT } else { tokens::TEXT_TERTIARY };
+    let age_fg = if card.card.urgent { tokens::get().warn_text } else { tokens::get().text_tertiary };
     draw_text(sh, &card.card.age, &age, Style::Number, age_fg, alpha, Align::Right, false);
 }
 
 /// The command block: `bg0` ground, radius 4, 6 pt padding, one Menlo 11 line
 /// per row. The wrapping came from `code_lines`, so a line fits its box.
 fn draw_code(block: &Rect, lines: &[String], alpha: f64) {
-    fill_round(block, CODE_RADIUS, tokens::GROUND, alpha);
+    fill_round(block, CODE_RADIUS, tokens::get().ground, alpha);
     let font = mono_font();
-    let attrs = mono_attrs(&font, tokens::TEXT_SECONDARY, alpha);
+    let attrs = mono_attrs(&font, tokens::get().text_secondary, alpha);
     for (i, line) in lines.iter().enumerate() {
         let row = Rect::new(
             block.x + CODE_PAD,
@@ -1509,7 +1509,7 @@ fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f6
             super::feather::Icon::Info,
             &Rect::new(x, note.y, NOTE_ICON, note.h),
             NOTE_ICON,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             alpha,
         );
         draw_text(
@@ -1517,7 +1517,7 @@ fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f6
             label,
             &Rect::new(x + NOTE_ICON + NOTE_ICON_GAP, note.y, text_w, note.h),
             Style::Hint,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             alpha,
             Align::Left,
             false,
@@ -1525,24 +1525,24 @@ fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f6
         options_right = x - 8.0;
     }
     let [check, first, cross, second] = note_options(*note, options_right, m, &card.card.options);
-    stroke_icon(super::feather::Icon::Check, &check, NOTE_ICON, tokens::OK_DOT, alpha);
+    stroke_icon(super::feather::Icon::Check, &check, NOTE_ICON, tokens::get().ok_dot, alpha);
     draw_text(
         sh,
         &card.card.options[0],
         &first,
         Style::Hint,
-        tokens::TEXT_TERTIARY,
+        tokens::get().text_tertiary,
         alpha,
         Align::Left,
         false,
     );
-    stroke_icon(super::feather::Icon::X, &cross, NOTE_ICON, tokens::INTERRUPT, alpha);
+    stroke_icon(super::feather::Icon::X, &cross, NOTE_ICON, tokens::get().interrupt, alpha);
     draw_text(
         sh,
         &card.card.options[1],
         &second,
         Style::Hint,
-        tokens::TEXT_TERTIARY,
+        tokens::get().text_tertiary,
         alpha,
         Align::Left,
         false,
@@ -1558,41 +1558,41 @@ fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: List
         | AsksHit::Brief(_)
         | AsksHit::PermissionApprove(_)
         | AsksHit::PermissionReject(_) => {
-            let ground = if down || hot { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
+            let ground = if down || hot { tokens::get().tile_pressed } else { tokens::get().tile_hover };
             fill_round(rect, AB_RADIUS, ground, alpha);
             let (icon, fg) = match hit {
-                AsksHit::Ok(_) | AsksHit::PermissionApprove(_) => (super::feather::Icon::Check, tokens::OK_DOT),
-                AsksHit::Ko(_) | AsksHit::PermissionReject(_) => (super::feather::Icon::X, tokens::INTERRUPT),
-                _ => (super::feather::Icon::Edit, tokens::TEXT_PRIMARY),
+                AsksHit::Ok(_) | AsksHit::PermissionApprove(_) => (super::feather::Icon::Check, tokens::get().ok_dot),
+                AsksHit::Ko(_) | AsksHit::PermissionReject(_) => (super::feather::Icon::X, tokens::get().interrupt),
+                _ => (super::feather::Icon::Edit, tokens::get().text_primary),
             };
             stroke_icon(icon, rect, AB_ICON, fg, alpha);
         }
         AsksHit::Open(_) | AsksHit::SnoozeMenu(_) => {
             if hot || down {
-                fill_round(rect, AB_RADIUS, tokens::WHITE, if down { 0.16 } else { 0.10 });
+                fill_round(rect, AB_RADIUS, tokens::get().white, if down { 0.16 } else { 0.10 });
             }
             let icon = if matches!(hit, AsksHit::Open(_)) {
                 super::feather::Icon::Open
             } else {
                 super::feather::Icon::Moon
             };
-            let fg = if hot || down { tokens::TEXT_PRIMARY } else { tokens::TEXT_TERTIARY };
+            let fg = if hot || down { tokens::get().text_primary } else { tokens::get().text_tertiary };
             stroke_icon(icon, rect, GHOST_ICON, fg, alpha);
         }
         AsksHit::Snooze(_, choice) => {
-            let ground = if down || hot { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
+            let ground = if down || hot { tokens::get().tile_pressed } else { tokens::get().tile_hover };
             fill_round(rect, SNOOZE_RADIUS, ground, alpha);
-            draw_text(sh, choice.label(), rect, Style::Chip, tokens::TEXT_SECONDARY, alpha, Align::Center, false);
+            draw_text(sh, choice.label(), rect, Style::Chip, tokens::get().text_secondary, alpha, Align::Center, false);
         }
         AsksHit::PermissionAlways(_) => {
-            let ground = if down || hot { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
+            let ground = if down || hot { tokens::get().tile_pressed } else { tokens::get().tile_hover };
             fill_round(rect, SNOOZE_RADIUS, ground, alpha);
-            draw_text(sh, "Always", rect, Style::Chip, tokens::TEXT_SECONDARY, alpha, Align::Center, false);
+            draw_text(sh, "Always", rect, Style::Chip, tokens::get().text_secondary, alpha, Align::Center, false);
         }
         AsksHit::ShowNow(_) => {
-            let ground = if down || hot { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
+            let ground = if down || hot { tokens::get().tile_pressed } else { tokens::get().tile_hover };
             fill_round(rect, SNOOZE_RADIUS, ground, alpha);
-            draw_text(sh, "Show now", rect, Style::Chip, tokens::TEXT_PRIMARY, alpha, Align::Center, false);
+            draw_text(sh, "Show now", rect, Style::Chip, tokens::get().text_primary, alpha, Align::Center, false);
         }
         // The overlay's chips and buttons are drawn whole by `draw_overlay`.
         AsksHit::BriefChip(_, _) | AsksHit::BriefSend(_) | AsksHit::BriefCancel(_) | AsksHit::ToggleSnoozed => {}
@@ -1612,11 +1612,11 @@ fn draw_snoozed_header(
     let hot = matches!(hovered, ListHit::Ask(h) if h == hit);
     let down = matches!(pressed, ListHit::Ask(h) if h == hit);
     if hot || down {
-        fill_round(rect, 6.0, tokens::WHITE, if down { 0.16 } else { 0.08 });
+        fill_round(rect, 6.0, tokens::get().white, if down { 0.16 } else { 0.08 });
     }
     let icon = if folded { super::feather::Icon::ChevronRight } else { super::feather::Icon::ChevronDown };
     let chevron = Rect::new(rect.x + 2.0, rect.y + (rect.h - SNOOZE_CHEVRON) / 2.0, SNOOZE_CHEVRON, SNOOZE_CHEVRON);
-    stroke_icon(icon, &chevron, SNOOZE_CHEVRON, tokens::TEXT_TERTIARY, 1.0);
+    stroke_icon(icon, &chevron, SNOOZE_CHEVRON, tokens::get().text_tertiary, 1.0);
     let label = format!("Snoozed {count}");
     let w = m.width(&label, Style::Chip);
     draw_text(
@@ -1624,7 +1624,7 @@ fn draw_snoozed_header(
         &label,
         &Rect::new(rect.x + SNOOZE_TEXT_X, rect.y, w.max(0.0), rect.h),
         Style::Chip,
-        tokens::TEXT_SECONDARY,
+        tokens::get().text_secondary,
         1.0,
         Align::Left,
         false,
@@ -1633,13 +1633,13 @@ fn draw_snoozed_header(
 
 fn draw_empty(sh: &Shared, rect: &Rect) {
     let icon = Rect::new(rect.x + (rect.w - EMPTY_ICON) / 2.0, rect.y + 8.0, EMPTY_ICON, EMPTY_ICON);
-    stroke_icon(super::feather::Icon::CheckCircle, &icon, EMPTY_ICON, tokens::TEXT_TERTIARY, 0.7);
+    stroke_icon(super::feather::Icon::CheckCircle, &icon, EMPTY_ICON, tokens::get().text_tertiary, 0.7);
     draw_text(
         sh,
         "No open questions",
         &Rect::new(rect.x, icon.bottom() + 10.0, rect.w, 20.0),
         Style::Title,
-        tokens::TEXT_SECONDARY,
+        tokens::get().text_secondary,
         1.0,
         Align::Center,
         false,
@@ -1649,7 +1649,7 @@ fn draw_empty(sh: &Shared, rect: &Rect) {
         "Agents ask here when they need you",
         &Rect::new(rect.x, icon.bottom() + 32.0, rect.w, 16.0),
         Style::Hint,
-        tokens::TEXT_TERTIARY,
+        tokens::get().text_tertiary,
         1.0,
         Align::Center,
         false,

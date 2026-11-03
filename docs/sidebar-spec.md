@@ -165,10 +165,10 @@ The selected tab's card differs by its fill and border, and by its text:
   (secondary / tertiary elsewhere). The `+` is white when shown (primary
   elsewhere).
 - Tiles: no ground of their own, they sit on the card; under the mouse a
-  `bg.hover` ground (`tokens::TILE_HOVER`), radius 6, and `btn2.hover`
-  pressed. The focused pane is a `SEL_BG` ground (`tokens::SEL_BG`, radius
-  6) with its title, subtitle and meta column in `SEL_TEXT`
-  (`tokens::SEL_TEXT`); its idle / shell ring follows the same ink.
+  `bg.hover` ground (`tokens::get().tile_hover`), radius 6, and `btn2.hover`
+  pressed. The focused pane is a `SEL_BG` ground (`tokens::get().sel_bg`,
+  radius 6) with its title, subtitle and meta column in `SEL_TEXT`
+  (`tokens::get().sel_text`); its idle / shell ring follows the same ink.
 
 ### 3.5 Tile, radius 6, no fill, padding 5 v / 6 h
 
@@ -558,7 +558,8 @@ ask here when they need you`, both tertiary and centred.
 
 `src/window/sidebar_agents.rs` owns this list: the view state, the pure model
 (`build`), the layout, the hit test and the drawing. The panes come from the
-window's own facts; the roster comes from `crate::team` (`team list --json`),
+window's own facts; the roster comes from `crate::team`, which runs the
+configured `[sidebar] roster_command` (nothing at all when it is absent),
 cached and refreshed on a background thread every 60 s while the list is up,
 never on the tick.
 
@@ -608,18 +609,23 @@ A roster entry (`crate::team::Team`) matches a pane by its agent session
 name, or a pane or tab title, case-insensitively. Its row shows the pane's
 state dot when matched, a dimmed ring when closed, the name, the role in
 tertiary (`· not open` when closed), and on the right the pane's meta or a
-22 pt `Open` button.
+22 pt `Open` button, the Scheduled body's small button style: `bg.hover` at
+rest, `btn2.hover` under the mouse and the press, an 11 pt Medium label.
 
 The closed dedicated sessions fold under a `Closed N` header, folded at
 start (`AgentsState::closed_folded`); every closed row has its own `Open`.
 
-`Open` runs the entry's `reopen` argv only when it is exactly
-`team reopen <valid-name>` for that entry, resolved to
-`~/AI directory/claude-config/team/team`: anything else is refused before a
-`Command`. The run happens on a background thread, then the roster refreshes.
-The button says `Opening…` and ignores clicks until the roster shows the
-entry open or 20 s pass (`OPEN_TIMEOUT_MS`); a failure says `Could not open`
-in `crit` for 10 s (`ERROR_MS`).
+The roster comes from `[sidebar] roster_command`, an argv
+(`["/usr/local/bin/team", "list", "--json"]`); absent or empty, both Team
+sections are hidden and no process is spawned, and no path is baked into the
+binary. `Open` runs the entry's `reopen` argv only when it is exactly
+`team reopen <valid-name>` for that entry, with argv[0] replaced by the
+configured roster command's argv[0] (same binary): anything else is refused
+before a process starts. The run happens on a background thread, then the
+roster refreshes. While it runs, the button says `Opening…` disabled: the
+same box and ground, a tertiary label, no hit target at all. A failure says
+`Could not open` in `crit` for 10 s (`ERROR_MS`), and the reopen is retried
+after `OPEN_TIMEOUT_MS` (20 s) if the roster still shows the entry closed.
 
 `tests/fixtures/team/list.json` holds the made-up roster the parsing and
 matching tests use; no real name is tracked.
@@ -873,8 +879,13 @@ into a `TurnEnd { summary }`. Fixtures under `tests/fixtures/prompt/`.
 ## 6. Tokens (`sidebar::tokens`, RGB floats, Claap design system)
 
 The palette comes from KovaLink `packages/protocol/tokens/ds.json`, the
-Claap design system, generated into `src/window/ds_tokens.rs`; `sidebar::tokens`
-names the dark set and drops the alpha channel.
+Claap design system, generated into `src/window/ds_tokens.rs`. `sidebar::tokens`
+holds both generated sets as `Palette` values (`DARK`, `LIGHT`) with the
+alpha channel dropped, and every call site reads the one in use through
+`get()`. The set follows the terminal background (`[colors] background`, its
+Rec. 709 luma strictly above 0.5 is light), picked at startup and again on
+`reload-config` (`tokens::set_background`). `crit.solid` is `#ED3726` in
+both sets.
 
 ```
 ground            bg0
@@ -940,9 +951,15 @@ the key window's `KovaView` handles it and refreshes the check mark in
 
 ```toml
 [layout]
-mode = "sidebar"              # "tabs" | "sidebar", default "tabs"
+mode = "sidebar"              # "tabs" (default) | "sidebar"
 sidebar_width = 280           # points, clamped to 200..520
 sidebar_collapsed_default = false   # new tabs start folded when true
+
+[sidebar]
+# The roster command, as argv: the program, then the words that print the
+# team roster as JSON. Absent or empty: the Agents view hides the Team and
+# Dedicated sections and spawns nothing.
+roster_command = ["/usr/local/bin/team", "list", "--json"]
 
 [keys]
 toggle_sidebar = "cmd+option+s"

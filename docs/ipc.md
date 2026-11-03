@@ -564,8 +564,10 @@ Response: `{ "ok": true, "data": { "removed": 3 } }`.
 
 Reads `~/.config/kova/config.toml` again and pushes its appearance half into
 every open window: `[colors]`, `[status_bar]`, `[global_status_bar]`, `[tab_bar]`,
-`[bookmarks]`, and the fade / focus outline of `[splits]`. The next frame draws
-with the new values — around 16 ms later, no restart, no session reload.
+`[bookmarks]`, and the fade / focus outline of `[splits]`. The sidebar re-picks
+its light or dark palette from the new `[colors] background`, and the Agents
+roster follows the new `[sidebar] roster_command`. The next frame draws
+with the new values, around 16 ms later: no restart, no session reload.
 
 What it does not touch, because they are read once at startup and would mean
 rebuilding the glyph atlas or resizing every PTY: `[font]`, `[terminal]`,

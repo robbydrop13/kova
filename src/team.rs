@@ -1,13 +1,16 @@
-//! The agent roster the Agents view lists: `team list --json` from the
-//! local team CLI, read like `routines::snapshot` (cached, refreshed on a
-//! background thread, never on the tick) and reopened with its own argv.
+//! The agent roster the Agents view lists: the command named by
+//! `[sidebar] roster_command` (nothing runs when the key is absent), read
+//! like `routines::snapshot` (cached, refreshed on a background thread, never
+//! on the tick) and reopened with its own argv.
 //!
 //! The CLI owns the names and the shape; this module only validates what it
 //! would run. `reopen` accepts nothing but `team reopen <valid-name>`, and
 //! the name is validated before it reaches a `Command`, so a roster entry
-//! can never smuggle another argument or a shell. See `docs/sidebar-spec.md`.
+//! can never smuggle another argument or a shell. The path of the binary is
+//! never hard-coded: it is the one the config names, in tracked files or
+//! nowhere. See `docs/sidebar-spec.md`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -74,13 +77,33 @@ impl Team {
     }
 }
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
+/// The roster CLI, as argv (`[sidebar] roster_command`): the program and the
+/// words that print the roster. Empty means no roster at all.
+static COMMAND: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Adopt the configured roster command. An empty list turns the roster off:
+/// both Team sections hide and no process is spawned. Called once at startup
+/// and again on `reload-config`.
+pub fn set_command(argv: &[String]) {
+    if COMMAND.read().as_slice() == argv {
+        return;
+    }
+    *COMMAND.write() = argv.to_vec();
+    // What was read belongs to the old command, and the next tick must not
+    // show it under the new one.
+    *CACHE.write() = None;
+    FILLED_AT.store(0, Ordering::Relaxed);
 }
 
-/// The CLI itself: `~/AI directory/claude-config/team/team`.
-pub fn bin(home: &Path) -> PathBuf {
-    home.join("AI directory/claude-config/team/team")
+/// Whether a roster command is configured. When it is not, the view hides
+/// the Team and Dedicated sections rather than claiming an empty team.
+pub fn configured() -> bool {
+    !COMMAND.read().is_empty()
+}
+
+/// The configured command, cloned for a background read.
+fn command() -> Vec<String> {
+    COMMAND.read().clone()
 }
 
 static CACHE: RwLock<Option<Arc<Team>>> = RwLock::new(None);
@@ -100,12 +123,15 @@ fn now_secs() -> u64 {
 /// The roster as last read, and a refresh in the background when the snapshot
 /// has aged out. Returns at once, and `None` until the first read lands.
 pub fn snapshot() -> Option<Arc<Team>> {
+    if !configured() {
+        return None;
+    }
     let age = now_secs().saturating_sub(FILLED_AT.load(Ordering::Relaxed));
     let due = age >= MAX_AGE_SECS || READ_AT.load(Ordering::Relaxed) < CHANGED.load(Ordering::Relaxed);
     if due && !REFRESHING.swap(true, Ordering::AcqRel) {
         std::thread::spawn(|| {
             let generation = CHANGED.load(Ordering::Relaxed);
-            let team = read(&home());
+            let team = read(&command());
             *CACHE.write() = Some(Arc::new(team));
             FILLED_AT.store(now_secs(), Ordering::Relaxed);
             READ_AT.store(generation, Ordering::Relaxed);
@@ -144,10 +170,12 @@ pub fn reopen(name: &str, argv: &[String]) -> Result<(), String> {
     if !valid_reopen(name, argv) {
         return Err(format!("refusing reopen argv: {argv:?}"));
     }
-    let bin = bin(&home());
+    let Some((bin, args)) = reopen_command(name, argv, &command()) else {
+        return Err("no roster command configured".to_string());
+    };
     let name = name.to_string();
     std::thread::spawn(move || {
-        let result = run_reopen(&bin, &name);
+        let result = run(&bin, &args);
         if let Err(why) = &result {
             log::warn!("team reopen {name}: {why}");
         }
@@ -159,17 +187,29 @@ pub fn reopen(name: &str, argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_reopen(bin: &Path, name: &str) -> Result<(), String> {
+/// What a validated reopen runs: the configured binary, then the entry's own
+/// `reopen <name>` words. The entry never chooses the program, the program is
+/// the one the config names; and it never chooses a word before `reopen`
+/// either, `valid_reopen` having checked the three of them.
+fn reopen_command(name: &str, argv: &[String], roster: &[String]) -> Option<(String, Vec<String>)> {
+    let (bin, _) = roster.split_first()?;
+    if !valid_reopen(name, argv) {
+        return None;
+    }
+    Some((bin.clone(), argv[1..].to_vec()))
+}
+
+fn run(bin: &str, args: &[String]) -> Result<(), String> {
     let out = std::process::Command::new(bin)
-        .args(["reopen", name])
+        .args(args)
         .output()
-        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+        .map_err(|e| format!("cannot run {bin}: {e}"))?;
     if out.status.success() {
         return Ok(());
     }
     let err = String::from_utf8_lossy(&out.stderr);
     if err.trim().is_empty() {
-        Err(format!("{} exited with {}", bin.display(), out.status))
+        Err(format!("{bin} exited with {}", out.status))
     } else {
         Err(first_line(&err))
     }
@@ -196,26 +236,32 @@ pub fn valid_reopen(name: &str, argv: &[String]) -> bool {
     argv.len() == 3 && argv[0] == "team" && argv[1] == "reopen" && argv[2] == name && valid_name(name)
 }
 
-fn read(home: &Path) -> Team {
-    let bin = bin(home);
+/// Read the roster by running `argv` (the configured command). An empty argv,
+/// or a binary that is not there, is an unavailable roster: the view hides
+/// the Team sections rather than claiming an empty team.
+fn read(argv: &[String]) -> Team {
+    let Some((bin, args)) = argv.split_first() else {
+        return Team::default();
+    };
+    let bin = Path::new(bin);
     if !bin.is_file() {
         return Team::default();
     }
-    let out = match std::process::Command::new(&bin).args(["list", "--json"]).output() {
+    let out = match std::process::Command::new(bin).args(args).output() {
         Ok(out) => out,
         Err(e) => {
-            log::warn!("team list: cannot run {}: {e}", bin.display());
+            log::warn!("roster: cannot run {}: {e}", bin.display());
             return Team::default();
         }
     };
     if !out.status.success() {
-        log::warn!("team list: {} exited with {}", bin.display(), out.status);
+        log::warn!("roster: {} exited with {}", bin.display(), out.status);
         return Team::default();
     }
     match Team::from_json(&String::from_utf8_lossy(&out.stdout)) {
         Some(team) => team,
         None => {
-            log::warn!("team list: cannot read the roster");
+            log::warn!("roster: cannot read the roster");
             Team::default()
         }
     }
@@ -248,11 +294,32 @@ mod tests {
     }
 
     #[test]
+    fn no_roster_command_hides_the_sections() {
+        set_command(&[]);
+        assert!(!configured());
+        // Nothing ran and there is nothing to show, which is what hides both
+        // Team sections; no process is spawned either.
+        assert!(snapshot().is_none());
+    }
+
+    #[test]
     fn a_missing_cli_is_an_unavailable_roster_not_an_empty_team() {
-        let dir = std::env::temp_dir().join("kova-team-missing");
-        let team = read(&dir);
+        assert!(!read(&[]).available);
+        let missing: Vec<String> = ["/nonexistent/team", "list", "--json"].iter().map(|s| s.to_string()).collect();
+        let team = read(&missing);
         assert!(!team.available);
         assert!(team.managers.is_empty());
+    }
+
+    #[test]
+    fn the_roster_command_runs_with_the_words_the_config_names() {
+        // `/bin/sh` stands in for the CLI: what matters is that the words
+        // after the program reach it, so `list --json` is the command's own.
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/team/list.json");
+        let argv: Vec<String> = ["/bin/sh", "-c", &format!("cat {fixture}")].iter().map(|s| s.to_string()).collect();
+        let team = read(&argv);
+        assert!(team.available);
+        assert_eq!(team.entry("alpha-manager").map(|e| e.name.as_str()), Some("alpha-manager"));
     }
 
     #[test]
@@ -277,6 +344,22 @@ mod tests {
         }
         // The name must be the entry's own: an argv can never reopen another.
         assert!(!valid_reopen("beta-coach", &ok));
+    }
+
+    #[test]
+    fn reopen_runs_the_configured_binary_and_only_the_entrys_own_words() {
+        let argv: Vec<String> = ["team", "reopen", "alpha-manager"].iter().map(|s| s.to_string()).collect();
+        let roster: Vec<String> = ["/usr/local/bin/team", "list", "--json"].iter().map(|s| s.to_string()).collect();
+        let Some((bin, args)) = reopen_command("alpha-manager", &argv, &roster) else {
+            panic!("a valid reopen has a command");
+        };
+        assert_eq!(bin, "/usr/local/bin/team");
+        assert_eq!(args, ["reopen", "alpha-manager"]);
+        // Without a configured command there is no binary to run.
+        assert!(reopen_command("alpha-manager", &argv, &[]).is_none());
+        // The entry's name is still its own: another entry's argv is refused.
+        let other: Vec<String> = ["team", "reopen", "beta-coach"].iter().map(|s| s.to_string()).collect();
+        assert!(reopen_command("alpha-manager", &other, &roster).is_none());
     }
 
     #[test]

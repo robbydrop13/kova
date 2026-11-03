@@ -337,9 +337,9 @@ fn last_value(r: &RoutineVm) -> String {
 /// reports failed, the one line of the grid that carries a verdict.
 pub fn body_value_ink(label: &str, r: &RoutineVm) -> [f32; 3] {
     if label == "Last run" && matches!(r.last_status, LastStatus::Failed(_)) {
-        tokens::CRIT_TEXT
+        tokens::get().crit_text
     } else {
-        tokens::TEXT_PRIMARY
+        tokens::get().text_primary
     }
 }
 
@@ -582,9 +582,9 @@ pub(super) fn hit(row: &Row, x: f64, y: f64) -> Option<SchedHit> {
 
 fn tone_ink(tone: Tone) -> [f32; 3] {
     match tone {
-        Tone::Muted => tokens::TEXT_TERTIARY,
-        Tone::Crit => tokens::CRIT_TEXT,
-        Tone::Info => tokens::INFO_TEXT,
+        Tone::Muted => tokens::get().text_tertiary,
+        Tone::Crit => tokens::get().crit_text,
+        Tone::Info => tokens::get().info_text,
     }
 }
 
@@ -615,8 +615,8 @@ fn draw_section(sh: &Shared, group: Group, count: usize, state: &SchedState, fra
     let cy = frame.y + frame.h / 2.0;
     let cx = frame.x + SECTION_CHEVRON_X;
     let chevron = if state.is_folded(group) { Icon::ChevronRight } else { Icon::ChevronDown };
-    stroke_icon(chevron, &Rect::new(cx, cy - CHEVRON / 2.0, CHEVRON, CHEVRON), CHEVRON, tokens::TEXT_TERTIARY, alpha);
-    let label_fg = if group == Group::NeedsAttention { tokens::CRIT_TEXT } else { tokens::TEXT_SECONDARY };
+    stroke_icon(chevron, &Rect::new(cx, cy - CHEVRON / 2.0, CHEVRON, CHEVRON), CHEVRON, tokens::get().text_tertiary, alpha);
+    let label_fg = if group == Group::NeedsAttention { tokens::get().crit_text } else { tokens::get().text_secondary };
     let x = frame.x + SECTION_LABEL_X;
     let w = draw_text_sh(sh, group.label(), &Rect::new(x, frame.y, frame.w, frame.h), Style::Chip, label_fg, alpha);
     let count_text = count.to_string();
@@ -625,7 +625,7 @@ fn draw_section(sh: &Shared, group: Group, count: usize, state: &SchedState, fra
         &count_text,
         &Rect::new(x + w + SECTION_COUNT_GAP, frame.y, frame.w, frame.h),
         Style::Chip,
-        tokens::TEXT_TERTIARY,
+        tokens::get().text_tertiary,
         alpha,
     );
     if let Some(note) = group.note() {
@@ -635,7 +635,7 @@ fn draw_section(sh: &Shared, group: Group, count: usize, state: &SchedState, fra
             note,
             &Rect::new(frame.right() - SECTION_PAD_X - w, frame.y, w, frame.h),
             Style::Hint,
-            tokens::TEXT_TERTIARY,
+            tokens::get().text_tertiary,
             alpha,
         );
     }
@@ -664,10 +664,10 @@ fn draw_routine(
     let row_hovered = hovered == ListHit::Sched(SchedHit::Row(index))
         || row.sched.iter().any(|(b, _, _)| hovered == hit(*b));
     if r.expanded {
-        fill_round(frame, OPEN_RADIUS, tokens::TILE, a);
-        stroke_round(frame, OPEN_RADIUS, 1.0, tokens::BORDER_SUBTLE, a);
+        fill_round(frame, OPEN_RADIUS, tokens::get().tile, a);
+        stroke_round(frame, OPEN_RADIUS, 1.0, tokens::get().border_subtle, a);
     } else if row_hovered {
-        fill_round(frame, ROW_RADIUS, tokens::TILE_HOVER, a);
+        fill_round(frame, ROW_RADIUS, tokens::get().tile_hover, a);
     }
     let cy = frame.y + ROW_H / 2.0;
     draw_glyph(r, frame.x + ROW_PAD_X + GLYPH_W / 2.0, cy, a);
@@ -682,13 +682,13 @@ fn draw_routine(
     } else if r.group != Group::Off && r.next_at.is_some() {
         let m = AppKitMetrics(sh);
         let w = m.width(&r.next_words, Style::Secondary).max(m.width(&r.in_words, Style::Number));
-        draw_text(sh, &r.next_words, &Rect::new(right - w, frame.y + 4.0, w, 16.0), Style::Secondary, tokens::TEXT_SECONDARY, a, Align::Right, false);
-        draw_text(sh, &r.in_words, &Rect::new(right - w, frame.y + 20.0, w, LINE_H), Style::Number, tokens::TEXT_TERTIARY, a, Align::Right, false);
+        draw_text(sh, &r.next_words, &Rect::new(right - w, frame.y + 4.0, w, 16.0), Style::Secondary, tokens::get().text_secondary, a, Align::Right, false);
+        draw_text(sh, &r.in_words, &Rect::new(right - w, frame.y + 20.0, w, LINE_H), Style::Number, tokens::get().text_tertiary, a, Align::Right, false);
         right -= w + 6.0;
     }
     let text_x = frame.x + TEXT_X;
     let text_w = (right - text_x).max(20.0);
-    draw_text(sh, &r.name, &Rect::new(text_x, frame.y + ROW_PAD_Y, text_w, LINE_H), Style::Title, tokens::TEXT_PRIMARY, a, Align::Left, false);
+    draw_text(sh, &r.name, &Rect::new(text_x, frame.y + ROW_PAD_Y, text_w, LINE_H), Style::Title, tokens::get().text_primary, a, Align::Left, false);
 
     let (line, tone) = match (state.busy_action(&r.name), state.error(&r.name)) {
         (Some(action), _) => (busy_words(action).to_string(), Tone::Muted),
@@ -705,10 +705,10 @@ fn draw_routine(
             let hovered_here = hovered == hit(*button);
             let pressed_here = pressed == hit(*button);
             if pressed_here || hovered_here {
-                fill_round(rect, BTN_RADIUS, tokens::WHITE, if pressed_here { 0.16 } else { 0.10 } * a);
+                fill_round(rect, BTN_RADIUS, tokens::get().white, if pressed_here { 0.16 } else { 0.10 } * a);
             }
             if let Some(icon) = button.icon() {
-                let fg = if button.crit() { tokens::CRIT_TEXT } else { tokens::TEXT_SECONDARY };
+                let fg = if button.crit() { tokens::get().crit_text } else { tokens::get().text_secondary };
                 stroke_icon(icon, rect, BTN_ICON, fg, a);
             }
         }
@@ -726,14 +726,14 @@ fn min_opt(acc: Option<f64>, x: f64) -> Option<f64> {
 fn draw_glyph(r: &RoutineVm, cx: f64, cy: f64, a: f64) {
     let box_ = Rect::new(cx - GLYPH_W / 2.0, cy - GLYPH_W / 2.0, GLYPH_W, GLYPH_W);
     let (icon, c) = match r.last_status {
-        _ if r.group == Group::Off => (Icon::Power, tokens::TEXT_TERTIARY),
-        LastStatus::Ok => (Icon::Check, tokens::OK_DOT),
-        LastStatus::Failed(_) => (Icon::XCircle, tokens::ERROR),
+        _ if r.group == Group::Off => (Icon::Power, tokens::get().text_tertiary),
+        LastStatus::Ok => (Icon::Check, tokens::get().ok_dot),
+        LastStatus::Failed(_) => (Icon::XCircle, tokens::get().error),
         LastStatus::Running => {
-            fill_dot(cx, cy, 8.0, tokens::WORKING, a);
+            fill_dot(cx, cy, 8.0, tokens::get().working, a);
             return;
         }
-        LastStatus::Never => (Icon::Ring, tokens::TEXT_TERTIARY),
+        LastStatus::Never => (Icon::Ring, tokens::get().text_tertiary),
     };
     stroke_icon(icon, &box_, GLYPH_D, c, a);
 }
@@ -745,10 +745,10 @@ fn draw_glyph(r: &RoutineVm, cx: f64, cy: f64, a: f64) {
 fn draw_body_button(sh: &Shared, button: SchedButton, r: &Rect, hovered: bool, pressed: bool, a: f64) {
     let crit = button.crit();
     if !crit {
-        let ground = if hovered || pressed { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
+        let ground = if hovered || pressed { tokens::get().tile_pressed } else { tokens::get().tile_hover };
         fill_round(r, BTN_RADIUS, ground, a);
     }
-    let fg = if crit { tokens::CRIT_TEXT } else { tokens::TEXT_PRIMARY };
+    let fg = if crit { tokens::get().crit_text } else { tokens::get().text_primary };
     let mut x = r.x + BODY_BTN_PAD;
     if let Some(icon) = button.icon() {
         let icon_box = Rect::new(x, r.y + (r.h - BODY_BTN_ICON) / 2.0, BODY_BTN_ICON, BODY_BTN_ICON);
@@ -775,7 +775,7 @@ fn draw_body(
     let body_w = body_width(frame);
     let mut y = frame.y + ROW_H + BODY_GAP;
     for (label, value) in body_rows(r) {
-        draw_text(sh, label, &Rect::new(body_x, y, KV_LABEL_W, KV_H), Style::Secondary, tokens::TEXT_TERTIARY, a, Align::Left, false);
+        draw_text(sh, label, &Rect::new(body_x, y, KV_LABEL_W, KV_H), Style::Secondary, tokens::get().text_tertiary, a, Align::Left, false);
         let ink = body_value_ink(label, r);
         draw_text(sh, &value, &Rect::new(body_x + KV_LABEL_W, y, (body_w - KV_LABEL_W).max(20.0), KV_H), Style::Secondary, ink, a, Align::Left, true);
         y += KV_H;
@@ -789,17 +789,17 @@ fn draw_body(
     let Some(box_) = row.sched_confirm else { return };
     // The confirmation: a crit wash, the question in bold, what it removes,
     // then Cancel and Delete (filled).
-    fill_round(&box_, 6.0, tokens::CRIT_TEXT, 0.12 * a);
-    stroke_round(&box_, 6.0, 1.0, tokens::CRIT_TEXT, 0.35 * a);
+    fill_round(&box_, 6.0, tokens::get().crit_text, 0.12 * a);
+    stroke_round(&box_, 6.0, 1.0, tokens::get().crit_text, 0.35 * a);
     let inner_x = box_.x + CONFIRM_PAD;
     let inner_w = (box_.w - 2.0 * CONFIRM_PAD).max(20.0);
-    draw_text(sh, &format!("Delete {}?", r.name), &Rect::new(inner_x, box_.y + CONFIRM_PAD, inner_w, CONFIRM_TITLE_H), Style::Title, tokens::TEXT_PRIMARY, a, Align::Left, false);
+    draw_text(sh, &format!("Delete {}?", r.name), &Rect::new(inner_x, box_.y + CONFIRM_PAD, inner_w, CONFIRM_TITLE_H), Style::Title, tokens::get().text_primary, a, Align::Left, false);
     draw_text(
         sh,
         "Removes its schedule and its prompt",
         &Rect::new(inner_x, box_.y + CONFIRM_PAD + CONFIRM_TITLE_H + CONFIRM_SUB_GAP, inner_w, CONFIRM_SUB_H),
         Style::Detail,
-        tokens::TEXT_TERTIARY,
+        tokens::get().text_tertiary,
         a,
         Align::Left,
         false,
@@ -811,14 +811,14 @@ fn draw_body(
         let hovered_here = hovered == hit(*button);
         let pressed_here = pressed == hit(*button);
         if *button == SchedButton::ConfirmDelete {
-            let ground = if hovered_here || pressed_here { tokens::CRIT_SOLID_HOVER } else { tokens::CRIT_SOLID };
+            let ground = if hovered_here || pressed_here { tokens::get().crit_solid_hover } else { tokens::get().crit_solid };
             fill_round(rect, BTN_RADIUS, ground, a);
-            draw_text(sh, button.label(), rect, Style::ChipStrong, tokens::TEXT_ON_FILL, 1.0, Align::Center, false);
+            draw_text(sh, button.label(), rect, Style::ChipStrong, tokens::get().text_on_fill, 1.0, Align::Center, false);
         } else {
             if hovered_here || pressed_here {
-                fill_round(rect, BTN_RADIUS, tokens::WHITE, if pressed_here { 0.16 } else { 0.10 } * a);
+                fill_round(rect, BTN_RADIUS, tokens::get().white, if pressed_here { 0.16 } else { 0.10 } * a);
             }
-            draw_text(sh, button.label(), rect, Style::Chip, tokens::TEXT_SECONDARY, a, Align::Center, false);
+            draw_text(sh, button.label(), rect, Style::Chip, tokens::get().text_secondary, a, Align::Center, false);
         }
     }
 }
@@ -1057,8 +1057,8 @@ mod tests {
     #[test]
     fn the_confirmation_deletes_in_the_solid_danger_colour() {
         // `#ED3726` solid, `#CC2314` under the mouse, white 11 semibold on it.
-        assert_eq!(tokens::CRIT_SOLID, [0.929, 0.216, 0.149]);
-        assert_eq!(tokens::CRIT_SOLID_HOVER, [0.800, 0.137, 0.078]);
+        assert_eq!(tokens::get().crit_solid, [0.929, 0.216, 0.149]);
+        assert_eq!(tokens::get().crit_solid_hover, [0.800, 0.137, 0.078]);
         assert_eq!(SchedButton::ConfirmDelete.style(), Style::ChipStrong);
         assert_eq!(SchedButton::ConfirmDelete.style().size(), 11.0);
         assert_eq!(
@@ -1075,11 +1075,11 @@ mod tests {
         let routines = fixture();
         let failed = index_of(&routines, "gamma-report");
         let ok = index_of(&routines, "alpha-digest");
-        assert_eq!(body_value_ink("Last run", &routines[failed]), tokens::CRIT_TEXT);
-        assert_eq!(body_value_ink("Last run", &routines[ok]), tokens::TEXT_PRIMARY);
+        assert_eq!(body_value_ink("Last run", &routines[failed]), tokens::get().crit_text);
+        assert_eq!(body_value_ink("Last run", &routines[ok]), tokens::get().text_primary);
         // Only that value: the rest of the grid keeps its ink.
-        assert_eq!(body_value_ink("Next", &routines[failed]), tokens::TEXT_PRIMARY);
-        assert_eq!(body_value_ink("Runs at", &routines[failed]), tokens::TEXT_PRIMARY);
+        assert_eq!(body_value_ink("Next", &routines[failed]), tokens::get().text_primary);
+        assert_eq!(body_value_ink("Runs at", &routines[failed]), tokens::get().text_primary);
     }
 
     #[test]
@@ -1173,7 +1173,7 @@ mod tests {
     fn the_home_directory_reads_as_a_tilde() {
         let home = std::env::var("HOME").unwrap();
         assert_eq!(short_home(&home), "~");
-        assert_eq!(short_home(&format!("{home}/Perso")), "~/Perso");
+        assert_eq!(short_home(&format!("{home}/project")), "~/project");
         assert_eq!(short_home("/run/alpha"), "/run/alpha");
     }
 }

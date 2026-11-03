@@ -1029,7 +1029,7 @@ mod tests {
     fn only_an_agent_running_the_routine_runner_counts() {
         let ours = json!({
             "Label": "com.example.routine.alpha-digest",
-            "ProgramArguments": ["/bin/bash", "/Users/x/.claude/routines/run-routine.sh", "alpha-digest", "/Users/x/Perso"],
+            "ProgramArguments": ["/bin/bash", "/Users/x/.claude/routines/run-routine.sh", "alpha-digest", "/Users/x/project"],
             "StartCalendarInterval": {"Hour": 10, "Minute": 2},
         });
         let parsed = parse_agent(&ours).expect("a routine");

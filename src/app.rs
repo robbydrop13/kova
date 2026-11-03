@@ -100,6 +100,8 @@ define_class!(
             let config = self.ivars().config.get().expect("config must be set before applicationDidFinishLaunching");
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
             window::sidebar::init(&config.layout);
+            window::sidebar::tokens::set_background(config.colors.background);
+            crate::team::set_command(&config.sidebar.roster_command);
             setup_menu(mtm, config);
 
             // Restore session (all windows) or create a single fresh window
@@ -1547,6 +1549,10 @@ fn handle_ipc_reload_config(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
 ) -> crate::ipc::IpcResponse {
     let config = Config::load();
+    // The sidebar follows the terminal background, and the roster command is
+    // read here too: both are re-picked on a reload, not only on a restart.
+    window::sidebar::tokens::set_background(config.colors.background);
+    crate::team::set_command(&config.sidebar.roster_command);
     let mut applied = 0usize;
     for win in windows.borrow().iter() {
         if let Some(view) = kova_view(win) {

@@ -99,6 +99,13 @@ dim_opacity = 0.3                     # how much an unfocused pane is faded (0.0
 dim_mode = "full"                     # "full" veils the whole pane, "text" fades only its glyphs
 focus_border_width = 2.0              # outline around the focused pane (only with 2+ panes on screen; never in a host app), 0.0 to disable
 focus_border_color = [0.4, 0.6, 1.0]
+
+[sidebar]
+# The team roster the sidebar's Agents view lists, as argv: the program, then
+# the words that print the roster as JSON. Absent or empty, the Team sections
+# are hidden and nothing is spawned. The sidebar itself follows the light or
+# dark set of the design system, picked from [colors] background.
+roster_command = ["/usr/local/bin/team", "list", "--json"]
 ```
 
 ### Keyboard shortcuts
