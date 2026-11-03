@@ -3015,10 +3015,10 @@ impl SidebarListView {
         let line = Rect::new(text_x, frame.y + TILE_PAD_V, (right - text_x).max(0.0), LINE_TITLE_H);
         let dot_cx = frame.x + TILE_PAD_H + GLYPH_BOX_W / 2.0;
         let cy = line.y + LINE_TITLE_H / 2.0;
-        if tile.state.neutral() {
-            let ring = if tile.focused { tokens::get().sel_row_text } else { tokens::get().text_tertiary };
-            stroke_ring(dot_cx, cy, GLYPH_D, 1.5, ring, alpha);
-        } else {
+        // Only a pane that needs the user keeps its dot (a question, an error):
+        // idle, working and unread said nothing the row does not already say
+        // (the state word, the unread dot on the right).
+        if matches!(tile.state, TileState::Awaiting | TileState::Error) {
             fill_dot(dot_cx, cy, GLYPH_D, tile.state.color(), alpha);
         }
 

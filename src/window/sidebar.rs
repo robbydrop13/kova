@@ -453,10 +453,6 @@ impl TileState {
         }
     }
 
-    /// Idle and shell tiles: grey, and their glyph is a hollow ring.
-    pub fn neutral(self) -> bool {
-        matches!(self, TileState::Idle | TileState::Shell)
-    }
 }
 
 /// What a collapsed header says about its panes: dots for the awaiting and
@@ -950,7 +946,6 @@ mod tests {
         assert_eq!(TileState::from_flags(PaneFlags { starting: true, idle_agent: true, ..PaneFlags::default() }), Starting);
         assert_eq!(TileState::from_flags(PaneFlags { idle_agent: true, ..PaneFlags::default() }), Idle);
         assert_eq!(TileState::from_flags(PaneFlags::default()), Shell);
-        assert!(Idle.neutral() && Shell.neutral() && !Working.neutral());
         assert_eq!(Unread(UnreadKind::Bell).chip(), "bell");
         assert_eq!(Unread(UnreadKind::Manual).chip(), "unread");
         assert_eq!(Working.color(), tokens::get().working);

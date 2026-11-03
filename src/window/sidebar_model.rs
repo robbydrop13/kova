@@ -459,6 +459,10 @@ impl TileVm {
     /// otherwise. An awaiting pane says `waiting 4m · Answer` on its subtitle
     /// instead (`waiting`), so its meta column stays empty.
     pub fn meta(&self) -> Option<String> {
+        // A minimized pane is out of the way: no state word on its row.
+        if self.minimized {
+            return None;
+        }
         match self.state {
             TileState::Working | TileState::Starting => Some(self.state.chip().to_string()),
             _ => None,
@@ -700,6 +704,10 @@ mod tests {
         assert_eq!(working.meta().as_deref(), Some("working"));
         let idle = TileVm::from_facts(&pane(5, PaneFlags { idle_agent: true, ..PaneFlags::default() }));
         assert_eq!(idle.meta(), None);
+        // A minimized pane keeps quiet, starting or not.
+        let mut folded = pane(6, PaneFlags { starting: true, ..PaneFlags::default() });
+        folded.minimized = true;
+        assert_eq!(TileVm::from_facts(&folded).meta(), None);
 
         // The turn-end summary only shows on an unread tile.
         let mut f = pane(2, PaneFlags { turn_end_unseen: true, ..PaneFlags::default() });
