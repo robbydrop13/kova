@@ -136,6 +136,13 @@ pub(super) struct SidebarState {
     pub(super) waits_on_you: u32,
     /// A scheduled routine's last run failed, the badge on the Scheduled icon.
     pub(super) routine_failed: bool,
+    /// `Show all` on the `Needs you` block: every row rather than the four
+    /// it folds to.
+    pub(super) needs_all: bool,
+    /// The ask a need row landed on: the Asks list draws that card lit. K11
+    /// reads it; nothing paints it yet.
+    #[allow(dead_code)]
+    pub(super) highlight_ask: Option<String>,
     /// The failed routine Cmd+J already showed, so it shows it once rather
     /// than on every press until the routine runs clean again.
     pub(super) routine_shown: Option<String>,
@@ -153,6 +160,8 @@ impl SidebarState {
             needs: Vec::new(),
             waits_on_you: 0,
             routine_failed: false,
+            needs_all: false,
+            highlight_ask: None,
             routine_shown: None,
         }
     }
@@ -281,10 +290,16 @@ impl KovaView {
                     if pane.is_working() {
                         return;
                     }
-                    let (error_since, permission_since) =
+                    let (error_since, permission_since, detail) =
                         match pane.prompt_preview.borrow().as_ref() {
-                            Some(PromptPreview::ApiError { since, .. }) => (Some(*since), None),
-                            Some(PromptPreview::Permission { since, .. }) => (None, Some(*since)),
+                            Some(PromptPreview::ApiError { since, kind, text, .. }) => (
+                                Some(*since),
+                                None,
+                                Some(if text.is_empty() { kind.clone() } else { text.clone() }),
+                            ),
+                            Some(PromptPreview::Permission { since, header, detail, .. }) => {
+                                (None, Some(*since), Some(detail.clone().unwrap_or_else(|| header.clone())))
+                            }
                             _ => return,
                         };
                     panes.push(PaneNeed {
@@ -292,6 +307,7 @@ impl KovaView {
                         error_since,
                         permission_since,
                         title: pane.display_title("Shell"),
+                        detail,
                     });
                 });
             }
@@ -326,6 +342,7 @@ impl KovaView {
                 // The board only holds what nobody answered.
                 answered: false,
                 title: first_line(&question.message),
+                detail: Some(rest_of(&question.message)),
             });
         });
         NeedInput { panes, routines, asks, now }
@@ -342,10 +359,11 @@ impl KovaView {
         }
         // The unread count across every window, for the Next pill.
         let unread = sidebar::unread_count(&self.collect_unread());
-        let (sort, list, waits_on_you, routine_failed) = {
+        let (sort, list, waits_on_you, routine_failed, needs, needs_all) = {
             let st = self.ivars().sidebar.borrow();
-            (st.sort, st.list, st.waits_on_you, st.routine_failed)
+            (st.sort, st.list, st.waits_on_you, st.routine_failed, st.needs.clone(), st.needs_all)
         };
+        let now = now_epoch_secs();
         let facts = self.sidebar_tab_facts();
         // Only the Scheduled list needs the rows; the read itself already
         // happens every tick in `sync_needs`, which is where the badges come
@@ -358,9 +376,10 @@ impl KovaView {
             }
             SidebarList::Panes | SidebarList::Asks | SidebarList::Agents => None,
         };
-        let mut model = SidebarModel::build(&facts, sort, unread, now_epoch_secs(), list, routines);
+        let mut model = SidebarModel::build(&facts, sort, unread, list, routines);
         model.asks_waiting = waits_on_you;
         model.routine_failed = routine_failed;
+        model.apply_needs(&needs, now, needs_all);
         view.set_model(model);
 
         // Follow the focus: reveal the focused pane's tile (its header when
@@ -497,6 +516,43 @@ impl KovaView {
             Some(open) if open == name => None,
             _ => Some(name.to_string()),
         };
+    }
+
+    /// `Show all` / `Show less` on the `Needs you` block.
+    pub(super) fn sidebar_toggle_needs_all(&self) {
+        let mut st = self.ivars().sidebar.borrow_mut();
+        st.needs_all = !st.needs_all;
+    }
+
+    /// A row of the `Needs you` block, by its stable key: an error focuses
+    /// its pane, a failed routine opens it in the Scheduled list, an ask or
+    /// a permission opens the Asks list on its card.
+    pub(super) fn sidebar_open_need(&self, key: &str) {
+        let item = {
+            let st = self.ivars().sidebar.borrow();
+            st.needs.iter().find(|item| item.key == key).cloned()
+        };
+        let Some(item) = item else { return };
+        match item.kind {
+            NeedKind::Error => {
+                if let Some(pane_id) = item.pane_id.and_then(|id| PaneId::try_from(id).ok()) {
+                    focus_pane_anywhere(pane_id);
+                }
+            }
+            NeedKind::FailedRoutine => {
+                let mut st = self.ivars().sidebar.borrow_mut();
+                st.list = SidebarList::Scheduled;
+                st.open_routine = Some(item.title);
+            }
+            NeedKind::Ask | NeedKind::Permission => {
+                let mut st = self.ivars().sidebar.borrow_mut();
+                st.list = SidebarList::Asks;
+                st.highlight_ask = match item.kind {
+                    NeedKind::Ask => item.key.strip_prefix("ask:").map(str::to_string),
+                    _ => None,
+                };
+            }
+        }
     }
 
     /// The Next pill: `Nothing to read` is not a button, only a pill with a
@@ -896,6 +952,34 @@ fn now_epoch_secs() -> u64 {
 /// draws: a markdown body would otherwise push everything else out.
 fn first_line(text: &str) -> String {
     text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_string()
+}
+
+/// What a question says after its first line: the row's detail under the
+/// title `first_line` takes. Empty when the question is one line.
+fn rest_of(text: &str) -> String {
+    let mut rest = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    rest.next();
+    rest.next().unwrap_or_default().to_string()
+}
+
+/// Focus a pane wherever it lives. A need item belongs to the app, not to
+/// one window (the sidebar lists every window's errors), so the click brings
+/// the window that holds the pane forward and lets it switch to the tab.
+/// Like `attention::focus_pane_in_any_window` without the big directory
+/// overlay: a click in the sidebar already says where it goes.
+fn focus_pane_anywhere(pane_id: PaneId) {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    for i in 0..ns_windows.count() {
+        let win = ns_windows.objectAtIndex(i);
+        let Some(view) = crate::app::kova_view(&win) else { continue };
+        if view.ipc_focus_pane(pane_id) {
+            win.makeKeyAndOrderFront(None);
+            return;
+        }
+    }
+    log::debug!("focus_pane_anywhere: pane {} not found", pane_id);
 }
 
 /// The flags a pane's tile state is derived from. `seen` is true for the

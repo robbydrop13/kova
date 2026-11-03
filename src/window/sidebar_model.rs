@@ -4,9 +4,10 @@
 //! `Pane` happen in `sidebar_ui.rs` (`PaneFacts`, `TabFacts`); everything from
 //! the facts to the model is pure and tested here.
 
+use super::needs::{NeedItem, NeedKind};
 use super::sidebar::{
     display_order, format_age, summary_runs, CollapsedSummary, NextPill, PaneFlags, SidebarSort,
-    SummaryRun, TileState, AGING_SECS,
+    SummaryRun, TileState,
 };
 #[cfg(test)]
 use super::sidebar::UnreadKind;
@@ -120,6 +121,52 @@ impl RoutineVm {
     }
 }
 
+/// One row of the `Needs you` block: what waits, in need order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NeedRowVm {
+    pub kind: NeedKind,
+    /// `pane:12`, `routine:<name>`, `ask:<id>`: what a click opens.
+    pub key: String,
+    pub pane_id: Option<PaneId>,
+    /// The pane, session or job the row is about.
+    pub title: String,
+    /// The line under the title: the provider's words, the command a
+    /// permission wants, the rest of a question. Empty when there is none.
+    pub detail: String,
+    /// `4m`: how long it waits. The block never grows old between two ticks.
+    pub age: String,
+}
+
+/// The block's rows at `now`, in need order.
+pub fn need_rows(items: &[NeedItem], now: u64) -> Vec<NeedRowVm> {
+    items
+        .iter()
+        .map(|item| NeedRowVm {
+            kind: item.kind,
+            key: item.key.clone(),
+            pane_id: item.pane_id.and_then(|id| PaneId::try_from(id).ok()),
+            title: item.title.clone(),
+            detail: item.detail.clone(),
+            age: format_age(now.saturating_sub(item.since)),
+        })
+        .collect()
+}
+
+/// How many rows the block shows: every error and failed routine, then the
+/// asks and permissions filling up to four rows, two of them at least. `all`
+/// is the `Show all` state, which shows every row.
+pub fn need_rows_shown(needs: &[NeedRowVm], all: bool) -> usize {
+    if all {
+        return needs.len();
+    }
+    let head = needs
+        .iter()
+        .filter(|row| matches!(row.kind, NeedKind::Error | NeedKind::FailedRoutine))
+        .count();
+    let tail = needs.len() - head;
+    head + tail.min(4usize.saturating_sub(head).max(2))
+}
+
 /// Everything the sidebar shows for one window.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarModel {
@@ -142,6 +189,11 @@ pub struct SidebarModel {
     pub pill: NextPill,
     /// The groups in display order.
     pub groups: Vec<GroupVm>,
+    /// The `Needs you` block's rows, in need order. `build` leaves it empty;
+    /// `apply_needs` fills it, with the tiles' `waiting` line.
+    pub needs: Vec<NeedRowVm>,
+    /// `Show all`: the block lists every row rather than the four it folds to.
+    pub needs_all: bool,
     /// Fewer than three panes in the window: show the `⌘T new tab · ⌘D split` hint.
     pub show_hint: bool,
 }
@@ -194,8 +246,10 @@ pub struct TileVm {
     pub detail: Option<String>,
     /// Unread tile: the first line of Claude's last answer.
     pub summary: Option<String>,
-    /// Awaiting tile: `4m` and whether it is old enough to go red.
-    pub age: Option<(String, bool)>,
+    /// A pane with an open ask or a permission prompt: the age word (`4m`)
+    /// its subtitle shows as `waiting 4m · Answer`. `apply_needs` fills it,
+    /// from the one need item that pane has.
+    pub waiting: Option<String>,
 }
 
 /// The reads of one `Pane` the model needs.
@@ -321,18 +375,15 @@ fn error_subtitle(kind: &str, text: &str) -> String {
 }
 
 impl TileVm {
-    pub fn from_facts(f: &PaneFacts, now: u64) -> Self {
+    pub fn from_facts(f: &PaneFacts) -> Self {
         let state = TileState::from_flags(f.flags);
         let mut question = None;
         let mut detail = None;
         let mut summary = None;
-        let mut age = None;
         match (state, f.preview.as_ref()) {
-            (TileState::Awaiting, Some(PromptPreview::Permission { header, question: q, detail: d, since, .. })) => {
+            (TileState::Awaiting, Some(PromptPreview::Permission { header, question: q, detail: d, .. })) => {
                 question = Some(q.clone());
                 detail = Some(d.clone().unwrap_or_else(|| header.clone()));
-                let secs = now.saturating_sub(*since);
-                age = Some((format_age(secs), secs >= AGING_SECS));
             }
             (TileState::Unread(_), Some(PromptPreview::TurnEnd { summary: s, .. })) if !s.is_empty() => {
                 summary = Some(s.clone());
@@ -368,20 +419,17 @@ impl TileVm {
             question,
             detail,
             summary,
-            age,
+            waiting: None,
         }
     }
 
-    /// The tile's right column: `waiting 4m` for an awaiting pane, the state
-    /// word while it works, its age otherwise. `None` when there is nothing
-    /// to say.
+    /// The tile's right column: the state word while it works, nothing
+    /// otherwise. An awaiting pane says `waiting 4m · Answer` on its subtitle
+    /// instead (`waiting`), so its meta column stays empty.
     pub fn meta(&self) -> Option<String> {
         match self.state {
-            TileState::Awaiting => {
-                Some(self.age.as_ref().map_or_else(|| self.state.chip().to_string(), |(age, _)| format!("waiting {age}")))
-            }
             TileState::Working | TileState::Starting => Some(self.state.chip().to_string()),
-            _ => self.age.as_ref().map(|(age, _)| age.clone()),
+            _ => None,
         }
     }
 }
@@ -410,7 +458,6 @@ impl SidebarModel {
         tabs: &[TabFacts],
         sort: SidebarSort,
         unread: usize,
-        now: u64,
         view: SidebarList,
         routines: Option<Vec<RoutineVm>>,
     ) -> Self {
@@ -440,7 +487,7 @@ impl SidebarModel {
                 let tiles = if tab.collapsed {
                     Vec::new()
                 } else {
-                    tab.panes.iter().map(|p| TileVm::from_facts(p, now)).collect()
+                    tab.panes.iter().map(TileVm::from_facts).collect()
                 };
                 GroupVm {
                     tab_idx: tab.tab_idx,
@@ -467,7 +514,28 @@ impl SidebarModel {
             sort,
             pill: NextPill::of(unread),
             groups,
+            needs: Vec::new(),
+            needs_all: false,
             show_hint: total_panes < 3,
+        }
+    }
+
+    /// Fill the `Needs you` block and, for every pane with an open ask or a
+    /// permission prompt, the age its tile's subtitle shows. `items` is the
+    /// tick's `needs::need_items`: the same list the badges and Next read.
+    pub fn apply_needs(&mut self, items: &[NeedItem], now: u64, all: bool) {
+        self.needs = need_rows(items, now);
+        self.needs_all = all;
+        for group in &mut self.groups {
+            for tile in &mut group.tiles {
+                tile.waiting = items
+                    .iter()
+                    .find(|item| {
+                        item.pane_id == Some(u64::from(tile.pane_id))
+                            && matches!(item.kind, NeedKind::Ask | NeedKind::Permission)
+                    })
+                    .map(|item| format_age(now.saturating_sub(item.since)));
+            }
         }
     }
 }
@@ -587,33 +655,35 @@ mod tests {
             since: 1000,
             seen: false,
         });
-        let t = TileVm::from_facts(&f, 1000 + 700);
+        let t = TileVm::from_facts(&f);
         assert_eq!(t.state, TileState::Awaiting);
         assert_eq!(t.title, "pane 1");
         assert_eq!(t.secondary, "link");
         assert_eq!(t.question.as_deref(), Some("Run it?"));
         // No detail: the header stands in.
         assert_eq!(t.detail.as_deref(), Some("Bash command"));
-        assert_eq!(t.age, Some(("11m".into(), true)));
-        assert_eq!(t.meta().as_deref(), Some("waiting 11m"));
+        // The age is the need block's business (`apply_needs`), and the meta
+        // column is empty: the subtitle says `waiting 4m · Answer`.
+        assert_eq!(t.waiting, None);
+        assert_eq!(t.meta(), None);
         assert_eq!(t.summary, None);
 
         // Working tiles say so; idle ones have nothing to add.
-        let working = TileVm::from_facts(&pane(4, PaneFlags { working: true, ..PaneFlags::default() }), 0);
+        let working = TileVm::from_facts(&pane(4, PaneFlags { working: true, ..PaneFlags::default() }));
         assert_eq!(working.meta().as_deref(), Some("working"));
-        let idle = TileVm::from_facts(&pane(5, PaneFlags { idle_agent: true, ..PaneFlags::default() }), 0);
+        let idle = TileVm::from_facts(&pane(5, PaneFlags { idle_agent: true, ..PaneFlags::default() }));
         assert_eq!(idle.meta(), None);
 
         // The turn-end summary only shows on an unread tile.
         let mut f = pane(2, PaneFlags { turn_end_unseen: true, ..PaneFlags::default() });
         f.preview = Some(PromptPreview::TurnEnd { summary: "Pushed the copy".into(), seen: false });
-        let t = TileVm::from_facts(&f, 0);
+        let t = TileVm::from_facts(&f);
         assert_eq!(t.state, TileState::Unread(UnreadKind::Done));
         assert_eq!(t.summary.as_deref(), Some("Pushed the copy"));
-        assert_eq!(t.age, None);
+        assert_eq!(t.waiting, None);
         let mut f = pane(3, PaneFlags { turn_end_unseen: true, seen: true, idle_agent: true, ..PaneFlags::default() });
         f.preview = Some(PromptPreview::TurnEnd { summary: "Pushed the copy".into(), seen: true });
-        let t = TileVm::from_facts(&f, 0);
+        let t = TileVm::from_facts(&f);
         assert_eq!(t.state, TileState::Idle);
         assert_eq!(t.summary, None);
     }
@@ -627,7 +697,7 @@ mod tests {
             since: 1,
             seen: false,
         });
-        let t = TileVm::from_facts(&f, 0);
+        let t = TileVm::from_facts(&f);
         assert_eq!(t.state, TileState::Error);
         assert_eq!(t.title, "pane 6");
         assert_eq!(t.secondary, "Limit reached · You've hit your session limit");
@@ -635,7 +705,7 @@ mod tests {
         // A turn in flight hides it, subtitle and all.
         let mut busy = f.clone();
         busy.flags.working = true;
-        let t = TileVm::from_facts(&busy, 0);
+        let t = TileVm::from_facts(&busy);
         assert_eq!(t.state, TileState::Working);
         assert_eq!(t.secondary, "link");
     }
@@ -699,7 +769,7 @@ mod tests {
             cwd: "/Users/me/Projects/Acme".into(),
             ..PaneFacts::default()
         };
-        let t = TileVm::from_facts(&restored, 0);
+        let t = TileVm::from_facts(&restored);
         assert_eq!(t.state, TileState::Shell);
         assert!(t.resumable);
         assert!(!t.bare_shell);
@@ -709,7 +779,7 @@ mod tests {
 
         // A plain shell: `shell` chip and `Start Claude`.
         let bare = PaneFacts { pane_id: 2, bare_shell: true, cwd: "/Users/me/link".into(), ..PaneFacts::default() };
-        let t = TileVm::from_facts(&bare, 0);
+        let t = TileVm::from_facts(&bare);
         assert!(t.bare_shell);
         assert!(!t.resumable);
         assert_eq!(t.meta(), None);
@@ -725,7 +795,7 @@ mod tests {
             cwd: "/Users/me/kova".into(),
             ..PaneFacts::default()
         };
-        let t = TileVm::from_facts(&live, 0);
+        let t = TileVm::from_facts(&live);
         assert_eq!(t.meta(), None);
         assert_eq!(t.title, "Sidebar identity");
         assert_eq!(t.secondary, "kova");
@@ -734,7 +804,7 @@ mod tests {
         // Renaming: the edit buffer is the title.
         let mut renaming = live.clone();
         renaming.edit = Some("Side\u{258f}".into());
-        let t = TileVm::from_facts(&renaming, 0);
+        let t = TileVm::from_facts(&renaming);
         assert_eq!(t.title, "Side\u{258f}");
         assert!(t.renaming);
     }
@@ -747,7 +817,7 @@ mod tests {
             tab(0, vec![pane(1, PaneFlags { permission_prompt: true, ..PaneFlags::default() }), pane(2, PaneFlags { idle_agent: true, ..PaneFlags::default() })]),
             folded,
         ];
-        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, 0, SidebarList::default(), None);
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, SidebarList::default(), None);
         let text: String = m.summary.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(text, "1 waiting \u{b7} 1 working \u{b7} 1 idle");
         assert_eq!(m.pill, NextPill::Next(2));
@@ -767,11 +837,11 @@ mod tests {
             tab(0, vec![pane(1, PaneFlags::default())]),
             tab(1, vec![pane(2, PaneFlags { permission_prompt: true, ..PaneFlags::default() })]),
         ];
-        let m = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0, SidebarList::default(), None);
+        let m = SidebarModel::build(&tabs, SidebarSort::Activity, 0, SidebarList::default(), None);
         assert_eq!(m.groups.iter().map(|g| g.tab_idx).collect::<Vec<_>>(), vec![1, 0]);
         assert_eq!(m.pill, NextPill::Nothing);
         assert!(m.show_hint);
-        let same = SidebarModel::build(&tabs, SidebarSort::Activity, 0, 0, SidebarList::default(), None);
+        let same = SidebarModel::build(&tabs, SidebarSort::Activity, 0, SidebarList::default(), None);
         assert_eq!(m, same);
     }
 
@@ -793,7 +863,7 @@ mod tests {
         assert_eq!(unread(kova), vec![2, 5, 6]);
         // Activity order: the awaiting tab first.
         assert_eq!(unread(pane_order(&tabs, SidebarSort::Activity)), vec![5, 6, 2]);
-        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 3, 0, SidebarList::default(), None);
+        let m = SidebarModel::build(&tabs, SidebarSort::Kova, 3, SidebarList::default(), None);
         assert!(m.groups[0].tiles[1].unread && !m.groups[0].tiles[0].unread);
         assert!(m.groups[1].tiles[1].unread);
     }

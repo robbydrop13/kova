@@ -28,11 +28,12 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSAffineTransform, NSDictionary, NSObjectProtocol, NSString};
 
 use super::feather::{self, Icon};
+use super::needs::NeedKind;
 use super::sidebar::{
     self, displacements, drag_bounds, next_slot, placeholder_y, tab_tint, tokens, NextPill, SidebarSort, Slot,
     SummaryRun, TileButton, TileState, RESUME_LABEL, START_CLAUDE_LABEL,
 };
-use super::sidebar_model::{GroupVm, RoutineVm, SidebarList, SidebarModel, TileVm};
+use super::sidebar_model::{need_rows_shown, GroupVm, NeedRowVm, RoutineVm, SidebarList, SidebarModel, TileVm};
 use super::sidebar_ui::{PaneAction, TabAction};
 use super::KovaView;
 use crate::pane::{PaneId, TabId};
@@ -181,6 +182,30 @@ const DRAG_THRESHOLD: f64 = 3.0;
 const GHOST_SCALE: f64 = 1.02;
 const GHOST_ALPHA: f64 = 0.94;
 
+// --- the `Needs you` block, above the groups ---
+/// The card: a raised ground with a border, its padding, and the gap under
+/// it before the groups.
+const NEED_RADIUS: f64 = 8.0;
+const NEED_PAD_TOP: f64 = 4.0;
+const NEED_PAD_BOTTOM: f64 = 6.0;
+const NEED_PAD_H: f64 = 4.0;
+const NEED_MARGIN_B: f64 = 10.0;
+/// The header line: `Needs you` on the left, the counts at the right.
+const NEED_HEADER_H: f64 = 20.0;
+/// One need: a 28 pt row, 6 pt either side of its content.
+const NEED_ROW_H: f64 = 28.0;
+const NEED_ROW_RADIUS: f64 = 6.0;
+const NEED_ROW_PAD_H: f64 = 6.0;
+/// Title to detail, and the room the age keeps at the right.
+const NEED_GAP: f64 = 8.0;
+/// The `Show all` / `Show less` ghost button.
+const NEED_BUTTON_H: f64 = 22.0;
+/// Below this list width the detail column is dropped and the title takes
+/// the room: three columns do not fit a narrow sidebar.
+const NEED_DETAIL_MIN_W: f64 = 280.0;
+const NEED_TITLE: &str = "Needs you";
+const NEED_ANSWER: &str = "Answer";
+
 // ---------------------------------------------------------------
 // Text styles
 // ---------------------------------------------------------------
@@ -303,6 +328,10 @@ pub enum RowKind {
     Tile { group: usize, index: usize, pane_id: PaneId, column: usize },
     /// One routine of the scheduled view.
     Routine { index: usize },
+    /// One row of the `Needs you` block, by its index in `model.needs`.
+    Need { index: usize },
+    /// The block's `Show all` / `Show less` ghost button.
+    NeedAll,
 }
 
 /// One laid-out row, in list (document) coordinates.
@@ -318,6 +347,11 @@ pub struct Row {
     /// Routine: lines the open prompt takes. Tiles carry none: their
     /// question is not part of the row any more.
     pub question_lines: usize,
+    /// Need: the detail column, zero width when the list is too narrow.
+    pub detail: Rect,
+    /// Tile of a pane with an open ask or permission prompt: the `Answer`
+    /// link on its subtitle line.
+    pub answer: Option<Rect>,
 }
 
 /// What a point of the list lands on.
@@ -339,6 +373,13 @@ pub enum ListHit {
     Panel(usize),
     /// A routine row: open it, or close it when it is already open.
     Routine(usize),
+    /// One row of the `Needs you` block: land on what it names.
+    Need(usize),
+    /// The block's `Show all` / `Show less` button.
+    NeedAll,
+    /// The `Answer` link of a waiting tile: the same landing as the pane's
+    /// ask row.
+    NeedAnswer(PaneId),
     Empty,
 }
 
@@ -355,7 +396,10 @@ fn arms_press(hit: ListHit) -> bool {
         | ListHit::HeaderAdd(_)
         | ListHit::TileButton(..)
         | ListHit::Panel(_)
-        | ListHit::Routine(_) => true,
+        | ListHit::Routine(_)
+        | ListHit::Need(_)
+        | ListHit::NeedAll
+        | ListHit::NeedAnswer(_) => true,
         // Headers and tiles arm themselves: they may become a drag instead.
         ListHit::Header(_) | ListHit::Tile(_) | ListHit::Empty => false,
     }
@@ -364,7 +408,7 @@ fn arms_press(hit: ListHit) -> bool {
 impl ListHit {
     pub fn pane(self) -> Option<PaneId> {
         match self {
-            ListHit::Tile(id) | ListHit::TileButton(id, _) => Some(id),
+            ListHit::Tile(id) | ListHit::TileButton(id, _) | ListHit::NeedAnswer(id) => Some(id),
             _ => None,
         }
     }
@@ -388,6 +432,10 @@ pub struct ListLayout {
     pub groups: Vec<Rect>,
     pub hint_y: Option<f64>,
     pub content_h: f64,
+    /// The `Needs you` card at the top of the Panes list, when it has rows.
+    pub needs_card: Option<Rect>,
+    /// Its header line: the title on the left, the counts on the right.
+    pub needs_header: Option<Rect>,
 }
 
 /// The one line the list draws under its rows, in the empty-state slot: the
@@ -414,7 +462,7 @@ impl ListLayout {
             // the empty routines list already borrows.
             y += HINT_H;
             y += LIST_BOTTOM;
-            return ListLayout { width, rows, groups, hint_y: Some(LIST_TOP), content_h: y };
+            return ListLayout { width, rows, groups, hint_y: Some(LIST_TOP), content_h: y, ..Default::default() };
         }
         if model.view == SidebarList::Scheduled {
             // A flat list: no groups, no drag, no tint bars. The empty case
@@ -438,6 +486,8 @@ impl ListLayout {
                     glyphs: Vec::new(),
                     actions: Vec::new(),
                     question_lines: prompt_lines,
+                    detail: Rect::default(),
+                    answer: None,
                 });
                 y += h;
             }
@@ -447,7 +497,42 @@ impl ListLayout {
                 hy
             });
             y += LIST_BOTTOM;
-            return ListLayout { width, rows, groups, hint_y, content_h: y };
+            return ListLayout { width, rows, groups, hint_y, content_h: y, ..Default::default() };
+        }
+        // The `Needs you` block: the first thing in the list, above the
+        // groups, and it scrolls with them.
+        let mut needs_card = None;
+        let mut needs_header = None;
+        if model.view == SidebarList::Panes && !model.needs.is_empty() {
+            let card_top = y;
+            let inner_x = x0 + NEED_PAD_H;
+            let inner_w = (x1 - x0) - 2.0 * NEED_PAD_H;
+            y += NEED_PAD_TOP;
+            let header = Rect::new(inner_x, y, inner_w, NEED_HEADER_H);
+            y += NEED_HEADER_H;
+            let shown = need_rows_shown(&model.needs, model.needs_all);
+            for (i, need) in model.needs.iter().enumerate().take(shown) {
+                rows.push(need_row(i, need, inner_x, y, inner_w, width, m));
+                y += NEED_ROW_H;
+            }
+            // The button stays once anything would be folded away: it is the
+            // only way back down from `Show all`.
+            if need_rows_shown(&model.needs, false) < model.needs.len() {
+                rows.push(Row {
+                    kind: RowKind::NeedAll,
+                    frame: Rect::new(inner_x, y, inner_w, NEED_BUTTON_H),
+                    glyphs: Vec::new(),
+                    actions: Vec::new(),
+                    question_lines: 0,
+                    detail: Rect::default(),
+                    answer: None,
+                });
+                y += NEED_BUTTON_H;
+            }
+            y += NEED_PAD_BOTTOM;
+            needs_card = Some(Rect::new(x0, card_top, x1 - x0, y - card_top));
+            needs_header = Some(header);
+            y += NEED_MARGIN_B;
         }
         for (gi, g) in model.groups.iter().enumerate() {
             if gi > 0 {
@@ -464,6 +549,8 @@ impl ListLayout {
                 glyphs: Vec::new(),
                 actions: Vec::new(),
                 question_lines: 0,
+                detail: Rect::default(),
+                answer: None,
             });
             y += HEADER_H;
             for (ti, tile) in g.tiles.iter().enumerate() {
@@ -484,7 +571,7 @@ impl ListLayout {
             hy
         });
         y += LIST_BOTTOM;
-        ListLayout { width, rows, groups, hint_y, content_h: y }
+        ListLayout { width, rows, groups, hint_y, content_h: y, needs_card, needs_header }
     }
 
     /// The `+` button of a header row.
@@ -524,6 +611,10 @@ impl ListLayout {
                 // The only thing a routine row does: open its body. It never
                 // runs or stops anything — launchctl stays that door.
                 RowKind::Routine { index } => ListHit::Routine(index),
+                // A need row lands on what it names: the pane, the routine,
+                // the ask card.
+                RowKind::Need { index } => ListHit::Need(index),
+                RowKind::NeedAll => ListHit::NeedAll,
                 RowKind::Header { group } => {
                     if x < row.frame.x + CHEVRON_ZONE_W {
                         ListHit::Chevron(group)
@@ -536,10 +627,13 @@ impl ListLayout {
                     }
                 }
                 RowKind::Tile { pane_id, .. } => {
-                    for (b, r) in row.glyphs.iter().chain(row.actions.iter()) {
-                        if r.contains(x, y) {
-                            return ListHit::TileButton(pane_id, *b);
+                    for (button, rect) in row.glyphs.iter().chain(row.actions.iter()) {
+                        if rect.contains(x, y) {
+                            return ListHit::TileButton(pane_id, *button);
                         }
+                    }
+                    if row.answer.is_some_and(|rect| rect.contains(x, y)) {
+                        return ListHit::NeedAnswer(pane_id);
                     }
                     ListHit::Tile(pane_id)
                 }
@@ -704,13 +798,90 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
         let call_w = link_w(m, label);
         actions.push((button, Rect::new(right - call_w, y + TILE_PAD_V + LINE_TITLE_H, call_w, LINE_SEC_H)));
     }
+    // A waiting pane's `Answer` link: the subtitle line's right end, where
+    // the row's need lands (the same target as its ask row).
+    let answer = tile.waiting.as_ref().map(|_| {
+        Rect::new(right - m.width(NEED_ANSWER, Style::Link), y + TILE_PAD_V + LINE_TITLE_H, m.width(NEED_ANSWER, Style::Link), LINE_SEC_H)
+    });
     Row {
         kind: RowKind::Tile { group, index, pane_id: tile.pane_id, column: tile.column },
         frame: Rect::new(x, y, w, h),
         glyphs,
         actions,
         question_lines: 0,
+        detail: Rect::default(),
+        answer,
     }
+}
+
+/// Lay out one row of the `Needs you` block: the state dot, the title, the
+/// detail (dropped below `NEED_DETAIL_MIN_W`) and the age at the right.
+fn need_row(index: usize, need: &NeedRowVm, x: f64, y: f64, w: f64, list_w: f64, m: &dyn TextMetrics) -> Row {
+    let text_x = x + NEED_ROW_PAD_H + GLYPH_BOX_W;
+    let right = x + w - NEED_ROW_PAD_H;
+    let age_w = m.width(&need.age, Style::Number);
+    let detail = if list_w >= NEED_DETAIL_MIN_W && !need.detail.is_empty() {
+        let text_right = right - age_w - NEED_GAP;
+        let room = (text_right - text_x).max(0.0);
+        // The title never takes more than half: the detail is why the row is
+        // there (the command, the error, the question).
+        let title_w = m.width(&need.title, Style::Title).min(room * 0.5);
+        let dx = text_x + title_w + NEED_GAP;
+        Rect::new(dx, y, (text_right - dx).max(0.0), NEED_ROW_H)
+    } else {
+        Rect::default()
+    };
+    Row {
+        kind: RowKind::Need { index },
+        frame: Rect::new(x, y, w, NEED_ROW_H),
+        glyphs: Vec::new(),
+        actions: Vec::new(),
+        question_lines: 0,
+        detail,
+        answer: None,
+    }
+}
+
+/// One run of the block's header counts, so each is coloured apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NeedTally {
+    /// Asks and permissions: an agent is blocked on an answer.
+    You,
+    /// Errors and failed runs: something ended badly.
+    Problem,
+    /// The ` · ` between two counts.
+    Dot,
+}
+
+/// `2 need you · 1 error · 1 failed`, zero counts left out.
+fn needs_summary(needs: &[NeedRowVm]) -> Vec<(String, NeedTally)> {
+    let count = |kinds: &[NeedKind]| needs.iter().filter(|row| kinds.contains(&row.kind)).count();
+    let you = count(&[NeedKind::Ask, NeedKind::Permission]);
+    let errors = count(&[NeedKind::Error]);
+    let failed = count(&[NeedKind::FailedRoutine]);
+    let mut runs = Vec::new();
+    let mut push = |text: String, run: NeedTally| {
+        if !runs.is_empty() {
+            runs.push((" \u{b7} ".to_string(), NeedTally::Dot));
+        }
+        runs.push((text, run));
+    };
+    if you > 0 {
+        push(format!("{you} need you"), NeedTally::You);
+    }
+    if errors > 0 {
+        push(format!("{errors} error{}", if errors == 1 { "" } else { "s" }), NeedTally::Problem);
+    }
+    if failed > 0 {
+        push(format!("{failed} failed"), NeedTally::Problem);
+    }
+    runs
+}
+
+/// The block's ghost button: `Show all N` while it folds rows away, `Show
+/// less` once everything is shown.
+fn need_all_label(total: usize, all: bool) -> String {
+    if all { "Show less".to_string() } else { format!("Show all {total}") }
 }
 
 /// The box of a link (`Resume`, `Stop`): its icon, the gap, the word, and
@@ -1385,6 +1556,8 @@ impl SidebarView {
                 sort: SidebarSort::Kova,
                 pill: NextPill::Nothing,
                 groups: Vec::new(),
+                needs: Vec::new(),
+                needs_all: false,
                 show_hint: false,
             },
             layout: ListLayout::default(),
@@ -1707,7 +1880,8 @@ define_class!(
                 if sh.model.view == SidebarList::Scheduled {
                     sh.layout.rows.iter().map(|r| r.frame.cg()).collect()
                 } else {
-                    sh.layout.groups.iter().map(|r| r.cg()).collect()
+                    // The needs card is clickable row by row, like a panel.
+                    sh.layout.groups.iter().chain(sh.layout.needs_card.iter()).map(|r| r.cg()).collect()
                 }
             };
             for r in panels {
@@ -1988,6 +2162,30 @@ impl SidebarListView {
                 };
                 kova.dispatch_pane_action(pane_id, action);
             }
+            ListHit::Need(index) => {
+                let key = self.ivars().shared.borrow().model.needs.get(index).map(|r| r.key.clone());
+                if let Some(key) = key {
+                    kova.sidebar_open_need(&key);
+                }
+            }
+            ListHit::NeedAll => kova.sidebar_toggle_needs_all(),
+            ListHit::NeedAnswer(pane_id) => {
+                // The pane's ask row: the same landing, wherever the click
+                // came from.
+                let key = {
+                    let sh = self.ivars().shared.borrow();
+                    sh.model
+                        .needs
+                        .iter()
+                        .find(|r| {
+                            r.pane_id == Some(pane_id) && matches!(r.kind, NeedKind::Ask | NeedKind::Permission)
+                        })
+                        .map(|r| r.key.clone())
+                };
+                if let Some(key) = key {
+                    kova.sidebar_open_need(&key);
+                }
+            }
             ListHit::Empty => {}
         }
     }
@@ -2074,6 +2272,15 @@ impl SidebarListView {
         let dirty_bottom = dirty.origin.y + dirty.size.height;
         let visible = |r: &Rect| r.bottom() >= dirty_top && r.y <= dirty_bottom;
 
+        // The `Needs you` card: the first thing in the Panes list.
+        if let (Some(card), Some(header)) = (sh.layout.needs_card, sh.layout.needs_header)
+            && visible(&card)
+        {
+            fill_round(&card, NEED_RADIUS, tokens::TILE, 1.0);
+            stroke_round(&card, NEED_RADIUS, 1.0, tokens::BORDER_SUBTLE, 1.0);
+            self.draw_needs_header(&sh, &header);
+        }
+
         // The active group is a raised card; the others have no fill.
         for (gi, block) in sh.layout.groups.iter().enumerate() {
             if !visible(block) {
@@ -2096,7 +2303,7 @@ impl SidebarListView {
             let lifted = match row.kind {
                 RowKind::Header { group } => lifted_group == Some(group),
                 RowKind::Tile { .. } => lifted_row == Some(ri),
-                RowKind::Routine { .. } => false,
+                RowKind::Routine { .. } | RowKind::Need { .. } | RowKind::NeedAll => false,
             };
             // The held tile is drawn later, floating; its skeleton takes
             // its place. The rows of its run step aside.
@@ -2172,6 +2379,14 @@ impl SidebarListView {
                     self.draw_tile(sh, tile, row, &frame, dy, alpha);
                 }
             }
+            RowKind::Need { index } => {
+                if let Some(need) = sh.model.needs.get(index) {
+                    self.draw_need(sh, need, row, &frame, dy, alpha);
+                }
+            }
+            RowKind::NeedAll => {
+                self.draw_need_all(sh, &frame, alpha);
+            }
         }
     }
 
@@ -2237,6 +2452,83 @@ impl SidebarListView {
         }
         let title_fg = if selected { tokens::WHITE } else { tokens::TEXT_PRIMARY };
         draw_text(sh, &g.title, &Rect::new(x, frame.y, (right - x).max(0.0), frame.h), Style::Title, title_fg, alpha, Align::Left, g.renaming);
+    }
+
+    /// The block's header line: `Needs you` on the left, the counts right
+    /// aligned against the card's edge and cut there when they do not fit.
+    fn draw_needs_header(&self, sh: &Shared, header: &Rect) {
+        let m = AppKitMetrics(sh);
+        let label_w =
+            draw_text(sh, NEED_TITLE, &Rect::new(header.x + NEED_ROW_PAD_H, header.y, header.w, header.h), Style::Sort, tokens::TEXT_SECONDARY, 1.0, Align::Left, false);
+        let runs = needs_summary(&sh.model.needs);
+        let total: f64 = runs.iter().map(|(text, _)| m.width(text, Style::Sort)).sum();
+        let min_x = header.x + NEED_ROW_PAD_H + label_w + NEED_GAP;
+        let max_x = header.right() - NEED_ROW_PAD_H;
+        let mut x = (max_x - total).max(min_x);
+        for (text, run) in runs {
+            if x >= max_x {
+                break;
+            }
+            let fg = match run {
+                NeedTally::You => tokens::WARN_TEXT,
+                NeedTally::Problem => tokens::CRIT_TEXT,
+                NeedTally::Dot => tokens::TEXT_TERTIARY,
+            };
+            draw_text(sh, &text, &Rect::new(x, header.y, (max_x - x).max(0.0), header.h), Style::Sort, fg, 1.0, Align::Left, false);
+            x += m.width(&text, Style::Sort);
+        }
+    }
+
+    /// One row of the block: the state dot (or the failed run's x-circle),
+    /// the title, the detail and the age.
+    fn draw_need(&self, sh: &Shared, need: &NeedRowVm, row: &Row, frame: &Rect, dy: f64, alpha: f64) {
+        let RowKind::Need { index } = row.kind else { return };
+        let hovered = sh.hovered == ListHit::Need(index);
+        let pressed = sh.pressed == ListHit::Need(index);
+        if pressed {
+            fill_round(frame, NEED_ROW_RADIUS, tokens::TILE_PRESSED, alpha);
+        } else if hovered {
+            fill_round(frame, NEED_ROW_RADIUS, tokens::TILE_HOVER, alpha);
+        }
+        let cy = frame.y + frame.h / 2.0;
+        let dot_cx = frame.x + NEED_ROW_PAD_H + GLYPH_BOX_W / 2.0;
+        let waiting = matches!(need.kind, NeedKind::Ask | NeedKind::Permission);
+        if need.kind == NeedKind::FailedRoutine {
+            // A scheduled run has no pane: the x-circle says the run died.
+            let box_ = Rect::new(dot_cx - ICON_D / 2.0, cy - ICON_D / 2.0, ICON_D, ICON_D);
+            stroke_icon(Icon::XCircle, &box_, ICON_D, tokens::ERROR, alpha);
+        } else {
+            fill_dot(dot_cx, cy, GLYPH_D, if waiting { tokens::AWAITING } else { tokens::ERROR }, alpha);
+        }
+        let m = AppKitMetrics(sh);
+        let text_x = frame.x + NEED_ROW_PAD_H + GLYPH_BOX_W;
+        let right = frame.right() - NEED_ROW_PAD_H;
+        let age_w = m.width(&need.age, Style::Number);
+        let age_x = right - age_w;
+        let title_right = if row.detail.w > 0.0 { row.detail.x - NEED_GAP } else { age_x - NEED_GAP };
+        draw_text(sh, &need.title, &Rect::new(text_x, frame.y, (title_right - text_x).max(0.0), frame.h), Style::Title, tokens::TEXT_PRIMARY, alpha, Align::Left, false);
+        if row.detail.w > 0.0 {
+            let detail = Rect::new(row.detail.x, row.detail.y + dy, row.detail.w, row.detail.h);
+            draw_text(sh, &need.detail, &detail, Style::Secondary, tokens::TEXT_TERTIARY, alpha, Align::Left, false);
+        }
+        let age_fg = if waiting { tokens::WARN_TEXT } else { tokens::CRIT_TEXT };
+        draw_text(sh, &need.age, &Rect::new(age_x, frame.y, age_w, frame.h), Style::Number, age_fg, alpha, Align::Right, false);
+    }
+
+    /// The block's ghost button: `Show all N` while folded, `Show less` once
+    /// every row is shown.
+    fn draw_need_all(&self, sh: &Shared, frame: &Rect, alpha: f64) {
+        let hovered = sh.hovered == ListHit::NeedAll;
+        let pressed = sh.pressed == ListHit::NeedAll;
+        if pressed {
+            fill_round(frame, NEED_ROW_RADIUS, tokens::TILE_PRESSED, alpha);
+        } else if hovered {
+            fill_round(frame, NEED_ROW_RADIUS, tokens::TILE_HOVER, alpha);
+        }
+        let label = need_all_label(sh.model.needs.len(), sh.model.needs_all);
+        let fg = if hovered { tokens::TEXT_PRIMARY } else { tokens::TEXT_SECONDARY };
+        let inner = Rect::new(frame.x + NEED_ROW_PAD_H, frame.y, (frame.w - 2.0 * NEED_ROW_PAD_H).max(0.0), frame.h);
+        draw_text(sh, &label, &inner, Style::Link, fg, alpha, Align::Left, false);
     }
 
     fn draw_tile(&self, sh: &Shared, tile: &TileVm, row: &Row, frame: &Rect, dy: f64, alpha: f64) {
@@ -2305,9 +2597,7 @@ impl SidebarListView {
                 fill_dot(right - meta_w - 3.0 - UNREAD_DOT_D / 2.0, dot_cy, UNREAD_DOT_D, dot, alpha);
             }
             if let Some(text) = &meta {
-                let aging = tile.age.as_ref().is_some_and(|(_, aging)| *aging);
-                let fg = if aging { tokens::ERROR } else { meta_fg };
-                draw_text(sh, text, &Rect::new(right - meta_w, line1.y, meta_w, LINE_TITLE_H), Style::Number, fg, alpha, Align::Right, false);
+                draw_text(sh, text, &Rect::new(right - meta_w, line1.y, meta_w, LINE_TITLE_H), Style::Number, meta_fg, alpha, Align::Right, false);
             }
             let block_w = meta_w + dot_w;
             if block_w > 0.0 {
@@ -2336,7 +2626,22 @@ impl SidebarListView {
             let w = draw_text(sh, "\u{2605}", &Rect::new(sx, line2.y, 14.0, LINE_SEC_H), Style::Secondary, tokens::AWAITING, alpha, Align::Left, false);
             sx += w + 4.0;
         }
-        draw_text(sh, &tile.secondary, &Rect::new(sx, line2.y, (sec_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
+        if let Some(waiting) = &tile.waiting {
+            // `waiting 4m · Answer`: the age in warn, the link landing where
+            // the pane's ask row does.
+            let answer = row.answer.map(|r| shifted(&r));
+            let text_right = answer.map_or(sec_right, |a| a.x - 12.0);
+            let label = format!("waiting {waiting}");
+            draw_text(sh, &label, &Rect::new(sx, line2.y, (text_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, tokens::WARN_TEXT, alpha, Align::Left, false);
+            if let Some(area) = answer {
+                draw_text(sh, "\u{b7}", &Rect::new(area.x - 9.0, line2.y, 8.0, LINE_SEC_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
+                let hovered_answer = sh.hovered == ListHit::NeedAnswer(tile.pane_id);
+                let fg = if hovered_answer { tokens::TEXT_PRIMARY } else { tokens::ACCENT };
+                draw_text(sh, NEED_ANSWER, &area, Style::Link, fg, alpha, Align::Left, false);
+            }
+        } else {
+            draw_text(sh, &tile.secondary, &Rect::new(sx, line2.y, (sec_right - sx).max(0.0), LINE_SEC_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
+        }
     }
 }
 
@@ -2376,7 +2681,7 @@ mod tests {
             question: None,
             detail: None,
             summary: None,
-            age: None,
+            waiting: None,
         }
     }
 
@@ -2405,6 +2710,9 @@ mod tests {
             ListHit::TileButton(1, TileButton::Stop),
             ListHit::Panel(0),
             ListHit::Routine(0),
+            ListHit::Need(0),
+            ListHit::NeedAll,
+            ListHit::NeedAnswer(1),
         ] {
             assert!(arms_press(hit), "{hit:?} would never reach activate()");
         }
@@ -2477,6 +2785,8 @@ mod tests {
                 group(1, true, vec![tile(20, 0, TileState::Idle)]),
                 group(2, false, vec![tile(30, 0, TileState::Shell)]),
             ],
+            needs: Vec::new(),
+            needs_all: false,
             show_hint: false,
         }
     }
@@ -2528,7 +2838,7 @@ mod tests {
         let mut awaiting = tile(1, 0, TileState::Awaiting);
         awaiting.question = Some("Should I overwrite hello.txt with the new content?".into());
         awaiting.detail = Some("Write hello.txt".into());
-        awaiting.age = Some(("4m".into(), false));
+        awaiting.waiting = Some("4m".into());
         let mut unread = tile(2, 0, TileState::Unread(UnreadKind::Done));
         unread.summary = Some("Pushed the copy".into());
         m.groups = vec![group(0, false, vec![awaiting, unread, tile(4, 0, TileState::Working)])];
@@ -2848,5 +3158,152 @@ mod tests {
         assert_eq!(Style::PillBadge.weight(), Weight::Bold);
         assert_eq!(Style::ALL.len(), 13);
         let _ = PaneFlags::default();
+    }
+
+    fn need(kind: NeedKind, n: u32) -> NeedRowVm {
+        NeedRowVm {
+            kind,
+            key: format!("k{n}"),
+            pane_id: Some(n),
+            title: format!("pane {n}"),
+            detail: "the detail".into(),
+            age: "4m".into(),
+        }
+    }
+
+    #[test]
+    fn the_needs_block_sits_above_the_groups_and_folds_its_rows() {
+        // Nothing waits: no card at all, and the groups keep their place.
+        let mut m = model();
+        let none = ListLayout::new(&m, W, &FakeMetrics);
+        assert_eq!(none.needs_card, None);
+        assert_eq!(none.rows[0].frame.y, 8.0);
+
+        // Three asks: three rows, no button, the card above the first group.
+        m.needs = (0..3).map(|i| need(NeedKind::Ask, i)).collect();
+        let three = ListLayout::new(&m, W, &FakeMetrics);
+        let card = three.needs_card.expect("a block with rows draws its card");
+        assert_eq!(card, Rect::new(SX, LIST_TOP, SR - SX, NEED_PAD_TOP + NEED_HEADER_H + 3.0 * NEED_ROW_H + NEED_PAD_BOTTOM));
+        assert_eq!(
+            three.needs_header,
+            Some(Rect::new(card.x + NEED_PAD_H, card.y + NEED_PAD_TOP, card.w - 2.0 * NEED_PAD_H, NEED_HEADER_H))
+        );
+        for (i, row) in three.rows.iter().take(3).enumerate() {
+            assert_eq!(row.kind, RowKind::Need { index: i });
+        }
+        assert!(!three.rows.iter().any(|r| r.kind == RowKind::NeedAll));
+        let header = three
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Header { group: 0 })
+            .expect("the groups follow the block");
+        assert_eq!(header.frame.y, card.bottom() + NEED_MARGIN_B + GROUP_PAD_V);
+
+        // `Show all` with nothing folded away changes nothing.
+        m.needs_all = true;
+        let three_all = ListLayout::new(&m, W, &FakeMetrics);
+        assert_eq!(three_all.needs_card, three.needs_card);
+        assert_eq!(three_all.rows.len(), three.rows.len());
+
+        // Six asks: four rows and the button while folded.
+        m.needs_all = false;
+        m.needs = (0..6).map(|i| need(NeedKind::Ask, i)).collect();
+        let six = ListLayout::new(&m, W, &FakeMetrics);
+        assert_eq!(six.rows.iter().filter(|r| matches!(r.kind, RowKind::Need { .. })).count(), 4);
+        assert!(six.rows.iter().any(|r| r.kind == RowKind::NeedAll));
+        assert_eq!(
+            six.needs_card.unwrap().h,
+            NEED_PAD_TOP + NEED_HEADER_H + 4.0 * NEED_ROW_H + NEED_BUTTON_H + NEED_PAD_BOTTOM
+        );
+
+        // Shown: every row, and the button stays to fold them back.
+        m.needs_all = true;
+        let six_all = ListLayout::new(&m, W, &FakeMetrics);
+        assert_eq!(six_all.rows.iter().filter(|r| matches!(r.kind, RowKind::Need { .. })).count(), 6);
+        assert!(six_all.rows.iter().any(|r| r.kind == RowKind::NeedAll));
+        assert_eq!(
+            six_all.needs_card.unwrap().h,
+            NEED_PAD_TOP + NEED_HEADER_H + 6.0 * NEED_ROW_H + NEED_BUTTON_H + NEED_PAD_BOTTOM
+        );
+        assert!(six_all.needs_card.unwrap().h > six.needs_card.unwrap().h);
+    }
+
+    #[test]
+    fn the_block_keeps_every_error_and_folds_the_asks_to_four_rows() {
+        let mut m = model();
+        m.needs = vec![
+            need(NeedKind::Error, 1),
+            need(NeedKind::FailedRoutine, 2),
+            need(NeedKind::Ask, 3),
+            need(NeedKind::Ask, 4),
+            need(NeedKind::Ask, 5),
+            need(NeedKind::Ask, 6),
+            need(NeedKind::Ask, 7),
+        ];
+        let l = ListLayout::new(&m, W, &FakeMetrics);
+        let kinds: Vec<RowKind> =
+            l.rows.iter().map(|r| r.kind).filter(|k| matches!(k, RowKind::Need { .. } | RowKind::NeedAll)).collect();
+        // Two problems and two asks: four rows, then the button.
+        assert_eq!(
+            kinds,
+            vec![
+                RowKind::Need { index: 0 },
+                RowKind::Need { index: 1 },
+                RowKind::Need { index: 2 },
+                RowKind::Need { index: 3 },
+                RowKind::NeedAll
+            ]
+        );
+        assert_eq!(need_all_label(7, false), "Show all 7");
+        assert_eq!(need_all_label(7, true), "Show less");
+
+        // More errors than rows: every one shows and nothing is folded.
+        m.needs = (0..6).map(|i| need(NeedKind::Error, i)).collect();
+        let errors = ListLayout::new(&m, W, &FakeMetrics);
+        assert_eq!(errors.rows.iter().filter(|r| matches!(r.kind, RowKind::Need { .. })).count(), 6);
+        assert!(!errors.rows.iter().any(|r| r.kind == RowKind::NeedAll));
+
+        // The header counts: asks in warn, errors and failed runs in crit.
+        let text: String = needs_summary(&m.needs).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(text, "6 errors");
+        let mixed = vec![need(NeedKind::Ask, 1), need(NeedKind::Error, 2), need(NeedKind::FailedRoutine, 3)];
+        let runs = needs_summary(&mixed);
+        let text: String = runs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(text, "1 need you \u{b7} 1 error \u{b7} 1 failed");
+        assert_eq!(runs[0].1, NeedTally::You);
+        assert_eq!(runs[2].1, NeedTally::Problem);
+        assert_eq!(runs[4].1, NeedTally::Problem);
+    }
+
+    #[test]
+    fn a_narrow_block_drops_the_need_detail() {
+        let mut m = model();
+        m.needs = vec![need(NeedKind::Permission, 1)];
+        let wide = ListLayout::new(&m, 320.0, &FakeMetrics);
+        let narrow = ListLayout::new(&m, 260.0, &FakeMetrics);
+        assert!(wide.rows[0].detail.w > 0.0);
+        assert_eq!(narrow.rows[0].detail, Rect::default());
+        // Same row height either way: only the detail column goes.
+        assert_eq!(wide.rows[0].frame.h, narrow.rows[0].frame.h);
+    }
+
+    #[test]
+    fn the_needs_rows_the_button_and_the_answer_link_hit_their_targets() {
+        let mut m = model();
+        m.needs = (1..=6).map(|i| need(NeedKind::Ask, i)).collect();
+        m.groups[0].tiles[0].waiting = Some("4m".into());
+        let l = ListLayout::new(&m, 320.0, &FakeMetrics);
+        let row = l.rows.iter().find(|r| r.kind == RowKind::Need { index: 1 }).expect("the second need row");
+        assert_eq!(l.hit(row.frame.x + 4.0, row.frame.y + 4.0), ListHit::Need(1));
+        let button = l.rows.iter().find(|r| r.kind == RowKind::NeedAll).expect("the button");
+        assert_eq!(l.hit(button.frame.x + 4.0, button.frame.y + 4.0), ListHit::NeedAll);
+        // The waiting tile's subtitle carries `Answer`, its own hit target.
+        let tile = l.rows.iter().find(|r| matches!(r.kind, RowKind::Tile { pane_id: 10, .. })).expect("pane 10");
+        let answer = tile.answer.expect("a waiting tile carries the link");
+        assert_eq!(l.hit(answer.x + 2.0, answer.y + 2.0), ListHit::NeedAnswer(10));
+        // The rest of the subtitle line is still the tile.
+        assert_eq!(l.hit(tile.frame.x + 40.0, answer.y + 2.0), ListHit::Tile(10));
+        // A tile with nothing waiting has no link at all.
+        assert_eq!(l.rows.iter().find(|r| matches!(r.kind, RowKind::Tile { pane_id: 11, .. })).and_then(|r| r.answer), None);
     }
 }

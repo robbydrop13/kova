@@ -182,15 +182,19 @@ A 44 pt row (5 + an 18 pt title line + a 16 pt subtitle line + 5, floored at
   first when bookmarked; a bare shell shows `Start Claude` and a restored
   session `Resume`, each after a filled 11 pt `play` (accent link, primary on
   hover) right-aligned at the end of the subtitle line.
+- A pane with an open ask or permission prompt (`TileVm::waiting`, filled by
+  `SidebarModel::apply_needs`) says `waiting 4m · Answer` at the start of the
+  subtitle instead: the age in `warn.text`, `Answer` an accent link hit
+  target (`ListHit::NeedAnswer`) that lands where that pane's ask row does.
 - Right, 6 pt in: the meta column (`Style::Number`, 11, right-aligned):
-  `waiting 4m` for an awaiting pane, `working` (or `starting`) while it
-  works, the age otherwise, in tertiary and `status.error` past 10 min
-  (`AGING_SECS`); a 6 pt accent dot comes before it on an unread tile.
+  `working` (or `starting`) while it works; empty for an awaiting pane, whose
+  subtitle carries the wait; a 6 pt accent dot comes before it on an unread
+  tile.
 
-The awaiting pane is no longer a tall card: same tile, amber dot and
-`waiting 4m` meta. Its question is not drawn in the row (a later `Needs you`
-block takes it), and neither is the turn-end summary: title and subtitle,
-one line each.
+The awaiting pane is no longer a tall card: same tile, amber dot and the
+`waiting 4m · Answer` subtitle. Its question is not drawn in the row (the
+`Needs you` block takes it), and neither is the turn-end summary: title and
+subtitle, one line each.
 
 Under the mouse the meta column gives way to the hover actions, right to
 left: `x` close (error red on hover), `minimize-2` / `maximize-2` minimize /
@@ -350,6 +354,41 @@ Both switch like the others but have no rows yet: the list draws one
 centred line in the same tertiary hint style as the empty routines view,
 `No open questions` for Asks and `Agents view coming next` for Agents.
 
+### 3.7.4 `Needs you` block (`SidebarList::Panes`)
+
+The first thing in the Panes list, above the groups, scrolls with them, and
+is left out entirely while `model.needs` is empty. A card on the tile ground
+(radius 8, 1 pt `border.subtle`), 4 pt of padding, 6 under the last row and
+10 before the first group. Its header (20 pt, `Style::Sort`) says `Needs you`
+on the left and the counts at the right, right-aligned and cut at the card's
+edge: `2 need you · 1 error · 1 failed`, the waiting count in `warn.text`,
+errors and failed runs in `crit.text`, the ` · ` in tertiary.
+
+One 28 pt row per need (`model.needs`, in `needs::need_items` order): a 16 pt
+glyph box at 6 pt from the row's edge (8 pt `awaiting` dot for an ask or a
+permission, `error` dot otherwise, the `x-circle` icon for a failed routine),
+then the title (`Style::Title`, primary, tail-truncated), the detail
+(`Style::Secondary`, tertiary: the provider's error, the command a permission
+wants, the rest of a question) and the age at the right (`Style::Number`,
+`warn.text` for asks and permissions, `crit.text` otherwise). The title keeps
+at most half of the room so the detail always reads; below 280 pt of list
+width the detail column is dropped and the title takes it
+(`NEED_DETAIL_MIN_W`). Rows light to `bg.hover` under the mouse.
+
+Folding (`sidebar_model::need_rows_shown`): every error and failed routine
+always shows, then the asks and permissions fill up to four rows, two of them
+at least. When anything would be folded away a 22 pt ghost button closes the
+card: `Show all N` while folded, `Show less` once every row shows
+(`SidebarState::needs_all`, in the model as `needs_all`).
+
+Clicks: an error row focuses its pane (in any window), a failed routine opens
+the Scheduled list on that routine (`open_routine`), an ask or a permission
+opens the Asks list and sets `SidebarState::highlight_ask` to the ask id. A
+pane holding an open ask or a permission prompt drops its meta column and
+says `waiting 4m · Answer` on the subtitle instead: the age in `warn.text`,
+`Answer` an accent link whose hit target (`ListHit::NeedAnswer`) lands where
+that pane's ask row would.
+
 ### 3.8 List extras
 
 - Hint `⌘T new tab · ⌘D split` (11, tertiary, centred) under the last group
@@ -381,6 +420,9 @@ centred line in the same tertiary hint style as the empty routines view,
 | Sort toggle                | kova <-> activity                                      |                    |              |
 | View switcher              | show that list (`sidebar_show_list`)                   |                    |              |
 | Routine row                | open it, or close it when it is open (`sidebar_toggle_routine`) |            |              |
+| `Needs you` row            | error: focus its pane (any window); failed routine: Scheduled, row open (`open_routine`); ask or permission: Asks, `highlight_ask` set | | |
+| `Show all` / `Show less`   | toggle `needs_all`                                     |                    |              |
+| Tile `Answer`              | same as that pane's ask row                            |                    | tile menu    |
 | Top area                   | window drag                                            | zoom               |              |
 | Separator +-4 pt           | drag resizes the sidebar                               |                    |              |
 

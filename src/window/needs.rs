@@ -41,6 +41,9 @@ pub struct NeedItem {
     pub since: u64,
     /// What the row says: the pane's title, the routine's name, the question.
     pub title: String,
+    /// The row's second line: the provider's words for an error, the command
+    /// a permission wants, the rest of a question. Empty when there is none.
+    pub detail: String,
 }
 
 /// What a pane is waiting on, if anything.
@@ -53,6 +56,10 @@ pub struct PaneNeed {
     #[serde(default)]
     pub permission_since: Option<u64>,
     pub title: String,
+    /// The error's text, or the permission prompt's detail (the command, the
+    /// file). Absent on older reports and in the shared fixture.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// A scheduled routine's last run, if it failed.
@@ -81,6 +88,9 @@ pub struct AskNeed {
     #[serde(default)]
     pub answered: bool,
     pub title: String,
+    /// What the question says after its first line.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// Everything the model needs to know, at one clock reading.
@@ -132,6 +142,7 @@ pub fn need_items(input: &NeedInput) -> Vec<NeedItem> {
                 pane_id: None,
                 since,
                 title: routine.name.clone(),
+                detail: "Routine failed".to_string(),
             })
         })
         .collect();
@@ -144,6 +155,7 @@ pub fn need_items(input: &NeedInput) -> Vec<NeedItem> {
         .filter(|ask| open(ask, input.now))
         .map(|ask| NeedItem {
             kind: NeedKind::Ask,
+            detail: ask.detail.clone().unwrap_or_default(),
             key: format!("ask:{}", ask.id),
             pane_id: ask.pane_id,
             since: ask.created_at,
@@ -196,6 +208,7 @@ fn pane_items(
         .filter_map(|pane| {
             Some(NeedItem {
                 kind,
+                detail: pane.detail.clone().unwrap_or_default(),
                 key: format!("pane:{}", pane.id),
                 pane_id: Some(pane.id),
                 since: since(pane)?,
@@ -287,8 +300,8 @@ mod tests {
     fn next_steps_over_failed_routines_and_the_pane_under_the_eye() {
         let input = NeedInput {
             panes: vec![
-                PaneNeed { id: 3, error_since: Some(10), permission_since: None, title: "a".into() },
-                PaneNeed { id: 4, error_since: None, permission_since: Some(20), title: "b".into() },
+                PaneNeed { id: 3, error_since: Some(10), permission_since: None, title: "a".into(), detail: None },
+                PaneNeed { id: 4, error_since: None, permission_since: Some(20), title: "b".into(), detail: None },
             ],
             routines: vec![RoutineNeed {
                 name: "nightly".into(),
@@ -315,6 +328,7 @@ mod tests {
             pane_id: Some(pane),
             since: pane,
             title: String::new(),
+            detail: String::new(),
         };
         let items = vec![item(1), item(2), item(3)];
         assert_eq!(next_need_pane(&items, Some(1)), Some(2));
