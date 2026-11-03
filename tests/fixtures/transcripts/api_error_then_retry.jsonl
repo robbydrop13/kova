@@ -1,0 +1,5 @@
+{"type":"user","timestamp":"2026-11-03T10:01:01.000Z","sessionId":"sess-test-2","cwd":"/Users/test/project","message":{"role":"user","content":"list the open files"}}
+{"type":"assistant","timestamp":"2026-11-03T10:01:03.000Z","sessionId":"sess-test-2","cwd":"/Users/test/project","message":{"model":"claude-test","content":[{"type":"text","text":"Two files are open."}]}}
+{"type":"assistant","isApiErrorMessage":true,"error":"server_error","timestamp":"2026-11-03T10:01:20.000Z","sessionId":"sess-test-2","cwd":"/Users/test/project","message":{"model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"API Error: 529 Overloaded"}]}}
+{"type":"user","timestamp":"2026-11-03T10:01:40.000Z","sessionId":"sess-test-2","cwd":"/Users/test/project","message":{"role":"user","content":"try again"}}
+{"type":"attachment","timestamp":"2026-11-03T10:01:40.500Z","sessionId":"sess-test-2","cwd":"/Users/test/project","content":"attached context"}

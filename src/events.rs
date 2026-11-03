@@ -36,6 +36,9 @@ pub struct PaneFlags {
     pub working: bool,
     pub awaiting: bool,
     pub awaiting_since: Option<u64>,
+    /// The pane's last turn died on an API error (a cached transcript read,
+    /// never a syscall). `pane-status` carries the transition.
+    pub error: bool,
 }
 
 /// Which pane holds the user's attention, and what is running in it.
@@ -287,6 +290,24 @@ impl EventState {
                                 }),
                             );
                         }
+                        if previous.error != flags.error {
+                            let error = if flags.error {
+                                source
+                                    .pane_json(flags.window, *id)
+                                    .map(|pane| pane.get("error").cloned().unwrap_or(serde_json::Value::Null))
+                                    .unwrap_or(serde_json::Value::Null)
+                            } else {
+                                serde_json::Value::Null
+                            };
+                            sink.publish(
+                                topic::PANE_STATUS,
+                                serde_json::json!({
+                                    "event": "error",
+                                    "pane_id": id,
+                                    "error": error,
+                                }),
+                            );
+                        }
                     }
                 }
             }
@@ -445,7 +466,11 @@ mod tests {
             out.extend(self.panes.iter().cloned());
         }
         fn pane_json(&self, window: usize, pane: PaneId) -> Option<serde_json::Value> {
-            Some(serde_json::json!({ "id": pane, "window": window }))
+            let error = match self.panes.iter().find(|(id, _)| *id == pane) {
+                Some((_, f)) if f.error => serde_json::json!({ "kind": "Limit reached", "text": "resets 5:20pm" }),
+                _ => serde_json::Value::Null,
+            };
+            Some(serde_json::json!({ "id": pane, "window": window, "error": error }))
         }
         fn collect_panes(&self, out: &mut Vec<serde_json::Value>) {
             out.extend(self.panes.iter().map(|(id, f)| serde_json::json!({ "id": id, "window": f.window })));
@@ -473,7 +498,33 @@ mod tests {
     }
 
     fn flags(working: bool, awaiting: bool) -> PaneFlags {
-        PaneFlags { window: 0, tab: 0, working, awaiting, awaiting_since: awaiting.then_some(7) }
+        PaneFlags { window: 0, tab: 0, working, awaiting, awaiting_since: awaiting.then_some(7), error: false }
+    }
+
+    #[test]
+    fn a_pane_entering_or_leaving_an_api_error_publishes_it() {
+        let mut state = EventState::new();
+        let mut sink = Recorder { mask: topic::PANE_STATUS, events: Vec::new() };
+        let mut world = FakeSource { panes: vec![(1, flags(false, false))], ..Default::default() };
+        state.poll_with(&world, &mut sink, true, 60, true);
+        assert!(sink.events.is_empty(), "the seeding pass announces nothing");
+
+        world.panes[0].1.error = true;
+        state.poll_with(&world, &mut sink, true, 60, true);
+        assert_eq!(
+            sink.events,
+            vec![serde_json::json!({
+                "event": "error",
+                "pane_id": 1,
+                "error": { "kind": "Limit reached", "text": "resets 5:20pm" },
+            })]
+        );
+        sink.events.clear();
+
+        world.panes[0].1.error = false;
+        state.poll_with(&world, &mut sink, true, 60, true);
+        assert_eq!(sink.events[0]["event"], "error");
+        assert_eq!(sink.events[0]["error"], serde_json::Value::Null);
     }
 
     /// The diff, run against a hand-set world: the first pass is silent, then

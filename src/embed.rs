@@ -1415,6 +1415,7 @@ impl EventSource for LibEvents {
                     working: s.is_working(),
                     awaiting: s.is_awaiting(),
                     awaiting_since: s.awaiting_since(),
+                    error: false,
                 },
             );
         }

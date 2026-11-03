@@ -2039,7 +2039,9 @@ impl Pane {
     pub fn mark_preview_seen(&self) {
         use crate::prompt_preview::PromptPreview;
         match self.prompt_preview.borrow_mut().as_mut() {
-            Some(PromptPreview::TurnEnd { seen, .. }) | Some(PromptPreview::Permission { seen, .. }) => *seen = true,
+            Some(PromptPreview::TurnEnd { seen, .. })
+            | Some(PromptPreview::Permission { seen, .. })
+            | Some(PromptPreview::ApiError { seen, .. }) => *seen = true,
             None => {}
         }
     }
@@ -2050,9 +2052,14 @@ impl Pane {
         matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::Permission { seen: false, .. }))
     }
 
-    /// The last turn ended with an answer nobody has looked at yet.
+    /// The last turn ended on something nobody has looked at yet: an answer
+    /// or an API error (both are where the turn stopped).
     pub fn is_turn_end_unseen(&self) -> bool {
-        matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::TurnEnd { seen: false, .. }))
+        use crate::prompt_preview::PromptPreview;
+        matches!(
+            *self.prompt_preview.borrow(),
+            Some(PromptPreview::TurnEnd { seen: false, .. }) | Some(PromptPreview::ApiError { seen: false, .. })
+        )
     }
 
     /// A permission prompt is on this pane's screen (`probe_prompt` read it)
@@ -2060,6 +2067,31 @@ impl Pane {
     pub fn has_permission_prompt(&self) -> bool {
         matches!(*self.prompt_preview.borrow(), Some(crate::prompt_preview::PromptPreview::Permission { .. }))
             && !self.is_working()
+    }
+
+    /// The last turn on this pane ended on an API error (an expired login, a
+    /// limit, an overload), reported by `probe_prompt` from the transcript.
+    /// A pane that is running again is never in that state: the turn in flight
+    /// wins over the one that died.
+    pub fn has_api_error(&self) -> bool {
+        !self.is_working()
+            && matches!(
+                *self.prompt_preview.borrow(),
+                Some(crate::prompt_preview::PromptPreview::ApiError { .. })
+            )
+    }
+
+    /// The error itself, for `list-panes`: the kind and what the provider said.
+    pub fn api_error(&self) -> Option<crate::prompt_preview::ApiError> {
+        if self.is_working() {
+            return None;
+        }
+        match self.prompt_preview.borrow().as_ref() {
+            Some(crate::prompt_preview::PromptPreview::ApiError { kind, text, .. }) => {
+                Some(crate::prompt_preview::ApiError { kind: kind.clone(), text: text.clone() })
+            }
+            _ => None,
+        }
     }
 
     /// Claude launched here but its session is not resolved yet: a restore
@@ -2112,24 +2144,30 @@ impl Pane {
                 since: crate::surface::now_epoch_secs(),
                 seen: false,
             }),
-            None => self.transcript_summary().map(|summary| crate::prompt_preview::PromptPreview::TurnEnd { summary, seen: false }),
+            None => self.transcript_preview(),
         };
         log::debug!("pane {}: prompt probe -> {:?}", self.id, preview.as_ref().map(|p| match p {
             crate::prompt_preview::PromptPreview::Permission { question, .. } => format!("permission: {question}"),
             crate::prompt_preview::PromptPreview::TurnEnd { summary, .. } => format!("turn end: {summary}"),
+            crate::prompt_preview::PromptPreview::ApiError { kind, text, .. } => format!("api error: {kind}: {text}"),
         }));
         self.prompt_preview.replace(preview);
     }
 
-    /// The last thing Claude said in this pane's transcript, if the session
-    /// and its file are known.
-    fn transcript_summary(&self) -> Option<String> {
+    /// What the transcript's tail says the turn ended on: an API error, else
+    /// the last thing Claude said.
+    fn transcript_preview(&self) -> Option<crate::prompt_preview::PromptPreview> {
+        use crate::prompt_preview::PromptPreview;
         let session_id = self.agent_session_id()?;
         let cwd = self.cwd()?;
         let home = std::env::var("HOME").unwrap_or_default();
         let path = crate::prompt_preview::transcript_path(&home, &cwd, &session_id);
         let tail = crate::prompt_preview::read_transcript_tail(&path)?;
+        if let Some(error) = crate::prompt_preview::api_error(&tail) {
+            return Some(PromptPreview::ApiError { kind: error.kind, text: error.text, seen: false });
+        }
         crate::prompt_preview::turn_end_summary(&tail)
+            .map(|summary| PromptPreview::TurnEnd { summary, seen: false })
     }
 
     /// Display title for this pane: agent session name > custom title > OSC

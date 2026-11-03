@@ -186,6 +186,9 @@ pub fn display_order(sort: SidebarSort, tab_states: &[TileState]) -> Vec<usize> 
 pub enum TileState {
     /// A permission prompt is on screen (detected, never the hook flag alone).
     Awaiting,
+    /// The last turn ended on a provider error: a limit, an overload, an
+    /// expired login. What the transcript says; a running pane wins.
+    Error,
     /// Something new nobody looked at: a finished turn, a completion, a bell,
     /// or the user's own mark.
     Unread(UnreadKind),
@@ -228,6 +231,8 @@ pub struct PaneFlags {
     pub working: bool,
     pub starting: bool,
     pub idle_agent: bool,
+    /// The last turn died on an API error (`Pane::has_api_error`).
+    pub error: bool,
     pub seen: bool,
 }
 
@@ -246,6 +251,8 @@ impl TileState {
     pub fn from_flags(f: PaneFlags) -> Self {
         if f.permission_prompt && !f.working {
             TileState::Awaiting
+        } else if f.error && !f.working {
+            TileState::Error
         } else if f.manual {
             TileState::Unread(UnreadKind::Manual)
         } else if !f.seen && (f.completion || f.bell || f.hook_unseen || f.turn_end_unseen) {
@@ -265,11 +272,12 @@ impl TileState {
     pub fn rank(self) -> u8 {
         match self {
             TileState::Awaiting => 0,
-            TileState::Unread(_) => 1,
-            TileState::Working => 2,
-            TileState::Starting => 3,
-            TileState::Idle => 4,
-            TileState::Shell => 5,
+            TileState::Error => 1,
+            TileState::Unread(_) => 2,
+            TileState::Working => 3,
+            TileState::Starting => 4,
+            TileState::Idle => 5,
+            TileState::Shell => 6,
         }
     }
 
@@ -282,6 +290,7 @@ impl TileState {
     pub fn chip(self) -> &'static str {
         match self {
             TileState::Awaiting => "waiting",
+            TileState::Error => "error",
             TileState::Unread(UnreadKind::Bell) => "bell",
             TileState::Unread(UnreadKind::Done) => "done",
             TileState::Unread(UnreadKind::Manual) => "unread",
@@ -297,6 +306,7 @@ impl TileState {
     pub fn color(self) -> [f32; 3] {
         match self {
             TileState::Awaiting => tokens::AWAITING,
+            TileState::Error => tokens::ERROR,
             TileState::Unread(_) => tokens::ACCENT,
             TileState::Working | TileState::Starting => tokens::WORKING,
             TileState::Idle | TileState::Shell => tokens::BORDER_STRONG,
@@ -774,6 +784,7 @@ mod tests {
             working: true,
             starting: true,
             idle_agent: true,
+            error: true,
             seen: false,
         };
         // A prompt on screen loses to the spinner: Claude went back to work.
@@ -783,6 +794,15 @@ mod tests {
         // The hook flag alone paints done, never waiting.
         assert_eq!(TileState::from_flags(PaneFlags { hook_unseen: true, ..PaneFlags::default() }), Unread(UnreadKind::Done));
         assert_eq!(TileState::from_flags(PaneFlags { turn_end_unseen: true, ..PaneFlags::default() }), Unread(UnreadKind::Done));
+        // An API error shows as such, but never over a turn in flight.
+        let failed = PaneFlags { error: true, idle_agent: true, ..PaneFlags::default() };
+        assert_eq!(TileState::from_flags(failed), Error);
+        assert_eq!(TileState::from_flags(PaneFlags { working: true, ..failed }), Working);
+        // It outranks unread output: the error is what the turn ended on.
+        assert_eq!(TileState::from_flags(PaneFlags { turn_end_unseen: true, ..failed }), Error);
+        assert_eq!(Error.chip(), "error");
+        assert_eq!(Error.color(), tokens::ERROR);
+        assert!(Error.rank() < Unread(UnreadKind::Done).rank());
         // The pane being looked at never shows unread, unless marked by hand.
         assert_eq!(TileState::from_flags(PaneFlags { permission_prompt: false, seen: true, ..all }), Working);
         assert_eq!(TileState::from_flags(PaneFlags { permission_prompt: false, seen: true, manual: true, ..all }), Unread(UnreadKind::Manual));

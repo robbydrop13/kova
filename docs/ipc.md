@@ -148,7 +148,8 @@ Response: `{ "data": [ { ... }, ... ] }` where each entry has:
   "resume_command": null,
   "peer_name": "subscribe on the Kova side",
   "dormant_session_id": null,
-  "subject": "auth"
+  "subject": "auth",
+  "error": null
 }
 ```
 
@@ -183,6 +184,8 @@ The pane switcher, open-pane search results, IPC `title`, and automatic tab titl
 `working` is `true` when the app in the pane is actively generating or running a tool, detected from its OSC 0/2 title: Claude Code prepends an **animated Braille spinner glyph** (U+2800–U+28FF, e.g. `⠂`/`⠐`) followed by a space *only while it works*. At the prompt it instead shows an asterisk-like idle marker (`✳ Claude Code`) or a plain title, so the asterisk is explicitly NOT treated as busy. Counting panes with `working: true` therefore gives the number of Claude Code sessions actually busy — as opposed to those merely open and waiting for input (which stay `is_idle: false` too, since the `claude` process is always a child). It reads the live OSC 0/2 title even when a sticky custom title (OSC 1 / manual rename) shadows the display. Kova also shows this count in the global status bar as `✳N` (hidden when zero).
 
 `awaiting` is `true` when the app in the pane has declared, over `set-pane-status`, that it is waiting for the user — and nothing Kova observed since contradicts it. `awaiting_since` is the epoch second at which the wait started (`null` when not waiting), so a client can show how long a session has been unanswered. Unlike `working`, this is *pushed*, not guessed: `working` is inferred from the terminal title, while `awaiting` is a claim the running app makes about itself. See `set-pane-status` for how it is set and, more importantly, for the ways Kova retracts it on its own.
+
+`error` is `null` unless the pane's last Claude turn ended on a provider error read from its transcript: `{"kind": "...", "text": "..."}`. `kind` is one of `"Limit reached"` (`rate_limit`), `"API error"` (`server_error`), `"Request failed"` (`invalid_request`), `"Logged out"` (`authentication_failed`) or `"Error"` for anything else. `text` is what the provider said, one line, at most 120 characters. The field is cleared when the agent goes back to work (a retry or a new prompt): a running pane never reports an error. Kova.app only, like `subject`: the detector reads Claude's transcript. The `error` event carries the same object when a pane enters the state, and `null` when it leaves it.
 
 `subject` is the name of the subject the pane is filed under in `Cmd+P` (the box it is drawn in), or `null`. Kova.app only: a library host has no subjects and its panes carry no such field. See `list-subjects`.
 
@@ -991,11 +994,14 @@ Every line after that is one event, told apart from a response by its `event` ke
 |---|---|---|
 | `focus` | `app_active`, `reason`, `pane` (a pane object, or `null`) | the pane holding the user's attention changed |
 | `pane-status` | `pane_id`, `awaiting`, `awaiting_since` | a pane raised or retracted its `awaiting` flag |
+| `error` | `pane_id`, `error` (the `list-panes` object, or `null`) | a pane entered or left the API-error state |
 | `pane-working` | `pane_id`, `working` | a pane started or stopped working |
 | `pane-open` | `pane` | a pane appeared |
 | `pane-close` | `pane_id`, `window`, `tab` | a pane went away |
 | `subjects` | `subjects` (the whole `list-subjects` answer) | a subject was created, renamed, recolored, deleted or moved, or a pane was filed into or out of one — from Cmd+P, a split inheriting its subject, a closed pane or tab, or IPC |
 | `ping` | — | 30 s of silence (see below) |
+
+`error` rides the `pane-status` topic: a client subscribed to `pane-status` receives it. It is not a subscription name of its own.
 
 **`focus` folds "is Kova even frontmost" into the same stream.** Leaving Kova for
 another app emits `focus` with `pane: null` and `reason: "app-inactive"`; coming

@@ -311,6 +311,14 @@ pub fn subtitle(project: &str, agent: Option<&str>, title: &str) -> String {
     }
 }
 
+/// An errored tile's subtitle: the kind word, then what the provider said.
+fn error_subtitle(kind: &str, text: &str) -> String {
+    if text.is_empty() {
+        return kind.to_string();
+    }
+    format!("{kind} \u{b7} {text}")
+}
+
 impl TileVm {
     pub fn from_facts(f: &PaneFacts, now: u64) -> Self {
         let state = TileState::from_flags(f.flags);
@@ -338,7 +346,10 @@ impl TileVm {
             f.process.as_deref(),
             &f.cwd,
         );
-        let secondary = subtitle(&project_name(&f.cwd), f.agent.as_deref(), &title);
+        let secondary = match (state, f.preview.as_ref()) {
+            (TileState::Error, Some(PromptPreview::ApiError { kind, text, .. })) => error_subtitle(kind, text),
+            _ => subtitle(&project_name(&f.cwd), f.agent.as_deref(), &title),
+        };
         TileVm {
             pane_id: f.pane_id,
             column: f.column,
@@ -604,6 +615,27 @@ mod tests {
         let t = TileVm::from_facts(&f, 0);
         assert_eq!(t.state, TileState::Idle);
         assert_eq!(t.summary, None);
+    }
+
+    #[test]
+    fn an_errored_tile_names_the_error_and_what_the_provider_said() {
+        let mut f = pane(6, PaneFlags { error: true, idle_agent: true, ..PaneFlags::default() });
+        f.preview = Some(PromptPreview::ApiError {
+            kind: "Limit reached".into(),
+            text: "You've hit your session limit".into(),
+            seen: false,
+        });
+        let t = TileVm::from_facts(&f, 0);
+        assert_eq!(t.state, TileState::Error);
+        assert_eq!(t.title, "pane 6");
+        assert_eq!(t.secondary, "Limit reached · You've hit your session limit");
+        assert_eq!(t.meta(), None);
+        // A turn in flight hides it, subtitle and all.
+        let mut busy = f.clone();
+        busy.flags.working = true;
+        let t = TileVm::from_facts(&busy, 0);
+        assert_eq!(t.state, TileState::Working);
+        assert_eq!(t.secondary, "link");
     }
 
     #[test]

@@ -801,6 +801,7 @@ pub(super) fn pane_flags(pane: &Pane, seen: bool) -> PaneFlags {
         working: pane.is_working(),
         starting: pane.is_starting_agent(),
         idle_agent: pane.is_idle_agent(),
+        error: pane.has_api_error(),
         seen,
     }
 }

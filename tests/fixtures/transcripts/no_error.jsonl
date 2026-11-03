@@ -1,0 +1,5 @@
+{"type":"summary","summary":"Fixture transcript without any provider error"}
+{"type":"user","timestamp":"2026-11-03T12:00:01.000Z","sessionId":"sess-test-4","cwd":"/Users/test/project","message":{"role":"user","content":"add the changelog entry"}}
+{"type":"assistant","timestamp":"2026-11-03T12:00:04.000Z","sessionId":"sess-test-4","cwd":"/Users/test/project","message":{"model":"claude-test","content":[{"type":"text","text":"Added under Unreleased."}]}}
+{"type":"attachment","timestamp":"2026-11-03T12:00:05.000Z","sessionId":"sess-test-4","cwd":"/Users/test/project","content":"attached context"}
+{"type":"user","timestamp":"2026-11-03T12:00:30.000Z","sessionId":"sess-test-4","cwd":"/Users/test/project","message":{"role":"user","content":"done"}}

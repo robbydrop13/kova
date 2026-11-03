@@ -57,6 +57,9 @@ pub fn pane_json(
             "unread".to_string(),
             serde_json::json!(super::sidebar_ui::pane_flags(pane, focused).is_unread()),
         );
+        // The API error the last turn ended on, or null. Kova.app only: the
+        // detector reads Claude's transcript, which a library host does not have.
+        obj.insert("error".to_string(), serde_json::json!(pane.api_error()));
         // The conversation the sidebar's `Resume` would reopen here
         // (`Pane::resume_target`), all three null when it offers none.
         // `resume-pane` runs exactly this line.
@@ -517,6 +520,7 @@ impl KovaView {
                         working: pane.is_working(),
                         awaiting: pane.is_awaiting(),
                         awaiting_since: pane.awaiting_since(),
+                        error: pane.has_api_error(),
                     },
                 );
             });
@@ -1237,15 +1241,16 @@ mod tests {
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         let mut keys = keys;
         keys.sort();
-        // `unread`, the three `resume_*` and `subject` are Kova.app's own, added
-        // on top of the library's `surface_json`: what the sidebar reads off the
-        // pane, the line its `Resume` button would run, and the subject it is filed under.
+        // `unread`, `error`, the three `resume_*` and `subject` are Kova.app's
+        // own, added on top of the library's `surface_json`: what the sidebar
+        // reads off the pane, the line its `Resume` button would run, and the
+        // subject it is filed under.
         assert_eq!(keys, [
             "agent", "agent_session_id", "agent_session_name", "awaiting", "awaiting_seen",
             "awaiting_since", "child_processes", "claude_config_dir", "claude_session_id",
-            "claude_session_name", "cwd", "dormant_session_id", "focused", "id", "is_idle", "minimized",
-            "peer_name", "pid", "resume_agent", "resume_command", "resume_session_id", "subject", "tab",
-            "title", "unread", "window", "working",
+            "claude_session_name", "cwd", "dormant_session_id", "error", "focused", "id", "is_idle",
+            "minimized", "peer_name", "pid", "resume_agent", "resume_command", "resume_session_id",
+            "subject", "tab", "title", "unread", "window", "working",
         ]);
         assert_eq!(v["subject"], serde_json::Value::Null, "a pane in no subject");
         let (mut b, _fb) = pane("");
@@ -1262,6 +1267,16 @@ mod tests {
         assert_eq!(v["minimized"], false);
         assert!(v["agent"].is_null(), "a bare shell has no agent");
         assert!(v["claude_session_id"].is_null());
+        assert_eq!(v["error"], serde_json::Value::Null, "no API error");
+        a.prompt_preview.replace(Some(crate::prompt_preview::PromptPreview::ApiError {
+            kind: "Limit reached".into(),
+            text: "resets 5:20pm".into(),
+            seen: false,
+        }));
+        assert_eq!(
+            pane_json(&a, 1, 2, true)["error"],
+            serde_json::json!({ "kind": "Limit reached", "text": "resets 5:20pm" })
+        );
         a.mark_awaiting_seen();
         assert_eq!(pane_json(&a, 1, 2, true)["awaiting_seen"], true);
     }

@@ -43,6 +43,17 @@ pub enum PromptPreview {
     },
     /// The turn ended with an answer; `seen` once the pane was looked at.
     TurnEnd { summary: String, seen: bool },
+    /// The turn died on a provider error; `seen` once the pane was looked at.
+    ApiError { kind: String, text: String, seen: bool },
+}
+
+/// A turn that ended on a provider error, as the sidebar tile says it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ApiError {
+    /// The word the tile shows, from the transcript's `error` value.
+    pub kind: String,
+    /// What the provider said, one line, at most 120 chars.
+    pub text: String,
 }
 
 /// The parts of a permission prompt the tile shows.
@@ -246,6 +257,53 @@ pub fn turn_end_summary(transcript_tail: &str) -> Option<String> {
     summary.map(|s| summary_line(&s)).filter(|s| !s.is_empty())
 }
 
+/// The provider error a transcript tail ends on: `Some` when the LAST `user`
+/// or `assistant` record is an assistant one flagged `isApiErrorMessage`.
+/// A later user line (the retry) or assistant line (a fresh answer) means the
+/// pane moved on, so nothing is reported. Every other record type (summary,
+/// system, attachment...) is ignored, including one written after the error.
+///
+/// Observed `error` values and the word the tile shows for each: `rate_limit`
+/// is "Limit reached", `server_error` "API error", `invalid_request` "Request
+/// failed", `authentication_failed` "Logged out", anything else "Error".
+pub fn api_error(transcript_tail: &str) -> Option<ApiError> {
+    for line in transcript_tail.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match record.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                if record.get("isApiErrorMessage").and_then(|f| f.as_bool()) != Some(true) {
+                    return None;
+                }
+                let text = record
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .and_then(|blocks| blocks.iter().find_map(|b| b.get("text").and_then(|t| t.as_str())))
+                    .map(summary_line)
+                    .unwrap_or_default();
+                let error = record.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                return Some(ApiError { kind: error_kind(error).to_string(), text });
+            }
+            Some("user") => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The word the tile shows for a transcript `error` value.
+fn error_kind(error: &str) -> &'static str {
+    match error {
+        "rate_limit" => "Limit reached",
+        "server_error" => "API error",
+        "invalid_request" => "Request failed",
+        "authentication_failed" => "Logged out",
+        _ => "Error",
+    }
+}
+
 /// One line out of a markdown answer: the first non-empty line, leading
 /// heading / list marks and every emphasis mark stripped, cut at
 /// `SUMMARY_MAX` chars with an ellipsis.
@@ -277,6 +335,10 @@ mod tests {
     const IDLE: &str = include_str!("../tests/fixtures/prompt/screen-idle.txt");
     const TRUST: &str = include_str!("../tests/fixtures/prompt/screen-trust-dialog.txt");
     const TRANSCRIPT: &str = include_str!("../tests/fixtures/prompt/transcript-echo.jsonl");
+    const ERROR_LAST: &str = include_str!("../tests/fixtures/transcripts/api_error_last.jsonl");
+    const ERROR_RETRY: &str = include_str!("../tests/fixtures/transcripts/api_error_then_retry.jsonl");
+    const ERROR_ANSWER: &str = include_str!("../tests/fixtures/transcripts/api_error_then_answer.jsonl");
+    const NO_ERROR: &str = include_str!("../tests/fixtures/transcripts/no_error.jsonl");
 
     #[test]
     fn a_bash_prompt_parses_to_its_header_question_and_command() {
@@ -358,8 +420,59 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_that_died_on_an_api_error_is_read_from_the_transcript_tail() {
+        let e = api_error(ERROR_LAST).expect("rate limit");
+        assert_eq!(e.kind, "Limit reached");
+        assert_eq!(e.text, "You've hit your session limit · resets 5:20pm (Europe/Paris)");
+        // A later turn, whether retried or answered, clears it.
+        assert_eq!(api_error(ERROR_RETRY), None);
+        assert_eq!(api_error(ERROR_ANSWER), None);
+        assert_eq!(api_error(NO_ERROR), None);
+        assert_eq!(api_error(""), None);
+    }
+
+    #[test]
+    fn every_observed_error_value_gets_a_tile_word() {
+        for (raw, kind) in [
+            ("rate_limit", "Limit reached"),
+            ("server_error", "API error"),
+            ("invalid_request", "Request failed"),
+            ("authentication_failed", "Logged out"),
+            ("model_not_found", "Error"),
+            ("unknown", "Error"),
+        ] {
+            let line = format!(
+                r#"{{"type":"assistant","isApiErrorMessage":true,"error":"{raw}","message":{{"content":[{{"type":"text","text":"failed"}}]}}}}"#
+            );
+            assert_eq!(api_error(&line).unwrap().kind, kind);
+        }
+    }
+
+    #[test]
+    fn an_error_text_is_one_line_of_at_most_120_chars() {
+        let long = "a".repeat(300);
+        let line = format!(
+            r#"{{"type":"assistant","isApiErrorMessage":true,"error":"unknown","message":{{"content":[{{"type":"text","text":"{long}\nsecond line"}}]}}}}"#
+        );
+        let e = api_error(&line).unwrap();
+        assert_eq!(e.text.chars().count(), 120);
+        assert!(e.text.ends_with('\u{2026}'));
+        assert!(!e.text.contains('\n'));
+    }
+
+    #[test]
     fn transcript_path_slugs_the_cwd_like_the_daemon() {
         let p = transcript_path("/Users/alice", "/Users/alice/dev/link", "abc-123");
         assert_eq!(p, PathBuf::from("/Users/alice/.claude/projects/-Users-alice-dev-link/abc-123.jsonl"));
+    }
+
+    // The last user or assistant line decides: records of any other type,
+    // written after the error, do not cancel it.
+    #[test]
+    fn only_the_last_user_or_assistant_record_decides() {
+        let error = r#"{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","message":{"content":[{"type":"text","text":"limit"}]}}"#;
+        assert!(api_error(&format!("{error}\n{{\"type\":\"summary\",\"summary\":\"later\"}}\n")).is_some());
+        assert!(api_error(&format!("not json\n{error}\n")).is_some());
+        assert_eq!(api_error(&format!("{error}\n{{\"type\":\"user\",\"message\":{{\"content\":\"retry\"}}}}\n")), None);
     }
 }

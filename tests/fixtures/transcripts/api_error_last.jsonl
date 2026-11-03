@@ -1,0 +1,5 @@
+{"type":"user","timestamp":"2026-11-03T09:12:01.000Z","sessionId":"sess-test-1","cwd":"/Users/test/project","message":{"role":"user","content":"summarise the failing test"}}
+{"type":"assistant","timestamp":"2026-11-03T09:12:04.000Z","sessionId":"sess-test-1","cwd":"/Users/test/project","message":{"model":"claude-test","content":[{"type":"text","text":"The fixture is missing from tests/fixtures."}]}}
+{"type":"user","timestamp":"2026-11-03T09:12:30.000Z","sessionId":"sess-test-1","cwd":"/Users/test/project","message":{"role":"user","content":"run it again"}}
+{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"2026-11-03T09:12:33.000Z","sessionId":"sess-test-1","cwd":"/Users/test/project","message":{"model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"You've hit your session limit · resets 5:20pm (Europe/Paris)"}]}}
+{"type":"summary","summary":"Fixture transcript for the sidebar error tile"}

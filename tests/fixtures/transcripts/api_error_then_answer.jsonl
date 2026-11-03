@@ -1,0 +1,6 @@
+{"type":"user","timestamp":"2026-11-03T11:20:01.000Z","sessionId":"sess-test-3","cwd":"/Users/test/project","message":{"role":"user","content":"explain the build script"}}
+{"type":"assistant","isApiErrorMessage":true,"error":"invalid_request","timestamp":"2026-11-03T11:20:02.000Z","sessionId":"sess-test-3","cwd":"/Users/test/project","message":{"model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"Prompt is too long"}]}}
+{"type":"assistant","timestamp":"2026-11-03T11:21:15.000Z","sessionId":"sess-test-3","cwd":"/Users/test/project","message":{"model":"claude-test","content":[{"type":"text","text":"It builds the binary and signs the bundle."}]}}
+{"type":"user","timestamp":"2026-11-03T11:22:00.000Z","sessionId":"sess-test-3","cwd":"/Users/test/project","message":{"role":"user","content":"thanks"}}
+{"type":"system","timestamp":"2026-11-03T11:22:00.500Z","sessionId":"sess-test-3","cwd":"/Users/test/project","content":"hook ran"}
+{"type":"summary","summary":"Fixture transcript with an error followed by an answer"}
