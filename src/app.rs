@@ -46,6 +46,16 @@ pub struct AppDelegateIvars {
     asks: RefCell<crate::ask::Board>,
 }
 
+impl AppDelegateIvars {
+    /// Visit the questions waiting for the user, read-only: the needs model
+    /// counts them and Next walks the pane each one came from. The board
+    /// lives on the delegate, not in a window, so every window reads the
+    /// same list here.
+    pub fn for_each_waiting_ask(&self, visit: impl FnMut(&crate::ask::Question)) {
+        self.asks.borrow().for_each_waiting(visit);
+    }
+}
+
 /// Marks the main thread as busy with Kova's own work for as long as it lives,
 /// restoring whatever the previous state was on the way out.
 struct BusyGuard<'a> {

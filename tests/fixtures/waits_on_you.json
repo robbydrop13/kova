@@ -1,0 +1,141 @@
+[
+  {
+    "name": "empty",
+    "input": { "now": 1000, "panes": [], "routines": [], "asks": [] },
+    "expect": { "waits_on_you": 0, "order": [] }
+  },
+  {
+    "name": "errors_oldest_first",
+    "input": {
+      "now": 1000,
+      "panes": [
+        { "id": 9, "error_since": 30, "permission_since": null, "title": "api" },
+        { "id": 4, "error_since": 10, "permission_since": null, "title": "web" },
+        { "id": 7, "error_since": 40, "permission_since": null, "title": "docs" }
+      ],
+      "routines": [],
+      "asks": []
+    },
+    "expect": { "waits_on_you": 0, "order": ["pane:4", "pane:9", "pane:7"] }
+  },
+  {
+    "name": "order_across_kinds",
+    "input": {
+      "now": 1000,
+      "panes": [
+        { "id": 3, "error_since": 10, "permission_since": null, "title": "api" },
+        { "id": 5, "error_since": null, "permission_since": 30, "title": "web" }
+      ],
+      "routines": [
+        { "name": "alpha", "failed_at": 20, "paused": false }
+      ],
+      "asks": [
+        { "id": "a1", "pane_id": 7, "created_at": 40, "snoozed_until": null, "answered": false, "title": "Ship the draft?" }
+      ]
+    },
+    "expect": { "waits_on_you": 2, "order": ["pane:3", "routine:alpha", "pane:5", "ask:a1"] }
+  },
+  {
+    "name": "snoozed_excluded",
+    "input": {
+      "now": 1000,
+      "panes": [],
+      "routines": [],
+      "asks": [
+        { "id": "a1", "pane_id": 7, "created_at": 100, "snoozed_until": 1200, "answered": false, "title": "Ship the draft?" }
+      ]
+    },
+    "expect": { "waits_on_you": 0, "order": [] }
+  },
+  {
+    "name": "snooze_expired_included",
+    "input": {
+      "now": 1000,
+      "panes": [],
+      "routines": [],
+      "asks": [
+        { "id": "a1", "pane_id": 7, "created_at": 100, "snoozed_until": 900, "answered": false, "title": "Ship the draft?" }
+      ]
+    },
+    "expect": { "waits_on_you": 1, "order": ["ask:a1"] }
+  },
+  {
+    "name": "answered_excluded",
+    "input": {
+      "now": 1000,
+      "panes": [],
+      "routines": [],
+      "asks": [
+        { "id": "a1", "pane_id": 7, "created_at": 100, "snoozed_until": null, "answered": true, "title": "Ship the draft?" }
+      ]
+    },
+    "expect": { "waits_on_you": 0, "order": [] }
+  },
+  {
+    "name": "ask_and_permission_same_pane_deduped",
+    "input": {
+      "now": 1000,
+      "panes": [
+        { "id": 5, "error_since": null, "permission_since": 50, "title": "web" }
+      ],
+      "routines": [],
+      "asks": [
+        { "id": "a1", "pane_id": 5, "created_at": 40, "snoozed_until": null, "answered": false, "title": "Run the migration?" }
+      ]
+    },
+    "expect": { "waits_on_you": 1, "order": ["ask:a1"] }
+  },
+  {
+    "name": "ask_and_permission_tied_keeps_the_ask",
+    "input": {
+      "now": 1000,
+      "panes": [
+        { "id": 5, "error_since": null, "permission_since": 50, "title": "web" }
+      ],
+      "routines": [],
+      "asks": [
+        { "id": "a1", "pane_id": 5, "created_at": 50, "snoozed_until": null, "answered": false, "title": "Run the migration?" }
+      ]
+    },
+    "expect": { "waits_on_you": 1, "order": ["ask:a1"] }
+  },
+  {
+    "name": "error_and_ask_same_pane_both",
+    "input": {
+      "now": 1000,
+      "panes": [
+        { "id": 5, "error_since": 10, "permission_since": null, "title": "web" }
+      ],
+      "routines": [],
+      "asks": [
+        { "id": "a1", "pane_id": 5, "created_at": 40, "snoozed_until": null, "answered": false, "title": "Re-run with the other key?" }
+      ]
+    },
+    "expect": { "waits_on_you": 1, "order": ["pane:5", "ask:a1"] }
+  },
+  {
+    "name": "paused_failed_routine_excluded",
+    "input": {
+      "now": 1000,
+      "panes": [],
+      "routines": [
+        { "name": "alpha", "failed_at": 10, "paused": true }
+      ],
+      "asks": []
+    },
+    "expect": { "waits_on_you": 0, "order": [] }
+  },
+  {
+    "name": "routines_oldest_first",
+    "input": {
+      "now": 1000,
+      "panes": [],
+      "routines": [
+        { "name": "beta", "failed_at": 50, "paused": false },
+        { "name": "alpha", "failed_at": 20, "paused": false }
+      ],
+      "asks": []
+    },
+    "expect": { "waits_on_you": 0, "order": ["routine:alpha", "routine:beta"] }
+  }
+]

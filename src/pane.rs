@@ -2164,7 +2164,11 @@ impl Pane {
         let path = crate::prompt_preview::transcript_path(&home, &cwd, &session_id);
         let tail = crate::prompt_preview::read_transcript_tail(&path)?;
         if let Some(error) = crate::prompt_preview::api_error(&tail) {
-            return Some(PromptPreview::ApiError { kind: error.kind, text: error.text, seen: false });
+            // Dated like the permission prompt above: the needs model orders
+            // what waits on the user by age, and nobody else knows when the
+            // transcript turned into an error.
+            let since = crate::surface::now_epoch_secs();
+            return Some(PromptPreview::ApiError { kind: error.kind, text: error.text, since, seen: false });
         }
         crate::prompt_preview::turn_end_summary(&tail)
             .map(|summary| PromptPreview::TurnEnd { summary, seen: false })

@@ -43,8 +43,9 @@ pub enum PromptPreview {
     },
     /// The turn ended with an answer; `seen` once the pane was looked at.
     TurnEnd { summary: String, seen: bool },
-    /// The turn died on a provider error; `seen` once the pane was looked at.
-    ApiError { kind: String, text: String, seen: bool },
+    /// A turn died on a provider error. `since` is when it was detected
+    /// (epoch seconds), `seen` once the pane was looked at.
+    ApiError { kind: String, text: String, since: u64, seen: bool },
 }
 
 /// A turn that ended on a provider error, as the sidebar tile says it.

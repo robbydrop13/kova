@@ -527,6 +527,16 @@ focused pane's place in that order, wrapping, never the focused pane itself
 (a status line says `Nothing to read` when nothing else is). IPC
 `list-panes` reports the same rule as `unread`.
 
+Before that order, `Cmd+J` walks what waits on the user
+(`src/window/needs.rs`): errors oldest first, failed routines oldest first,
+then permission prompts and open questions merged by age, with a pane's own
+prompt and open question collapsed into one item. `KovaView::sync_needs`
+rebuilds that list every tick and the key, the Asks badge (`waits_on_you`:
+permissions and asks only, never errors or failed runs) and the Scheduled
+badge all read it. A failed routine has no pane to land on, so it switches
+the sidebar to Scheduled once, and the next press falls through to the
+unread order above.
+
 ### 5.1 Where the question text comes from
 
 Unchanged from v2: `src/prompt_preview.rs` (pure) and `Pane::probe_prompt`

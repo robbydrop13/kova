@@ -1271,6 +1271,7 @@ mod tests {
         a.prompt_preview.replace(Some(crate::prompt_preview::PromptPreview::ApiError {
             kind: "Limit reached".into(),
             text: "resets 5:20pm".into(),
+            since: 1,
             seen: false,
         }));
         assert_eq!(

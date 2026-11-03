@@ -10,6 +10,7 @@ pub use ipc_handlers::{IpcMergeTabResult, IpcMoveTabResult, IpcSwapPaneResult, S
 use overlays::{FilterState, RenamePaneState, RenameTabState};
 mod recent_projects_overlay;
 use recent_projects_overlay::RecentProjectsState;
+mod needs;
 mod resize;
 mod search_palette;
 use search_palette::{SearchPaletteState, SearchRow, is_shortcut, is_typed_char, typed_text};

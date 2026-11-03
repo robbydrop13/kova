@@ -2,8 +2,9 @@
 //! sessions, then a loop over every open session. The visit history walked by
 //! `Cmd+Shift+Option+arrows` shares the same jump.
 
+use super::needs;
 use super::sidebar::SidebarSort;
-use super::sidebar_model::pane_order;
+use super::sidebar_model::{pane_order, SidebarList};
 use super::*;
 
 /// Show the tier banner in whichever window owns `pane_id` — the jump may have
@@ -91,6 +92,10 @@ fn next_pane_in_loop(candidates: &mut Vec<(u64, PaneId)>, current: Option<PaneId
 /// pane's status bar names, and what colours it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum AttentionTier {
+    /// Something waits on the user: a turn that died on an error, a
+    /// permission prompt, an open question. Ahead of unread output because
+    /// none of these clears by itself.
+    Waiting,
     /// A bell, or a command that finished while the eye was elsewhere.
     Unread,
     /// A Claude session sitting open and idle, first time round.
@@ -106,6 +111,7 @@ impl AttentionTier {
     /// Label painted across the focused pane's status bar.
     fn label(self) -> &'static str {
         match self {
+            Self::Waiting => "Waiting on you",
             Self::Unread => "Tier 1 — unread output",
             Self::IdleAgent => "Tier 2 — idle agent session",
             Self::AgentLoop => "Tier 2 — open agent session (loop)",
@@ -117,6 +123,7 @@ impl AttentionTier {
     /// read as the same event.
     fn color(self) -> [f32; 3] {
         match self {
+            Self::Waiting => [0.72, 0.42, 0.10],
             Self::Unread => [0.15, 0.33, 0.68],
             Self::IdleAgent | Self::AgentLoop => [0.15, 0.50, 0.24],
         }
@@ -269,6 +276,33 @@ impl KovaView {
             let tabs = self.ivars().tabs.borrow();
             tabs.get(active_tab).map(|t| t.focused_pane)
         };
+
+        // What waits on the user comes before unread output: a pane whose
+        // turn died, or that sits on a permission prompt or an open question,
+        // cannot clear that by itself. `sync_needs` rebuilt the list on this
+        // tick, whether or not the sidebar is on screen.
+        let needs = self.ivars().sidebar.borrow().needs.clone();
+        let target = needs::next_need_pane(&needs, current.map(u64::from))
+            .and_then(|id| PaneId::try_from(id).ok());
+        if let Some(pane_id) = target {
+            log::info!("Cmd+J: waiting on you, from pane {:?} to pane {}", current, pane_id);
+            focus_pane_in_any_window(pane_id);
+            show_attention_banner(pane_id, AttentionTier::Waiting);
+            return;
+        }
+        // A failed routine has no pane to land on: the Scheduled list is where
+        // it lives. Once per routine, so later presses walk behind it.
+        let shown = self.ivars().sidebar.borrow().routine_shown.clone();
+        if let Some(name) = needs::first_failed_routine(&needs)
+            && shown.as_deref() != Some(name)
+            && self.ivars().sidebar.borrow().list != SidebarList::Scheduled
+        {
+            log::info!("Cmd+J: routine {} failed, showing Scheduled", name);
+            self.ivars().sidebar.borrow_mut().routine_shown = Some(name.to_string());
+            self.sidebar_show_list(SidebarList::Scheduled);
+            self.mark_dirty();
+            return;
+        }
 
         let mut unread: Vec<Candidate> = Vec::new();
         let mut idle_agent: Vec<Candidate> = Vec::new();

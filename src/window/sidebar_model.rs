@@ -130,10 +130,11 @@ pub struct SidebarModel {
     /// False until the first background read lands: an empty list then means
     /// "not read yet", not "nothing scheduled".
     pub routines_loaded: bool,
-    /// Questions waiting for an answer, for the Asks badge. Filled by the
-    /// task that lists them; zero until then.
+    /// What a human has to answer, for the Asks badge (`needs::waits_on_you`).
+    /// `build` leaves it at zero; `sync_sidebar` fills it from `sync_needs`.
     pub asks_waiting: u32,
-    /// A scheduled routine's last run failed: the red dot on its icon.
+    /// A scheduled routine's last run failed: the red dot on its icon. Same
+    /// path as the count above.
     pub routine_failed: bool,
     /// `2 waiting · 3 working · 4 idle`, one coloured run at a time.
     pub summary: Vec<(String, SummaryRun)>,
@@ -458,8 +459,8 @@ impl SidebarModel {
             view,
             routines_loaded: routines.is_some(),
             routines: routines.unwrap_or_default(),
-            // Both badges belong to the tasks that fill their lists: no
-            // question and no failed run is visible until then.
+            // Both badges come from the needs model, which needs the live
+            // panes and the board: `sync_sidebar` sets them right after.
             asks_waiting: 0,
             routine_failed: false,
             summary: summary_runs(waiting, working, idle_here),
@@ -623,6 +624,7 @@ mod tests {
         f.preview = Some(PromptPreview::ApiError {
             kind: "Limit reached".into(),
             text: "You've hit your session limit".into(),
+            since: 1,
             seen: false,
         });
         let t = TileVm::from_facts(&f, 0);

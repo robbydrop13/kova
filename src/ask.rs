@@ -1024,6 +1024,15 @@ impl Board {
         self.pending.iter().map(|(q, _)| q).collect()
     }
 
+    /// Visit the questions waiting for the user, oldest first, without
+    /// copying them: the needs model reads the id, the pane and the times,
+    /// and holds nothing. Read-only, unlike `answer` and `snooze`.
+    pub fn for_each_waiting(&self, mut visit: impl FnMut(&Question)) {
+        for (question, _) in &self.pending {
+            visit(question);
+        }
+    }
+
     /// The user answered `session_id`'s questions in the conversation itself:
     /// take them off the card and off disk, deliver nothing. A `kova ask` still
     /// waiting gets [`WITHDRAWN`] and exits 3. Returns how many were withdrawn.

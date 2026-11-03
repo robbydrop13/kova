@@ -92,6 +92,23 @@ impl When {
         era * 146097 + doe - 719468
     }
 
+    /// The epoch second this local minute starts at. `mktime` reads the fields
+    /// in the local zone, which is the zone routinectl printed them in, so a
+    /// routine's last run compares directly with a pane's or an ask's clock.
+    /// Out of range (a year before 1970, a broken timestamp) is 0: the needs
+    /// model then simply sorts it first.
+    pub fn epoch_secs(&self) -> u64 {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        tm.tm_year = self.year - 1900;
+        tm.tm_mon = self.month as i32 - 1;
+        tm.tm_mday = self.day as i32;
+        tm.tm_hour = self.hour as i32;
+        tm.tm_min = self.minute as i32;
+        tm.tm_isdst = -1;
+        let secs = unsafe { libc::mktime(&mut tm) };
+        if secs < 0 { 0 } else { secs as u64 }
+    }
+
     fn minute_number(&self) -> i64 {
         self.day_number() * 1440 + self.hour as i64 * 60 + self.minute as i64
     }
@@ -661,6 +678,28 @@ mod tests {
         assert_eq!(at("2026-11-03T07:43:27").minute, 43);
         assert_eq!(When::parse("2026-13-01T00:00"), None);
         assert_eq!(When::parse("tomorrow"), None);
+    }
+
+    #[test]
+    fn a_local_minute_reads_back_from_its_epoch_second() {
+        // Zoned through libc both ways, so the test holds whatever the Mac's
+        // zone is: what matters is that the two agree, not which instant it is.
+        let when = When { year: 2026, month: 11, day: 3, hour: 9, minute: 47 };
+        let secs = when.epoch_secs();
+        assert!(secs > 0);
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let t = secs as libc::time_t;
+        unsafe { libc::localtime_r(&t, &mut tm) };
+        assert_eq!(
+            (
+                tm.tm_year + 1900,
+                (tm.tm_mon + 1) as u32,
+                tm.tm_mday as u32,
+                tm.tm_hour as u32,
+                tm.tm_min as u32
+            ),
+            (2026, 11, 3, 9, 47)
+        );
     }
 
     #[test]

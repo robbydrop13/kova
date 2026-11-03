@@ -7,6 +7,7 @@
 
 use super::*;
 use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
+use super::needs::{self, AskNeed, NeedInput, NeedItem, NeedKind, PaneNeed, RoutineNeed};
 use super::sidebar_model::{header_title, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
@@ -127,6 +128,17 @@ pub(super) struct SidebarState {
     menu_pane: PaneId,
     /// The tab a context menu is open for.
     menu_tab: usize,
+    /// What waits on the user, in the order `Next` walks it
+    /// (`needs::need_items`), rebuilt once per tick whether the sidebar is on
+    /// screen or not: the badges and Cmd+J read the same list.
+    pub(super) needs: Vec<NeedItem>,
+    /// `needs::waits_on_you`, the badge on the Asks icon.
+    pub(super) waits_on_you: u32,
+    /// A scheduled routine's last run failed, the badge on the Scheduled icon.
+    pub(super) routine_failed: bool,
+    /// The failed routine Cmd+J already showed, so it shows it once rather
+    /// than on every press until the routine runs clean again.
+    pub(super) routine_shown: Option<String>,
 }
 
 impl SidebarState {
@@ -138,6 +150,10 @@ impl SidebarState {
             last_reveal: None,
             menu_pane: 0,
             menu_tab: 0,
+            needs: Vec::new(),
+            waits_on_you: 0,
+            routine_failed: false,
+            routine_shown: None,
         }
     }
 }
@@ -225,24 +241,115 @@ impl KovaView {
     // ---------------------------------------------------------------
     // Per-tick sync
     // ---------------------------------------------------------------
+    /// What waits on the user, once per tick: the order Cmd+J walks and the
+    /// two badges on the switcher. Runs before the sidebar early-outs below,
+    /// and so whether or not the sidebar is on screen: `routines::snapshot`
+    /// only reads on this path, and the jump must not depend on the view.
+    fn sync_needs(&self) {
+        let input = self.need_input(now_epoch_secs());
+        let items = needs::need_items(&input);
+        let routine_failed = items.iter().any(|item| item.kind == NeedKind::FailedRoutine);
+        let mut st = self.ivars().sidebar.borrow_mut();
+        st.needs = items;
+        st.waits_on_you = needs::waits_on_you(&input);
+        st.routine_failed = routine_failed;
+        if !routine_failed {
+            st.routine_shown = None;
+        }
+    }
+
+    /// What the app already knows, in the shape `needs::need_items` takes:
+    /// every pane's error and permission timestamps, the routines' last
+    /// failure, the open questions. Every window's panes, like
+    /// `collect_unread`: the badges and the jump cover the whole app.
+    fn need_input(&self, now: u64) -> NeedInput {
+        use crate::prompt_preview::PromptPreview;
+        let mut panes = Vec::new();
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let app = NSApplication::sharedApplication(mtm);
+        let ns_windows = app.windows();
+        for i in 0..ns_windows.count() {
+            let win = ns_windows.objectAtIndex(i);
+            let Some(view) = crate::app::kova_view(&win) else { continue };
+            let tabs = view.ivars().tabs.borrow();
+            for tab in tabs.iter() {
+                tab.for_each_pane(&mut |pane| {
+                    // `has_api_error` and `has_permission_prompt` read this
+                    // same preview behind a `!is_working` guard: one read and
+                    // the same guard, so the model cannot see what the tile
+                    // hides.
+                    if pane.is_working() {
+                        return;
+                    }
+                    let (error_since, permission_since) =
+                        match pane.prompt_preview.borrow().as_ref() {
+                            Some(PromptPreview::ApiError { since, .. }) => (Some(*since), None),
+                            Some(PromptPreview::Permission { since, .. }) => (None, Some(*since)),
+                            _ => return,
+                        };
+                    panes.push(PaneNeed {
+                        id: u64::from(pane.id),
+                        error_since,
+                        permission_since,
+                        title: pane.display_title("Shell"),
+                    });
+                });
+            }
+        }
+        // A run in flight is not a failure: the row says `running`, and the
+        // exit code routinectl carries until it ends is the previous one.
+        let routines = crate::routines::snapshot()
+            .map(|list| {
+                list.iter()
+                    .filter(|routine| !routine.running)
+                    .map(|routine| RoutineNeed {
+                        name: routine.name.clone(),
+                        failed_at: routine
+                            .last
+                            .as_ref()
+                            .filter(|last| last.code != 0)
+                            .and_then(|last| last.at())
+                            .map(|when| when.epoch_secs()),
+                        paused: routine.paused,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut asks = Vec::new();
+        let delegate = crate::app::app_delegate(mtm);
+        delegate.ivars().for_each_waiting_ask(|question| {
+            asks.push(AskNeed {
+                id: question.id.clone(),
+                pane_id: question.from.pane_id.map(u64::from),
+                created_at: question.asked_at,
+                snoozed_until: (question.snoozed_until > 0).then_some(question.snoozed_until),
+                // The board only holds what nobody answered.
+                answered: false,
+                title: first_line(&question.message),
+            });
+        });
+        NeedInput { panes, routines, asks, now }
+    }
 
     /// Read the tabs into a model and hand it to the sidebar view, which
     /// redraws only when something changed. Also where the list follows a
     /// focus change. Runs once per tick.
     pub(super) fn sync_sidebar(&self) {
+        self.sync_needs();
         let Some(view) = self.ivars().sidebar_view.get() else { return };
         if !self.sidebar_active() {
             return;
         }
         // The unread count across every window, for the Next pill.
         let unread = sidebar::unread_count(&self.collect_unread());
-        let (sort, list) = {
+        let (sort, list, waits_on_you, routine_failed) = {
             let st = self.ivars().sidebar.borrow();
-            (st.sort, st.list)
+            (st.sort, st.list, st.waits_on_you, st.routine_failed)
         };
         let facts = self.sidebar_tab_facts();
-        // Only the Scheduled view reads them, and `snapshot` refreshes off
-        // the tick: an open Panes view never shells out to launchctl.
+        // Only the Scheduled list needs the rows; the read itself already
+        // happens every tick in `sync_needs`, which is where the badges come
+        // from, so this only shapes them.
         let routines = match list {
             SidebarList::Scheduled => {
                 let open = self.ivars().sidebar.borrow().open_routine.clone();
@@ -251,7 +358,9 @@ impl KovaView {
             }
             SidebarList::Panes | SidebarList::Asks | SidebarList::Agents => None,
         };
-        let model = SidebarModel::build(&facts, sort, unread, now_epoch_secs(), list, routines);
+        let mut model = SidebarModel::build(&facts, sort, unread, now_epoch_secs(), list, routines);
+        model.asks_waiting = waits_on_you;
+        model.routine_failed = routine_failed;
         view.set_model(model);
 
         // Follow the focus: reveal the focused pane's tile (its header when
@@ -781,6 +890,12 @@ fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// The first non-empty line of a question, for the one-line row a need item
+/// draws: a markdown body would otherwise push everything else out.
+fn first_line(text: &str) -> String {
+    text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_string()
 }
 
 /// The flags a pane's tile state is derived from. `seen` is true for the
