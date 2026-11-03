@@ -2103,7 +2103,9 @@ impl Pane {
     /// Claude launched here but its session is not resolved yet: a restore
     /// command pending, or a `claude` foreground process without a session.
     pub fn is_starting_agent(&self) -> bool {
-        self.has_pending_command()
+        // A dormant conversation also waits in `pending_command`, but nothing
+        // starts until the pane is first on screen: it is asleep, not starting.
+        (self.has_pending_command() && self.dormant_session_id().is_none())
             || (self.agent_kind().is_none() && self.fg_process().is_some_and(|p| p.name == "claude"))
     }
 

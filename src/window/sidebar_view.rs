@@ -2851,7 +2851,7 @@ impl SidebarListView {
             fill_round(frame, HEADER_RADIUS, tokens::get().white, 0.05 * alpha);
         }
         let (muted, muted_alpha) = if selected { (tokens::get().white, 0.72) } else { (tokens::get().text_secondary, 1.0) };
-        let (number_fg, number_alpha) = if selected { (tokens::get().white, 0.72) } else { (tokens::get().text_tertiary, 1.0) };
+        let (number_fg, number_alpha) = if selected { (tokens::get().white, 0.72) } else { (tokens::get().text_muted, 1.0) };
         let cy = frame.y + frame.h / 2.0;
         let chevron = if g.collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
         stroke_icon(chevron, &ListLayout::header_chevron(frame), CHEVRON_D, muted, muted_alpha * alpha);
@@ -3005,7 +3005,7 @@ impl SidebarListView {
         let (title_fg, sec_fg, meta_fg) = if tile.focused {
             (tokens::get().sel_row_text, tokens::get().sel_row_text, tokens::get().sel_row_text)
         } else {
-            (tokens::get().text_primary, tokens::get().text_secondary, tokens::get().text_tertiary)
+            (tokens::get().text_primary, tokens::get().text_secondary, tokens::get().text_muted)
         };
 
         // One line: the state dot in its box, the session name, and the right

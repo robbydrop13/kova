@@ -357,7 +357,7 @@ mod tests {
         // `/bin/sh` stands in for the CLI: what matters is that the words
         // after the program reach it, so `list --json` is the command's own.
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/team/list.json");
-        let argv: Vec<String> = ["/bin/sh", "-c", &format!("cat {fixture}")].iter().map(|s| s.to_string()).collect();
+        let argv: Vec<String> = ["/bin/sh", "-c", &format!("cat '{fixture}'")].iter().map(|s| s.to_string()).collect();
         let team = read(&argv);
         assert!(team.available);
         assert_eq!(team.entry("alpha-manager").map(|e| e.name.as_str()), Some("alpha-manager"));

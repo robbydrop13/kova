@@ -114,6 +114,9 @@ pub mod tokens {
         pub text_primary: [f32; 3],
         pub text_secondary: [f32; 3],
         pub text_tertiary: [f32; 3],
+        /// Quieter than tertiary: state words (`starting`, `working`) and the
+        /// pane counts in group headers. Claap `gray.700` (dark), `gray.800` (light).
+        pub text_muted: [f32; 3],
         pub text_on_fill: [f32; 3],
         pub awaiting: [f32; 3],
         pub working: [f32; 3],
@@ -177,6 +180,7 @@ pub mod tokens {
         text_primary: rgb(dark::T1),
         text_secondary: rgb(dark::T2),
         text_tertiary: rgb(dark::T3),
+        text_muted: [0.580, 0.580, 0.580], // gray.700 #949494
         text_on_fill: WHITE,
         awaiting: rgb(dark::WARN_DOT),
         working: rgb(dark::INFO_DOT),
@@ -214,6 +218,7 @@ pub mod tokens {
         text_primary: rgb(light::T1),
         text_secondary: rgb(light::T2),
         text_tertiary: rgb(light::T3),
+        text_muted: [0.525, 0.525, 0.525], // gray.800 #868686
         text_on_fill: WHITE,
         awaiting: rgb(light::WARN_DOT),
         working: rgb(light::INFO_DOT),
