@@ -246,9 +246,11 @@ pub fn project_name(cwd: &str) -> String {
 }
 
 /// The subtitle, KovaLink's: `project · agent`, the agent left out when it is
-/// already the title.
+/// already the title or when it is `claude` (the default agent here: naming
+/// it is noise), and the project alone on a plain shell.
 pub fn subtitle(project: &str, agent: Option<&str>, title: &str) -> String {
     match agent {
+        Some("claude") => project.to_string(),
         Some(agent) if agent != title && !project.is_empty() => format!("{project} \u{b7} {agent}"),
         Some(agent) if agent != title => agent.to_string(),
         _ => project.to_string(),
@@ -304,17 +306,16 @@ impl TileVm {
         }
     }
 
-    /// Whether the tile is the tall awaiting card.
-    pub fn awaiting(&self) -> bool {
-        self.state == TileState::Awaiting
-    }
-
-    /// The chip: the state word, except that a shell holding an agent's
-    /// resume line names that agent (`claude`, `codex`) rather than `shell`.
-    pub fn chip(&self) -> String {
-        match (self.state, self.resumable, self.agent.as_deref()) {
-            (TileState::Shell, true, Some(agent)) => agent.to_string(),
-            _ => self.state.chip().to_string(),
+    /// The tile's right column: `waiting 4m` for an awaiting pane, the state
+    /// word while it works, its age otherwise. `None` when there is nothing
+    /// to say.
+    pub fn meta(&self) -> Option<String> {
+        match self.state {
+            TileState::Awaiting => {
+                Some(self.age.as_ref().map_or_else(|| self.state.chip().to_string(), |(age, _)| format!("waiting {age}")))
+            }
+            TileState::Working | TileState::Starting => Some(self.state.chip().to_string()),
+            _ => self.age.as_ref().map(|(age, _)| age.clone()),
         }
     }
 }
@@ -477,14 +478,20 @@ mod tests {
         });
         let t = TileVm::from_facts(&f, 1000 + 700);
         assert_eq!(t.state, TileState::Awaiting);
-        assert!(t.awaiting());
         assert_eq!(t.title, "pane 1");
-        assert_eq!(t.secondary, "link \u{b7} claude");
+        assert_eq!(t.secondary, "link");
         assert_eq!(t.question.as_deref(), Some("Run it?"));
         // No detail: the header stands in.
         assert_eq!(t.detail.as_deref(), Some("Bash command"));
         assert_eq!(t.age, Some(("11m".into(), true)));
+        assert_eq!(t.meta().as_deref(), Some("waiting 11m"));
         assert_eq!(t.summary, None);
+
+        // Working tiles say so; idle ones have nothing to add.
+        let working = TileVm::from_facts(&pane(4, PaneFlags { working: true, ..PaneFlags::default() }), 0);
+        assert_eq!(working.meta().as_deref(), Some("working"));
+        let idle = TileVm::from_facts(&pane(5, PaneFlags { idle_agent: true, ..PaneFlags::default() }), 0);
+        assert_eq!(idle.meta(), None);
 
         // The turn-end summary only shows on an unread tile.
         let mut f = pane(2, PaneFlags { turn_end_unseen: true, ..PaneFlags::default() });
@@ -537,8 +544,10 @@ mod tests {
         assert_eq!(project_name("/Users/me/link/"), "link");
         assert_eq!(project_name("/"), "/");
         assert_eq!(project_name(""), "");
-        assert_eq!(subtitle("Acme", Some("claude"), "Fix the login"), "Acme \u{b7} claude");
+        // `claude` is the default agent: the subtitle says the project only.
+        assert_eq!(subtitle("Acme", Some("claude"), "Fix the login"), "Acme");
         assert_eq!(subtitle("Acme", Some("claude"), "claude"), "Acme");
+        assert_eq!(subtitle("Acme", Some("codex"), "Shell"), "Acme \u{b7} codex");
         assert_eq!(subtitle("Acme", None, "Shell"), "Acme");
         assert_eq!(subtitle("", Some("codex"), "Shell"), "codex");
         assert_eq!(subtitle("", None, "Shell"), "");
@@ -561,7 +570,7 @@ mod tests {
         assert_eq!(t.state, TileState::Shell);
         assert!(t.resumable);
         assert!(!t.bare_shell);
-        assert_eq!(t.chip(), "claude");
+        assert_eq!(t.meta(), None);
         assert_eq!(t.title, "claude");
         assert_eq!(t.secondary, "Acme");
 
@@ -570,7 +579,7 @@ mod tests {
         let t = TileVm::from_facts(&bare, 0);
         assert!(t.bare_shell);
         assert!(!t.resumable);
-        assert_eq!(t.chip(), "shell");
+        assert_eq!(t.meta(), None);
         assert_eq!(t.title, "Shell");
         assert_eq!(t.secondary, "link");
 
@@ -584,9 +593,9 @@ mod tests {
             ..PaneFacts::default()
         };
         let t = TileVm::from_facts(&live, 0);
-        assert_eq!(t.chip(), "idle");
+        assert_eq!(t.meta(), None);
         assert_eq!(t.title, "Sidebar identity");
-        assert_eq!(t.secondary, "kova \u{b7} claude");
+        assert_eq!(t.secondary, "kova");
         assert!(!t.bare_shell && !t.resumable);
 
         // Renaming: the edit buffer is the title.

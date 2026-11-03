@@ -117,70 +117,88 @@ Truncation is AppKit's: titles and subtitles at the tail (never a head-cut
 visible), the question wrapped to two lines with an ellipsis on the last
 (`TruncatesLastVisibleLine`).
 
-### 3.4 Group (one per tab; `TabGroupView.tsx`)
+### 3.4 Group (one block per tab)
 
-Content inset 12 on each side; groups 16 apart. Groups have no colour wash
-any more: the active group is a `bg1` card, radius 8, with a 1 pt
-`border.subtle` stroke; the other groups draw nothing. The whole panel is
-one click target: a click on its padding, on a gap or on the empty bottom
-(`ListHit::Panel`, the fallback once no row or control took the point)
-selects the tab, and the hand cursor covers every panel (cursor rects on the
-list view, refreshed on relayout). The header sits at the top of the panel,
-the tiles 12 pt apart (`PANEL_GAP`), and the panel pads 12 pt all around
-(`PANEL_PAD`: above the header, at the sides, under the last row). No tint
-bar. The tint is `TAB_COLORS[c]` (twelve colours: red, orange, yellow,
-green, blue, violet, pink, coral, lime, teal, cyan, indigo) or `tabNone`
-grey.
+Content inset 12 on each side; groups 4 apart (`GROUP_GAP`). A group draws
+nothing of its own: the selected one is a `bg1` card, radius 8, with a 1 pt
+`border.subtle` stroke, and it pads 2 pt above its header and under its last
+tile (`GROUP_PAD_V`). The whole block is one click target: a click inside it
+but outside a row (that 2 pt padding, the gaps, the 14 pt side insets, the
+empty bottom) is `ListHit::Panel` and selects the tab, and the hand cursor
+covers every block (cursor rects on the list view, refreshed on relayout).
+The header runs edge to edge at the top of the block; the tiles are 2 pt
+apart (`ROW_GAP`), 14 pt in from the group's edges, under the chevron. No
+tint bar in the panel: the tab's colour is the bar in the header, drawn from
+`TAB_COLORS[c]` (twelve colours: red, orange, yellow, green, blue, violet,
+pink, coral, lime, teal, cyan, indigo) or `tabNone` grey.
 
-Header 28 tall, its hover ground a full pill (radius 14), no ground of its
-own otherwise (the group's background shows through):
-the `chevron-down` / `chevron-right` icon, the 8 pt tint dot, the Cmd+N
-number, the title (15 semibold, primary), then at the right the `+` button
-(24 pt, radius 8) and, when folded, the collapsed summary: a 6 pt amber dot
-when a pane awaits, a 6 pt blue dot when one works, `4 panes`. Row hover:
-white 5 %; pressed 10 %. The `+` is hidden until the mouse is anywhere on
-the header row (dot and `+` included); it has no ground of its own, and
-white 14 % (radius 8) appears under it only while the mouse is on the `+`
-itself (20 % pressed). The dot is a button (section 4.3, colour picker): its
-16 pt box (`ListLayout::dot_button`) is its own hit (`ListHit::HeaderDot`),
-between the chevron zone and the number, and a 1 pt white ring at 20 %
-(35 % pressed) appears around it under the mouse.
+Header 28 tall, its hover ground a rounded row (radius 6), no ground of its
+own otherwise (the card shows through): the `chevron-down` / `chevron-right`
+icon (12 pt, in a 24 pt zone from the group's left edge), the tab's colour as
+a vertical bar 3 wide x 10 tall (radius 1.5), the title (`Style::Title`, 13
+medium, primary), then at the right the pane count (`Style::Number`, 11,
+tertiary) and, when folded, the 6 pt amber / blue dots of the panes that wait
+or work, left of the count. Row hover: white 5 %; pressed 10 %. The `+` (24
+pt, radius 8) takes the count's place while the mouse is anywhere on the
+header row (bar and `+` included); it has no ground of its own, and white
+14 % (radius 8) appears under it only while the mouse is on the `+` itself
+(20 % pressed). The colour bar is a button (section 4.3, colour picker): its
+16 pt box (`ListLayout::dot_button`, the bar itself in
+`ListLayout::tint_bar`, both centred 30 pt into the row by
+`ListLayout::dot_centre`) is its hit (`ListHit::HeaderDot`), between the
+chevron zone and the title, and a 1 pt white ring at 20 % (35 % pressed)
+appears around it under the mouse. `ListLayout::header_chevron` is the
+chevron's 12 pt box.
 
 #### 3.4.1 Selected tab
 
 The selected tab's card differs by its fill and border, and by its text:
 
-- Header: title white; number, chevron and collapsed count white 72 %
-  (secondary / tertiary elsewhere); the dot in the tint with a 3 pt halo at
-  28 %. The `+` is white when shown (primary elsewhere).
-- Tiles (every panel): white 12 % with a 1 pt border white 6 %, radius 10;
-  hover +4 %; pressed +6 %; minimized 7 % less. In the selected panel the
-  secondary text is white 68 % and the idle / shell ring white 45 %.
-  Focused pane (selected panel only): white 22 % (+3 % under the mouse), a
-  1 pt border white 22 % and a soft shadow (`NSShadow`, 0 / 6 pt down, 18 pt
-  blur, black 22 %); the accent ring is gone, the focused tile is simply the
-  brightest one. The awaiting card keeps its amber look inside the panel.
-- Chips (`TileState::chip_style(selected)`): neutral chips are white 55 % on
-  white 7 % in the selected panel; `text.tertiary` on white 5 % elsewhere.
-  Awaiting, working, starting and unread chips keep their colour at 85 % on
-  10 % of the same colour, in both places.
+- Header: title white; count, chevron and folded dots white 72 %
+  (secondary / tertiary elsewhere). The `+` is white when shown (primary
+  elsewhere).
+- Tiles: no ground of their own, they sit on the card; under the mouse a
+  `bg.hover` ground (`tokens::TILE_HOVER`), radius 6, and `btn2.hover`
+  pressed. The focused pane is a `SEL_BG` ground (`tokens::SEL_BG`, radius
+  6) with its title, subtitle and meta column in `SEL_TEXT`
+  (`tokens::SEL_TEXT`); its idle / shell ring follows the same ink.
 
-### 3.5 Tile (`SessionRow.tsx`), radius 10, fill `bg.raised`, padding 8 v / 10 h
+### 3.5 Tile, radius 6, no fill, padding 5 v / 6 h
 
-Row 1 (20 tall): the state glyph at x 10 (an 8 pt dot in the state colour;
-a 1.5 pt `border.strong` ring for idle and shell), the title from x 26 (`⊟ `
-prefix when minimized), the chip right-aligned: 18 tall, radius 9, padding 7,
-its colours from `TileState::chip_style` (3.4.1): working 85 % on working
-10 % (`working`, `starting`), accent 85 % on accent 10 % + 6 pt accent dot
-(`done`, `bell`), tertiary on white 5 % (`idle`, `shell`, or the agent of a
-restored session: see below). Row 2 (16 tall, 2 below): the subtitle in
-secondary, a `★` in amber first when bookmarked; a bare shell shows
-`Start Claude` and a restored session `Resume`, each after a filled 11 pt
-`play` (accent link, primary on hover) right-aligned instead of the end of
-the subtitle. An unread tile with a turn-end summary adds a third row in
-secondary. Heights 54 / 72. Fill, border, hover, pressed, minimized and
-the focused pane: 3.4.1 (white layers over the card, no accent
-ring).
+A 44 pt row (5 + an 18 pt title line + a 16 pt subtitle line + 5, floored at
+`TILE_MIN_H` 40), inset 14 pt from the group's edges:
+
+- Left: a 16 x 18 box at 6 pt from the tile's edge (`TILE_PAD_H`) holding the
+  8 pt state dot in the state colour; idle and shell draw a 1.5 pt
+  `text.tertiary` ring instead of a fill.
+- From 26 pt into the tile (`TEXT_X`; 40 pt into the group, aligned with the
+  header's title): the title (`Style::Title`, 13 medium, one line,
+  tail-truncated, `⊟ ` prefix when minimized) over the subtitle
+  (`Style::Secondary`, 12, one line, tail-truncated). A `★` in amber comes
+  first when bookmarked; a bare shell shows `Start Claude` and a restored
+  session `Resume`, each after a filled 11 pt `play` (accent link, primary on
+  hover) right-aligned at the end of the subtitle line.
+- Right, 6 pt in: the meta column (`Style::Number`, 11, right-aligned):
+  `waiting 4m` for an awaiting pane, `working` (or `starting`) while it
+  works, the age otherwise, in tertiary and `status.error` past 10 min
+  (`AGING_SECS`); a 6 pt accent dot comes before it on an unread tile.
+
+The awaiting pane is no longer a tall card: same tile, amber dot and
+`waiting 4m` meta. Its question is not drawn in the row (a later `Needs you`
+block takes it), and neither is the turn-end summary: title and subtitle,
+one line each.
+
+Under the mouse the meta column gives way to the hover actions, right to
+left: `x` close (error red on hover), `minimize-2` / `maximize-2` minimize /
+restore, `check` mark read (unread tile) or `mail` mark unread (read tile),
+and `square` stop (interrupt colour; working or awaiting only). No play
+glyph: `Start Claude` and `Resume` are the links on the subtitle line, and a
+click on the tile already focuses the pane. Each is a 22 pt button (radius 6,
+bare; white 12 % under the one hovered, 20 % pressed) holding a 16 pt Feather
+icon, 2 apart, on the title line, with a tooltip (`Close`, `Minimize`,
+`Restore`, `Mark read`, `Mark unread`, `Stop`) through
+`addToolTipRect:owner:userData:`. Pressed paints on mouse down, the action
+fires on mouse up inside the same button (a leave cancels).
 
 Identity (`sidebar_model::tile_title`, `subtitle`; the phone's `paneLabel`
 and `SessionRow` subtitle, from the same `Pane` reads the daemon gets over
@@ -193,28 +211,18 @@ IPC):
   Kova keeps as the sticky title), else the agent (`claude`, `codex`), else
   the foreground process, else `Shell`. Tail-truncated.
 - Subtitle: `project · agent`, `project` being the cwd's last segment (the
-  phone's `projectName`), the agent left out when it is already the title, and
-  the project alone on a plain shell.
+  phone's `projectName`), the agent left out when it is already the title or
+  when it is `claude` (the default agent: naming it is noise, other agents
+  stay), and the project alone on a plain shell.
 - Agent: the live one (`Pane::agent_kind()`), else the one whose resume line
   waits at the prompt (`Pane::restored_session()`: a bare shell whose last
   command is `claude … --resume <id>` or `codex resume <id>`, which is what a
   restored pane holds until Enter is pressed). Such a restored session keeps
-  the shell tile (ring) but its chip reads `claude` / `codex` and its call is
-  `Resume`; `shell` and `Start Claude` are for a plain shell only.
+  the shell tile (ring) but titles itself after its agent (`claude` /
+  `codex`) and its call is `Resume`; `Shell` and `Start Claude` are for a
+  plain shell only.
 - The group header without a custom tab name is titled the same way from the
   focused pane.
-
-Hover actions replace the chip on row 1, right to left: `x` close (error
-red on hover), `minimize-2` / `maximize-2` minimize / restore, `check` mark
-read (unread tile) or `mail` mark unread (read tile), and `square` stop
-(interrupt colour; working or awaiting only). No play glyph: `Start Claude`
-and `Resume` are the links on row 2, and a click on the tile already
-focuses the pane. Each is a 24 pt button (radius 7, bare; white 12 % under
-the one hovered, 20 % pressed) holding a 16 pt Feather icon, 2 apart, with
-a tooltip (`Close`, `Minimize`, `Restore`, `Mark read`, `Mark unread`,
-`Stop`) through `addToolTipRect:owner:userData:`. Pressed paints on mouse
-down, the action fires on mouse up inside the same button (a leave
-cancels).
 
 #### Icon set (`src/window/feather.rs`)
 
@@ -224,9 +232,9 @@ button, so the stroke is 1.33 pt and the icon scales with the row. The
 views are flipped (y down, like SVG), so the published coordinates are used
 as they are. `chevron-down` / `chevron-right` (collapse caret), `plus`
 (header), `x` (close), `maximize-2` / `minimize-2` (restore / minimize),
-`square` (stop), `check` / `mail` (mark read / unread). The `Start Claude`,
-`Resume` and `Stop` links and the Next pill use the filled `play` and
-`square` (11 pt in the links, 12 pt in the pill). `Icon::segments` and the point mapping are pure
+`square` (stop), `check` / `mail` (mark read / unread). The `Start Claude`
+and `Resume` links and the Next pill use the filled `play` (11 pt in the
+links, 12 pt in the pill). `Icon::segments` and the point mapping are pure
 and unit-tested.
 
 ### 3.6 Awaiting card (`AwaitingCard.tsx`), radius 12, fill `awaitingBg`

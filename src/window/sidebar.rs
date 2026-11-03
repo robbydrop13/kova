@@ -108,7 +108,6 @@ pub mod tokens {
     pub const TEXT_TERTIARY: [f32; 3] = rgb(ds::T3);
     pub const TEXT_ON_FILL: [f32; 3] = [1.0, 1.0, 1.0];
     pub const AWAITING: [f32; 3] = rgb(ds::WARN_DOT);
-    pub const AWAITING_BG: [f32; 3] = rgb(ds::WARN_BG);
     pub const WORKING: [f32; 3] = rgb(ds::INFO_DOT);
     pub const ERROR: [f32; 3] = rgb(ds::CRIT_DOT);
     pub const INTERRUPT: [f32; 3] = rgb(ds::CRIT);
@@ -125,27 +124,6 @@ pub mod tokens {
     /// The white every translucent layer of the selected group is cut from.
     pub const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
     pub const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
-}
-
-// ---------------------------------------------------------------
-// Selected tab layers
-// ---------------------------------------------------------------
-
-/// Alpha of the white the selected group's tiles are filled with.
-pub const SEL_TILE_ALPHA: f64 = 0.12;
-/// The tile's lift under the mouse (a point less on the focused tile, which
-/// is already the brightest), and the focused tile's lift.
-pub const SEL_TILE_HOVER_LIFT: f64 = 0.04;
-pub const SEL_TILE_FOCUS_LIFT: f64 = 0.10;
-
-/// Fill alpha of a tile in the selected group.
-pub fn sel_tile_alpha(focused: bool, hovered: bool) -> f64 {
-    let hover = match (focused, hovered) {
-        (_, false) => 0.0,
-        (true, true) => SEL_TILE_HOVER_LIFT - 0.01,
-        (false, true) => SEL_TILE_HOVER_LIFT,
-    };
-    SEL_TILE_ALPHA + if focused { SEL_TILE_FOCUS_LIFT } else { 0.0 } + hover
 }
 
 /// The tint of a tab: its Kova colour, or the neutral grey without one.
@@ -300,7 +278,7 @@ impl TileState {
         states.min_by_key(|s| s.rank()).unwrap_or(TileState::Shell)
     }
 
-    /// Chip copy. The awaiting tile shows its age instead of a chip.
+    /// The state word: what the tile's meta column and the folded header say.
     pub fn chip(self) -> &'static str {
         match self {
             TileState::Awaiting => "waiting",
@@ -314,8 +292,8 @@ impl TileState {
         }
     }
 
-    /// Colour of the state glyph and the chip text. Neutral states take
-    /// `border.strong` for the glyph ring.
+    /// Colour of the state dot. Neutral states take `border.strong` for the
+    /// glyph ring.
     pub fn color(self) -> [f32; 3] {
         match self {
             TileState::Awaiting => tokens::AWAITING,
@@ -325,33 +303,10 @@ impl TileState {
         }
     }
 
-    /// The chip's colours: a coloured state keeps its colour at 85 % on
-    /// 10 % of the same colour; a neutral chip is tertiary on white 5 %, or
-    /// white 55 % on white 7 % inside the selected group.
-    pub fn chip_style(self, selected: bool) -> ChipStyle {
-        if !self.neutral() {
-            let c = self.color();
-            ChipStyle { bg: c, bg_alpha: 0.10, fg: c, fg_alpha: 0.85 }
-        } else if selected {
-            ChipStyle { bg: tokens::WHITE, bg_alpha: 0.07, fg: tokens::WHITE, fg_alpha: 0.55 }
-        } else {
-            ChipStyle { bg: tokens::WHITE, bg_alpha: 0.05, fg: tokens::TEXT_TERTIARY, fg_alpha: 1.0 }
-        }
-    }
-
-    /// Neutral chips (idle, shell) are grey, and their glyph is a hollow ring.
+    /// Idle and shell tiles: grey, and their glyph is a hollow ring.
     pub fn neutral(self) -> bool {
         matches!(self, TileState::Idle | TileState::Shell)
     }
-}
-
-/// A chip's fill and caption, each with its alpha.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ChipStyle {
-    pub bg: [f32; 3],
-    pub bg_alpha: f64,
-    pub fg: [f32; 3],
-    pub fg_alpha: f64,
 }
 
 /// What a collapsed header says about its panes: dots for the awaiting and
@@ -376,11 +331,6 @@ impl CollapsedSummary {
         }
         s
     }
-
-    /// `k panes` / `1 pane`.
-    pub fn count_label(&self) -> String {
-        if self.count == 1 { "1 pane".to_string() } else { format!("{} panes", self.count) }
-    }
 }
 
 // ---------------------------------------------------------------
@@ -393,16 +343,12 @@ pub enum TileButton {
     Close,
     Minimize,
     Restore,
-    /// Interrupt (`■`): the hover glyph, and the awaiting tile's `■ Stop`.
+    /// Interrupt (`■`): the hover glyph of a working or awaiting tile.
     Stop,
-    /// The bare shell tile's `▶ Start Claude` link (a link only: the play
-    /// hover glyph was dropped, it duplicated the link).
+    /// The bare shell tile's `▶ Start Claude` link.
     StartClaude,
-    /// The `▶ Resume` link of a shell holding an agent's resume line (a
-    /// link only, like `StartClaude`).
+    /// The `▶ Resume` link of a shell holding an agent's resume line.
     Resume,
-    /// The awaiting tile's `Open` button.
-    Open,
     /// `mail`: mark the pane unread by hand.
     MarkUnread,
     /// `check`: mark everything here read.
@@ -417,7 +363,7 @@ impl TileButton {
             TileButton::Minimize => Icon::Minimize,
             TileButton::Restore => Icon::Maximize,
             TileButton::Stop => Icon::Square,
-            TileButton::StartClaude | TileButton::Resume | TileButton::Open => Icon::Play,
+            TileButton::StartClaude | TileButton::Resume => Icon::Play,
             TileButton::MarkUnread => Icon::Mail,
             TileButton::MarkRead => Icon::Check,
         }
@@ -431,7 +377,6 @@ impl TileButton {
             TileButton::Stop => "Stop",
             TileButton::StartClaude => "Start Claude here",
             TileButton::Resume => "Resume the session",
-            TileButton::Open => "Open",
             TileButton::MarkUnread => "Mark unread",
             TileButton::MarkRead => "Mark read",
         }
@@ -454,11 +399,7 @@ impl TileButton {
     }
 }
 
-/// Copy of the awaiting tile's action line and the shell tile's call. The
-/// links carry a filled Feather icon before the word (square for Stop, play
-/// for the others).
-pub const OPEN_LABEL: &str = "Open";
-pub const STOP_LABEL: &str = "Stop";
+/// Copy of the shell tile's call: a filled play, then the word.
 pub const START_CLAUDE_LABEL: &str = "Start Claude";
 pub const RESUME_LABEL: &str = "Resume";
 
@@ -881,28 +822,6 @@ mod tests {
     }
 
     #[test]
-    fn chips_keep_their_colour_and_neutral_ones_follow_the_group() {
-        use TileState::*;
-        let working = Working.chip_style(false);
-        assert_eq!(working, ChipStyle { bg: tokens::WORKING, bg_alpha: 0.10, fg: tokens::WORKING, fg_alpha: 0.85 });
-        assert_eq!(Working.chip_style(true), working);
-        assert_eq!(Awaiting.chip_style(true).fg, tokens::AWAITING);
-        assert_eq!(Unread(UnreadKind::Done).chip_style(false).fg, tokens::ACCENT);
-        let plain = Shell.chip_style(false);
-        assert_eq!(plain, ChipStyle { bg: tokens::WHITE, bg_alpha: 0.05, fg: tokens::TEXT_TERTIARY, fg_alpha: 1.0 });
-        assert_eq!(Idle.chip_style(false), plain);
-        assert_eq!(Idle.chip_style(true), ChipStyle { bg: tokens::WHITE, bg_alpha: 0.07, fg: tokens::WHITE, fg_alpha: 0.55 });
-    }
-
-    #[test]
-    fn tiles_lift_under_focus_and_hover() {
-        assert_eq!(sel_tile_alpha(false, false), 0.12);
-        assert_eq!(sel_tile_alpha(false, true), 0.16);
-        assert_eq!(sel_tile_alpha(true, false), 0.22);
-        assert!((sel_tile_alpha(true, true) - 0.25).abs() < 1e-9);
-    }
-
-    #[test]
     fn buttons_and_links_carry_feather_icons() {
         assert_eq!(TileButton::Close.icon(), Icon::X);
         assert_eq!(TileButton::Minimize.icon(), Icon::Minimize);
@@ -910,7 +829,6 @@ mod tests {
         assert_eq!(TileButton::Stop.icon(), Icon::Square);
         assert_eq!(TileButton::StartClaude.icon(), Icon::Play);
         assert_eq!(TileButton::Resume.icon(), Icon::Play);
-        assert_eq!(STOP_LABEL, "Stop");
         assert_eq!(RESUME_LABEL, "Resume");
     }
 
@@ -932,9 +850,6 @@ mod tests {
         use TileState::*;
         let s = CollapsedSummary::of([Working, Awaiting, Shell, Working].into_iter());
         assert_eq!(s, CollapsedSummary { awaiting: 1, working: 2, count: 4 });
-        assert_eq!(s.count_label(), "4 panes");
-        let one = CollapsedSummary::of([Idle].into_iter());
-        assert_eq!(one.count_label(), "1 pane");
         assert_eq!(TileState::most_urgent([Working, Awaiting, Shell].into_iter()), Awaiting);
         assert_eq!(TileState::most_urgent(std::iter::empty()), Shell);
     }
