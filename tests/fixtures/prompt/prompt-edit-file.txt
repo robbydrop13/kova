@@ -1,0 +1,15 @@
+────────────────────────────────────────────────────────────
+ Edit file
+
+   src/main.rs
+     +
+     + fn main() {
+     +     println!("hello");
+     + }
+
+ Do you want to make this edit to main.rs?
+ ❯ 1. Yes
+   2. Yes, and always allow edits to src/main.rs in this project
+   3. No, and tell Claude what to do differently
+
+ Esc to cancel · Tab to amend

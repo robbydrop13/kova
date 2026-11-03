@@ -426,12 +426,15 @@ share (`2026-11-03T20:30`).
 ### 3.7.3 Asks list (`SidebarList::Asks`)
 
 `src/window/sidebar_asks.rs` owns this list: the view model, the pure layout,
-the drawing and the hit test. The board (`ask::Board`) holds the questions;
-`sidebar_ui::ask_cards` turns them into `AskCardVm`s once per tick while this
-list is up, resolving each `pane_id` to its tab across every window and
-checking `claude_session::live_session_ids` for a conversation that outlived
-its pane. The meta line reads `N need you · newest first` while N > 0 and
-stays empty at 0; the open cards are newest first.
+the drawing and the hit test. Two kinds of card share it. The
+board (`ask::Board`) holds the questions, and `sidebar_ui::ask_cards` turns
+them into `AskCardVm`s once per tick while this list is up, resolving each
+`pane_id` to its tab across every window and checking
+`claude_session::live_session_ids` for a conversation that outlived its pane.
+The same read walks every pane and turns a `PromptPreview::Permission` into
+a permission card, read from `Pane::permission_prompt`. The meta line reads
+`N need you · newest first` while N > 0 and stays empty at 0; the open cards
+are newest first, questions and permissions together.
 
 A card (radius 8, `bg1` `TILE`, 1 pt `b3` `BORDER_SUBTLE`, 10 v / 12 h
 padding, 8 pt apart):
@@ -465,6 +468,41 @@ a chevron (`AsksState::folded`, true by default, remembered per window). Open
 it and each snoozed question is a dimmed card (alpha 0.55) on the same
 geometry, without the action rows: `back at 20:00` on the left and a
 `Show now` ghost button on the right, which cancels the snooze.
+
+#### Permission cards
+
+A pane whose screen asks permission is a card in the same list, newest first,
+with no `kova ask` behind it. `sidebar_ui::ask_cards` builds it from the
+pane's `PromptPreview::Permission` and the prompt it was read from
+(`Pane::permission_prompt`), keyed `perm:<pane id>:<fingerprint>`:
+`AskCardVm::from_permission`. It has the same frame, ground and padding, and:
+
+| Part | Content | Style |
+|---|---|---|
+| Header (18 pt) | the dot, `from` (the pane's agent session name, else its title), a `Permission` tag, the tab, the age | `Title` primary, tag and tab `Hint`/`Summary` tertiary in a 1 pt `b3` chip, age `Number` |
+| Message | the prompt's question (`Do you want to proceed?`), six lines then an ellipsis | `Secondary` primary |
+| Code block | the command or file under a `bg0` ground, radius 4, 6 pt padding, Menlo 11, hard-wrapped at the font's advance, four lines then an ellipsis | 11 Menlo secondary |
+| Actions (28 pt) | a green check (Approve), a red cross (Reject), a small `Always` chip when the prompt offers that option, and the ghost Open at the right | button ground `bg.hover` / `bg.pressed`; `Always` in `Chip` |
+
+No Brief and no Moon: a permission has no instruction to add and nothing to
+snooze. The buttons come from the option labels (`ParsedPrompt::choices`):
+Approve is the first label starting with `Yes` that does not promise
+`always`/`don't ask again`, Always the one that does, Reject the one starting
+with `No`. A prompt whose options do not number from 1 (scrolled so option 1
+is off screen) keeps its card, with only Open.
+
+A click re-reads the pane's screen right then (`Pane::answer_permission`)
+and compares `prompt_preview::permission_answer`'s fingerprint with the one
+the card was built from. Equal: the option's digit alone goes to the pane's
+PTY, the way Claude Code takes a numbered choice, and the card goes to
+`Sending` like an asked answer. Different or gone: nothing is typed, the card
+says `Prompt changed, open the pane` in `crit.text` for 5 s
+(`AsksState::flash`, `FLASH_MS`), and the pane keeps the preview it just read,
+so the list shows the new screen (or drops the card) on the next tick.
+
+The list's `waiting` set (`sync_sidebar_asks_state`) holds the board's
+questions and the permission cards of the last read, so a card leaves with
+its prompt: Sending, then `Sent to <from>` for 1.5 s.
 
 #### Brief overlay (the pencil)
 
@@ -509,9 +547,12 @@ text on any question.
 A need row that lands on an ask (`ListHit::Need`, `Cmd+J`) switches to this
 list, sets `AsksState::highlight` to the ask id and scrolls its card into
 view once; the card's border takes `sel.rail` for two seconds
-(`HIGHLIGHT_MS`, cleared on the tick). With no question at all the list draws
-its own empty state, not the hint line: a check-circle, `No open questions`
-and `Agents ask here when they need you`, both tertiary and centred.
+(`HIGHLIGHT_MS`, cleared on the tick). A permission row cannot name its card
+before the list is read again (the id carries the screen's fingerprint), so
+it sets `AsksState::highlight_pane` and `sync_sidebar` lights the card of
+that pane on the same tick. With no card at all the list draws its own empty
+state, not the hint line: a check-circle, `No open questions` and `Agents
+ask here when they need you`, both tertiary and centred.
 
 ### 3.7.4 Agents list (`SidebarList::Agents`)
 
@@ -613,12 +654,13 @@ card: `Show all N` while folded, `Show less` once every row shows
 (`SidebarState::needs_all`, in the model as `needs_all`).
 
 Clicks: an error row focuses its pane (in any window), a failed routine opens
-the Scheduled list on that routine (`open_routine`), an ask or a permission
-opens the Asks list and sets `AsksState::highlight` to the ask id (2 s, the
-card border in `sel.rail`). A pane holding an open ask or a permission prompt
-drops its meta column and says `waiting 4m · Answer` on the subtitle instead:
-the age in `warn.text`, `Answer` an accent link whose hit target
-(`ListHit::NeedAnswer`) lands where that pane's ask row would.
+the Scheduled list on that routine (`open_routine`), an ask opens the Asks
+list on its card and a permission opens it on its pane's card (2 s, the card
+border in `sel.rail`; `AsksState::highlight` for an ask id,
+`AsksState::highlight_pane` for a permission). A pane holding an open ask or
+a permission prompt drops its meta column and says `waiting 4m · Answer` on
+the subtitle instead: the age in `warn.text`, `Answer` an accent link whose
+hit target (`ListHit::NeedAnswer`) lands where that pane's ask row would.
 
 ### 3.8 List extras
 
@@ -817,13 +859,16 @@ unread order above.
 
 ### 5.1 Where the question text comes from
 
-Unchanged from v2: `src/prompt_preview.rs` (pure) and `Pane::probe_prompt`
-(the trigger) read a Claude pane's screen once its spinner stops (1 s
-debounce) and parse the permission prompt with the daemon's grammar; the
-fallback reads the last assistant text of the transcript
-(`~/.claude/projects/<slug>/<id>.jsonl`) into a `TurnEnd { summary }`.
-Cleared on a rising edge of `is_working()` and with the waiting flag in
-`Pane::clear_awaiting`. Fixtures under `tests/fixtures/prompt/`.
+`src/prompt_preview.rs` (pure) and `Pane::probe_prompt` (the trigger) read a
+Claude pane's screen once its spinner stops (1 s debounce) and parse the
+permission prompt with the daemon's grammar, numbered options included
+(`ParsedPrompt::options`, `choices`, `fingerprint`). The parsed prompt sits on
+the pane (`Pane::permission`) beside the preview the tile reads, both written
+by the same read; `Pane::refresh_prompt_preview` is that read on demand, the
+one a permission click goes through. Cleared on a rising edge of
+`is_working()`, which is Claude taking its answer. The fallback reads the last
+assistant text of the transcript (`~/.claude/projects/<slug>/<id>.jsonl`)
+into a `TurnEnd { summary }`. Fixtures under `tests/fixtures/prompt/`.
 
 ## 6. Tokens (`sidebar::tokens`, RGB floats, Claap design system)
 

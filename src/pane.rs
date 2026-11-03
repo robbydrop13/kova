@@ -1906,6 +1906,11 @@ pub struct Pane {
     /// The permission prompt read off this pane's screen, for the sidebar tile.
     /// Refreshed by the throttled probe, never per frame.
     pub prompt_preview: RefCell<Option<crate::prompt_preview::PromptPreview>>,
+    /// What `prompt_preview` was read from when it is a permission prompt: its
+    /// numbered options, and the fingerprint the Asks card answers against
+    /// (`prompt_preview::permission_answer`). Written with the preview, never
+    /// apart from it.
+    pub permission: RefCell<Option<crate::prompt_preview::ParsedPrompt>>,
     /// Where that probe stands, so a screen is read once a turn settles rather
     /// than on every frame.
     prompt_probe: Cell<PromptProbe>,
@@ -1960,6 +1965,7 @@ impl Pane {
             last_seen: Cell::new(0),
             manual_unread: Cell::new(false),
             prompt_preview: RefCell::new(None),
+            permission: RefCell::new(None),
             prompt_probe: Cell::new(PromptProbe::default()),
         }
     }
@@ -2120,6 +2126,7 @@ impl Pane {
             if working {
                 probe.due = None;
                 self.prompt_preview.replace(None);
+                self.permission.replace(None);
             } else {
                 probe.due = Some(std::time::Instant::now() + PROMPT_DEBOUNCE);
             }
@@ -2135,23 +2142,84 @@ impl Pane {
         if working || self.agent_kind() != Some(crate::agent_session::Agent::Claude) {
             return;
         }
-        let visible = self.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
-        let preview = match crate::prompt_preview::parse_permission_prompt(&visible) {
-            Some(p) => Some(crate::prompt_preview::PromptPreview::Permission {
-                header: p.header,
-                question: p.question,
-                detail: p.detail,
-                since: crate::surface::now_epoch_secs(),
-                seen: false,
-            }),
-            None => self.transcript_preview(),
-        };
-        log::debug!("pane {}: prompt probe -> {:?}", self.id, preview.as_ref().map(|p| match p {
+        self.refresh_prompt_preview();
+        log::debug!("pane {}: prompt probe -> {:?}", self.id, self.prompt_preview.borrow().as_ref().map(|p| match p {
             crate::prompt_preview::PromptPreview::Permission { question, .. } => format!("permission: {question}"),
             crate::prompt_preview::PromptPreview::TurnEnd { summary, .. } => format!("turn end: {summary}"),
             crate::prompt_preview::PromptPreview::ApiError { kind, text, .. } => format!("api error: {kind}: {text}"),
         }));
+    }
+
+    /// Read the screen now and keep what it says, the way `probe_prompt` does
+    /// once a turn settles. The Asks card goes through here before it types
+    /// anything: a click answers the screen the user can see at that moment,
+    /// not the one an earlier probe took. Returns the prompt when the screen
+    /// is a permission one. The `since` and `seen` marks of an unchanged
+    /// prompt are kept, so a refresh does not restamp it.
+    pub fn refresh_prompt_preview(&self) -> Option<crate::prompt_preview::ParsedPrompt> {
+        use crate::prompt_preview::PromptPreview;
+        if self.is_working() || self.agent_kind() != Some(crate::agent_session::Agent::Claude) {
+            self.prompt_preview.replace(None);
+            self.permission.replace(None);
+            return None;
+        }
+        let visible = self.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+        let parsed = crate::prompt_preview::parse_permission_prompt(&visible);
+        let same = match (parsed.as_ref(), self.permission.borrow().as_ref()) {
+            (Some(p), Some(previous)) => previous.fingerprint() == p.fingerprint(),
+            _ => false,
+        };
+        let (since, seen) = if same {
+            match self.prompt_preview.borrow().as_ref() {
+                Some(PromptPreview::Permission { since, seen, .. }) => (*since, *seen),
+                _ => (crate::surface::now_epoch_secs(), false),
+            }
+        } else {
+            (crate::surface::now_epoch_secs(), false)
+        };
+        let preview = match &parsed {
+            Some(p) => Some(PromptPreview::Permission {
+                header: p.header.clone(),
+                question: p.question.clone(),
+                detail: p.detail.clone(),
+                since,
+                seen,
+            }),
+            None => self.transcript_preview(),
+        };
         self.prompt_preview.replace(preview);
+        self.permission.replace(parsed.clone());
+        parsed
+    }
+
+    /// The permission prompt on screen, when the preview is one: what the
+    /// Asks card is built from. Cloned, so the card keeps the screen it was
+    /// drawn for while the pane moves on.
+    pub fn permission_prompt(&self) -> Option<crate::prompt_preview::ParsedPrompt> {
+        if self.is_working() {
+            return None;
+        }
+        self.permission.borrow().clone()
+    }
+
+    /// Answer the permission prompt on this pane with `choice`: the screen is
+    /// read again first, and the digit Claude Code takes for that option goes
+    /// to the PTY only when it is still the prompt `card` was built from (see
+    /// `prompt_preview::permission_answer`). False when nothing was typed.
+    pub fn answer_permission(
+        &self,
+        card: &crate::prompt_preview::ParsedPrompt,
+        choice: crate::prompt_preview::PermissionChoice,
+    ) -> bool {
+        let fresh = self.refresh_prompt_preview();
+        let Some(digit) = crate::prompt_preview::permission_answer(card, fresh.as_ref(), choice) else {
+            return false;
+        };
+        log::info!("pane {}: permission answered with option {}", self.id, digit);
+        // The digit and Enter in one write, as KovaLink's daemon does
+        // (`KeyGate.emitAnswer`), the form proven against Claude Code.
+        self.pty.write(format!("{digit}\r").as_bytes());
+        true
     }
 
     /// What the transcript's tail says the turn ended on: an API error, else
@@ -2874,6 +2942,40 @@ mod tests {
             peer_name: None,
             config_dir: None,
         }
+    }
+
+    /// Lay a screen on a capture pane the way a program's output leaves one.
+    fn show(pane: &super::Pane, screen: &str) {
+        let mut t = pane.terminal.write();
+        for line in screen.split('\n') {
+            for c in line.chars() {
+                t.put_char(c);
+            }
+            t.newline();
+            t.carriage_return();
+        }
+    }
+
+    #[test]
+    fn a_permission_click_types_the_digit_and_refuses_a_changed_screen() {
+        use crate::input::tests::drain;
+        use crate::prompt_preview::{ParsedPrompt, PermissionChoice};
+        let (pane, fd) = super::Pane::capture(100, 40);
+        pane.set_agent_session(Some(claude_session()));
+        show(&pane, include_str!("../tests/fixtures/prompt/prompt-bash-two-options.txt"));
+        let card: ParsedPrompt = pane.refresh_prompt_preview().expect("the prompt is on screen");
+        assert_eq!(card.choices().approve, Some(1));
+        assert!(pane.answer_permission(&card, PermissionChoice::Approve));
+        assert_eq!(drain(&fd), b"1\r");
+
+        // The same card against another command: the screen moved on, so
+        // nothing is typed.
+        show(&pane, include_str!("../tests/fixtures/prompt/prompt-bash-three.txt"));
+        assert!(!pane.answer_permission(&card, PermissionChoice::Reject));
+        assert_eq!(drain(&fd), b"");
+        // And the pane's preview holds the screen that is really there.
+        let fresh = pane.permission_prompt().expect("the new prompt");
+        assert_eq!(fresh.detail.as_deref(), Some("cargo test"));
     }
 
     #[test]

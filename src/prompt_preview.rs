@@ -22,8 +22,20 @@
 //!  Esc to cancel · Tab to amend            footer, LAST non-empty line
 //! ```
 //!
-//! Any deviation yields `None`: a stale prompt higher up the screen does not
-//! parse either, because the footer has to be the last non-empty line.
+//! The options are kept as `(number, label)` pairs, and the labels alone say
+//! what each button of the Asks card does (`ParsedPrompt::choices`): the
+//! first `Yes` that is not an `always` approves once, the one that always
+//! allows is the card's `Always`, the `No` rejects. A screen whose option
+//! block strays from the numbering (a prompt scrolled so option 1 is off
+//! screen) is still a permission prompt, with no options: its card offers
+//! only `Open`, and nothing may be typed into it.
+//!
+//! A `fingerprint` of the header, the question, the detail and the option
+//! labels lets a click answer only the screen it was shown for: the card
+//! holds the hash, the click reads the pane again and compares.
+//!
+//! Any other deviation yields `None`: a stale prompt higher up the screen does
+//! not parse either, because the footer has to be the last non-empty line.
 
 use std::path::{Path, PathBuf};
 
@@ -57,7 +69,7 @@ pub struct ApiError {
     pub text: String,
 }
 
-/// The parts of a permission prompt the tile shows.
+/// The parts of a permission prompt the tile and the Asks card show.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedPrompt {
     /// `Bash command`, `Create file`, ...
@@ -66,6 +78,123 @@ pub struct ParsedPrompt {
     pub question: String,
     /// First detail line under the header (the command, the file name).
     pub detail: Option<String>,
+    /// The numbered options, in order: `(1, "Yes")`, ... Empty when the block
+    /// on screen does not number from 1 (a prompt scrolled partway): its card
+    /// then offers only `Open`.
+    pub options: Vec<(u32, String)>,
+}
+
+/// Which button of a permission card a click is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionChoice {
+    /// The first `Yes` that is not an `always`.
+    Approve,
+    /// The option that always allows.
+    Always,
+    /// The `No`.
+    Reject,
+}
+
+/// The digit each button of a permission card types, read off the labels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PermissionChoices {
+    pub approve: Option<u32>,
+    pub always: Option<u32>,
+    pub reject: Option<u32>,
+}
+
+impl PermissionChoices {
+    pub fn digit(self, choice: PermissionChoice) -> Option<u32> {
+        match choice {
+            PermissionChoice::Approve => self.approve,
+            PermissionChoice::Always => self.always,
+            PermissionChoice::Reject => self.reject,
+        }
+    }
+}
+
+impl ParsedPrompt {
+    /// The option each card button sends, by label: the first `Yes` that is
+    /// not an `always` approves, the one containing `always` or `don't ask
+    /// again` is `Always`, the one starting with `No` rejects. A wording that
+    /// matches none of them leaves the matching buttons out, and the card
+    /// only offers `Open`.
+    pub fn choices(&self) -> PermissionChoices {
+        let mut out = PermissionChoices::default();
+        for (number, label) in &self.options {
+            let lower = label.to_ascii_lowercase();
+            let always = lower.contains("always") || lower.contains("don't ask again");
+            if out.always.is_none() && always {
+                out.always = Some(*number);
+            }
+            if out.approve.is_none() && !always && label.starts_with("Yes") {
+                out.approve = Some(*number);
+            }
+            if out.reject.is_none() && label.starts_with("No") {
+                out.reject = Some(*number);
+            }
+        }
+        out
+    }
+
+    /// A stable hash of the header, the question, the detail and the option
+    /// labels, trimmed (FNV-1a): two reads of the same screen give the same
+    /// number, a screen with another command or another prompt another one.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h = Fingerprint::new();
+        h.text(&self.header);
+        h.text(&self.question);
+        h.text(self.detail.as_deref().unwrap_or(""));
+        for (number, label) in &self.options {
+            h.number(*number);
+            h.text(label);
+        }
+        h.0
+    }
+}
+
+/// FNV-1a, 64 bit: fixed constants, so the fingerprint means the same thing
+/// across runs and builds.
+struct Fingerprint(u64);
+
+impl Fingerprint {
+    fn new() -> Self {
+        Fingerprint(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn byte(&mut self, b: u8) {
+        self.0 ^= b as u64;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    /// A trimmed field, closed by a unit separator so `a|b` and `ab` differ.
+    fn text(&mut self, text: &str) {
+        for b in text.trim().as_bytes() {
+            self.byte(*b);
+        }
+        self.byte(0x1f);
+    }
+
+    fn number(&mut self, n: u32) {
+        for b in n.to_le_bytes() {
+            self.byte(b);
+        }
+    }
+}
+
+/// The digit a click may type: the one `choice` names, and only while `fresh`
+/// is the same prompt as `old`. `None` means the screen moved on (another
+/// command, another question): nothing may be typed into it.
+pub fn permission_answer(
+    old: &ParsedPrompt,
+    fresh: Option<&ParsedPrompt>,
+    choice: PermissionChoice,
+) -> Option<u32> {
+    let fresh = fresh?;
+    if fresh.fingerprint() != old.fingerprint() {
+        return None;
+    }
+    fresh.choices().digit(choice)
 }
 
 /// Sanity bound: past this it is not a permission prompt.
@@ -98,6 +227,19 @@ fn parse_option(line: &str) -> Option<(u32, String, bool)> {
     Some((digits.parse().ok()?, label.to_string(), marked))
 }
 
+/// A line of the option block, even one `parse_option` refuses (`1.Yes`, the
+/// label glued to the dot): the block's extent is what puts the question
+/// above it, whatever the numbering.
+fn is_option_line(line: &str) -> bool {
+    let s = line.trim_start();
+    let s = match s.strip_prefix('\u{276f}').or_else(|| s.strip_prefix('>')) {
+        Some(rest) => rest.trim_start(),
+        None => s,
+    };
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && s[digits..].starts_with('.')
+}
+
 /// The full-width frame rule: a run of at least ten `─`.
 fn is_frame(line: &str) -> bool {
     let t = line.trim();
@@ -119,8 +261,9 @@ fn is_tip(line: &str) -> bool {
     line.trim_start().starts_with("Tip: ")
 }
 
-/// Parse the visible text of a pane. `None` as soon as the rendering strays
-/// from the observed grammar: expected, not an error.
+/// Parse the visible text of a pane. `None` when the screen is not a
+/// permission prompt at all; a prompt whose option block strays from the
+/// numbering keeps its header and question, with no options.
 pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
     if visible.is_empty() {
         return None;
@@ -134,34 +277,37 @@ pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
     }
 
     // 2. The option block: contiguous lines right above the footer (blank
-    //    lines tolerated in between), numbered consecutively from 1.
+    //    lines tolerated in between). Its extent is read whether or not the
+    //    numbers hold, so the question is always found above it; the options
+    //    themselves are kept only when they number 1, 2, 3...
     let mut i = footer_at;
     while i > 0 && lines[i - 1].trim().is_empty() {
         i -= 1;
     }
     let mut collected = Vec::new();
-    while i > 0 {
+    let mut well_formed = true;
+    while i > 0 && is_option_line(lines[i - 1]) {
         match parse_option(lines[i - 1]) {
-            Some(opt) => {
-                collected.push(opt);
-                i -= 1;
-            }
-            None => break,
+            Some(opt) => collected.push(opt),
+            None => well_formed = false,
         }
+        i -= 1;
     }
     collected.reverse();
-    if collected.len() < 2 || collected.len() > MAX_OPTIONS {
-        return None;
-    }
-    if collected.iter().enumerate().any(|(k, (n, _, _))| *n != k as u32 + 1) {
-        return None;
-    }
-    if collected.iter().filter(|(_, _, marked)| *marked).count() > 1 {
-        return None;
-    }
+    let numbered = well_formed
+        && collected.len() >= 2
+        && collected.len() <= MAX_OPTIONS
+        && collected.iter().enumerate().all(|(k, (n, _, _))| *n == k as u32 + 1)
+        && collected.iter().filter(|(_, _, marked)| *marked).count() <= 1;
+    let options: Vec<(u32, String)> = if numbered {
+        collected.into_iter().map(|(number, label, _)| (number, label)).collect()
+    } else {
+        Vec::new()
+    };
     let first_option_at = i;
 
-    // 3. The question: first non-empty line above option 1, ending with `?`.
+    // 3. The question: first non-empty line above the option block, ending
+    //    with `?`.
     let mut q = first_option_at;
     while q > 0 && lines[q - 1].trim().is_empty() {
         q -= 1;
@@ -171,7 +317,7 @@ pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
     }
     q -= 1;
     let question = lines[q].trim();
-    if !question.ends_with('?') || parse_option(question).is_some() || is_rule(question) {
+    if !question.ends_with('?') || is_option_line(question) || is_rule(question) {
         return None;
     }
 
@@ -186,7 +332,7 @@ pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
     if body.is_empty() {
         return None;
     }
-    if body.iter().any(|l| parse_option(l).is_some() || is_footer(l)) {
+    if body.iter().any(|l| is_option_line(l) || is_footer(l)) {
         return None;
     }
 
@@ -194,6 +340,7 @@ pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
         header: body[0].to_string(),
         question: question.to_string(),
         detail: body.get(1).map(|s| s.to_string()),
+        options,
     })
 }
 
@@ -332,6 +479,10 @@ mod tests {
     const BASH: &str = include_str!("../tests/fixtures/prompt/prompt-bash.txt");
     const BASH_1: &str = include_str!("../tests/fixtures/prompt/prompt-bash-consecutive-1.txt");
     const BASH_2: &str = include_str!("../tests/fixtures/prompt/prompt-bash-consecutive-2.txt");
+    const BASH_THREE: &str = include_str!("../tests/fixtures/prompt/prompt-bash-three.txt");
+    const BASH_TWO: &str = include_str!("../tests/fixtures/prompt/prompt-bash-two-options.txt");
+    const EDIT_FILE: &str = include_str!("../tests/fixtures/prompt/prompt-edit-file.txt");
+    const SCROLLED: &str = include_str!("../tests/fixtures/prompt/prompt-scrolled.txt");
     const WRITE: &str = include_str!("../tests/fixtures/prompt/prompt-write.txt");
     const IDLE: &str = include_str!("../tests/fixtures/prompt/screen-idle.txt");
     const TRUST: &str = include_str!("../tests/fixtures/prompt/screen-trust-dialog.txt");
@@ -382,11 +533,112 @@ mod tests {
     }
 
     #[test]
-    fn options_must_be_numbered_from_one_without_gaps() {
+    fn options_that_do_not_number_from_one_leave_the_prompt_without_options() {
+        // A prompt scrolled so option 1 sits above the visible area: still a
+        // permission prompt, with nothing to type.
+        let scrolled = parse_permission_prompt(SCROLLED).expect("still a prompt");
+        assert_eq!(scrolled.question, "Do you want to proceed?");
+        assert!(scrolled.options.is_empty());
+        assert_eq!(scrolled.choices(), PermissionChoices::default());
+
         let broken = BASH.replace("   4. No", "   5. No");
-        assert_eq!(parse_permission_prompt(&broken), None);
+        let p = parse_permission_prompt(&broken).expect("the frame and question hold");
+        assert!(p.options.is_empty(), "{:?}", p.options);
+
         let one_option = "────────────────\n Bash command\n cmd\n Proceed?\n ❯ 1. Yes\n\n Esc to cancel\n";
-        assert_eq!(parse_permission_prompt(one_option), None);
+        assert!(parse_permission_prompt(one_option).expect("still a prompt").options.is_empty());
+        // No question, no prompt.
+        assert_eq!(parse_permission_prompt("Esc to cancel\n"), None);
+    }
+
+    #[test]
+    fn the_options_are_kept_in_order_with_their_numbers() {
+        let bash = parse_permission_prompt(BASH_THREE).expect("bash prompt");
+        let labels: Vec<&str> = bash.options.iter().map(|(_, label)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Yes",
+                "Yes, and don't ask again for cargo test in /Users/test/project",
+                "No, and tell Claude what to do differently",
+            ]
+        );
+        assert_eq!(bash.options.iter().map(|(n, _)| *n).collect::<Vec<_>>(), [1, 2, 3]);
+
+        let edit = parse_permission_prompt(EDIT_FILE).expect("edit prompt");
+        assert_eq!(edit.header, "Edit file");
+        assert_eq!(edit.detail.as_deref(), Some("src/main.rs"));
+        assert_eq!(edit.question, "Do you want to make this edit to main.rs?");
+        assert_eq!(edit.options.len(), 3);
+
+        let two = parse_permission_prompt(BASH_TWO).expect("two options");
+        assert_eq!(two.options, [(1, "Yes".to_string()), (2, "No".to_string())]);
+    }
+
+    #[test]
+    fn the_labels_decide_what_each_card_button_types() {
+        let bash = parse_permission_prompt(BASH_THREE).expect("bash");
+        assert_eq!(
+            bash.choices(),
+            PermissionChoices { approve: Some(1), always: Some(2), reject: Some(3) }
+        );
+        // The four-option capture: the auto-mode option starts with `Yes` but
+        // is neither an always nor the first one, so approve stays option 1.
+        let four = parse_permission_prompt(BASH).expect("four options");
+        assert_eq!(four.choices(), PermissionChoices { approve: Some(1), always: Some(2), reject: Some(4) });
+        // The write capture offers no always.
+        let write = parse_permission_prompt(WRITE).expect("write");
+        assert_eq!(write.choices(), PermissionChoices { approve: Some(1), always: None, reject: Some(3) });
+        // Two options, no always.
+        let two = parse_permission_prompt(BASH_TWO).expect("two");
+        assert_eq!(two.choices(), PermissionChoices { approve: Some(1), always: None, reject: Some(2) });
+
+        // A wording Kova has not seen: no button names an option.
+        let unseen = ParsedPrompt {
+            header: "Bash command".into(),
+            question: "Do you want to proceed?".into(),
+            detail: None,
+            options: vec![(1, "Sure".into()), (2, "Later".into())],
+        };
+        assert_eq!(unseen.choices(), PermissionChoices::default());
+    }
+
+    #[test]
+    fn the_fingerprint_holds_the_screen_and_follows_the_command() {
+        let a = parse_permission_prompt(BASH_1).expect("first");
+        let b = parse_permission_prompt(BASH_2).expect("second");
+        assert_eq!(a.fingerprint(), parse_permission_prompt(BASH_1).expect("again").fingerprint());
+        assert_ne!(a.fingerprint(), b.fingerprint(), "another command is another prompt");
+
+        let mut other_question = a.clone();
+        other_question.question = "Do you still want to proceed?".into();
+        assert_ne!(a.fingerprint(), other_question.fingerprint());
+        let mut relabelled = a.clone();
+        relabelled.options[1].1 = "Yes, and always allow everything".into();
+        assert_ne!(a.fingerprint(), relabelled.fingerprint());
+        let mut no_options = a.clone();
+        no_options.options.clear();
+        assert_ne!(a.fingerprint(), no_options.fingerprint());
+    }
+
+    #[test]
+    fn a_click_types_only_while_the_screen_is_the_one_the_card_shows() {
+        let old = parse_permission_prompt(BASH_1).expect("first");
+        let same = parse_permission_prompt(BASH_1).expect("again");
+        assert_eq!(permission_answer(&old, Some(&same), PermissionChoice::Approve), Some(1));
+        assert_eq!(permission_answer(&old, Some(&same), PermissionChoice::Always), Some(2));
+        assert_eq!(permission_answer(&old, Some(&same), PermissionChoice::Reject), Some(4));
+
+        // Another command under the same question: nothing may be typed.
+        let moved = parse_permission_prompt(BASH_2).expect("second");
+        for choice in [PermissionChoice::Approve, PermissionChoice::Always, PermissionChoice::Reject] {
+            assert_eq!(permission_answer(&old, Some(&moved), choice), None);
+        }
+        // The prompt is gone entirely.
+        assert_eq!(permission_answer(&old, None, PermissionChoice::Approve), None);
+        // A prompt with no options offers no digit, unchanged or not.
+        let empty = parse_permission_prompt(SCROLLED).expect("scrolled");
+        assert_eq!(permission_answer(&empty, Some(&empty), PermissionChoice::Approve), None);
     }
 
     #[test]

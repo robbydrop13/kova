@@ -1,0 +1,10 @@
+────────────────────────────────────────────────────────────
+ Bash command
+
+   npm run build
+
+ Do you want to proceed?
+   2. Yes
+   3. No
+
+ Esc to cancel · Tab to amend

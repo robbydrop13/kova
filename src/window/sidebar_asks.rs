@@ -1,9 +1,12 @@
-//! The Asks view of the sidebar: the open `kova ask` questions as cards, with
-//! the two answers the user actually needs (OK and KO), Brief, Snooze and the
-//! pane the question came from. Pure: `layout` turns `AsksState` into rects,
-//! `hit` turns a point into an `AsksHit`, `click` runs the state machine and
-//! returns the action to queue on the delegate. `sidebar_ui` builds the cards
-//! from `ask::Board`, `sidebar_view` draws them and dispatches the clicks.
+//! The Asks view of the sidebar: the open `kova ask` questions and the
+//! permission prompts waiting in panes, as cards. A question card carries the
+//! two answers the user actually needs (OK and KO), Brief, Snooze and the pane
+//! it came from; a permission card carries Approve, Reject, Always when the
+//! prompt offers it, the command in a code block and the pane to open. Pure:
+//! `layout` turns `AsksState` into rects, `hit` turns a point into an
+//! `AsksHit`, `click` runs the state machine and returns the action to queue
+//! on the delegate. `sidebar_ui` builds the cards from `ask::Board` and the
+//! panes' previews, `sidebar_view` draws them and dispatches the clicks.
 //!
 //! The card is Robin's 3 Nov design: `bg1` ground, 1 pt `b3` border, radius 8,
 //! 10/12 padding, 8 pt apart. A highlighted card takes the selected rail's
@@ -14,12 +17,18 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use objc2::runtime::AnyObject;
+use objc2_app_kit::{NSColor, NSFont, NSLineBreakMode, NSMutableParagraphStyle, NSStringDrawing};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_foundation::{NSDictionary, NSString};
+
 use super::sidebar::{format_age, tokens};
 use super::sidebar_view::{
     AppKitMetrics, Align, EDGE_TOLERANCE, LIST_BOTTOM, LIST_TOP, ListHit, PAD_H, Rect, Shared, Style, TextMetrics,
     draw_text, draw_wrapped, fill_dot, fill_round, stroke_icon, stroke_round,
 };
 use crate::pane::PaneId;
+use crate::prompt_preview::{ParsedPrompt, PermissionChoice};
 
 // ---------------------------------------------------------------
 // Metrics (points)
@@ -88,6 +97,27 @@ const SENT_LINGER_MS: u64 = 1500;
 const SENDING_TIMEOUT_MS: u64 = 3000;
 /// A highlight (a need row walked to its card) lasts two seconds.
 pub const HIGHLIGHT_MS: u64 = 2000;
+// A permission card: the `Permission` tag in the header, the command in a
+// monospace block, and the crit line a refused click leaves for 5 s.
+const TAG_H: f64 = 16.0;
+const TAG_PAD_H: f64 = 5.0;
+const TAG_RADIUS: f64 = 4.0;
+const TAG_TEXT: &str = "Permission";
+/// Between the question and the code block, and the block and the actions.
+const CODE_GAP: f64 = 8.0;
+const CODE_RADIUS: f64 = 4.0;
+const CODE_PAD: f64 = 6.0;
+const CODE_LINE_H: f64 = 14.0;
+const CODE_MAX_LINES: usize = 4;
+/// Menlo 11 at 0.6023 em: the block's own wrap, so the layout and the drawn
+/// lines agree without a `TextMetrics` width for a monospace face.
+const CODE_ADVANCE: f64 = 6.63;
+const MONO_SIZE: f64 = 11.0;
+/// The `Always` text button: a small chip on the action row.
+const ALWAYS_PAD: f64 = 8.0;
+/// How long a permission card says `Prompt changed, open the pane`.
+pub const FLASH_MS: u64 = 5000;
+pub const FLASH_TEXT: &str = "Prompt changed, open the pane";
 
 // The Brief overlay, in points: a card centred at the top of the list, over a
 // 40 % black scrim, holding the question, its options as chips, the
@@ -121,14 +151,43 @@ pub(super) const BRIEF_SCRIM: f64 = 0.4;
 // The view model
 // ---------------------------------------------------------------
 
-/// One question as the sidebar card shows it.
+/// A permission prompt as its card shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionCard {
+    /// The screen the card was built from. A click answers only while a fresh
+    /// read of the pane hashes to the same `fingerprint`
+    /// (`prompt_preview::permission_answer`).
+    pub prompt: ParsedPrompt,
+    /// `ParsedPrompt::fingerprint`, and the card id's last part.
+    pub fingerprint: u64,
+    /// The digit each button types; `None` leaves the button out.
+    pub approve: Option<u32>,
+    pub always: Option<u32>,
+    pub reject: Option<u32>,
+}
+
+impl PermissionCard {
+    pub fn new(prompt: ParsedPrompt) -> Self {
+        let choices = prompt.choices();
+        PermissionCard {
+            fingerprint: prompt.fingerprint(),
+            prompt,
+            approve: choices.approve,
+            always: choices.always,
+            reject: choices.reject,
+        }
+    }
+}
+
+/// One question, or one waiting permission prompt, as the sidebar card shows
+/// it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AskCardVm {
     /// A stable, cheap key for the hit enum: the question id hashed. The
     /// view can compare hits without cloning a string on every mouse move.
     pub key: u64,
     pub id: String,
-    /// The agent or session that asked.
+    /// The agent or session that asked, or the pane whose prompt waits.
     pub from: String,
     /// The tab its pane belongs to, empty when the pane is gone.
     pub tab: String,
@@ -140,7 +199,7 @@ pub struct AskCardVm {
     pub urgent: bool,
     pub message: String,
     /// The two options OK and KO send: the question's first two actions, or
-    /// `OK` / `No` when it declared fewer.
+    /// `OK` / `No` when it declared fewer. Empty on a permission card.
     pub options: [String; 2],
     /// Every option the agent proposed, in order: the Brief overlay's chips.
     /// One `Reply` when it proposed none, like the card's single button.
@@ -153,6 +212,9 @@ pub struct AskCardVm {
     pub snoozed: bool,
     /// `20:00`, local time.
     pub back_at: String,
+    /// A permission prompt read off a pane's screen: this card replaces the
+    /// question's, with its own buttons and no Brief, Snooze or note.
+    pub permission: Option<PermissionCard>,
 }
 
 /// The key the hit enum carries for a question id.
@@ -189,13 +251,41 @@ impl AskCardVm {
             ended: pane.is_none() && !live,
             snoozed,
             back_at: if snoozed { local_hhmm(question.snoozed_until) } else { String::new() },
+            permission: None,
+        }
+    }
+
+    /// The card of the permission prompt read in `pane`: its question is the
+    /// message, the command goes in the code block, and the id carries the
+    /// screen's fingerprint, so a prompt that changed is another card. `from`
+    /// is the pane's agent session name, else its title.
+    pub fn from_permission(prompt: ParsedPrompt, pane: (PaneId, String), from: String, since: u64, now: u64) -> Self {
+        let permission = PermissionCard::new(prompt);
+        let age_secs = now.saturating_sub(since);
+        let id = format!("perm:{}:{:016x}", pane.0, permission.fingerprint);
+        AskCardVm {
+            key: ask_key(&id),
+            id,
+            from,
+            tab: pane.1,
+            pane_id: Some(pane.0),
+            age: format_age(age_secs),
+            urgent: age_secs >= URGENT_AFTER_SECS,
+            message: permission.prompt.question.clone(),
+            options: [String::new(), String::new()],
+            choices: Vec::new(),
+            created_at: since,
+            ended: false,
+            snoozed: false,
+            back_at: String::new(),
+            permission: Some(permission),
         }
     }
 }
 
-/// What the view keeps between ticks: the cards read from the board, the
-/// folded state of the snoozed section, the card whose snooze row is open,
-/// the card being sent, and the highlighted card.
+/// What the view keeps between ticks: the cards read from the board and the
+/// panes, the folded state of the snoozed section, the card whose snooze row
+/// is open, the card being sent, and the highlighted card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsksState {
     pub cards: Vec<AskCardVm>,
@@ -204,6 +294,13 @@ pub struct AsksState {
     pub snooze_open: Option<String>,
     pub transient: Option<TransientAsk>,
     pub highlight: Option<Highlight>,
+    /// A permission card whose click found another screen: the pane says so
+    /// on its card, in crit, for `FLASH_MS`.
+    pub flash: Option<Flash>,
+    /// The permission card the next read of the list lights: a need row's
+    /// `Answer` names the pane, and the card's id carries the screen's
+    /// fingerprint, so it is resolved once the cards are read.
+    pub highlight_pane: Option<PaneId>,
     /// The Brief overlay, when one is open.
     pub brief: Option<BriefOpen>,
     /// What was typed in the Brief field, by question id. Kept after the
@@ -219,6 +316,8 @@ impl Default for AsksState {
             snooze_open: None,
             transient: None,
             highlight: None,
+            flash: None,
+            highlight_pane: None,
             brief: None,
             drafts: HashMap::new(),
         }
@@ -242,9 +341,9 @@ impl AsksState {
         self.cards.iter().find(|card| card.key == key)
     }
 
-    /// A new read of the board. The transient answer survives it: it is the
-    /// card that just left the board (or is about to). The Brief overlay
-    /// closes with its question, keeping the draft.
+    /// A new read of the board and the panes. The transient answer survives
+    /// it: it is the card that just left the list (or is about to). The Brief
+    /// overlay closes with its question, keeping the draft.
     pub fn set_cards(&mut self, cards: Vec<AskCardVm>) {
         self.cards = cards;
         if let Some(brief) = &self.brief
@@ -254,9 +353,10 @@ impl AsksState {
         }
     }
 
-    /// Drop the transient card once the board no longer holds it (it becomes
+    /// Drop the transient card once the list no longer holds it (it becomes
     /// `Sent`, for `SENT_LINGER_MS`) or once a sending click gave up. Clear a
-    /// highlight that ran out. `waiting` is the keys the board still holds.
+    /// highlight or a crit line that ran out. `waiting` is the keys the list
+    /// still holds: the board's questions and the panes' prompts.
     pub fn prune(&mut self, waiting: &[u64], now_ms: u64) {
         if let Some(t) = &mut self.transient {
             match t.phase {
@@ -274,6 +374,9 @@ impl AsksState {
         }
         if self.highlight.as_ref().is_some_and(|h| now_ms >= h.until_ms) {
             self.highlight = None;
+        }
+        if self.flash.as_ref().is_some_and(|f| now_ms >= f.until_ms) {
+            self.flash = None;
         }
     }
 }
@@ -306,6 +409,14 @@ pub enum TransientPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Highlight {
     pub id: String,
+    pub until_ms: u64,
+}
+
+/// The crit line a refused permission click leaves on its card: the screen
+/// changed under it, so the pane has to be opened instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Flash {
+    pub pane_id: PaneId,
     pub until_ms: u64,
 }
 
@@ -405,6 +516,24 @@ pub enum AsksHit {
     ToggleSnoozed,
     /// Cancel a snooze: the question is open now.
     ShowNow(u64),
+    /// A permission prompt: type the option each label names, if the screen
+    /// still is the one the card shows.
+    PermissionApprove(u64),
+    PermissionReject(u64),
+    PermissionAlways(u64),
+}
+
+impl AsksHit {
+    /// The permission choice a hit is, with the card key. `None` for every
+    /// other button: those go through `click`.
+    pub fn permission(self) -> Option<(u64, PermissionChoice)> {
+        match self {
+            AsksHit::PermissionApprove(key) => Some((key, PermissionChoice::Approve)),
+            AsksHit::PermissionReject(key) => Some((key, PermissionChoice::Reject)),
+            AsksHit::PermissionAlways(key) => Some((key, PermissionChoice::Always)),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -458,6 +587,10 @@ pub fn click(state: &mut AsksState, hit: AsksHit, now_ms: u64) -> Option<AskActi
             None
         }
         AsksHit::ShowNow(key) => state.card(key).map(|card| AskAction::Unsnooze { id: card.id.clone() }),
+        // A permission button is served by `sidebar_ui::sidebar_ask_hit`,
+        // which holds the pane: only a click that really reached the PTY
+        // moves the card (`permission_sending`).
+        AsksHit::PermissionApprove(_) | AsksHit::PermissionReject(_) | AsksHit::PermissionAlways(_) => None,
     }
 }
 
@@ -493,6 +626,30 @@ fn send_brief(state: &mut AsksState, key: u64, now_ms: u64) -> Option<AskAction>
         until_ms: now_ms + SENDING_TIMEOUT_MS,
     });
     Some(action)
+}
+
+/// A permission click whose digit reached the pane: the card goes to
+/// `Sending`, with the same timeout an ask answer has, and disappears when the
+/// prompt leaves the screen. Nothing happens on a card already being sent.
+pub fn permission_sending(state: &mut AsksState, key: u64, now_ms: u64) {
+    if state.transient.as_ref().is_some_and(|t| t.card.key == key) {
+        return;
+    }
+    let Some(card) = state.card(key).cloned() else { return };
+    if state.flash.as_ref().is_some_and(|f| Some(f.pane_id) == card.pane_id) {
+        state.flash = None;
+    }
+    state.transient = Some(TransientAsk {
+        card,
+        phase: TransientPhase::Sending,
+        until_ms: now_ms + SENDING_TIMEOUT_MS,
+    });
+}
+
+/// The screen moved on under a permission card: nothing was typed, and the
+/// card says why in crit for `FLASH_MS`.
+pub fn permission_refused(state: &mut AsksState, pane_id: PaneId, now_ms: u64) {
+    state.flash = Some(Flash { pane_id, until_ms: now_ms + FLASH_MS });
 }
 
 /// What the Brief sends: `picked` is an index into `card.choices`, `draft` the
@@ -532,6 +689,14 @@ pub struct CardLayout {
     pub header: Rect,
     pub message: Rect,
     pub message_lines: usize,
+    /// The `Permission` tag in a permission card's header.
+    pub tag: Option<Rect>,
+    /// The command block under a permission card's question, and the lines
+    /// the block shows (already wrapped, at most `CODE_MAX_LINES`).
+    pub code: Option<Rect>,
+    pub code_lines: Vec<String>,
+    /// The crit line of a refused permission click.
+    pub flash: Option<Rect>,
     /// The sending/sent line, in the action row's place.
     pub status: Option<Rect>,
     pub phase: Option<TransientPhase>,
@@ -785,6 +950,9 @@ fn open_card(
     w: f64,
     m: &dyn TextMetrics,
 ) -> (CardLayout, f64) {
+    if card.permission.is_some() {
+        return permission_card(card, phase, state, x, y, w, m);
+    }
     let inner_x = x + CARD_PAD_H;
     let inner_w = (w - 2.0 * CARD_PAD_H).max(0.0);
     let lines = m.lines(&card.message, Style::Secondary, inner_w, MSG_MAX_LINES).max(1);
@@ -848,11 +1016,150 @@ fn open_card(
             header,
             message,
             message_lines: lines,
+            tag: None,
+            code: None,
+            code_lines: Vec::new(),
+            flash: None,
             status,
             phase,
             buttons,
             note,
             snooze_row,
+            highlighted: false,
+            faded: false,
+            card: card.clone(),
+        },
+        h,
+    )
+}
+
+/// The header's columns after the dot, shared by the layout and the drawing so
+/// the tag and the tab beside it cannot drift: `from`'s width, the tag, the
+/// tab's width.
+fn header_columns(card: &AskCardVm, header: Rect, m: &dyn TextMetrics) -> (f64, Option<Rect>, f64) {
+    let age_w = m.width(&card.age, Style::Number);
+    let text_x = header.x + HEADER_TEXT_X;
+    let room = (header.right() - age_w - 8.0 - text_x).max(0.0);
+    let tag_w = if card.permission.is_some() { m.width(TAG_TEXT, Style::Hint) + 2.0 * TAG_PAD_H } else { 0.0 };
+    let tab_w = if card.tab.is_empty() { 0.0 } else { m.width(&card.tab, Style::Summary).min(room * 0.45) };
+    let gap = if tag_w > 0.0 { HEADER_TAB_GAP } else { 0.0 };
+    let tab_gap = if tab_w > 0.0 { HEADER_TAB_GAP } else { 0.0 };
+    let from_w = (room - tag_w - gap - tab_w - tab_gap).max(0.0);
+    let tag = (tag_w > 0.0).then(|| Rect::new(text_x + from_w + gap, header.y + (HEADER_H - TAG_H) / 2.0, tag_w, TAG_H));
+    (from_w, tag, tab_w)
+}
+
+/// The code block's lines: hard-wrapped at Menlo 11's advance, at most
+/// `CODE_MAX_LINES`, the last one cut with an ellipsis when there is more.
+fn code_lines(text: &str, width: f64) -> Vec<String> {
+    let cols = (((width - 2.0 * CODE_PAD) / CODE_ADVANCE).floor().max(1.0)) as usize;
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let mut current = String::new();
+        let mut count = 0;
+        for c in line.chars() {
+            if count == cols {
+                out.push(std::mem::take(&mut current));
+                count = 0;
+            }
+            current.push(c);
+            count += 1;
+        }
+        out.push(current);
+    }
+    if out.len() > CODE_MAX_LINES {
+        out.truncate(CODE_MAX_LINES);
+        if let Some(last) = out.last_mut() {
+            *last = last.chars().take(cols.saturating_sub(1)).collect();
+            last.push('\u{2026}');
+        }
+    }
+    out
+}
+
+/// The card of a permission prompt: the head with its `Permission` tag, the
+/// question, the command in its code block, then Approve, Reject and Always
+/// where the screen offers them, and the ghost that opens the pane. No Brief,
+/// no snooze and no note line: only what the prompt itself allows.
+fn permission_card(
+    card: &AskCardVm,
+    phase: Option<TransientPhase>,
+    state: &AsksState,
+    x: f64,
+    y: f64,
+    w: f64,
+    m: &dyn TextMetrics,
+) -> (CardLayout, f64) {
+    let inner_x = x + CARD_PAD_H;
+    let inner_w = (w - 2.0 * CARD_PAD_H).max(0.0);
+    let header = Rect::new(inner_x, y + CARD_PAD_V, inner_w, HEADER_H);
+    let (_, tag, _) = header_columns(card, header, m);
+    let lines = m.lines(&card.message, Style::Secondary, inner_w, MSG_MAX_LINES).max(1);
+    let message = Rect::new(inner_x, header.bottom() + HEADER_GAP, inner_w, lines as f64 * MSG_LINE_H);
+
+    let mut next = message.bottom();
+    let mut code = None;
+    let mut code_text = Vec::new();
+    if let Some(command) = card.permission.as_ref().and_then(|p| p.prompt.detail.as_deref()).filter(|c| !c.is_empty())
+    {
+        code_text = code_lines(command, inner_w);
+        let block = Rect::new(inner_x, next + CODE_GAP, inner_w, code_text.len() as f64 * CODE_LINE_H + 2.0 * CODE_PAD);
+        next = block.bottom();
+        code = Some(block);
+    }
+
+    let action_y = next + ACT_GAP;
+    let mut buttons = Vec::new();
+    let mut status = None;
+    if phase.is_some() {
+        status = Some(Rect::new(inner_x, action_y, inner_w, STATUS_H));
+        next = action_y + STATUS_H;
+    } else {
+        let mut bx = inner_x;
+        if let Some(permission) = &card.permission {
+            if permission.approve.is_some() {
+                buttons.push((AsksHit::PermissionApprove(card.key), Rect::new(bx, action_y, AB_W, AB_H)));
+                bx += AB_W + AB_GAP;
+            }
+            if permission.reject.is_some() {
+                buttons.push((AsksHit::PermissionReject(card.key), Rect::new(bx, action_y, AB_W, AB_H)));
+                bx += AB_W + AB_GAP;
+            }
+            if permission.always.is_some() {
+                let room = (inner_x + inner_w - bx).max(0.0);
+                let bw = (m.width("Always", Style::Chip) + 2.0 * ALWAYS_PAD).min(room);
+                buttons.push((AsksHit::PermissionAlways(card.key), Rect::new(bx, action_y, bw, AB_H)));
+            }
+        }
+        if let Some(pane_id) = card.pane_id {
+            let open = Rect::new(inner_x + inner_w - GHOST_W, action_y, GHOST_W, AB_H);
+            buttons.push((AsksHit::Open(pane_id), open));
+        }
+        next = action_y + AB_H;
+    }
+    let flash = if state.flash.as_ref().is_some_and(|f| card.pane_id == Some(f.pane_id)) {
+        let line = Rect::new(inner_x, next + NOTE_GAP, inner_w, NOTE_H);
+        next = line.bottom();
+        Some(line)
+    } else {
+        None
+    };
+    let h = next - y + CARD_PAD_V;
+    (
+        CardLayout {
+            frame: Rect::new(x, y, w, h),
+            header,
+            message,
+            message_lines: lines,
+            tag,
+            code,
+            code_lines: code_text,
+            flash,
+            status,
+            phase,
+            buttons,
+            note: Rect::default(),
+            snooze_row: None,
             highlighted: false,
             faded: false,
             card: card.clone(),
@@ -878,6 +1185,10 @@ fn snoozed_card(card: &AskCardVm, x: f64, y: f64, w: f64, m: &dyn TextMetrics) -
             header,
             message,
             message_lines: lines,
+            tag: None,
+            code: None,
+            code_lines: Vec::new(),
+            flash: None,
             status: None,
             phase: None,
             buttons: vec![(AsksHit::ShowNow(card.key), show)],
@@ -934,6 +1245,12 @@ fn draw_card(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, hovered: Lis
 
     draw_header(sh, m, card, alpha);
     draw_wrapped(sh, &card.card.message, &card.message, Style::Secondary, tokens::TEXT_PRIMARY, alpha);
+    if let Some(block) = card.code {
+        draw_code(&block, &card.code_lines, alpha);
+    }
+    if let Some(flash) = card.flash {
+        draw_text(sh, FLASH_TEXT, &flash, Style::Hint, tokens::CRIT_TEXT, alpha, Align::Left, false);
+    }
 
     if let (Some(status), Some(phase)) = (card.status, card.phase) {
         let (icon, fg, text) = match phase {
@@ -952,7 +1269,7 @@ fn draw_card(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, hovered: Lis
             Align::Left,
             false,
         );
-    } else if !card.faded {
+    } else if !card.faded && card.card.permission.is_none() {
         draw_options(sh, m, card, alpha);
     }
     if card.faded {
@@ -1076,18 +1393,12 @@ fn draw_overlay(
 }
 
 fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64) {
-    let header = &card.header;
+    let header = card.header;
     fill_dot(header.x + 4.0, header.y + header.h / 2.0, STATE_DOT_D, tokens::AWAITING, alpha);
     let age_w = m.width(&card.card.age, Style::Number);
     let age = Rect::new(header.right() - age_w, header.y, age_w, header.h);
     let text_x = header.x + HEADER_TEXT_X;
-    let room = (age.x - 8.0 - text_x).max(0.0);
-    let tab_w = if card.card.tab.is_empty() {
-        0.0
-    } else {
-        m.width(&card.card.tab, Style::Summary).min(room * 0.45)
-    };
-    let from_w = if tab_w > 0.0 { (room - tab_w - HEADER_TAB_GAP).max(0.0) } else { room };
+    let (from_w, tag, tab_w) = header_columns(&card.card, header, m);
     draw_text(
         sh,
         &card.card.from,
@@ -1098,11 +1409,20 @@ fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64
         Align::Left,
         false,
     );
+    let tab_x = match tag {
+        Some(tag) => {
+            fill_round(&tag, TAG_RADIUS, tokens::WHITE, 0.08 * alpha);
+            stroke_round(&tag, TAG_RADIUS, 1.0, tokens::BORDER_SUBTLE, alpha);
+            draw_text(sh, TAG_TEXT, &tag, Style::Hint, tokens::TEXT_TERTIARY, alpha, Align::Center, false);
+            tag.right() + HEADER_TAB_GAP
+        }
+        None => text_x + from_w + HEADER_TAB_GAP,
+    };
     if tab_w > 0.0 {
         draw_text(
             sh,
             &card.card.tab,
-            &Rect::new(text_x + from_w + HEADER_TAB_GAP, header.y, tab_w, header.h),
+            &Rect::new(tab_x, header.y, tab_w, header.h),
             Style::Summary,
             tokens::TEXT_TERTIARY,
             alpha,
@@ -1112,6 +1432,53 @@ fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64
     }
     let age_fg = if card.card.urgent { tokens::WARN_TEXT } else { tokens::TEXT_TERTIARY };
     draw_text(sh, &card.card.age, &age, Style::Number, age_fg, alpha, Align::Right, false);
+}
+
+/// The command block: `bg0` ground, radius 4, 6 pt padding, one Menlo 11 line
+/// per row. The wrapping came from `code_lines`, so a line fits its box.
+fn draw_code(block: &Rect, lines: &[String], alpha: f64) {
+    fill_round(block, CODE_RADIUS, tokens::GROUND, alpha);
+    let font = mono_font();
+    let attrs = mono_attrs(&font, tokens::TEXT_SECONDARY, alpha);
+    for (i, line) in lines.iter().enumerate() {
+        let row = Rect::new(
+            block.x + CODE_PAD,
+            block.y + CODE_PAD + i as f64 * CODE_LINE_H,
+            (block.w - 2.0 * CODE_PAD).max(0.0),
+            CODE_LINE_H,
+        );
+        unsafe {
+            NSString::from_str(line).drawInRect_withAttributes(
+                CGRect { origin: CGPoint { x: row.x, y: row.y }, size: CGSize { width: row.w, height: row.h } },
+                Some(&attrs),
+            )
+        };
+    }
+}
+
+/// Menlo 11, the one face the sidebar draws outside the design type scale.
+fn mono_font() -> objc2::rc::Retained<NSFont> {
+    NSFont::fontWithName_size(&NSString::from_str("Menlo"), MONO_SIZE).unwrap_or_else(|| {
+        NSFont::systemFontOfSize_weight(MONO_SIZE, unsafe { objc2_app_kit::NSFontWeightRegular })
+    })
+}
+
+fn mono_attrs(font: &NSFont, c: [f32; 3], alpha: f64) -> objc2::rc::Retained<NSDictionary<NSString, AnyObject>> {
+    let color = NSColor::colorWithSRGBRed_green_blue_alpha(c[0] as f64, c[1] as f64, c[2] as f64, alpha);
+    // One row per line: a command wider than the block is clipped, never
+    // wrapped into the line below.
+    let paragraph = NSMutableParagraphStyle::new();
+    paragraph.setLineBreakMode(NSLineBreakMode::ByClipping);
+    unsafe {
+        NSDictionary::from_slices::<NSString>(
+            &[
+                objc2_app_kit::NSFontAttributeName,
+                objc2_app_kit::NSForegroundColorAttributeName,
+                objc2_app_kit::NSParagraphStyleAttributeName,
+            ],
+            &[font as &AnyObject, &*color as &AnyObject, &*paragraph as &AnyObject],
+        )
+    }
 }
 
 /// The note line's two options, `[check icon, its label, x icon, its label]`:
@@ -1186,12 +1553,16 @@ fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: List
     let hot = matches!(hovered, ListHit::Ask(h) if h == hit);
     let down = matches!(pressed, ListHit::Ask(h) if h == hit);
     match hit {
-        AsksHit::Ok(_) | AsksHit::Ko(_) | AsksHit::Brief(_) => {
+        AsksHit::Ok(_)
+        | AsksHit::Ko(_)
+        | AsksHit::Brief(_)
+        | AsksHit::PermissionApprove(_)
+        | AsksHit::PermissionReject(_) => {
             let ground = if down || hot { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
             fill_round(rect, AB_RADIUS, ground, alpha);
             let (icon, fg) = match hit {
-                AsksHit::Ok(_) => (super::feather::Icon::Check, tokens::OK_DOT),
-                AsksHit::Ko(_) => (super::feather::Icon::X, tokens::INTERRUPT),
+                AsksHit::Ok(_) | AsksHit::PermissionApprove(_) => (super::feather::Icon::Check, tokens::OK_DOT),
+                AsksHit::Ko(_) | AsksHit::PermissionReject(_) => (super::feather::Icon::X, tokens::INTERRUPT),
                 _ => (super::feather::Icon::Edit, tokens::TEXT_PRIMARY),
             };
             stroke_icon(icon, rect, AB_ICON, fg, alpha);
@@ -1212,6 +1583,11 @@ fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: List
             let ground = if down || hot { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
             fill_round(rect, SNOOZE_RADIUS, ground, alpha);
             draw_text(sh, choice.label(), rect, Style::Chip, tokens::TEXT_SECONDARY, alpha, Align::Center, false);
+        }
+        AsksHit::PermissionAlways(_) => {
+            let ground = if down || hot { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
+            fill_round(rect, SNOOZE_RADIUS, ground, alpha);
+            draw_text(sh, "Always", rect, Style::Chip, tokens::TEXT_SECONDARY, alpha, Align::Center, false);
         }
         AsksHit::ShowNow(_) => {
             let ground = if down || hot { tokens::TILE_PRESSED } else { tokens::TILE_HOVER };
@@ -1350,6 +1726,7 @@ mod tests {
             ended: false,
             snoozed: false,
             back_at: String::new(),
+            permission: None,
         }
     }
 
@@ -1774,5 +2151,168 @@ mod tests {
         assert_eq!(cross.x, 10.0 + NOTE_ICON + NOTE_ICON_GAP + 18.0 + 6.0);
         assert_eq!(second.x, cross.right() + NOTE_ICON_GAP);
         assert_eq!(second.w, note.right() - second.x);
+    }
+
+    // ---------------------------------------------------------------
+    // Permission cards
+    // ---------------------------------------------------------------
+
+    fn prompt(command: &str) -> ParsedPrompt {
+        ParsedPrompt {
+            header: "Bash command".into(),
+            question: "Do you want to proceed?".into(),
+            detail: Some(command.into()),
+            options: vec![
+                (1, "Yes".into()),
+                (2, "Yes, and don't ask again for this command".into()),
+                (3, "No, and tell Claude what to do differently".into()),
+            ],
+        }
+    }
+
+    fn permission(command: &str) -> AskCardVm {
+        AskCardVm::from_permission(prompt(command), (3, "kova".into()), "claude".into(), 100, 100)
+    }
+
+    #[test]
+    fn a_permission_card_carries_its_tag_its_code_block_and_the_three_answers() {
+        let card = permission("cargo test");
+        let key = card.key;
+        assert_eq!(card.message, "Do you want to proceed?");
+        assert_eq!(card.from, "claude");
+        let permission = card.permission.as_ref().expect("a permission card");
+        assert_eq!((permission.approve, permission.always, permission.reject), (Some(1), Some(2), Some(3)));
+        assert!(card.id.starts_with("perm:3:"));
+
+        let l = layout(&state(vec![card]), W, &FakeMetrics);
+        let row = &l.cards[0];
+        let tag = row.tag.expect("the Permission tag");
+        assert!(row.header.contains(tag.x, tag.y), "the tag sits in the header");
+        assert!(tag.w > 0.0 && tag.h == TAG_H);
+
+        let code = row.code.expect("the command block");
+        assert_eq!(row.code_lines, ["cargo test"], "one command, one line");
+        assert_eq!(code.x, row.frame.x + CARD_PAD_H);
+        assert_eq!(code.y, row.message.bottom() + CODE_GAP);
+        assert_eq!(code.h, CODE_LINE_H + 2.0 * CODE_PAD);
+
+        // Approve, Reject, Always, then the ghost that opens the pane. No OK,
+        // Brief or Snooze: a permission has nothing else to say.
+        let hits: Vec<AsksHit> = row.buttons.iter().map(|(hit, _)| *hit).collect();
+        assert_eq!(
+            hits,
+            [
+                AsksHit::PermissionApprove(key),
+                AsksHit::PermissionReject(key),
+                AsksHit::PermissionAlways(key),
+                AsksHit::Open(3)
+            ]
+        );
+        // Each button sits in the card, and a click on it lands there.
+        for (hit, rect) in &row.buttons {
+            assert!(row.frame.contains(rect.x, rect.y), "{hit:?} starts outside");
+            assert_eq!(l.hit(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0), Some(*hit));
+        }
+        let approve = row.buttons[0].1;
+        let reject = row.buttons[1].1;
+        let always = row.buttons[2].1;
+        assert_eq!(approve.h, AB_H);
+        assert_eq!(reject.x, approve.right() + AB_GAP);
+        assert_eq!(always.x, reject.right() + AB_GAP);
+        assert_eq!(always.w, 6.0 * 6.0 + 2.0 * ALWAYS_PAD, "`Always` and its padding");
+        assert_eq!(row.buttons[3].1.right(), row.frame.right() - CARD_PAD_H);
+        // The block, the actions: no note line under them.
+        assert_eq!(row.note, Rect::default());
+        assert_eq!(row.frame.h, CODE_PAD * 2.0 + CODE_LINE_H + CODE_GAP + ACT_GAP + AB_H + CARD_PAD_V + CARD_PAD_V + HEADER_H + HEADER_GAP + MSG_LINE_H);
+    }
+
+    #[test]
+    fn a_permission_without_parseable_options_only_opens_its_pane() {
+        let mut card = permission("npm run build");
+        let permission = card.permission.as_mut().expect("a permission");
+        permission.prompt.options.clear();
+        permission.approve = None;
+        permission.always = None;
+        permission.reject = None;
+        let key = card.key;
+        let l = layout(&state(vec![card]), W, &FakeMetrics);
+        let hits: Vec<AsksHit> = l.cards[0].buttons.iter().map(|(hit, _)| *hit).collect();
+        assert_eq!(hits, [AsksHit::Open(3)]);
+        assert!(!hits.iter().any(|hit| hit.permission().is_some_and(|(k, _)| k == key)));
+    }
+
+    #[test]
+    fn the_command_block_wraps_by_character_and_stops_at_four_lines() {
+        // 236 pt wide, 12 pt of padding: 33 characters of Menlo 11 a line.
+        let one = code_lines("cargo test", 236.0);
+        assert_eq!(one, ["cargo test"]);
+        let long = code_lines(&"x".repeat(40), 236.0);
+        assert_eq!(long.len(), 2);
+        assert_eq!(long[0].chars().count(), 33);
+        assert_eq!(long[1].chars().count(), 7);
+        // Five lines' worth: four rows, the last cut with an ellipsis.
+        let many = code_lines(&"y".repeat(200), 236.0);
+        assert_eq!(many.len(), CODE_MAX_LINES);
+        assert!(many[3].ends_with('\u{2026}'));
+        assert!(many[3].chars().count() <= 33);
+    }
+
+    #[test]
+    fn a_permission_card_key_follows_the_screen_it_shows() {
+        let a = permission("cargo test");
+        let same = permission("cargo test");
+        let other = permission("cargo build --release");
+        assert_eq!(a.key, same.key, "the same screen keeps the card");
+        assert_ne!(a.key, other.key, "another command is another card");
+    }
+
+    #[test]
+    fn answering_a_permission_goes_sending_then_leaves_with_the_prompt() {
+        let mut st = state(vec![permission("cargo test")]);
+        let key = st.cards[0].key;
+        permission_sending(&mut st, key, NOW_MS);
+        let sending = st.transient.as_ref().expect("sending");
+        assert_eq!(sending.phase, TransientPhase::Sending);
+        assert_eq!(sending.until_ms, NOW_MS + SENDING_TIMEOUT_MS);
+        // A second click lands on the same card: nothing more is sent.
+        permission_sending(&mut st, key, NOW_MS + 10);
+        assert_eq!(st.transient.as_ref().map(|t| t.until_ms), Some(NOW_MS + SENDING_TIMEOUT_MS));
+
+        // The prompt left the screen: the card says Sent, then disappears.
+        st.prune(&[], NOW_MS + 20);
+        assert_eq!(st.transient.as_ref().map(|t| t.phase), Some(TransientPhase::Sent));
+        st.prune(&[], NOW_MS + 20 + SENT_LINGER_MS + 1);
+        assert!(st.transient.is_none());
+    }
+
+    #[test]
+    fn a_refused_permission_click_says_why_in_crit_for_five_seconds() {
+        let mut st = state(vec![permission("cargo test")]);
+        permission_refused(&mut st, 3, NOW_MS);
+        let l = layout(&st, W, &FakeMetrics);
+        let flash = l.cards[0].flash.expect("the crit line");
+        assert_eq!(flash.x, l.cards[0].frame.x + CARD_PAD_H);
+        assert!(flash.bottom() <= l.cards[0].frame.bottom(), "the line stays in the card");
+        // It holds for five seconds, then goes.
+        st.prune(&[], NOW_MS + FLASH_MS - 1);
+        assert!(st.flash.is_some());
+        st.prune(&[], NOW_MS + FLASH_MS);
+        assert!(st.flash.is_none());
+        // Another pane's card never shows it.
+        let mut other = permission("cargo test");
+        other.pane_id = Some(4);
+        let mut st = state(vec![other]);
+        permission_refused(&mut st, 3, NOW_MS);
+        assert!(layout(&st, W, &FakeMetrics).cards[0].flash.is_none());
+    }
+
+    #[test]
+    fn the_permission_card_ignores_the_brief_and_snooze_hits() {
+        let mut st = state(vec![permission("cargo test")]);
+        let key = st.cards[0].key;
+        assert!(click(&mut st, AsksHit::PermissionApprove(key), NOW_MS).is_none());
+        assert!(st.transient.is_none(), "click alone sends nothing: the pane decides");
+        assert!(st.brief.is_none());
+        assert_eq!(st.snooze_open, None);
     }
 }

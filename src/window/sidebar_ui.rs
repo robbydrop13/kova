@@ -399,11 +399,14 @@ impl KovaView {
         NeedInput { panes, routines, asks, now }
     }
 
-    /// The Asks cards at `now`: every question the board holds, with the tab
-    /// it came from (across every window, like `need_input`) and whether its
+    /// The Asks cards at `now`: every question the board holds and every
+    /// permission prompt waiting in a pane, with the tab they came from
+    /// (across every window, like `need_input`) and whether a question's
     /// conversation is still alive somewhere.
     fn ask_cards(&self, now: u64) -> Vec<AskCardVm> {
+        use crate::prompt_preview::PromptPreview;
         let mut panes: std::collections::HashMap<PaneId, String> = std::collections::HashMap::new();
+        let mut permissions = Vec::new();
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let app = NSApplication::sharedApplication(mtm);
         let ns_windows = app.windows();
@@ -415,11 +418,26 @@ impl KovaView {
                 let title = tab.title();
                 tab.for_each_pane(&mut |pane| {
                     panes.insert(pane.id, title.clone());
+                    if pane.is_working() {
+                        return;
+                    }
+                    // The `since` of the preview and the parsed prompt behind
+                    // it are written together (`Pane::refresh_prompt_preview`).
+                    let since = match pane.prompt_preview.borrow().as_ref() {
+                        Some(PromptPreview::Permission { since, .. }) => *since,
+                        _ => return,
+                    };
+                    let Some(prompt) = pane.permission_prompt() else { return };
+                    let from = pane
+                        .agent_session_name()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| pane.display_title("Shell"));
+                    permissions.push(AskCardVm::from_permission(prompt, (pane.id, title.clone()), from, since, now));
                 });
             }
         }
         let live = crate::claude_session::live_session_ids();
-        let mut cards = Vec::new();
+        let mut cards = permissions;
         crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|question| {
             let pane = question
                 .from
@@ -439,14 +457,18 @@ impl KovaView {
 
     /// Clear what the Asks view only keeps for a moment, and notice a card
     /// the board has just let go of. Runs whether or not the list is up: the
-    /// transient card must not outlive a view switch.
+    /// transient card must not outlive a view switch. A permission card lives
+    /// as long as its pane's screen shows the prompt, which is the list the
+    /// last read left in `asks.cards`.
     fn sync_sidebar_asks_state(&self) {
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let mut waiting = Vec::new();
         crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|question| {
             waiting.push(sidebar_asks::ask_key(&question.id));
         });
-        self.ivars().sidebar.borrow_mut().asks.prune(&waiting, sidebar_asks::now_ms());
+        let mut state = self.ivars().sidebar.borrow_mut();
+        waiting.extend(state.asks.cards.iter().filter(|card| card.permission.is_some()).map(|card| card.key));
+        state.asks.prune(&waiting, sidebar_asks::now_ms());
     }
 
     /// Read the tabs into a model and hand it to the sidebar view, which
@@ -498,6 +520,17 @@ impl KovaView {
             let cards = self.ask_cards(now);
             let mut st = self.ivars().sidebar.borrow_mut();
             st.asks.set_cards(cards);
+            // A need row's `Answer` on a permission named its pane: the card
+            // for that pane exists only now, so it is this read that lights it.
+            if let Some(pane) = st.asks.highlight_pane.take()
+                && let Some(card) =
+                    st.asks.cards.iter().find(|card| card.permission.is_some() && card.pane_id == Some(pane))
+            {
+                st.asks.highlight = Some(Highlight {
+                    id: card.id.clone(),
+                    until_ms: sidebar_asks::now_ms() + sidebar_asks::HIGHLIGHT_MS,
+                });
+            }
             model.asks = st.asks.clone();
             model.summary = asks_summary(model.asks.open_count());
         }
@@ -664,8 +697,10 @@ impl KovaView {
         st.list = list;
         if list != SidebarList::Asks {
             // The field and the overlay belong to the Asks list; the draft
-            // stays in `asks.drafts` for when the user comes back.
+            // stays in `asks.drafts` for when the user comes back. A pending
+            // permission highlight would name a card nobody can see.
             st.asks.brief = None;
+            st.asks.highlight_pane = None;
         }
     }
 
@@ -814,6 +849,14 @@ impl KovaView {
                     }),
                     _ => None,
                 };
+                // A permission card's id carries the screen's fingerprint, which
+                // the list only learns on its next read: name the pane now, the
+                // card is lit there (`sync_sidebar`).
+                st.asks.highlight_pane = if item.kind == NeedKind::Permission {
+                    item.pane_id.and_then(|id| PaneId::try_from(id).ok())
+                } else {
+                    None
+                };
                 st.last_revealed_ask = None;
             }
         }
@@ -821,7 +864,13 @@ impl KovaView {
 
     /// A click on an Asks card, or in the Brief overlay: run the state
     /// machine, queue the answer, and land the view where the button says.
+    /// A permission button is the one click that types into a pane: it reads
+    /// the screen again first and gives up when it moved on.
     pub(super) fn sidebar_ask_hit(&self, hit: AsksHit) {
+        if let Some((key, choice)) = hit.permission() {
+            self.sidebar_permission_hit(key, choice);
+            return;
+        }
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let now = sidebar_asks::now_ms();
         let (action, asks) = {
@@ -839,6 +888,33 @@ impl KovaView {
         }
         if let AsksHit::Open(pane_id) = hit {
             focus_pane_anywhere(pane_id);
+        }
+    }
+
+    /// Answer a permission prompt from its card: the pane reads its screen
+    /// again and types the digit only while it is still the prompt the card
+    /// shows. On a match the card goes to `Sending`; otherwise it says
+    /// `Prompt changed, open the pane` in crit and the pane keeps its new
+    /// preview, which the next read of the list shows.
+    fn sidebar_permission_hit(&self, key: u64, choice: crate::prompt_preview::PermissionChoice) {
+        let typed = {
+            let st = self.ivars().sidebar.borrow();
+            let Some(card) = st.asks.card(key) else { return };
+            let (Some(permission), Some(pane_id)) = (card.permission.as_ref(), card.pane_id) else { return };
+            with_pane(pane_id, |pane| pane.answer_permission(&permission.prompt, choice)).unwrap_or(false)
+        };
+        let now = sidebar_asks::now_ms();
+        let asks = {
+            let mut st = self.ivars().sidebar.borrow_mut();
+            if typed {
+                sidebar_asks::permission_sending(&mut st.asks, key, now);
+            } else if let Some(pane_id) = st.asks.card(key).and_then(|card| card.pane_id) {
+                sidebar_asks::permission_refused(&mut st.asks, pane_id, now);
+            }
+            st.asks.clone()
+        };
+        if let Some(view) = self.ivars().sidebar_view.get() {
+            view.adopt_asks(asks);
         }
     }
 
@@ -1283,6 +1359,36 @@ fn focus_pane_anywhere(pane_id: PaneId) {
         }
     }
     log::debug!("focus_pane_anywhere: pane {} not found", pane_id);
+}
+
+/// Run `f` on the pane with `id`, in whatever window holds it. A permission
+/// card can belong to any window's pane (the list shows them all), and the
+/// click has to reach the pane itself, not just the window.
+fn with_pane<R>(pane_id: PaneId, f: impl FnOnce(&Pane) -> R) -> Option<R> {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let ns_windows = app.windows();
+    let mut f = Some(f);
+    for i in 0..ns_windows.count() {
+        let win = ns_windows.objectAtIndex(i);
+        let Some(view) = crate::app::kova_view(&win) else { continue };
+        let tabs = view.ivars().tabs.borrow();
+        let mut out = None;
+        for tab in tabs.iter() {
+            tab.for_each_pane(&mut |pane| {
+                if out.is_none()
+                    && pane.id == pane_id
+                    && let Some(f) = f.take()
+                {
+                    out = Some(f(pane));
+                }
+            });
+        }
+        if out.is_some() {
+            return out;
+        }
+    }
+    None
 }
 
 /// The flags a pane's tile state is derived from. `seen` is true for the
