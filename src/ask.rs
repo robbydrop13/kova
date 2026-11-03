@@ -188,18 +188,20 @@ pub const SNOOZE_MAX_SECS: u64 = 24 * 60 * 60;
 pub const ANSWER_TEXT_MAX: usize = 8 * 1024;
 
 /// Whether an answer that did not come from the card may be handed to the
-/// agent: the action is one of the buttons the question declared, the free text
-/// is of human size, and there is no text at all unless the question asked for
-/// some. The card constrains all three by construction; a socket client does not.
+/// agent: the action is one of the buttons the card shows, except that the
+/// free answer `Other` is accepted on any question, and the text is of human
+/// size. The text itself is allowed even when the question asked for none:
+/// the Asks list's Brief gives an instruction on every question, and a socket
+/// client is held to the same rule.
 pub fn accepts_external_answer(question: &Question, action: &str, text: &str) -> Result<(), String> {
-    if !question.buttons().iter().any(|b| b == action) {
+    if action == OTHER && text.trim().is_empty() {
+        return Err("\"Other\" needs the text of the free answer".to_string());
+    }
+    if action != OTHER && !question.buttons().iter().any(|b| b == action) {
         return Err(format!("{:?} is not one of this question's buttons", action));
     }
     if text.len() > ANSWER_TEXT_MAX {
         return Err(format!("answer text is longer than {} bytes", ANSWER_TEXT_MAX));
-    }
-    if !question.input && !text.is_empty() {
-        return Err("this question has no text field, so \"text\" must be empty".to_string());
     }
     Ok(())
 }
@@ -1083,9 +1085,10 @@ impl Board {
     /// An answer given somewhere other than the card: KovaLink, from the phone,
     /// so a question does not block the user until he is back at the Mac.
     ///
-    /// `action` must be one of the buttons the question declared. The client
-    /// picks among them and does not get to invent the word the agent reads
-    /// back: that word reaches a command line in `late_answer_message`.
+    /// `action` must be a button the card shows, or `Other` with text. The
+    /// client picks among them and does not get to invent the word the agent
+    /// reads back: that word reaches a command line in `late_answer_message`.
+    /// The text rides on any action, asked for or not.
     pub fn answer_external(&mut self, id: &str, action: &str, text: &str) -> Result<(), String> {
         let Some((question, _)) = self.pending.iter().find(|(q, _)| q.id == id) else {
             return Err(format!("no question {}", id));
@@ -1722,9 +1725,19 @@ mod tests {
         assert!(accepts_external_answer(&q, "ok", "").is_err(), "the comparison is exact");
         q.actions.clear();
         assert_eq!(accepts_external_answer(&q, "Reply", "x"), Ok(()), "no actions: the single Reply button");
+        // The Brief gives an instruction on a question that asked for no text.
         q.input = false;
         assert_eq!(accepts_external_answer(&q, "Reply", ""), Ok(()));
-        assert!(accepts_external_answer(&q, "Reply", "x").unwrap_err().contains("no text field"));
+        assert_eq!(accepts_external_answer(&q, "Reply", "x"), Ok(()), "text rides on a declared button");
+        // Other is the free answer, on any question, and only with text.
+        assert_eq!(accepts_external_answer(&q, "Other", "an instruction"), Ok(()));
+        assert!(accepts_external_answer(&q, "Other", "").is_err(), "Other without text says nothing");
+        assert!(accepts_external_answer(&q, "Other", "  ").is_err());
+        q.input = true;
+        assert!(accepts_external_answer(&q, "Other", "").is_err());
+        assert!(accepts_external_answer(&q, "Invented", "x").is_err(), "an unknown word is refused");
+        let long = "x".repeat(ANSWER_TEXT_MAX + 1);
+        assert!(accepts_external_answer(&q, "Other", &long).is_err());
     }
 
     #[test]

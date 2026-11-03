@@ -394,8 +394,43 @@ it and each snoozed question is a dimmed card (alpha 0.55) on the same
 geometry, without the action rows: `back at 20:00` on the left and a
 `Show now` ghost button on the right, which cancels the snooze.
 
-Brief is K12: the pencil records `SidebarState::brief_open = Some(ask_id)`
-and draws nothing else yet. Open focuses the ask's pane in any window.
+#### Brief overlay (the pencil)
+
+`AsksHit::Brief` opens the Brief overlay on any question, including the ones
+with no text field: an instruction typed on top of the ask. It is one card
+over a 40 % black scrim covering the visible list; a click outside the card
+cancels it. The card (`BriefLayout`) sits 12 pt from the top of the list and
+12 pt from each side, 12 pt of padding, `bg1` ground, 1 pt `b3` border,
+radius 8, top to bottom: the header (a warn dot, `Brief for <asker>` in
+`Title`, the age in `Number` at the right), the question (`Secondary`),
+the agent's options as chips, the instruction field, Cancel and Send, and a
+two-line hint in `Hint` tertiary.
+
+Chips are 22 pt tall, full radius, 1 pt `b3` border, `Chip` (11 Medium);
+they wrap a row at a time. One is picked at most: a picked chip takes
+`ACCENT` and white text (`TEXT_ON_FILL`), and a second click unpicks it.
+The instruction rides on the answer whether or not a chip is picked.
+
+The instruction field is native (`SidebarView` in `sidebar_view.rs`): one
+`NSTextField` at most, owned by the view, keyed by the ask id, created and
+focused when the overlay opens, moved only when its rect changes, removed
+when the overlay closes or the question leaves the board. What was typed is
+kept in `AsksState.drafts`, so reopening Brief on the same ask restores it.
+Three lines (60 pt) at least, six (120 pt) at most, then the field scrolls;
+placeholder `Your instruction`, Inter 12. Enter starts a new line, Cmd+Enter
+sends, Escape cancels. Cmd+A/C/V/X/Z reach the field because
+`KovaView::perform_key_equivalent` (`src/window/mod.rs`) answers NO while the
+window's first responder is an `NSTextView`: the terminal's key map must not
+take them first. Opening and closing the field is logged
+(`sidebar: brief field open|close <id>`).
+
+Send is disabled while no chip is picked and the field is empty. It queues
+`AskAction::Answer`: the picked option with the text, or `ask::OTHER` with
+the text alone. The text is trimmed, then capped at `ask::ANSWER_TEXT_MAX`
+(8 KiB) on a character boundary. The card then goes to `Sending` like OK and
+KO. `ask::accepts_external_answer` follows the same rule: text is allowed on
+any button whatever the question's `input`, and `Other` is accepted with
+text on any question.
 
 A need row that lands on an ask (`ListHit::Need`, `Cmd+J`) switches to this
 list, sets `AsksState::highlight` to the ask id and scrolls its card into

@@ -477,9 +477,10 @@ Errors:
 - `no pending question <id>`: already answered (on the Mac, or by another
   client), or never asked here;
 - `"action" must be one of: OK, KO`: `action` is not one of that question's
-  `buttons` (case matters);
-- `"text" must be empty: this question has no text field`: the question was
-  asked with `input: false`.
+  `buttons` (case matters). Exception: `"Other"` with a non-empty `text` is
+  accepted on any question (the Brief: a free instruction);
+- `"Other"` without text is refused. `text` is accepted on any button, whatever
+  `input`, up to 8 KiB.
 
 Kova.app only: a library host answers `command not supported by this host`.
 

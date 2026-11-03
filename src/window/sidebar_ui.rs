@@ -143,9 +143,6 @@ pub(super) struct SidebarState {
     /// The Asks list's cards and transient state, read from the board while
     /// the Asks list is up.
     pub(super) asks: AsksState,
-    /// The question whose Brief overlay is open. K12 draws the field; this
-    /// only records the choice.
-    pub(super) brief_open: Option<String>,
     /// The ask a highlight already scrolled to, so it reveals its card once.
     last_revealed_ask: Option<String>,
     /// The failed routine Cmd+J already showed, so it shows it once rather
@@ -167,7 +164,6 @@ impl SidebarState {
             routine_failed: false,
             needs_all: false,
             asks: AsksState::default(),
-            brief_open: None,
             last_revealed_ask: None,
             routine_shown: None,
         }
@@ -595,7 +591,13 @@ impl KovaView {
     /// The view switcher: show `list`. Clicking the selected icon is a no-op,
     /// like a segmented control.
     pub(super) fn sidebar_show_list(&self, list: SidebarList) {
-        self.ivars().sidebar.borrow_mut().list = list;
+        let mut st = self.ivars().sidebar.borrow_mut();
+        st.list = list;
+        if list != SidebarList::Asks {
+            // The field and the overlay belong to the Asks list; the draft
+            // stays in `asks.drafts` for when the user comes back.
+            st.asks.brief = None;
+        }
     }
 
     /// Click a routine: open it, or close it when it is the open one.
@@ -648,28 +650,38 @@ impl KovaView {
         }
     }
 
-    /// A click on an Asks card: run the card's state machine, queue the board
-    /// action, and land the view where the button says.
+    /// A click on an Asks card, or in the Brief overlay: run the state
+    /// machine, queue the answer, and land the view where the button says.
     pub(super) fn sidebar_ask_hit(&self, hit: AsksHit) {
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let now = sidebar_asks::now_ms();
-        let (action, brief) = {
+        let (action, asks) = {
             let mut st = self.ivars().sidebar.borrow_mut();
             let action = sidebar_asks::click(&mut st.asks, hit, now);
-            let brief = match hit {
-                AsksHit::Brief(key) => st.asks.card(key).map(|card| card.id.clone()),
-                _ => None,
-            };
-            (action, brief)
+            (action, st.asks.clone())
         };
-        if let Some(id) = brief {
-            self.ivars().sidebar.borrow_mut().brief_open = Some(id);
+        if let Some(view) = self.ivars().sidebar_view.get() {
+            // The state machine lives here, the field and the overlay live in
+            // the view: hand it the result now, not on the next tick.
+            view.adopt_asks(asks);
         }
         if let Some(action) = action {
             crate::app::app_delegate(mtm).ivars().queue_ask_action(action);
         }
         if let AsksHit::Open(pane_id) = hit {
             focus_pane_anywhere(pane_id);
+        }
+    }
+
+    /// The Brief field's live text: kept in the state so reopening the
+    /// overlay on the same ask restores it. The view's own model copy is
+    /// updated on the same keystroke, for the card's height.
+    pub(super) fn sidebar_brief_draft(&self, id: &str, text: &str) {
+        let mut st = self.ivars().sidebar.borrow_mut();
+        if text.is_empty() {
+            st.asks.drafts.remove(id);
+        } else {
+            st.asks.drafts.insert(id.to_string(), text.to_string());
         }
     }
 

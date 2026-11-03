@@ -16,16 +16,17 @@ use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAffineTransformNSAppKitAdditions, NSBezierPath, NSColor, NSCursor, NSEvent, NSEventMask, NSFont, NSGraphicsContext,
-    NSImage, NSLineBreakMode, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView, NSScrollerStyle,
-    NSShadow, NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTrackingArea,
-    NSTrackingAreaOptions, NSView,
+    NSAffineTransformNSAppKitAdditions, NSApplication, NSBezierPath, NSColor, NSControl,
+    NSControlTextEditingDelegate, NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSFocusRingType, NSFont,
+    NSGraphicsContext, NSImage, NSLineBreakMode, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView,
+    NSScrollerStyle, NSShadow, NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTextField,
+    NSTextFieldDelegate, NSTextView, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSAffineTransform, NSDictionary, NSObjectProtocol, NSString};
+use objc2_foundation::{NSAffineTransform, NSDictionary, NSNotification, NSObjectProtocol, NSString};
 
 use super::feather::{self, Icon};
 use super::needs::NeedKind;
@@ -1367,10 +1368,21 @@ fn build_fonts() -> Vec<(Style, Retained<NSFont>)> {
 // SidebarView: chrome and scroll view
 // ---------------------------------------------------------------
 
+/// The Brief overlay's one native field: the question it edits, the box that
+/// carries its ground and border, and the rect the last layout gave it (moved
+/// only when that changes, never rebuilt on a tick).
+struct BriefField {
+    id: String,
+    box_: Retained<NSView>,
+    field: Retained<NSTextField>,
+    rect: Rect,
+}
+
 pub struct SidebarViewIvars {
     shared: Rc<RefCell<Shared>>,
     scroll: OnceCell<Retained<NSScrollView>>,
     list: OnceCell<Retained<SidebarListView>>,
+    brief_field: RefCell<Option<BriefField>>,
 }
 
 define_class!(
@@ -1381,6 +1393,22 @@ define_class!(
     pub struct SidebarView;
 
     unsafe impl NSObjectProtocol for SidebarView {}
+
+    /// The Brief field's callbacks: the text feeds the draft and grows the
+    /// card, Enter starts a new line, Cmd+Enter sends, Escape cancels.
+    unsafe impl NSControlTextEditingDelegate for SidebarView {
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            self.brief_text_changed();
+        }
+
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn control_text_view_do_command(&self, _control: &NSControl, text_view: &NSTextView, selector: Sel) -> bool {
+            self.brief_command(text_view, selector)
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for SidebarView {}
 
     impl SidebarView {
         #[unsafe(method(isFlipped))]
@@ -1594,6 +1622,7 @@ impl SidebarView {
             shared: shared.clone(),
             scroll: OnceCell::new(),
             list: OnceCell::new(),
+            brief_field: RefCell::new(None),
         });
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setWantsLayer(true);
@@ -1716,7 +1745,185 @@ impl SidebarView {
         if let Some(win) = list.window() {
             win.invalidateCursorRectsForView(&list);
         }
+        self.sync_brief_field(&list);
         list.setNeedsDisplay(true);
+    }
+
+    // ---------------------------------------------------------------
+    // Brief overlay's native field
+    // ---------------------------------------------------------------
+
+    /// Make the one native field match the overlay: created and focused when
+    /// a Brief opens, moved when its rect changes, removed when the overlay
+    /// closes or its question leaves the board. Never rebuilt on a tick.
+    fn sync_brief_field(&self, list: &SidebarListView) {
+        let target = {
+            let sh = self.ivars().shared.borrow();
+            match (&sh.model.asks.brief, &sh.layout.asks.brief) {
+                (Some(brief), Some(layout)) => Some((
+                    brief.id.clone(),
+                    sh.model.asks.drafts.get(&brief.id).cloned().unwrap_or_default(),
+                    layout.card,
+                    layout.field,
+                )),
+                _ => None,
+            }
+        };
+        let Some((id, text, card, rect)) = target else {
+            self.close_brief_field();
+            return;
+        };
+        let open = self.ivars().brief_field.borrow().as_ref().is_some_and(|open| open.id == id);
+        if open {
+            let mut slot = self.ivars().brief_field.borrow_mut();
+            let field = slot.as_mut().expect("just checked");
+            if field.rect != rect {
+                field.rect = rect;
+                field.box_.setFrame(rect.cg());
+                Self::place_brief_text(field);
+            }
+            return;
+        }
+        self.close_brief_field();
+        self.open_brief_field(list, &id, &text, card, rect);
+    }
+
+    /// The text area inside the box: the pads the pure layout measured with.
+    fn place_brief_text(brief: &BriefField) {
+        let inner = Rect::new(
+            sidebar_asks::BRIEF_FIELD_PAD_H,
+            sidebar_asks::BRIEF_FIELD_PAD_V,
+            (brief.rect.w - 2.0 * sidebar_asks::BRIEF_FIELD_PAD_H).max(0.0),
+            (brief.rect.h - 2.0 * sidebar_asks::BRIEF_FIELD_PAD_V).max(0.0),
+        );
+        brief.field.setFrame(inner.cg());
+    }
+
+    fn open_brief_field(&self, list: &SidebarListView, id: &str, text: &str, card: Rect, rect: Rect) {
+        let mtm = MainThreadMarker::from(self);
+        let box_ = NSView::new(mtm);
+        box_.setWantsLayer(true);
+        if let Some(layer) = box_.layer() {
+            layer.setCornerRadius(6.0);
+            layer.setBorderWidth(1.0);
+            layer.setBackgroundColor(Some(&color(tokens::GROUND, 1.0).CGColor()));
+            layer.setBorderColor(Some(&color(tokens::BORDER_SUBTLE, 1.0).CGColor()));
+        }
+        let font = self.ivars().shared.borrow().font(Style::Secondary).retain();
+        let field = NSTextField::new(mtm);
+        field.setBordered(false);
+        field.setDrawsBackground(false);
+        field.setFocusRingType(NSFocusRingType::None);
+        field.setFont(Some(&font));
+        field.setTextColor(Some(&color(tokens::TEXT_PRIMARY, 1.0)));
+        field.setUsesSingleLineMode(false);
+        field.setMaximumNumberOfLines(0);
+        if let Some(cell) = field.cell() {
+            cell.setWraps(true);
+            cell.setScrollable(false);
+        }
+        field.setStringValue(&NSString::from_str(text));
+        field.setPlaceholderString(Some(&NSString::from_str("Your instruction")));
+        unsafe { field.setDelegate(Some(ProtocolObject::from_ref(self))) };
+        box_.addSubview(&field);
+        box_.setFrame(rect.cg());
+        list.addSubview(&box_);
+        let open = BriefField { id: id.to_string(), box_, field, rect };
+        Self::place_brief_text(&open);
+        *self.ivars().brief_field.borrow_mut() = Some(open);
+        log::info!("sidebar: brief field open {}", id);
+        list.scrollRectToVisible(card.inset(-4.0).cg());
+        let field = self.ivars().brief_field.borrow().as_ref().map(|open| open.field.retain());
+        if let (Some(field), Some(win)) = (field, self.window()) {
+            win.makeFirstResponder(Some(&field));
+        }
+    }
+
+    fn close_brief_field(&self) {
+        let Some(open) = self.ivars().brief_field.borrow_mut().take() else { return };
+        log::info!("sidebar: brief field close {}", open.id);
+        // The keyboard goes back to the terminal, then the box goes: removing
+        // the first responder's view first would leave the window keyless.
+        if let (Some(win), Some(kova)) = (self.window(), kova_of(self)) {
+            win.makeFirstResponder(Some(&kova));
+        }
+        open.box_.removeFromSuperview();
+    }
+
+    /// The field's live text: kept in the window's state (so reopening Brief
+    /// restores it) and in this view's model (so the card grows at once).
+    fn brief_text_changed(&self) {
+        let (id, text) = {
+            let slot = self.ivars().brief_field.borrow();
+            let Some(open) = slot.as_ref() else { return };
+            let text = match open.field.currentEditor() {
+                Some(editor) => editor.string().to_string(),
+                None => open.field.stringValue().to_string(),
+            };
+            (open.id.clone(), text)
+        };
+        {
+            let mut sh = self.ivars().shared.borrow_mut();
+            if text.is_empty() {
+                sh.model.asks.drafts.remove(&id);
+            } else {
+                sh.model.asks.drafts.insert(id.clone(), text.clone());
+            }
+        }
+        if let Some(kova) = kova_of(self) {
+            kova.sidebar_brief_draft(&id, &text);
+        }
+        self.relayout_list();
+    }
+
+    /// Enter, Cmd+Enter and Escape in the field. Enter is a new line in an
+    /// instruction; the card's own field keeps Enter for sending.
+    fn brief_command(&self, text_view: &NSTextView, selector: Sel) -> bool {
+        if selector == sel!(cancelOperation:) {
+            if let Some(key) = self.brief_key() {
+                self.activate_brief(AsksHit::BriefCancel(key));
+            }
+            return true;
+        }
+        if selector == sel!(insertNewline:) {
+            let cmd = NSApplication::sharedApplication(MainThreadMarker::from(self))
+                .currentEvent()
+                .map(|event| event.modifierFlags().contains(NSEventModifierFlags::Command))
+                .unwrap_or(false);
+            if cmd {
+                if let Some(key) = self.brief_key() {
+                    self.activate_brief(AsksHit::BriefSend(key));
+                }
+            } else {
+                let _: () = unsafe { msg_send![text_view, insertNewlineIgnoringFieldEditor: None::<&AnyObject>] };
+            }
+            return true;
+        }
+        false
+    }
+
+    fn brief_key(&self) -> Option<u64> {
+        let id = self.ivars().brief_field.borrow().as_ref().map(|open| open.id.clone())?;
+        let sh = self.ivars().shared.borrow();
+        sh.model.asks.cards.iter().find(|card| card.id == id).map(|card| card.key)
+    }
+
+    /// A command from the field goes through the list, which turns a hit
+    /// into a click on the window's state.
+    fn activate_brief(&self, hit: AsksHit) {
+        if let Some(list) = self.ivars().list.get() {
+            list.activate(ListHit::Ask(hit));
+        }
+    }
+
+    /// Mirror the window's Asks state at once: waiting for the next tick
+    /// would leave a click's open, pick or close invisible for a frame.
+    pub(super) fn adopt_asks(&self, asks: sidebar_asks::AsksState) {
+        {
+            let mut sh = self.ivars().shared.borrow_mut();
+            sh.model.asks = asks;
+        }
+        self.relayout_list();
     }
 
     fn draw_chrome(&self) {
@@ -2300,7 +2507,9 @@ impl SidebarListView {
     fn draw_list(&self, dirty: CGRect) {
         let sh = self.ivars().shared.borrow();
         if sh.layout.asks.shown {
-            sidebar_asks::draw(&sh, &sh.model.asks, &sh.layout.asks, sh.hovered, sh.pressed);
+            let visible = self.visibleRect();
+            let scrim = Rect::new(visible.origin.x, visible.origin.y, visible.size.width, visible.size.height);
+            sidebar_asks::draw(&sh, &sh.model.asks, &sh.layout.asks, sh.hovered, sh.pressed, scrim);
             return;
         }
         let dirty_top = dirty.origin.y;

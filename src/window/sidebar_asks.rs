@@ -10,6 +10,7 @@
 //! colour as its border. See `docs/sidebar-spec.md`.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -86,6 +87,34 @@ const SENDING_TIMEOUT_MS: u64 = 3000;
 /// A highlight (a need row walked to its card) lasts two seconds.
 pub const HIGHLIGHT_MS: u64 = 2000;
 
+// The Brief overlay, in points: a card centred at the top of the list, over a
+// 40 % black scrim, holding the question, its options as chips, the
+// instruction field and the two buttons.
+const BRIEF_TOP: f64 = 12.0;
+const BRIEF_SIDE: f64 = 12.0;
+const BRIEF_RADIUS: f64 = 8.0;
+const BRIEF_PAD: f64 = 12.0;
+const BRIEF_GAP: f64 = 10.0;
+const BRIEF_CHIP_H: f64 = 22.0;
+const BRIEF_CHIP_GAP: f64 = 6.0;
+const BRIEF_CHIP_ROW_GAP: f64 = 6.0;
+const BRIEF_CHIP_PAD: f64 = 9.0;
+/// The instruction field: 12 pt text, three lines at least, six then it
+/// scrolls. `sidebar_view` insets the native field by the two pads.
+pub(super) const BRIEF_FIELD_LINE_H: f64 = 20.0;
+pub(super) const BRIEF_FIELD_PAD_H: f64 = 8.0;
+pub(super) const BRIEF_FIELD_PAD_V: f64 = 6.0;
+const BRIEF_FIELD_MIN_LINES: usize = 3;
+const BRIEF_FIELD_MAX_LINES: usize = 6;
+const BRIEF_BTN_H: f64 = 26.0;
+const BRIEF_BTN_GAP: f64 = 8.0;
+const BRIEF_BTN_PAD: f64 = 12.0;
+const BRIEF_SEND_ICON: f64 = 12.0;
+const BRIEF_SEND_ICON_GAP: f64 = 4.0;
+const BRIEF_HINT_H: f64 = 14.0;
+/// The black the list takes behind the card.
+pub(super) const BRIEF_SCRIM: f64 = 0.4;
+
 // ---------------------------------------------------------------
 // The view model
 // ---------------------------------------------------------------
@@ -111,6 +140,9 @@ pub struct AskCardVm {
     /// The two options OK and KO send: the question's first two actions, or
     /// `OK` / `No` when it declared fewer.
     pub options: [String; 2],
+    /// Every option the agent proposed, in order: the Brief overlay's chips.
+    /// One `Reply` when it proposed none, like the card's single button.
+    pub choices: Vec<String>,
     pub created_at: u64,
     /// The question's conversation has no live pane in Kova and no live
     /// Claude process: the note says `Session ended`.
@@ -134,8 +166,10 @@ impl AskCardVm {
     /// conversation is alive in another process, so its session has not
     /// ended even without a pane here.
     pub fn from_question(question: &crate::ask::Question, pane: Option<(PaneId, String)>, live: bool, now: u64) -> Self {
-        let first = question.actions.first().cloned().unwrap_or_else(|| "OK".to_string());
-        let second = question.actions.get(1).cloned().unwrap_or_else(|| "No".to_string());
+        let choices =
+            if question.actions.is_empty() { vec!["Reply".to_string()] } else { question.actions.clone() };
+        let first = choices[0].clone();
+        let second = choices.get(1).cloned().unwrap_or_else(|| "No".to_string());
         let age_secs = now.saturating_sub(question.asked_at);
         let snoozed = question.snoozed_until > now;
         AskCardVm {
@@ -148,6 +182,7 @@ impl AskCardVm {
             urgent: age_secs >= URGENT_AFTER_SECS,
             message: question.message.clone(),
             options: [first, second],
+            choices,
             created_at: question.asked_at,
             ended: pane.is_none() && !live,
             snoozed,
@@ -167,11 +202,24 @@ pub struct AsksState {
     pub snooze_open: Option<String>,
     pub transient: Option<TransientAsk>,
     pub highlight: Option<Highlight>,
+    /// The Brief overlay, when one is open.
+    pub brief: Option<BriefOpen>,
+    /// What was typed in the Brief field, by question id. Kept after the
+    /// overlay closes, so reopening Brief on the same ask restores it.
+    pub drafts: HashMap<String, String>,
 }
 
 impl Default for AsksState {
     fn default() -> Self {
-        AsksState { cards: Vec::new(), folded: true, snooze_open: None, transient: None, highlight: None }
+        AsksState {
+            cards: Vec::new(),
+            folded: true,
+            snooze_open: None,
+            transient: None,
+            highlight: None,
+            brief: None,
+            drafts: HashMap::new(),
+        }
     }
 }
 
@@ -193,9 +241,15 @@ impl AsksState {
     }
 
     /// A new read of the board. The transient answer survives it: it is the
-    /// card that just left the board (or is about to).
+    /// card that just left the board (or is about to). The Brief overlay
+    /// closes with its question, keeping the draft.
     pub fn set_cards(&mut self, cards: Vec<AskCardVm>) {
         self.cards = cards;
+        if let Some(brief) = &self.brief
+            && !self.cards.iter().any(|card| card.id == brief.id)
+        {
+            self.brief = None;
+        }
     }
 
     /// Drop the transient card once the board no longer holds it (it becomes
@@ -229,6 +283,15 @@ pub struct TransientAsk {
     pub phase: TransientPhase,
     /// Epoch millis: the sending timeout, then the sent linger's end.
     pub until_ms: u64,
+}
+
+/// The Brief overlay: an instruction typed on top of one question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BriefOpen {
+    pub id: String,
+    /// The chip picked, as an index into the card's `choices`; `None` sends
+    /// the free answer (`ask::OTHER`) instead.
+    pub picked: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,6 +387,13 @@ pub enum AsksHit {
     Ko(u64),
     /// Open the Brief overlay on this question.
     Brief(u64),
+    /// Pick a chip of the open Brief overlay, or unpick it when it already is.
+    BriefChip(u64, usize),
+    /// Send the instruction the Brief overlay holds.
+    BriefSend(u64),
+    /// Close the Brief overlay without sending. A click outside its card is
+    /// this too.
+    BriefCancel(u64),
     /// Focus the pane the question came from.
     Open(PaneId),
     /// Open or close the three-choice snooze row.
@@ -346,8 +416,28 @@ pub fn click(state: &mut AsksState, hit: AsksHit, now_ms: u64) -> Option<AskActi
     match hit {
         AsksHit::Ok(key) => answer(state, key, 0, now_ms),
         AsksHit::Ko(key) => answer(state, key, 1, now_ms),
-        AsksHit::Brief(_) => {
+        AsksHit::Brief(key) => {
+            let id = state.card(key)?.id.clone();
             state.snooze_open = None;
+            state.brief = Some(BriefOpen { id, picked: None });
+            None
+        }
+        AsksHit::BriefChip(key, index) => {
+            let card = state.card(key)?;
+            if index >= card.choices.len() {
+                return None;
+            }
+            let id = card.id.clone();
+            let brief = state.brief.as_mut().filter(|brief| brief.id == id)?;
+            brief.picked = if brief.picked == Some(index) { None } else { Some(index) };
+            None
+        }
+        AsksHit::BriefSend(key) => send_brief(state, key, now_ms),
+        AsksHit::BriefCancel(key) => {
+            let id = state.card(key)?.id.clone();
+            if state.brief.as_ref().is_some_and(|brief| brief.id == id) {
+                state.brief = None;
+            }
             None
         }
         AsksHit::Open(_) => None,
@@ -382,6 +472,52 @@ fn answer(state: &mut AsksState, key: u64, option: usize, now_ms: u64) -> Option
     Some(AskAction::Answer { id: card.id, action: card.options[option].clone(), text: String::new() })
 }
 
+/// Queue the Brief's answer: the picked chip, or the free answer `Other` when
+/// none is. The text is trimmed and capped at `ask::ANSWER_TEXT_MAX`; with no
+/// chip and no text there is nothing to send and the overlay stays open.
+fn send_brief(state: &mut AsksState, key: u64, now_ms: u64) -> Option<AskAction> {
+    if state.transient.as_ref().is_some_and(|t| t.card.key == key) {
+        return None;
+    }
+    let card = state.card(key)?.clone();
+    let brief = state.brief.as_ref().filter(|brief| brief.id == card.id)?;
+    let draft = state.drafts.get(&card.id).map(String::as_str).unwrap_or("");
+    let action = brief_action(&card, brief.picked, draft)?;
+    state.brief = None;
+    state.drafts.remove(&card.id);
+    state.transient = Some(TransientAsk {
+        card: card.clone(),
+        phase: TransientPhase::Sending,
+        until_ms: now_ms + SENDING_TIMEOUT_MS,
+    });
+    Some(action)
+}
+
+/// What the Brief sends: `picked` is an index into `card.choices`, `draft` the
+/// field's text. No chip means the free answer, so an empty draft has nothing
+/// to send. The text is trimmed, then cut at `ask::ANSWER_TEXT_MAX` bytes on a
+/// character boundary.
+pub fn brief_action(card: &AskCardVm, picked: Option<usize>, draft: &str) -> Option<AskAction> {
+    let text = cap_answer_text(draft.trim());
+    let action = match picked.and_then(|i| card.choices.get(i)) {
+        Some(choice) => choice.clone(),
+        None if !text.is_empty() => crate::ask::OTHER.to_string(),
+        None => return None,
+    };
+    Some(AskAction::Answer { id: card.id.clone(), action, text: text.to_string() })
+}
+
+fn cap_answer_text(text: &str) -> &str {
+    if text.len() <= crate::ask::ANSWER_TEXT_MAX {
+        return text;
+    }
+    let mut end = crate::ask::ANSWER_TEXT_MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 // ---------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------
@@ -408,6 +544,38 @@ pub struct CardLayout {
     pub faded: bool,
 }
 
+/// One chip of the Brief overlay: the option it sends, its label.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BriefChip {
+    pub index: usize,
+    pub label: String,
+    pub rect: Rect,
+}
+
+/// The Brief overlay, laid out: one card over the list, and what it holds.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BriefLayout {
+    /// The question briefed: its key and id.
+    pub key: u64,
+    pub id: String,
+    pub from: String,
+    pub age: String,
+    pub card: Rect,
+    pub header: Rect,
+    pub message: String,
+    pub message_rect: Rect,
+    /// The options, as chips, in the order they were proposed.
+    pub choices: Vec<BriefChip>,
+    pub picked: Option<usize>,
+    /// The instruction field, where the native field sits.
+    pub field: Rect,
+    pub cancel: Rect,
+    pub send: Rect,
+    pub hint: Rect,
+    /// A send has something to send: an option or some text.
+    pub send_enabled: bool,
+}
+
 /// One object of the Asks list, laid out.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AsksLayout {
@@ -418,6 +586,9 @@ pub struct AsksLayout {
     pub snoozed_count: usize,
     pub snoozed_cards: Vec<CardLayout>,
     pub empty: Option<Rect>,
+    /// The Brief overlay, when a question is being briefed. It covers the
+    /// list: nothing under it is clickable.
+    pub brief: Option<BriefLayout>,
     pub content_h: f64,
 }
 
@@ -425,6 +596,23 @@ impl AsksLayout {
     /// The button under `(x, y)`, if any. A press on the card's body is not a
     /// target: nothing happens there.
     pub fn hit(&self, x: f64, y: f64) -> Option<AsksHit> {
+        if let Some(brief) = &self.brief {
+            if !brief.card.contains(x, y) {
+                return Some(AsksHit::BriefCancel(brief.key));
+            }
+            if let Some(chip) = brief.choices.iter().find(|chip| chip.rect.contains(x, y)) {
+                return Some(AsksHit::BriefChip(brief.key, chip.index));
+            }
+            if brief.cancel.contains(x, y) {
+                return Some(AsksHit::BriefCancel(brief.key));
+            }
+            if brief.send.contains(x, y) {
+                return Some(AsksHit::BriefSend(brief.key));
+            }
+            // The field is a native subview and sees its own clicks; the
+            // rest of the card is text.
+            return None;
+        }
         for card in self.cards.iter().chain(self.snoozed_cards.iter()) {
             if !card.frame.contains(x, y) {
                 continue;
@@ -439,6 +627,14 @@ impl AsksLayout {
 
     /// Every clickable box, for the hand cursor.
     pub fn button_rects(&self) -> Vec<Rect> {
+        if let Some(brief) = &self.brief {
+            let mut rects: Vec<Rect> = brief.choices.iter().map(|chip| chip.rect).collect();
+            rects.push(brief.cancel);
+            if brief.send_enabled {
+                rects.push(brief.send);
+            }
+            return rects;
+        }
         let mut rects: Vec<Rect> = self
             .cards
             .iter()
@@ -503,8 +699,79 @@ pub fn layout(state: &AsksState, width: f64, m: &dyn TextMetrics) -> AsksLayout 
             }
         }
     }
+    out.brief = brief_layout(state, width, m);
     out.content_h = y + LIST_BOTTOM;
+    if let Some(brief) = &out.brief {
+        // The card may be taller than the list: the list still scrolls to
+        // its bottom, so all of it can be read.
+        out.content_h = out.content_h.max(brief.card.bottom() + LIST_BOTTOM);
+    }
     out
+}
+
+/// The Brief overlay's geometry at `width`: a card centred at the top of the
+/// list. `None` when no overlay is open, or when the question it names left
+/// the list (answered elsewhere).
+fn brief_layout(state: &AsksState, width: f64, m: &dyn TextMetrics) -> Option<BriefLayout> {
+    let brief = state.brief.as_ref()?;
+    let card = state.cards.iter().find(|card| card.id == brief.id)?;
+    let x = BRIEF_SIDE;
+    let w = (width - 2.0 * BRIEF_SIDE).max(60.0);
+    let y = LIST_TOP + BRIEF_TOP;
+    let inner_x = x + BRIEF_PAD;
+    let inner_w = (w - 2.0 * BRIEF_PAD).max(0.0);
+
+    let header = Rect::new(inner_x, y + BRIEF_PAD, inner_w, HEADER_H);
+    let message_lines = m.lines(&card.message, Style::Secondary, inner_w, MSG_MAX_LINES).max(1);
+    let message = Rect::new(inner_x, header.bottom() + HEADER_GAP, inner_w, message_lines as f64 * MSG_LINE_H);
+
+    let mut choices = Vec::new();
+    let mut cx = inner_x;
+    let mut cy = message.bottom() + BRIEF_GAP;
+    for (index, label) in card.choices.iter().enumerate() {
+        let cw = (m.width(label, Style::Chip) + 2.0 * BRIEF_CHIP_PAD).min(inner_w);
+        if cx > inner_x && cx + cw > inner_x + inner_w {
+            cx = inner_x;
+            cy += BRIEF_CHIP_H + BRIEF_CHIP_ROW_GAP;
+        }
+        choices.push(BriefChip { index, label: label.clone(), rect: Rect::new(cx, cy, cw, BRIEF_CHIP_H) });
+        cx += cw + BRIEF_CHIP_GAP;
+    }
+    let chips_bottom = if choices.is_empty() { cy } else { cy + BRIEF_CHIP_H };
+
+    let draft = state.drafts.get(&card.id).map(String::as_str).unwrap_or("");
+    let field_w = inner_w.max(1.0);
+    let text_w = (field_w - 2.0 * BRIEF_FIELD_PAD_H).max(1.0);
+    let lines = m
+        .lines(draft, Style::Secondary, text_w, BRIEF_FIELD_MAX_LINES)
+        .clamp(BRIEF_FIELD_MIN_LINES, BRIEF_FIELD_MAX_LINES);
+    let field = Rect::new(inner_x, chips_bottom + BRIEF_GAP, field_w, lines as f64 * BRIEF_FIELD_LINE_H);
+
+    let send_w = m.width("Send", Style::Chip) + 2.0 * BRIEF_BTN_PAD + BRIEF_SEND_ICON + BRIEF_SEND_ICON_GAP;
+    let cancel_w = m.width("Cancel", Style::Chip) + 2.0 * BRIEF_BTN_PAD;
+    let buttons_y = field.bottom() + BRIEF_GAP;
+    let send = Rect::new(inner_x + inner_w - send_w, buttons_y, send_w, BRIEF_BTN_H);
+    let cancel = Rect::new(send.x - BRIEF_BTN_GAP - cancel_w, buttons_y, cancel_w, BRIEF_BTN_H);
+    let hint = Rect::new(inner_x, buttons_y + BRIEF_BTN_H + HEADER_GAP, inner_w, 2.0 * BRIEF_HINT_H);
+
+    let picked = brief.picked.filter(|index| *index < card.choices.len());
+    Some(BriefLayout {
+        key: card.key,
+        id: card.id.clone(),
+        from: card.from.clone(),
+        age: card.age.clone(),
+        card: Rect::new(x, y, w, hint.bottom() + BRIEF_PAD - y),
+        header,
+        message: card.message.clone(),
+        message_rect: message,
+        choices,
+        picked,
+        field,
+        cancel,
+        send,
+        hint,
+        send_enabled: picked.is_some() || !draft.trim().is_empty(),
+    })
 }
 
 fn open_card(
@@ -627,8 +894,16 @@ fn snoozed_card(card: &AskCardVm, x: f64, y: f64, w: f64, m: &dyn TextMetrics) -
 // ---------------------------------------------------------------
 
 /// Draw the whole Asks list. The view calls this instead of its row loop
-/// while the Asks list is up.
-pub(super) fn draw(sh: &Shared, state: &AsksState, layout: &AsksLayout, hovered: ListHit, pressed: ListHit) {
+/// while the Asks list is up. `scrim` is the visible part of the list, the
+/// ground the Brief overlay dims.
+pub(super) fn draw(
+    sh: &Shared,
+    state: &AsksState,
+    layout: &AsksLayout,
+    hovered: ListHit,
+    pressed: ListHit,
+    scrim: Rect,
+) {
     let m = AppKitMetrics(sh);
     if let Some(empty) = layout.empty {
         draw_empty(sh, &empty);
@@ -642,6 +917,9 @@ pub(super) fn draw(sh: &Shared, state: &AsksState, layout: &AsksLayout, hovered:
     }
     for card in &layout.snoozed_cards {
         draw_card(sh, &m, card, hovered, pressed);
+    }
+    if let Some(brief) = &layout.brief {
+        draw_overlay(sh, &m, brief, &scrim, hovered, pressed);
     }
 }
 
@@ -691,6 +969,108 @@ fn draw_card(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, hovered: Lis
     for (hit, rect) in &card.buttons {
         draw_button(sh, *hit, rect, alpha, hovered, pressed);
     }
+}
+
+/// The Brief overlay: the scrim over the list, then the card. The instruction
+/// field is a native subview the view places over `brief.field`; its ground
+/// and border are drawn here too, so the card reads whole before it lands.
+fn draw_overlay(
+    sh: &Shared,
+    m: &AppKitMetrics<'_>,
+    brief: &BriefLayout,
+    scrim: &Rect,
+    hovered: ListHit,
+    pressed: ListHit,
+) {
+    fill_round(scrim, 0.0, tokens::BLACK, BRIEF_SCRIM);
+    fill_round(&brief.card, BRIEF_RADIUS, tokens::TILE, 1.0);
+    stroke_round(&brief.card, BRIEF_RADIUS, 1.0, tokens::BORDER_SUBTLE, 1.0);
+
+    // Header: the warn dot, "Brief for <from>", the age at the right.
+    let header = &brief.header;
+    fill_dot(header.x + 4.0, header.y + header.h / 2.0, STATE_DOT_D, tokens::AWAITING, 1.0);
+    let title = Rect::new(header.x + HEADER_TEXT_X, header.y, (header.w - HEADER_TEXT_X - 40.0).max(0.0), header.h);
+    draw_text(sh, &format!("Brief for {}", brief.from), &title, Style::Title, tokens::TEXT_PRIMARY, 1.0, Align::Left, false);
+    let age_w = m.width(&brief.age, Style::Number);
+    draw_text(
+        sh,
+        &brief.age,
+        &Rect::new(header.right() - age_w, header.y, age_w, header.h),
+        Style::Number,
+        tokens::TEXT_TERTIARY,
+        1.0,
+        Align::Right,
+        false,
+    );
+
+    draw_wrapped(sh, &brief.message, &brief.message_rect, Style::Secondary, tokens::TEXT_SECONDARY, 1.0);
+
+    // The options: a picked one takes the accent ground and white text.
+    for chip in &brief.choices {
+        let selected = brief.picked == Some(chip.index);
+        let hit = AsksHit::BriefChip(brief.key, chip.index);
+        let hot = matches!(hovered, ListHit::Ask(h) if h == hit);
+        let down = matches!(pressed, ListHit::Ask(h) if h == hit);
+        let radius = chip.rect.h / 2.0;
+        if selected {
+            fill_round(&chip.rect, radius, if down { tokens::ACCENT_PRESSED } else { tokens::ACCENT }, 1.0);
+        } else {
+            if hot || down {
+                fill_round(&chip.rect, radius, tokens::WHITE, if down { 0.12 } else { 0.08 });
+            }
+            stroke_round(&chip.rect, radius, 1.0, tokens::BORDER_SUBTLE, 1.0);
+        }
+        let fg = if selected { tokens::TEXT_ON_FILL } else { tokens::TEXT_SECONDARY };
+        draw_text(sh, &chip.label, &chip.rect, Style::Chip, fg, 1.0, Align::Center, false);
+    }
+
+    // The field's box. The native field covers it while the overlay is open.
+    fill_round(&brief.field, 6.0, tokens::GROUND, 1.0);
+    stroke_round(&brief.field, 6.0, 1.0, tokens::BORDER_SUBTLE, 1.0);
+
+    // Cancel is a ghost; Send takes the accent, faded while it has nothing
+    // to send.
+    let cancel_hit = AsksHit::BriefCancel(brief.key);
+    let cancel_down = matches!(pressed, ListHit::Ask(h) if h == cancel_hit);
+    let cancel_hot = matches!(hovered, ListHit::Ask(h) if h == cancel_hit);
+    if cancel_hot || cancel_down {
+        fill_round(&brief.cancel, SNOOZE_RADIUS, tokens::WHITE, if cancel_down { 0.12 } else { 0.08 });
+    }
+    draw_text(sh, "Cancel", &brief.cancel, Style::Chip, tokens::TEXT_SECONDARY, 1.0, Align::Center, false);
+    let send_hit = AsksHit::BriefSend(brief.key);
+    let send_down = matches!(pressed, ListHit::Ask(h) if h == send_hit);
+    let send_ground = if send_down { tokens::ACCENT_PRESSED } else { tokens::ACCENT };
+    fill_round(&brief.send, SNOOZE_RADIUS, send_ground, if brief.send_enabled { 1.0 } else { 0.4 });
+    let send_alpha = if brief.send_enabled { 1.0 } else { 0.6 };
+    let text_w = m.width("Send", Style::Chip);
+    let total = BRIEF_SEND_ICON + BRIEF_SEND_ICON_GAP + text_w;
+    let icon_x = brief.send.x + (brief.send.w - total) / 2.0;
+    stroke_icon(
+        super::feather::Icon::Send,
+        &Rect::new(icon_x, brief.send.y + (brief.send.h - BRIEF_SEND_ICON) / 2.0, BRIEF_SEND_ICON, BRIEF_SEND_ICON),
+        BRIEF_SEND_ICON,
+        tokens::TEXT_ON_FILL,
+        send_alpha,
+    );
+    draw_text(
+        sh,
+        "Send",
+        &Rect::new(icon_x + BRIEF_SEND_ICON + BRIEF_SEND_ICON_GAP, brief.send.y, text_w, brief.send.h),
+        Style::Chip,
+        tokens::TEXT_ON_FILL,
+        send_alpha,
+        Align::Left,
+        false,
+    );
+
+    draw_wrapped(
+        sh,
+        "Pick an option or not, the instruction goes with it. Cmd+Enter sends",
+        &brief.hint,
+        Style::Hint,
+        tokens::TEXT_TERTIARY,
+        1.0,
+    );
 }
 
 fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64) {
@@ -835,7 +1215,8 @@ fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: List
             fill_round(rect, SNOOZE_RADIUS, ground, alpha);
             draw_text(sh, "Show now", rect, Style::Chip, tokens::TEXT_PRIMARY, alpha, Align::Center, false);
         }
-        AsksHit::ToggleSnoozed => {}
+        // The overlay's chips and buttons are drawn whole by `draw_overlay`.
+        AsksHit::BriefChip(_, _) | AsksHit::BriefSend(_) | AsksHit::BriefCancel(_) | AsksHit::ToggleSnoozed => {}
     }
 }
 
@@ -961,6 +1342,7 @@ mod tests {
             urgent: false,
             message: message.into(),
             options: ["Ship it".into(), "Wait".into()],
+            choices: vec!["Ship it".into(), "Wait".into()],
             created_at: 100,
             ended: false,
             snoozed: false,
@@ -1205,6 +1587,7 @@ mod tests {
         assert_eq!(vm.pane_id, Some(3));
         assert!(!vm.ended);
         assert_eq!(vm.options, ["Ship it".to_string(), "Wait".to_string()]);
+        assert_eq!(vm.choices, ["Ship it".to_string(), "Wait".to_string()]);
 
         let old = AskCardVm::from_question(&question(vec!["Go"], now - 7200), None, false, now);
         assert!(old.urgent);
@@ -1216,5 +1599,162 @@ mod tests {
         // A live conversation elsewhere is not over, even without a pane.
         let live = AskCardVm::from_question(&q, None, true, now);
         assert!(!live.ended);
+    }
+
+    // ---------------------------------------------------------------
+    // Brief overlay
+    // ---------------------------------------------------------------
+
+    fn brief_card() -> AskCardVm {
+        let mut card = card(7, "a", "short message");
+        card.choices = vec!["Ship it".into(), "Wait".into()];
+        card
+    }
+
+    fn brief_state(cards: Vec<AskCardVm>, picked: Option<usize>, draft: &str) -> AsksState {
+        let mut st = state(cards);
+        let id = st.cards[0].id.clone();
+        st.brief = Some(BriefOpen { id: id.clone(), picked });
+        if !draft.is_empty() {
+            st.drafts.insert(id, draft.to_string());
+        }
+        st
+    }
+
+    #[test]
+    fn the_overlay_sits_below_the_top_and_wraps_its_chips() {
+        let mut card = brief_card();
+        card.choices = vec!["a".repeat(15), "b".repeat(15), "c".repeat(15)];
+        let st = brief_state(vec![card], None, "");
+        let narrow = layout(&st, 300.0, &FakeMetrics);
+        let wide = layout(&st, 420.0, &FakeMetrics);
+        let n = narrow.brief.expect("the overlay");
+        let w = wide.brief.expect("the overlay");
+        // 12 pt from each side and from the top of the list, 12 pt of padding.
+        assert_eq!(n.card.x, 12.0);
+        assert_eq!(n.card.y, LIST_TOP + 12.0);
+        assert_eq!(n.card.w, 276.0);
+        assert_eq!(w.card.w, 396.0);
+        // One line of question, then the chips: 15 characters are 90 pt wide,
+        // plus 9 pt of padding either side.
+        assert_eq!(n.choices[0].rect, Rect::new(24.0, 79.0, 108.0, 22.0));
+        assert_eq!(n.choices[1].rect.y, 79.0);
+        assert_eq!(n.choices[2].rect.y, 107.0, "the third chip wraps at 300");
+        assert_eq!(w.choices[2].rect.y, 79.0, "it fits one line at 420");
+        // The field is three lines at least, whatever the draft.
+        assert_eq!(n.field, Rect::new(24.0, 139.0, 252.0, 60.0));
+        assert_eq!(w.field, Rect::new(24.0, 111.0, 372.0, 60.0));
+        // Buttons right-aligned under the field, 8 pt apart.
+        assert_eq!(n.cancel, Rect::new(144.0, 209.0, 60.0, 26.0));
+        assert_eq!(n.send, Rect::new(212.0, 209.0, 64.0, 26.0));
+        assert_eq!(w.cancel, Rect::new(264.0, 181.0, 60.0, 26.0));
+        assert_eq!(w.send, Rect::new(332.0, 181.0, 64.0, 26.0));
+        assert_eq!(n.card.bottom(), 281.0);
+        assert_eq!(w.card.bottom(), 253.0);
+        assert!(!n.send_enabled);
+    }
+
+    #[test]
+    fn the_field_grows_from_three_lines_to_six() {
+        // 252 pt of field, 8 pt either side: 39 characters a line.
+        let one = brief_state(vec![brief_card()], None, &"x".repeat(10));
+        let four = brief_state(vec![brief_card()], None, &"x".repeat(39 * 4));
+        let ten = brief_state(vec![brief_card()], None, &"x".repeat(39 * 10));
+        let height = |st: AsksState| layout(&st, 300.0, &FakeMetrics).brief.expect("open").field.h;
+        assert_eq!(height(one), 60.0);
+        assert_eq!(height(four), 80.0);
+        assert_eq!(height(ten), 120.0, "six lines, then the field scrolls");
+    }
+
+    #[test]
+    fn the_overlay_hits_chips_buttons_and_cancels_outside() {
+        let st = brief_state(vec![brief_card()], Some(0), "an instruction");
+        let l = layout(&st, 300.0, &FakeMetrics);
+        let b = l.brief.as_ref().expect("the overlay");
+        let centre = |r: Rect| (r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let (x, y) = centre(b.choices[1].rect);
+        assert_eq!(l.hit(x, y), Some(AsksHit::BriefChip(7, 1)));
+        let (x, y) = centre(b.cancel);
+        assert_eq!(l.hit(x, y), Some(AsksHit::BriefCancel(7)));
+        let (x, y) = centre(b.send);
+        assert_eq!(l.hit(x, y), Some(AsksHit::BriefSend(7)));
+        // Outside the card is a cancel, including over the list behind.
+        assert_eq!(l.hit(b.card.x - 1.0, b.card.y), Some(AsksHit::BriefCancel(7)));
+        assert_eq!(l.hit(b.card.x + 10.0, b.card.bottom() + 4.0), Some(AsksHit::BriefCancel(7)));
+        // Inside the card, on its text: nothing.
+        assert_eq!(l.hit(b.header.x + 80.0, b.header.y + 4.0), None);
+        assert_eq!(b.picked, Some(0));
+        assert!(b.send_enabled);
+    }
+
+    #[test]
+    fn a_chip_toggles_and_send_takes_the_picked_option() {
+        let mut st = state(vec![brief_card()]);
+        assert!(click(&mut st, AsksHit::Brief(7), NOW_MS).is_none());
+        assert_eq!(st.brief.as_ref().and_then(|b| b.picked), None);
+        assert!(click(&mut st, AsksHit::BriefChip(7, 1), NOW_MS).is_none());
+        assert_eq!(st.brief.as_ref().and_then(|b| b.picked), Some(1));
+        assert!(click(&mut st, AsksHit::BriefChip(7, 1), NOW_MS).is_none());
+        assert_eq!(st.brief.as_ref().and_then(|b| b.picked), None, "a second click unpicks");
+        click(&mut st, AsksHit::BriefChip(7, 0), NOW_MS);
+        st.drafts.insert("a".into(), "  ship it  ".into());
+        let action = click(&mut st, AsksHit::BriefSend(7), NOW_MS).expect("an answer");
+        assert_eq!(
+            action,
+            AskAction::Answer { id: "a".into(), action: "Ship it".into(), text: "ship it".into() }
+        );
+        assert!(st.brief.is_none());
+        assert_eq!(st.transient.as_ref().map(|t| t.phase), Some(TransientPhase::Sending));
+    }
+
+    #[test]
+    fn with_no_chip_the_text_is_the_free_answer() {
+        let mut st = state(vec![brief_card()]);
+        click(&mut st, AsksHit::Brief(7), NOW_MS);
+        assert!(click(&mut st, AsksHit::BriefSend(7), NOW_MS).is_none(), "nothing to send");
+        assert!(st.brief.is_some(), "the overlay stays open");
+        st.drafts.insert("a".into(), " use the cheap one ".into());
+        let action = click(&mut st, AsksHit::BriefSend(7), NOW_MS).expect("an answer");
+        assert_eq!(
+            action,
+            AskAction::Answer {
+                id: "a".into(),
+                action: crate::ask::OTHER.into(),
+                text: "use the cheap one".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_brief_text_is_capped_at_eight_kib_on_a_character_boundary() {
+        let card = brief_card();
+        let plain = brief_action(&card, None, &"x".repeat(crate::ask::ANSWER_TEXT_MAX + 100)).expect("an answer");
+        let AskAction::Answer { text, .. } = plain else { panic!("an answer") };
+        assert_eq!(text.len(), crate::ask::ANSWER_TEXT_MAX);
+        // A two-byte character straddling the limit: the cut must land before
+        // it rather than inside it.
+        let cut = format!("{}{}", "x".repeat(crate::ask::ANSWER_TEXT_MAX - 2), "\u{e9}".repeat(2));
+        let action = brief_action(&card, None, &cut).expect("an answer");
+        let AskAction::Answer { text, .. } = action else { panic!("an answer") };
+        assert_eq!(text.len(), crate::ask::ANSWER_TEXT_MAX);
+        assert!(text.ends_with('\u{e9}'));
+    }
+
+    #[test]
+    fn cancel_keeps_the_draft_and_a_vanished_ask_closes_the_overlay() {
+        let mut st = state(vec![brief_card()]);
+        click(&mut st, AsksHit::Brief(7), NOW_MS);
+        st.drafts.insert("a".into(), "half typed".into());
+        assert!(click(&mut st, AsksHit::BriefCancel(7), NOW_MS).is_none());
+        assert!(st.brief.is_none());
+        assert_eq!(st.drafts.get("a").map(String::as_str), Some("half typed"));
+
+        // Reopening keeps the text; the board answering it elsewhere closes
+        // the overlay and the draft stays for the record.
+        click(&mut st, AsksHit::Brief(7), NOW_MS);
+        assert!(st.brief.is_some());
+        st.set_cards(Vec::new());
+        assert!(st.brief.is_none());
+        assert_eq!(st.drafts.get("a").map(String::as_str), Some("half typed"));
     }
 }

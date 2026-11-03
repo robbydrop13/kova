@@ -523,6 +523,17 @@ define_class!(
 
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
+            // A native text field has the keyboard (the sidebar's Brief
+            // field): Cmd+A/C/V/X/Z are its own, and the terminal's map must
+            // not take them first. AppKit hands them to the field editor once
+            // no view claims them as a key equivalent.
+            if self
+                .window()
+                .and_then(|win| win.firstResponder())
+                .is_some_and(|responder| responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())
+            {
+                return objc2::runtime::Bool::NO;
+            }
             let combo = KeyCombo::from_event(event);
 
             let keybindings = match self.ivars().keybindings.get() {
