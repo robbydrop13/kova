@@ -115,7 +115,7 @@ enum MenuRow {
 
 pub(super) struct SidebarState {
     pub(super) sort: SidebarSort,
-    /// Which list the switcher left of the Next pill has selected.
+    /// Which list the switcher at the top of the sidebar has selected.
     pub(super) list: SidebarList,
     /// The routine clicked open, by name. One at a time: the body is long,
     /// and two open at once turns the list into a wall of prompt.
@@ -241,15 +241,15 @@ impl KovaView {
             (st.sort, st.list)
         };
         let facts = self.sidebar_tab_facts();
-        // Only the Routines view reads them, and `snapshot` refreshes off the
-        // tick: an open Panes view never shells out to launchctl.
+        // Only the Scheduled view reads them, and `snapshot` refreshes off
+        // the tick: an open Panes view never shells out to launchctl.
         let routines = match list {
-            SidebarList::Routines => {
+            SidebarList::Scheduled => {
                 let open = self.ivars().sidebar.borrow().open_routine.clone();
                 crate::routines::snapshot()
                     .map(|rs| rs.iter().map(|r| RoutineVm::of(r, open.as_deref() == Some(&r.name))).collect())
             }
-            SidebarList::Panes => None,
+            SidebarList::Panes | SidebarList::Asks | SidebarList::Agents => None,
         };
         let model = SidebarModel::build(&facts, sort, unread, now_epoch_secs(), list, routines);
         view.set_model(model);

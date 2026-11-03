@@ -21,8 +21,24 @@ pub enum SidebarList {
     /// The panes of this window, grouped by tab.
     #[default]
     Panes,
+    /// The open questions of the agent (`kova ask`).
+    Asks,
+    /// The agents running in this window.
+    Agents,
     /// The scheduled local routines (`crate::routines`).
-    Routines,
+    Scheduled,
+}
+
+impl SidebarList {
+    /// The title the chrome shows above the list.
+    pub fn title(self) -> &'static str {
+        match self {
+            SidebarList::Panes => "Panes",
+            SidebarList::Asks => "Asks",
+            SidebarList::Agents => "Agents",
+            SidebarList::Scheduled => "Scheduled",
+        }
+    }
 }
 
 
@@ -74,13 +90,18 @@ impl RoutineVm {
 /// Everything the sidebar shows for one window.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarModel {
-    /// Which list is showing; the switcher sits left of the Next pill.
+    /// Which list is showing; the switcher in the top right corner picks it.
     pub view: SidebarList,
-    /// The routines, read only while the Routines view is up.
+    /// The routines, read only while the Scheduled view is up.
     pub routines: Vec<RoutineVm>,
     /// False until the first background read lands: an empty list then means
     /// "not read yet", not "nothing scheduled".
     pub routines_loaded: bool,
+    /// Questions waiting for an answer, for the Asks badge. Filled by the
+    /// task that lists them; zero until then.
+    pub asks_waiting: u32,
+    /// A scheduled routine's last run failed: the red dot on its icon.
+    pub routine_failed: bool,
     /// `2 waiting · 3 working · 4 idle`, one coloured run at a time.
     pub summary: Vec<(String, SummaryRun)>,
     pub sort: SidebarSort,
@@ -393,6 +414,10 @@ impl SidebarModel {
             view,
             routines_loaded: routines.is_some(),
             routines: routines.unwrap_or_default(),
+            // Both badges belong to the tasks that fill their lists: no
+            // question and no failed run is visible until then.
+            asks_waiting: 0,
+            routine_failed: false,
             summary: summary_runs(waiting, working, idle_here),
             sort,
             pill: NextPill::of(unread),
@@ -449,6 +474,15 @@ mod tests {
     #[test]
     fn the_sidebar_opens_on_the_panes_list() {
         assert_eq!(SidebarList::default(), SidebarList::Panes);
+    }
+
+    #[test]
+    fn every_list_names_itself_in_the_chrome() {
+        let titles: Vec<&str> = [SidebarList::Panes, SidebarList::Asks, SidebarList::Agents, SidebarList::Scheduled]
+            .iter()
+            .map(|l| l.title())
+            .collect();
+        assert_eq!(titles, ["Panes", "Asks", "Agents", "Scheduled"]);
     }
 
     fn pane(id: PaneId, flags: PaneFlags) -> PaneFacts {

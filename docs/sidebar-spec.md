@@ -89,21 +89,25 @@ mouse up.
 
 | Region   | Height | Content                                                         |
 |----------|--------|-----------------------------------------------------------------|
-| Top area | 36     | Traffic lights, window drag (`performWindowDragWithEvent`), double click = zoom |
-| Summary  | 24     | Left: `2 waiting · 3 working · 4 idle`; right: `⇅ kova` / `⇅ activity` |
-| Pill     | 36     | The Next pill, 28 tall, radius 14, content-sized, right-aligned 12 from the edge |
+| Top row  | 38     | Traffic lights, window drag (`performWindowDragWithEvent`), double click = zoom; the view switcher right-aligned 10 from the inner edge |
+| Title    | 40     | Left, 14 in: the list's name (`Style::ViewTitle`); right, 12 from the inner edge: the Next pill, 24 tall |
+| Meta     | 20     | Inside the list inset and 6 more: the summary on the left, the sort ghost on the right |
 | List     | rest   | `NSScrollView` down to the bottom, width = inner width - 4 (the edge zone stays the chrome's) |
+
+The sidebar spans the window's full height, under its title bar: the top row
+is where macOS draws the traffic lights, and the switcher shares it at the
+right end rather than sitting on a row of its own.
 
 No footer: the way back to the tab bar is View > Show Tab Bar and ⌥⌘S
 (section 7); the version label stays in the tab bar of tabs mode.
 
 ### 3.3 Typography (`sidebar_view::Style`, `fonts::inter_name`, `NSFont::fontWithName_size`)
 
-The Claap design system type scale, in Inter: header and tile titles 13
-medium; secondary line, question, detail and pill label 12 (detail regular,
-pill semibold); links 12 medium; chips, summary, hint, number and sort toggle
-11 (chips and sort medium); pill badge 10 bold. A plus sign drawn as a glyph
-stays at 14 medium.
+The Claap design system type scale, in Inter: the chrome's view title 15
+semibold; header and tile titles 13 medium; secondary line, question, detail
+and pill label 12 (detail regular, pill semibold); links 12 medium; chips,
+summary, hint, number and sort ghost 11 (chips and sort medium); pill badge
+10 bold. A plus sign drawn as a glyph stays at 14 medium.
 
 The four faces (Regular, Medium, SemiBold, Bold) are bundled in the binary
 (`assets/fonts/Inter-*.ttf`, SIL Open Font License 1.1) and registered with
@@ -250,46 +254,49 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
 
 ### 3.7 Summary, sort, Next pill
 
-- Summary runs: `N waiting` amber, `N working` blue (starting counts as
-  working), `N idle` tertiary, dots tertiary; zero counts omitted; all zero:
-  `nothing running`. Counts cover this window; the pill counts cover every
-  window (like Cmd+J).
-- Sort toggle: `⇅ kova` tertiary / `⇅ activity` accent, primary on hover on
-  a `bg.pressed` rounded ground.
-- Next pill (`sidebar::NextPill`, from KovaLink `NextPill.tsx`), one
-  unread model (section 5.2):
+- Summary runs, on the meta row: `N working` in `status.infoText` (starting
+  counts as working), the waiting and idle counts and the dots tertiary;
+  zero counts omitted; all zero: `nothing running`. Counts cover this
+  window; the pill counts cover every window (like Cmd+J).
+- Sort ghost, at the meta row's right: the `sort` icon at 11 then the
+  label, `Tab order` in the default order and `Activity` when the list is
+  sorted by urgency. Tertiary, `ACCENT` while sorted by activity, primary
+  under the mouse, on a 10 % white ground (radius 4).
+- Next pill (`NextPill`, `sidebar.rs`), one state pair (section 5.2):
 
-| State   | Condition          | Fill             | Text                                | Badge                             |
-|---------|--------------------|------------------|-------------------------------------|-----------------------------------|
-| next    | unread count > 0   | `accent.primary` | white filled `play` + `Next unread` | white 18 pt circle, accent digits |
-| nothing | unread count == 0  | `bg.raised`      | tertiary `Nothing to read`          | none; not a button (no hover, no press) |
+| State   | Fill             | Text                                   | Badge |
+|---------|------------------|----------------------------------------|-------|
+| next    | `ACCENT`         | white play 11 + `Next`                 | white circle 16, accent count |
+| nothing | `BG2`            | tertiary `Nothing to read`             | none, and not a button |
 
-  The pill is sized to its content (`sidebar_view::pill_width`: 12 pt
-  padding either side, the 12 pt play and a 5 pt gap when clickable, the
-  label, an 8 pt gap and the badge when there is a count; the badge is 18
-  wide at least, `digits + 8` beyond) and right-aligned 12 pt from the
-  sidebar's edge on its own row; a sidebar too narrow clamps it to the
-  inset width. The `nothing` state is content-sized and right-aligned the
-  same way. The hit region is the pill's rect. No `⌘J` inside the pill: the
-  shortcut lives in the help overlay and the README. Hover:
-  `accent.primaryPressed`. Pressed: text alpha 0.85. The count is
-  `KovaView::collect_unread` (`src/window/attention.rs`), the same list
-  `do_focus_next_attention` walks, read once per tick. A change of the pill's
-  content re-lays the chrome, like a change of the sort label.
+  The pill is 24 tall and content-sized (`pill_width`: 9 pt padding each
+  side, the 11 pt play and a 4 pt gap when clickable, the label, a 6 pt gap
+  and the badge when there is a count; the circle is 16 wide at least,
+  wider for two digits). It sits on the title row, 12 from the inner right
+  edge; the row's title keeps an 8 pt gap, so a long name truncates before
+  the two meet. `Nothing` draws no play and no badge, ignores hover, and
+  its hit does nothing. `Next` darkens to `ACCENT_PRESSED` under the mouse;
+  pressed, its text and icon drop to 85 %.
 
 ### 3.7.1 View switcher
 
-Two icon buttons at the left of the pill's row, 26 pt square, 2 pt apart,
-12 pt from the sidebar edge (`ChromeLayout::switch`): `sidebar` selects the
-panes list, `clock` the routines list. The selected one sits on a
-`bg.pressed` ground, radius 7; the other is tertiary and takes the same
-ground at 0.55 on hover. Clicking the selected icon does nothing, like a
-segmented control. The buttons take their width from the row first, so a
-narrow sidebar shrinks the pill and never them. The selection lives in
-`SidebarState::list` and is per window; it is not saved to the session, so
-a restart opens on the panes list.
+Four buttons on the top row, right-aligned 10 from the inner edge, on the
+traffic lights' own row: 26 pt each, 2 apart, radius 6 (`SWITCH_LISTS`).
+`sidebar` shows the panes, `message` the asks, `users` the agents,
+`clock` the scheduled routines. The icons are 15 pt strokes: the selected
+one sits on `SEL_BG` in `SEL_TEXT`, the others are `TEXT_TERTIARY` and take
+a 10 % white ground under the mouse (16 % while pressed). A press on a
+button switches lists; the rest of the row still drags the window.
+Clicking the selected icon does nothing, like a segmented control.
 
-### 3.7.2 Routines list (`SidebarList::Routines`)
+Two badges, both hung on the icon's top right corner (4 pt in from its
+right edge, 5 pt above its top) with a 2 pt ring of the sidebar ground:
+
+- Asks: the count of waiting questions in `ACCENT`, white 10 bold digits,
+  15 pt at least and wider for two digits. Shown when `asks_waiting > 0`.
+- Scheduled: an 8 pt `ERROR` dot when `routine_failed`.
+
+### 3.7.2 Scheduled list (`SidebarList::Scheduled`)
 
 A flat list of `crate::routines` rows, no groups, no drag, nothing
 clickable: `launchctl` stays the only way to change a routine. One row per
@@ -327,6 +334,12 @@ background read lands, `no routines scheduled` after it. The rows come from
 `routines::snapshot`, which serves a cache and refreshes on a thread at
 most every 30 s, and only while this view is up — the panes list never
 shells out to `launchctl`.
+
+### 3.7.3 Asks and Agents, still empty
+
+Both switch like the others but have no rows yet: the list draws one
+centred line in the same tertiary hint style as the empty routines view,
+`No open questions` for Asks and `Agents view coming next` for Agents.
 
 ### 3.8 List extras
 
@@ -450,7 +463,7 @@ other tab change.
 
 ### 4.5 Sort
 
-`⇅ kova` (tab order) or `⇅ activity`: tabs ordered by the most urgent state of
+`Tab order` or `Activity`: tabs ordered by the most urgent state of
 any of their panes, in the tile state's priority order, ties keeping tab
 order. Header numbers are the tab's real Cmd+N number either way.
 
@@ -550,13 +563,15 @@ status.critText   crit
 tabNone           t3
 tab tint          TAB_COLORS[c] (Kova palette, mirrored by the phone)
 
-top 36  summary 24  pill region 36 (pill 28, radius 14, content-sized, right inset 12, pad 12)
+top row 38 (switcher 4 x 26, gap 2, radius 6, right inset 10)  title 40 (name 14 in, pill right inset 12)
+meta 20 (6 inside the list inset 12)  pill 24 (radius 12, content-sized, pad 9, icon 11, gap 4, badge 16, gap 6)
+switcher badge 15 (radius 7.5, ring 2)  failure dot 8  sort ghost: icon 11 (gap 4, pad 4), height 16
 list inset 12 (+6 top, +12 bottom)  group gap 16  header 28 (hover pill radius 14)
 active card radius 8, pad 12, row gap 12  dot box 16
 tile radius 10, pad 8/10  card radius 12, pad 10/12, bar 4
 rows: title 20, secondary 16, question 16/line, gap 2  chip 18 (radius 9, pad 7)
 hover button 24 (radius 7, gap 2, icon 16)  header + 24 (radius 8)
-link icon 11 (gap 4)  pill icon 12 (gap 5)  pill badge 18 (gap 8)  actions row 20  hint 20  width 280, clamp 200..520
+link icon 11 (gap 4)  actions row 20  hint 20  width 280, clamp 200..520
 ```
 
 Motion: hover and pressed states are redrawn on the next frame (KovaLink's

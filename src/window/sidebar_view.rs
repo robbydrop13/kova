@@ -1,8 +1,8 @@
 //! The sidebar as an AppKit view: KovaLink's home screen in Inter, group
 //! blocks, tiles with no fill of their own and their meta column, drawn with
 //! Cocoa (`drawRect:`) next to the Metal
-//! terminal view. Two classes: `SidebarView` owns the chrome (traffic-light
-//! strip, summary row, Next pill, resize edge) and an `NSScrollView`;
+//! terminal view. Two classes: `SidebarView` owns the chrome (view switcher,
+//! title row, meta row, Next pill, resize edge) and an `NSScrollView`;
 //! `SidebarListView` is the scroll view's document and draws the groups and
 //! tiles. Both share one `Shared` cell holding the `SidebarModel`, the
 //! layouts and the transient mouse state.
@@ -45,19 +45,26 @@ use crate::pane::{PaneId, TabId};
 pub const SEP_W: f64 = 1.0;
 /// Points either side of the separator that grab the resize handle.
 const EDGE_TOLERANCE: f64 = 4.0;
-/// Traffic lights and the window drag region.
-const TOP_H: f64 = 36.0;
-const SUMMARY_H: f64 = 24.0;
-const PILL_REGION_H: f64 = 36.0;
-const PILL_H: f64 = 28.0;
-/// The pill's distance from the sidebar's right edge, and the padding
-/// inside it on either side of its content.
+/// The top row, under the title bar: the traffic lights on the left and the
+/// view switcher at its right end.
+const TOP_H: f64 = 38.0;
+/// The title row: the list's name on the left, the Next pill on the right.
+const TITLE_H: f64 = 40.0;
+/// The meta row: the summary on the left, the sort ghost on the right.
+const META_H: f64 = 20.0;
+/// The title's distance from the sidebar's left edge, and the least gap
+/// kept between its end and the pill.
+const TITLE_LEFT: f64 = 14.0;
+const TITLE_GAP: f64 = 8.0;
+/// The pill's distance from the sidebar's right edge, its height, and the
+/// padding inside it either side of its content.
 const PILL_INSET: f64 = 12.0;
-const PILL_PAD: f64 = 12.0;
+const PILL_H: f64 = 24.0;
+const PILL_PAD: f64 = 9.0;
 /// Inside the pill: icon to label, and label to badge.
-const PILL_ICON_GAP: f64 = 5.0;
-const PILL_BADGE_GAP: f64 = 8.0;
-const PILL_BADGE_H: f64 = 18.0;
+const PILL_ICON_GAP: f64 = 4.0;
+const PILL_BADGE_GAP: f64 = 6.0;
+const PILL_BADGE_H: f64 = 16.0;
 /// Horizontal padding of the chrome and the list content.
 const PAD_H: f64 = 12.0;
 const LIST_TOP: f64 = 6.0;
@@ -90,12 +97,33 @@ const ADD_RADIUS: f64 = 8.0;
 const ICON_D: f64 = 16.0;
 const LINK_ICON_D: f64 = 11.0;
 const LINK_ICON_GAP: f64 = 4.0;
-const PILL_ICON_D: f64 = 12.0;
-/// The view switcher, left of the Next pill: two icon buttons sharing a row
-/// with it, the selected one on a rounded ground (Notion's segmented look).
+const PILL_ICON_D: f64 = 11.0;
+/// The view switcher, at the right end of the top row: four 26 pt icon
+/// buttons, the selected one on a `SEL_BG` ground.
 const SWITCH_BTN: f64 = 26.0;
 const SWITCH_ICON_D: f64 = 15.0;
 const SWITCH_GAP: f64 = 2.0;
+const SWITCH_RADIUS: f64 = 6.0;
+/// The switcher's distance from the sidebar's inner right edge.
+const SWITCH_INSET: f64 = 10.0;
+/// A count badge on a switcher icon: 15 pt at least, hung on the icon's top
+/// right corner (4 in from its right edge, 5 above its top) with a 2 pt ring
+/// of the sidebar ground so it reads against the selected ground too.
+const SWITCH_BADGE_H: f64 = 15.0;
+const SWITCH_BADGE_INSET: f64 = 4.0;
+const SWITCH_BADGE_RISE: f64 = 5.0;
+const SWITCH_BADGE_RING: f64 = 2.0;
+/// The failure dot on the Scheduled icon.
+const SWITCH_DOT_D: f64 = 8.0;
+/// The meta row's ghost sort button: its ground, the icon, its gap to the
+/// label, and the padding either side.
+const SORT_H: f64 = 16.0;
+const SORT_RADIUS: f64 = 4.0;
+const SORT_ICON_D: f64 = 11.0;
+const SORT_ICON_GAP: f64 = 4.0;
+const SORT_PAD: f64 = 4.0;
+/// The sort button's padding inside the list content inset.
+const META_PAD: f64 = 6.0;
 /// A pane tile's vertical padding: 5 above the title, 5 under the subtitle.
 const TILE_PAD_V: f64 = 5.0;
 /// A routine row: two lines (name over schedule) and the last run under
@@ -160,6 +188,7 @@ const GHOST_ALPHA: f64 = 0.94;
 /// The Claap design system type scale, Inter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Style {
+    ViewTitle,
     Title,
     Secondary,
     Chip,
@@ -184,7 +213,8 @@ pub enum Weight {
 }
 
 impl Style {
-    pub const ALL: [Style; 12] = [
+    pub const ALL: [Style; 13] = [
+        Style::ViewTitle,
         Style::Title,
         Style::Secondary,
         Style::Chip,
@@ -201,6 +231,7 @@ impl Style {
 
     pub fn size(self) -> f64 {
         match self {
+            Style::ViewTitle => 15.0,
             Style::Title => 13.0,
             Style::Secondary | Style::Question | Style::Detail | Style::Link | Style::Pill => 12.0,
             Style::Chip | Style::Summary | Style::Hint | Style::Number | Style::Sort => 11.0,
@@ -210,8 +241,8 @@ impl Style {
 
     pub fn weight(self) -> Weight {
         match self {
+            Style::ViewTitle | Style::Pill => Weight::Semibold,
             Style::Title | Style::Chip | Style::Link | Style::Sort => Weight::Medium,
-            Style::Pill => Weight::Semibold,
             Style::PillBadge => Weight::Bold,
             _ => Weight::Regular,
         }
@@ -270,7 +301,7 @@ impl Rect {
 pub enum RowKind {
     Header { group: usize },
     Tile { group: usize, index: usize, pane_id: PaneId, column: usize },
-    /// One routine of the Routines view.
+    /// One routine of the scheduled view.
     Routine { index: usize },
 }
 
@@ -359,6 +390,18 @@ pub struct ListLayout {
     pub content_h: f64,
 }
 
+/// The one line the list draws under its rows, in the empty-state slot: the
+/// panes hint, the routines read state, or why a list has nothing to show.
+fn hint_text(model: &SidebarModel) -> &'static str {
+    match model.view {
+        SidebarList::Scheduled if !model.routines_loaded => "reading routines\u{2026}",
+        SidebarList::Scheduled => "no routines scheduled",
+        SidebarList::Asks => "No open questions",
+        SidebarList::Agents => "Agents view coming next",
+        SidebarList::Panes => "\u{2318}T new tab \u{b7} \u{2318}D split",
+    }
+}
+
 impl ListLayout {
     pub fn new(model: &SidebarModel, width: f64, m: &dyn TextMetrics) -> Self {
         let x0 = PAD_H;
@@ -366,7 +409,14 @@ impl ListLayout {
         let mut rows = Vec::new();
         let mut groups = Vec::with_capacity(model.groups.len());
         let mut y = LIST_TOP;
-        if model.view == SidebarList::Routines {
+        if matches!(model.view, SidebarList::Asks | SidebarList::Agents) {
+            // Neither list has rows yet: one centred line, in the hint slot
+            // the empty routines list already borrows.
+            y += HINT_H;
+            y += LIST_BOTTOM;
+            return ListLayout { width, rows, groups, hint_y: Some(LIST_TOP), content_h: y };
+        }
+        if model.view == SidebarList::Scheduled {
             // A flat list: no groups, no drag, no tint bars. The empty case
             // draws its own line, so an empty list still has room for it.
             let content_x = x0 + PANEL_PAD;
@@ -676,7 +726,7 @@ pub enum ChromeHit {
     TopArea,
     SortToggle,
     NextPill,
-    /// One of the two view-switcher buttons, left of the pill.
+    /// One of the four view-switcher buttons, at the right end of the top row.
     ViewSwitch(SidebarList),
     /// The resize handle at the right edge.
     Edge,
@@ -688,24 +738,28 @@ pub enum ChromeHit {
 pub struct ChromeLayout {
     pub width: f64,
     pub height: f64,
+    /// The list's name, on the title row's left. Its width stops short of
+    /// the pill, so a long name truncates before it collides with it.
+    pub title: Rect,
     pub summary: Rect,
     pub sort: Rect,
     /// The Next pill: sized to its content, against the right edge. Also
     /// its hit region.
     pub pill: Rect,
-    /// The two view-switcher buttons on the pill's row, left to right.
-    pub switch: [Rect; 2],
+    /// The four view-switcher buttons on the top row, left to right.
+    pub switch: [Rect; 4],
     pub list: Rect,
 }
 
 /// The list each switcher button selects, in the order they are drawn.
-pub const SWITCH_LISTS: [SidebarList; 2] = [SidebarList::Panes, SidebarList::Routines];
+pub const SWITCH_LISTS: [SidebarList; 4] =
+    [SidebarList::Panes, SidebarList::Asks, SidebarList::Agents, SidebarList::Scheduled];
 
 /// The width of the Next pill around its content: the side padding, the
 /// filled play and its gap when the pill is clickable, the label, and the
 /// count badge with its gap when there is a count.
 pub fn pill_width(pill: NextPill, m: &dyn TextMetrics) -> f64 {
-    let icon = if pill.icon().is_some() { PILL_ICON_D + PILL_ICON_GAP } else { 0.0 };
+    let icon = if pill.clickable() { PILL_ICON_D + PILL_ICON_GAP } else { 0.0 };
     let badge = pill.badge().map_or(0.0, |n| PILL_BADGE_GAP + badge_width(n, m));
     2.0 * PILL_PAD + icon + m.width(pill.label(), Style::Pill) + badge
 }
@@ -715,29 +769,36 @@ fn badge_width(n: usize, m: &dyn TextMetrics) -> f64 {
     (m.width(&n.to_string(), Style::PillBadge) + 8.0).max(PILL_BADGE_H)
 }
 
+/// A badge hung on a switcher icon's top right corner: 4 pt in from its
+/// right edge, 5 pt above its top.
+fn switch_badge(btn: &Rect, w: f64, h: f64) -> Rect {
+    Rect::new(btn.right() - SWITCH_BADGE_INSET - w, btn.y - SWITCH_BADGE_RISE, w, h)
+}
+
 impl ChromeLayout {
     pub fn new(width: f64, height: f64, sort_label_w: f64, pill_w: f64) -> Self {
         let inner_w = width - SEP_W;
-        let summary = Rect::new(PAD_H, TOP_H, inner_w - 2.0 * PAD_H, SUMMARY_H);
-        let sort_w = sort_label_w + 12.0;
-        let sort = Rect::new(summary.right() - sort_w, TOP_H + (SUMMARY_H - 20.0) / 2.0, sort_w, 20.0);
-        // Right-aligned, never wider than the inset width on a narrow
-        // sidebar.
-        // The switcher takes its room on the left of the row first; the pill
-        // gets what is left, so a narrow sidebar shrinks the pill, never the
-        // buttons (an unreachable button is worse than a clipped label).
-        let switch_row_y = TOP_H + SUMMARY_H;
-        let switch_y = switch_row_y + (PILL_REGION_H - SWITCH_BTN) / 2.0;
-        let switch = [
-            Rect::new(PILL_INSET, switch_y, SWITCH_BTN, SWITCH_BTN),
-            Rect::new(PILL_INSET + SWITCH_BTN + SWITCH_GAP, switch_y, SWITCH_BTN, SWITCH_BTN),
-        ];
-        let pill_left = switch[1].right() + PILL_INSET;
-        let pill_w = pill_w.min(inner_w - PILL_INSET - pill_left).max(0.0);
-        let pill = Rect::new(inner_w - PILL_INSET - pill_w, switch_row_y + (PILL_REGION_H - PILL_H) / 2.0, pill_w, PILL_H);
-        let list_y = TOP_H + SUMMARY_H + PILL_REGION_H;
+        // Right-aligned on the traffic-light row; the pill sits on the row
+        // below, so the two never compete for the width.
+        let switch_w = SWITCH_LISTS.len() as f64 * SWITCH_BTN + (SWITCH_LISTS.len() - 1) as f64 * SWITCH_GAP;
+        let switch_x = (inner_w - SWITCH_INSET - switch_w).max(0.0);
+        let switch_y = (TOP_H - SWITCH_BTN) / 2.0;
+        let switch =
+            std::array::from_fn(|i| Rect::new(switch_x + i as f64 * (SWITCH_BTN + SWITCH_GAP), switch_y, SWITCH_BTN, SWITCH_BTN));
+        // The title keeps its gap before the pill whatever the width: the
+        // pill gives way first, down to nothing on a narrow sidebar.
+        let pill_w = pill_w.min(inner_w - PILL_INSET - TITLE_LEFT - TITLE_GAP).max(0.0);
+        let pill = Rect::new(inner_w - PILL_INSET - pill_w, TOP_H + (TITLE_H - PILL_H) / 2.0, pill_w, PILL_H);
+        let title = Rect::new(TITLE_LEFT, TOP_H, (pill.x - TITLE_GAP - TITLE_LEFT).max(0.0), TITLE_H);
+        // The meta row sits inside the list's own 12 pt inset, 6 more in on
+        // either side, so its text lines up with the tiles' content.
+        let meta_x = PAD_H + META_PAD;
+        let summary = Rect::new(meta_x, TOP_H + TITLE_H, inner_w - 2.0 * meta_x, META_H);
+        let sort_w = sort_label_w + SORT_ICON_D + SORT_ICON_GAP + 2.0 * SORT_PAD;
+        let sort = Rect::new(summary.right() - sort_w, summary.y + (META_H - SORT_H) / 2.0, sort_w, SORT_H);
+        let list_y = TOP_H + TITLE_H + META_H;
         let list = Rect::new(0.0, list_y, inner_w - EDGE_TOLERANCE, (height - list_y).max(0.0));
-        ChromeLayout { width, height, summary, sort, pill, switch, list }
+        ChromeLayout { width, height, title, summary, sort, pill, switch, list }
     }
 
     pub fn hit(&self, x: f64, y: f64) -> ChromeHit {
@@ -747,16 +808,18 @@ impl ChromeLayout {
         if x < 0.0 || x >= self.width || y < 0.0 || y >= self.height {
             return ChromeHit::Empty;
         }
+        // The buttons come before the top-area fallback: they live inside
+        // it, and a press on one must switch lists, not drag the window.
+        for (rect, list) in self.switch.iter().zip(SWITCH_LISTS) {
+            if rect.contains(x, y) {
+                return ChromeHit::ViewSwitch(list);
+            }
+        }
         if y < TOP_H {
             return ChromeHit::TopArea;
         }
         if self.sort.contains(x, y) {
             return ChromeHit::SortToggle;
-        }
-        for (rect, list) in self.switch.iter().zip(SWITCH_LISTS) {
-            if rect.contains(x, y) {
-                return ChromeHit::ViewSwitch(list);
-            }
         }
         if self.pill.contains(x, y) {
             return ChromeHit::NextPill;
@@ -1312,6 +1375,8 @@ impl SidebarView {
                 view: SidebarList::default(),
                 routines: Vec::new(),
                 routines_loaded: false,
+                asks_waiting: 0,
+                routine_failed: false,
                 summary: Vec::new(),
                 sort: SidebarSort::Kova,
                 pill: NextPill::Nothing,
@@ -1457,30 +1522,57 @@ impl SidebarView {
         fill_rect(&Rect::new(0.0, 0.0, b.size.width, b.size.height), tokens::GROUND, 1.0);
         fill_rect(&Rect::new(b.size.width - SEP_W, 0.0, SEP_W, b.size.height), tokens::SEPARATOR, 1.0);
 
-        // View switcher, left of the pill: the selected icon on a raised
-        // ground, the other one bare and tertiary until the mouse finds it.
+        // Top row: the view switcher at its right end, beside the traffic
+        // lights. The selected icon sits on `SEL_BG`, the others are
+        // tertiary and take a 10 % white ground under the mouse.
         for (rect, list) in c.switch.iter().zip(SWITCH_LISTS) {
             let selected = sh.model.view == list;
             let hovered = sh.chrome_hovered == ChromeHit::ViewSwitch(list);
             let pressed = sh.chrome_pressed == ChromeHit::ViewSwitch(list);
             if selected {
-                fill_round(rect, 7.0, tokens::TILE_PRESSED, 1.0);
+                fill_round(rect, SWITCH_RADIUS, tokens::SEL_BG, 1.0);
             } else if hovered || pressed {
-                fill_round(rect, 7.0, tokens::TILE_PRESSED, if pressed { 0.9 } else { 0.55 });
+                fill_round(rect, SWITCH_RADIUS, tokens::WHITE, if pressed { 0.16 } else { 0.10 });
             }
-            let fg = if selected || hovered { tokens::TEXT_PRIMARY } else { tokens::TEXT_TERTIARY };
+            let fg = if selected { tokens::SEL_TEXT } else { tokens::TEXT_TERTIARY };
             let icon = match list {
                 SidebarList::Panes => Icon::Sidebar,
-                SidebarList::Routines => Icon::Clock,
+                SidebarList::Asks => Icon::Message,
+                SidebarList::Agents => Icon::Users,
+                SidebarList::Scheduled => Icon::Clock,
             };
             stroke_icon(icon, rect, SWITCH_ICON_D, fg, if pressed { 0.85 } else { 1.0 });
+            // The badge's ground ring first, then the badge: it has to read
+            // over the selected ground as well as the sidebar's.
+            let ring = |r: Rect, radius: f64| {
+                fill_round(&r.inset(-SWITCH_BADGE_RING), radius + SWITCH_BADGE_RING, tokens::GROUND, 1.0);
+            };
+            match list {
+                SidebarList::Asks if sh.model.asks_waiting > 0 => {
+                    let label = sh.model.asks_waiting.to_string();
+                    let w = (AppKitMetrics(&sh).width(&label, Style::PillBadge) + 8.0).max(SWITCH_BADGE_H);
+                    let r = switch_badge(rect, w, SWITCH_BADGE_H);
+                    ring(r, SWITCH_BADGE_H / 2.0);
+                    fill_round(&r, SWITCH_BADGE_H / 2.0, tokens::ACCENT, 1.0);
+                    draw_text(&sh, &label, &r, Style::PillBadge, tokens::TEXT_ON_FILL, 1.0, Align::Center, false);
+                }
+                SidebarList::Scheduled if sh.model.routine_failed => {
+                    let r = switch_badge(rect, SWITCH_DOT_D, SWITCH_DOT_D);
+                    ring(r, SWITCH_DOT_D / 2.0);
+                    fill_round(&r, SWITCH_DOT_D / 2.0, tokens::ERROR, 1.0);
+                }
+                _ => {}
+            }
         }
 
-        // Summary row: coloured counts on the left, sort toggle on the right.
+        // Title row: the list's name, then the Next pill at the right.
+        draw_text(&sh, sh.model.view.title(), &c.title, Style::ViewTitle, tokens::TEXT_PRIMARY, 1.0, Align::Left, false);
+
+        // Meta row: the summary on the left, the sort ghost on the right.
         let sort_hovered = sh.chrome_hovered == ChromeHit::SortToggle;
         let sort_pressed = sh.chrome_pressed == ChromeHit::SortToggle;
         if sort_hovered || sort_pressed {
-            fill_round(&c.sort, 6.0, tokens::TILE_PRESSED, if sort_pressed { 1.0 } else { 0.7 });
+            fill_round(&c.sort, SORT_RADIUS, tokens::WHITE, if sort_pressed { 0.16 } else { 0.10 });
         }
         let sort_fg = if sort_hovered {
             tokens::TEXT_PRIMARY
@@ -1489,14 +1581,20 @@ impl SidebarView {
         } else {
             tokens::TEXT_TERTIARY
         };
-        draw_text(&sh, sh.model.sort.label(), &c.sort.inset(0.0), Style::Sort, sort_fg, 1.0, Align::Center, false);
+        {
+            let label = sh.model.sort.label();
+            let text_w = AppKitMetrics(&sh).width(label, Style::Sort);
+            let mut x = c.sort.x + (c.sort.w - (SORT_ICON_D + SORT_ICON_GAP + text_w)).max(0.0) / 2.0;
+            stroke_icon(Icon::Sort, &Rect::new(x, c.sort.y, SORT_ICON_D, c.sort.h), SORT_ICON_D, sort_fg, 1.0);
+            x += SORT_ICON_D + SORT_ICON_GAP;
+            draw_text(&sh, label, &Rect::new(x, c.sort.y, text_w, c.sort.h), Style::Sort, sort_fg, 1.0, Align::Left, false);
+        }
         let mut x = c.summary.x;
         let max_x = c.sort.x - 8.0;
         for (text, run) in &sh.model.summary {
             let fg = match run {
-                SummaryRun::Waiting => tokens::AWAITING,
-                SummaryRun::Working => tokens::WORKING,
-                SummaryRun::Idle | SummaryRun::Dot => tokens::TEXT_TERTIARY,
+                SummaryRun::Working => tokens::INFO_TEXT,
+                SummaryRun::Waiting | SummaryRun::Idle | SummaryRun::Dot => tokens::TEXT_TERTIARY,
             };
             if x >= max_x {
                 break;
@@ -1510,7 +1608,7 @@ impl SidebarView {
             let hovered = sh.chrome_hovered == ChromeHit::NextPill;
             let pressed = sh.chrome_pressed == ChromeHit::NextPill;
             // Accent when there is something to read (darker under the
-            // mouse), a plain raised ground otherwise: not a button then, so
+            // mouse), a plain sunken ground otherwise: not a button then, so
             // no hover and no press.
             let clickable = sh.model.pill.clickable();
             let (fill, text, badge): ([f32; 3], [f32; 3], Option<([f32; 3], [f32; 3])>) = match sh.model.pill {
@@ -1519,7 +1617,7 @@ impl SidebarView {
                     tokens::TEXT_ON_FILL,
                     Some((tokens::TEXT_ON_FILL, tokens::ACCENT)),
                 ),
-                NextPill::Nothing => (tokens::TILE, tokens::TEXT_TERTIARY, None),
+                NextPill::Nothing => (tokens::BG2, tokens::TEXT_TERTIARY, None),
             };
             let text_alpha = if pressed && clickable { 0.85 } else { 1.0 };
             // Content-sized (`pill_width`), so the parts are laid end to
@@ -1539,7 +1637,8 @@ impl SidebarView {
                 fill_icon(icon, &Rect::new(left, c.pill.y, PILL_ICON_D, c.pill.h), PILL_ICON_D, text, text_alpha);
                 left += PILL_ICON_D + PILL_ICON_GAP;
             }
-            draw_text(&sh, sh.model.pill.label(), &Rect::new(left, c.pill.y, (right - left).max(0.0), c.pill.h), Style::Pill, text, text_alpha, Align::Left, false);
+            let label = sh.model.pill.label();
+            draw_text(&sh, label, &Rect::new(left, c.pill.y, (right - left).max(0.0), c.pill.h), Style::Pill, text, text_alpha, Align::Left, false);
         }
     }
 }
@@ -1594,14 +1693,14 @@ define_class!(
         }
 
         /// The hand over every group block: the whole tab is a click target.
-        /// In the routines view there are no blocks, and each row is the
-        /// target.
+        /// In the scheduled view there are no blocks, and each row is the
+        /// target; the two empty lists have neither.
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
             // Bind the rects first: adding a cursor rect is an AppKit call.
             let panels: Vec<CGRect> = {
                 let sh = self.ivars().shared.borrow();
-                if sh.model.view == SidebarList::Routines {
+                if sh.model.view == SidebarList::Scheduled {
                     sh.layout.rows.iter().map(|r| r.frame.cg()).collect()
                 } else {
                     sh.layout.groups.iter().map(|r| r.cg()).collect()
@@ -2011,14 +2110,7 @@ impl SidebarListView {
 
         if let Some(hy) = sh.layout.hint_y {
             let r = Rect::new(PAD_H, hy, sh.layout.width - 2.0 * PAD_H, HINT_H);
-            // The Routines view borrows the hint's slot for its empty line:
-            // "no routines" is the only thing it ever has to say there.
-            let hint = match sh.model.view {
-                SidebarList::Routines if !sh.model.routines_loaded => "reading routines\u{2026}",
-                SidebarList::Routines => "no routines scheduled",
-                SidebarList::Panes => "\u{2318}T new tab \u{b7} \u{2318}D split",
-            };
-            draw_text(&sh, hint, &r, Style::Hint, tokens::TEXT_TERTIARY, 1.0, Align::Center, false);
+            draw_text(&sh, hint_text(&sh.model), &r, Style::Hint, tokens::TEXT_TERTIARY, 1.0, Align::Center, false);
         }
 
         // Drag feedback: the insertion line, then the floating copy.
@@ -2320,9 +2412,9 @@ mod tests {
     }
 
     #[test]
-    fn the_routines_view_is_a_flat_list_with_no_groups_to_drag() {
+    fn the_scheduled_view_is_a_flat_list_with_no_groups_to_drag() {
         let mut m = model();
-        m.view = SidebarList::Routines;
+        m.view = SidebarList::Scheduled;
         m.routines_loaded = true;
         m.routines = vec![
             RoutineVm { name: "tri-inbox".into(), ..RoutineVm::default() },
@@ -2371,6 +2463,8 @@ mod tests {
             view: SidebarList::default(),
             routines: Vec::new(),
             routines_loaded: false,
+            asks_waiting: 0,
+            routine_failed: false,
             summary: Vec::new(),
             sort: SidebarSort::Kova,
             pill: NextPill::Nothing,
@@ -2631,40 +2725,47 @@ mod tests {
     }
 
     #[test]
-    fn the_chrome_stacks_top_area_summary_pill_and_list_down_to_the_bottom() {
+    fn the_chrome_stacks_the_top_row_the_title_the_meta_row_and_the_list() {
         let c = ChromeLayout::new(W, 600.0, 40.0, 130.0);
-        assert_eq!(c.summary, Rect::new(12.0, 36.0, W - 1.0 - 24.0, 24.0));
+        // Top row: four 26 pt buttons, 2 apart, 10 from the inner right
+        // edge, on the traffic lights' own row.
+        let switch_left = W - 1.0 - 10.0 - (4.0 * 26.0 + 3.0 * 2.0);
+        assert_eq!(c.switch[0], Rect::new(switch_left, 6.0, 26.0, 26.0));
+        assert_eq!(c.switch[1].x, c.switch[0].right() + 2.0);
+        assert_eq!(c.switch[3].right(), W - 1.0 - 10.0);
+        // Title row, 40 tall: the name 14 in, the pill 12 from the right,
+        // 24 tall.
+        assert_eq!(c.title, Rect::new(14.0, 38.0, W - 1.0 - 12.0 - 130.0 - 8.0 - 14.0, 40.0));
+        assert_eq!(c.pill, Rect::new(W - 1.0 - 12.0 - 130.0, 46.0, 130.0, 24.0));
+        // The title stops short of the pill: it truncates instead of colliding.
+        assert_eq!(c.title.right() + 8.0, c.pill.x);
+        // Meta row, 20 tall, 6 inside the list's inset: summary left, sort
+        // ghost right.
+        assert_eq!(c.summary, Rect::new(18.0, 78.0, W - 1.0 - 36.0, 20.0));
         assert_eq!(c.sort.right(), c.summary.right());
-        assert_eq!(c.sort.w, 52.0);
-        // The pill is as wide as its content, 12 from the right edge, on
-        // its own row under the summary.
-        assert_eq!(c.pill, Rect::new(W - 1.0 - 12.0 - 130.0, 64.0, 130.0, 28.0));
+        assert_eq!(c.sort.w, 40.0 + 11.0 + 4.0 + 8.0);
+        assert_eq!((c.sort.h, c.summary.bottom()), (16.0, 98.0));
         // No footer: the list runs to the bottom.
-        assert_eq!(c.list, Rect::new(0.0, 96.0, W - 1.0 - 4.0, 600.0 - 96.0));
+        assert_eq!(c.list, Rect::new(0.0, 98.0, W - 1.0 - 4.0, 600.0 - 98.0));
+
+        // A press on a button switches lists; the rest of the top row still
+        // drags the window.
         assert_eq!(c.hit(10.0, 10.0), ChromeHit::TopArea);
-        assert_eq!(c.hit(10.0, 45.0), ChromeHit::Empty);
-        assert_eq!(c.hit(c.sort.x + 5.0, 45.0), ChromeHit::SortToggle);
-        // The hit region is the pill's own rect: nothing left of it.
-        assert_eq!(c.hit(c.pill.x + 5.0, 70.0), ChromeHit::NextPill);
-        assert_eq!(c.hit(c.pill.right() - 1.0, 70.0), ChromeHit::NextPill);
-        assert_eq!(c.hit(c.pill.x - 5.0, 70.0), ChromeHit::Empty);
-        // The two switcher buttons sit at the left of that same row.
-        assert_eq!(c.switch[0], Rect::new(12.0, 65.0, 26.0, 26.0));
-        assert_eq!(c.switch[1], Rect::new(40.0, 65.0, 26.0, 26.0));
-        assert_eq!(c.hit(20.0, 70.0), ChromeHit::ViewSwitch(SidebarList::Panes));
-        assert_eq!(c.hit(45.0, 70.0), ChromeHit::ViewSwitch(SidebarList::Routines));
-        // Between them, and above the row, nothing.
-        assert_eq!(c.hit(39.0, 70.0), ChromeHit::Empty);
-        assert_eq!(c.hit(20.0, 50.0), ChromeHit::Empty);
-        assert_eq!(c.hit(c.pill.x + 5.0, 61.0), ChromeHit::Empty);
+        for (rect, list) in c.switch.iter().zip(SWITCH_LISTS) {
+            assert_eq!(c.hit(rect.x + 5.0, rect.y + 5.0), ChromeHit::ViewSwitch(list));
+        }
+        assert_eq!(c.hit(c.switch[0].right() + 1.0, 10.0), ChromeHit::TopArea);
+        assert_eq!(c.hit(c.switch[0].x - 5.0, 10.0), ChromeHit::TopArea);
+        // The title row is not a target; the pill is, on its own rect only.
+        assert_eq!(c.hit(10.0, 50.0), ChromeHit::Empty);
+        assert_eq!(c.hit(c.pill.x + 5.0, 50.0), ChromeHit::NextPill);
+        assert_eq!(c.hit(c.pill.right() - 1.0, 50.0), ChromeHit::NextPill);
+        assert_eq!(c.hit(c.pill.x - 5.0, 50.0), ChromeHit::Empty);
+        // The sort ghost on the meta row, nothing else there.
+        assert_eq!(c.hit(c.sort.x + 5.0, 85.0), ChromeHit::SortToggle);
+        assert_eq!(c.hit(c.summary.x + 5.0, 85.0), ChromeHit::Empty);
         assert_eq!(c.hit(100.0, 300.0), ChromeHit::Empty);
         assert_eq!(c.hit(100.0, 585.0), ChromeHit::Empty);
-        // A pill wider than the sidebar is clamped to what the switcher
-        // leaves: the buttons keep their size, the pill gives way.
-        let narrow = ChromeLayout::new(200.0, 600.0, 40.0, 400.0);
-        assert_eq!(narrow.switch[1].right(), 66.0);
-        assert_eq!(narrow.pill, Rect::new(78.0, 64.0, 200.0 - 1.0 - 12.0 - 78.0, 28.0));
-        assert_eq!(narrow.pill.right(), 200.0 - 1.0 - 12.0);
         // The resize handle wins near the separator, on both sides.
         assert_eq!(c.hit(W - 4.0, 300.0), ChromeHit::Edge);
         assert_eq!(c.hit(W + 3.0, 300.0), ChromeHit::Edge);
@@ -2673,19 +2774,60 @@ mod tests {
     }
 
     #[test]
+    fn the_chrome_fits_the_whole_width_range() {
+        for w in [200.0, 300.0, 520.0] {
+            let c = ChromeLayout::new(w, 600.0, 40.0, 130.0);
+            let inner = w - 1.0;
+            assert!(c.switch[0].x >= 0.0);
+            assert_eq!(c.switch[3].right(), inner - 10.0);
+            for (rect, list) in c.switch.iter().zip(SWITCH_LISTS) {
+                assert_eq!(c.hit(rect.x + 13.0, rect.y + 13.0), ChromeHit::ViewSwitch(list));
+            }
+            // The title narrows before the pill does, and never overlaps it.
+            assert!(c.title.w > 0.0);
+            assert_eq!(c.title.right() + 8.0, c.pill.x);
+            assert_eq!(c.pill.right(), inner - 12.0);
+            assert!(c.sort.x > c.summary.x);
+        }
+        // A pill wider than the row gives way: it stops at the title's gap,
+        // which is squeezed out rather than overlapped.
+        let long = ChromeLayout::new(300.0, 600.0, 40.0, 400.0);
+        assert_eq!(long.pill.x, 22.0);
+        assert_eq!(long.pill.w, 300.0 - 1.0 - 12.0 - 22.0);
+        assert_eq!(long.title.w, 0.0);
+    }
+
+    #[test]
+    fn the_two_empty_lists_say_so_in_the_hint_slot() {
+        for (view, text) in
+            [(SidebarList::Asks, "No open questions"), (SidebarList::Agents, "Agents view coming next")]
+        {
+            let mut m = model();
+            m.view = view;
+            let l = ListLayout::new(&m, 260.0, &FakeMetrics);
+            assert!(l.rows.is_empty());
+            assert!(l.groups.is_empty());
+            assert_eq!(l.hint_y, Some(LIST_TOP));
+            assert_eq!(hint_text(&m), text);
+        }
+    }
+
+    #[test]
     fn the_next_pill_is_as_wide_as_its_content() {
-        // Next unread, 3: pad 12, play 12 + 5, 11 chars x 6, gap 8, badge
-        // max(6 + 8, 18) = 18, pad 12.
-        assert_eq!(pill_width(NextPill::Next(3), &FakeMetrics), 12.0 + 17.0 + 66.0 + 8.0 + 18.0 + 12.0);
-        // Two digits widen the badge: 12 + 8 = 20.
-        assert_eq!(pill_width(NextPill::Next(12), &FakeMetrics), 12.0 + 17.0 + 66.0 + 8.0 + 20.0 + 12.0);
+        // Next, 3: pad 9, play 11 + gap 4, "Next" 4 chars x 6, gap 6, the
+        // 16 pt circle, pad 9.
+        assert_eq!(pill_width(NextPill::Next(3), &FakeMetrics), 9.0 + 15.0 + 24.0 + 6.0 + 16.0 + 9.0);
+        // Two digits widen the circle: 12 + 8 = 20.
+        assert_eq!(pill_width(NextPill::Next(12), &FakeMetrics), 9.0 + 15.0 + 24.0 + 6.0 + 20.0 + 9.0);
         // Nothing to read: no play, no badge; 15 chars.
-        assert_eq!(pill_width(NextPill::Nothing, &FakeMetrics), 12.0 + 90.0 + 12.0);
+        assert_eq!(pill_width(NextPill::Nothing, &FakeMetrics), 9.0 + 90.0 + 9.0);
     }
 
     #[test]
     fn styles_match_the_design_system_scale() {
-        // 11, 12 and 13 with the weights Claap's design system pins.
+        // 10 to 15 with the weights Claap's design system pins.
+        assert_eq!(Style::ViewTitle.size(), 15.0);
+        assert_eq!(Style::ViewTitle.weight(), Weight::Semibold);
         assert_eq!(Style::Title.size(), 13.0);
         assert_eq!(Style::Title.weight(), Weight::Medium);
         assert_eq!(Style::Secondary.size(), 12.0);
@@ -2700,7 +2842,7 @@ mod tests {
         assert_eq!(Style::Sort.weight(), Weight::Medium);
         assert_eq!(Style::PillBadge.size(), 10.0);
         assert_eq!(Style::PillBadge.weight(), Weight::Bold);
-        assert_eq!(Style::ALL.len(), 12);
+        assert_eq!(Style::ALL.len(), 13);
         let _ = PaneFlags::default();
     }
 }

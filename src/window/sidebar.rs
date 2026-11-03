@@ -158,8 +158,8 @@ impl SidebarSort {
     /// Copy of the sort toggle in the summary row.
     pub fn label(self) -> &'static str {
         match self {
-            SidebarSort::Kova => "\u{21c5} kova",
-            SidebarSort::Activity => "\u{21c5} activity",
+            SidebarSort::Kova => "Tab order",
+            SidebarSort::Activity => "Activity",
         }
     }
 }
@@ -588,7 +588,7 @@ impl NextPill {
 
     pub fn label(self) -> &'static str {
         match self {
-            NextPill::Next(_) => "Next unread",
+            NextPill::Next(_) => "Next",
             NextPill::Nothing => "Nothing to read",
         }
     }
@@ -745,7 +745,7 @@ mod tests {
         assert_eq!(NextPill::Nothing.badge(), None);
         assert!(NextPill::Next(1).clickable());
         assert!(!NextPill::Nothing.clickable());
-        assert_eq!(NextPill::Next(1).label(), "Next unread");
+        assert_eq!(NextPill::Next(1).label(), "Next");
         assert_eq!(NextPill::Nothing.label(), "Nothing to read");
         assert_eq!(NextPill::Next(1).icon(), Some(Icon::Play));
         assert_eq!(NextPill::Nothing.icon(), None);
@@ -861,7 +861,7 @@ mod tests {
         assert_eq!(display_order(SidebarSort::Kova, &states), vec![0, 1, 2, 3, 4]);
         assert_eq!(display_order(SidebarSort::Activity, &states), vec![2, 1, 3, 4, 0]);
         assert_eq!(SidebarSort::Kova.toggled(), SidebarSort::Activity);
-        assert_eq!(SidebarSort::Activity.label(), "\u{21c5} activity");
+        assert_eq!(SidebarSort::Activity.label(), "Activity");
     }
 
     #[test]
