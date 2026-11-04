@@ -207,7 +207,11 @@ edges like the header:
   before it on an unread tile.
 - The hover buttons (`close`, `minimize`, `mark unread`, `stop`) sit
   `COLUMN_GAP` (8 pt) left of the column, never over it: a call to action or
-  an `Answer` link stays clickable while the mouse is on the row.
+  an `Answer` link stays clickable while the mouse is on the row. Hovering
+  never hides the name: a wait shows only `Answer` while hovered (the
+  `waiting 4m ·` age gives way), and only the buttons that leave the name
+  `TITLE_MIN_W` (72 pt) show, the leftmost giving way first (`stop`, then
+  `mark unread`, …; `close` last). The name truncates with an ellipsis.
 
 The awaiting pane is no longer a tall card: same 26 pt row, amber dot and
 the `waiting 4m · Answer` column. Its question is not drawn in the row (the

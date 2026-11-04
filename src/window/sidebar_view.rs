@@ -148,6 +148,9 @@ const LINE_TITLE_H: f64 = 18.0;
 const TILE_HEIGHT: f64 = 2.0 * TILE_PAD_V + LINE_TITLE_H;
 /// The gap between a tile's right column and the hover buttons beside it.
 const COLUMN_GAP: f64 = 8.0;
+/// What a hovered tile keeps for its name: the hover buttons that would eat
+/// into it are left out (the leftmost first), so hovering never hides it.
+const TITLE_MIN_W: f64 = 72.0;
 /// The state glyph's box (the 8 pt dot centred in it) and the text column,
 /// which starts on the header's title (`CHEVRON_ZONE_W + 16`).
 const GLYPH_BOX_W: f64 = 16.0;
@@ -884,6 +887,24 @@ fn tile_column(tile: &TileVm, right: f64, y: f64, h: f64, m: &dyn TextMetrics) -
     col
 }
 
+impl TileColumn {
+    /// Where the column starts while the row is hovered: a wait shows only
+    /// its `Answer` link (the age gives way to the buttons and the name).
+    fn hover_x(&self) -> f64 {
+        self.answer.map_or(self.x, |a| a.x)
+    }
+}
+
+/// The hover buttons that fit right of a name kept at `TITLE_MIN_W` or more:
+/// `text_x` is where the name starts, `glyph_right` where the buttons end.
+fn hover_glyph_count(text_x: f64, glyph_right: f64, wanted: usize) -> usize {
+    let room = glyph_right - text_x - TITLE_MIN_W + BUTTON_GAP;
+    if room <= 0.0 {
+        return 0;
+    }
+    ((room / (BUTTON_D + BUTTON_GAP)).floor() as usize).min(wanted)
+}
+
 /// Lay out one tile at `y`.
 fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m: &dyn TextMetrics) -> Row {
     let right = x + w - TILE_PAD_H;
@@ -892,9 +913,12 @@ fn tile_row(group: usize, index: usize, tile: &TileVm, x: f64, y: f64, w: f64, m
     let col = tile_column(tile, right, line.y, LINE_TITLE_H, m);
     // The hover buttons sit left of the column, so a call to action or an
     // `Answer` link stays clickable while the mouse is on the row.
-    let glyph_right = if col.w > 0.0 { col.x - COLUMN_GAP } else { right };
-    let glyphs = TileButton::hover_glyphs(tile.state, tile.minimized, tile.unread)
+    let glyph_right = if col.w > 0.0 { col.hover_x() - COLUMN_GAP } else { right };
+    let wanted = TileButton::hover_glyphs(tile.state, tile.minimized, tile.unread);
+    let fit = hover_glyph_count(x + TEXT_X, glyph_right, wanted.len());
+    let glyphs = wanted
         .into_iter()
+        .take(fit)
         .enumerate()
         .map(|(k, b)| {
             let bx = glyph_right - (k as f64 + 1.0) * BUTTON_D - k as f64 * BUTTON_GAP;
@@ -3025,13 +3049,16 @@ impl SidebarListView {
         // The right column, laid out right to left, then the name in what is
         // left of it. The unread dot comes before the column.
         let col = tile_column(tile, right, line.y, LINE_TITLE_H, &AppKitMetrics(sh));
-        let mut name_right = col.x;
-        if let Some((label, r)) = &col.wait {
+        let col_x = if hovered { col.hover_x() } else { col.x };
+        let mut name_right = col_x;
+        if let Some((label, r)) = col.wait.as_ref().filter(|_| !hovered) {
             draw_text(sh, label, &shifted(r), Style::Secondary, tokens::get().warn_text, alpha, Align::Left, false);
         }
         if let Some(area) = col.answer {
             let area = shifted(&area);
-            draw_text(sh, "\u{b7}", &Rect::new(area.x - 9.0, area.y, 8.0, LINE_TITLE_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
+            if !hovered {
+                draw_text(sh, "\u{b7}", &Rect::new(area.x - 9.0, area.y, 8.0, LINE_TITLE_H), Style::Secondary, sec_fg, alpha, Align::Left, false);
+            }
             let link_hovered = sh.hovered == ListHit::NeedAnswer(tile.pane_id);
             draw_text(sh, NEED_ANSWER, &area, Style::Link, link_ink(tile.focused, link_hovered), alpha, Align::Left, false);
         }
@@ -3044,7 +3071,7 @@ impl SidebarListView {
             draw_text(sh, text, &shifted(r), Style::Number, meta_fg, alpha, Align::Right, false);
         }
         if matches!(tile.state, TileState::Unread(_)) {
-            let x = col.x - 8.0 - UNREAD_DOT_D / 2.0;
+            let x = col_x - 8.0 - UNREAD_DOT_D / 2.0;
             fill_dot(x, cy, UNREAD_DOT_D, tokens::get().accent, alpha);
             name_right = x - UNREAD_DOT_D / 2.0 - 4.0;
         }
@@ -3100,6 +3127,31 @@ mod tests {
         fn lines(&self, text: &str, _style: Style, width: f64, max: usize) -> usize {
             ((text.chars().count() as f64 * 6.0 / width).ceil() as usize).clamp(1, max)
         }
+    }
+
+    #[test]
+    fn hovering_a_waiting_tile_never_hides_its_name() {
+        let mut t = tile(7, 0, TileState::Awaiting);
+        t.waiting = Some("13h".into());
+        for w in [200.0, 240.0, 280.0, 360.0] {
+            let row = tile_row(0, 0, &t, 0.0, 0.0, w, &FakeMetrics);
+            let text_x = TEXT_X;
+            // The buttons sit right of a name kept at TITLE_MIN_W, and left of `Answer`.
+            if let Some((_, leftmost)) = row.glyphs.last() {
+                assert!(leftmost.x - text_x >= TITLE_MIN_W - 0.01, "width {w}: name squeezed");
+            }
+            let answer = row.answer.unwrap();
+            for (_, r) in &row.glyphs {
+                assert!(r.right() <= answer.x - COLUMN_GAP + 0.01, "width {w}: a button over Answer");
+            }
+        }
+        // Wide enough, all four buttons (the age gives way while hovered).
+        assert_eq!(tile_row(0, 0, &t, 0.0, 0.0, 280.0, &FakeMetrics).glyphs.len(), 4);
+        // Narrow, the leftmost go first, Close always last to go.
+        let narrow = tile_row(0, 0, &t, 0.0, 0.0, 200.0, &FakeMetrics);
+        assert!(narrow.glyphs.len() < 4);
+        assert_eq!(narrow.glyphs.first().map(|(b, _)| *b), Some(TileButton::Close));
+        assert_eq!(hover_glyph_count(0.0, TITLE_MIN_W - 1.0, 4), 0);
     }
 
     fn tile(pane_id: PaneId, column: usize, state: TileState) -> TileVm {
@@ -3374,11 +3426,12 @@ mod tests {
         assert_eq!(l.group_of(ListHit::Tile(99)), None);
         assert_eq!(l.group_of(ListHit::Empty), None);
         assert_eq!(ListHit::Panel(1).group(), None);
-        // Working tile: close, minimize, mark unread, stop, 22 pt boxes left
-        // of its `working` column, centred on the row.
+        // Working tile: close, minimize, mark unread, 22 pt boxes left of its
+        // `working` column, centred on the row; Stop, the leftmost, gives way
+        // at this width so the name keeps TITLE_MIN_W.
         let row = &l.rows[2];
         let boxes: Vec<TileButton> = row.glyphs.iter().map(|(b, _)| *b).collect();
-        assert_eq!(boxes, vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread, TileButton::Stop]);
+        assert_eq!(boxes, vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread]);
         let column_w = FakeMetrics.width("working", Style::Number);
         let (_, close) = row.glyphs[0];
         assert_eq!(close.right(), TR - TILE_PAD_H - COLUMN_GAP - column_w);
@@ -3389,8 +3442,11 @@ mod tests {
         // Minimize sits one gap left of close, mark one gap left of minimize.
         assert_eq!(mark.right(), close.x - 2.0 * BUTTON_GAP - BUTTON_D);
         assert_eq!(l.hit(mark.x + 5.0, mark.y + 5.0), ListHit::TileButton(11, TileButton::MarkUnread));
-        let (_, stop) = row.glyphs[3];
-        assert_eq!(l.hit(stop.x + 5.0, stop.y + 5.0), ListHit::TileButton(11, TileButton::Stop));
+        // A wider list has room for Stop too.
+        let wide = ListLayout::new(&model(), W + 40.0, &FakeMetrics);
+        let (b, stop) = wide.rows[2].glyphs[3];
+        assert_eq!(b, TileButton::Stop);
+        assert_eq!(wide.hit(stop.x + 5.0, stop.y + 5.0), ListHit::TileButton(11, TileButton::Stop));
         // The bare shell's `▶ Start Claude` is the right end of its one line.
         let shell = &l.rows[5];
         let (b, start) = shell.actions[0];
@@ -3414,9 +3470,13 @@ mod tests {
         assert_eq!(resume.w, LINK_ICON_D + LINK_ICON_GAP + RESUME_LABEL.chars().count() as f64 * 6.0 + 8.0);
         assert_eq!(resume.right(), TR - TILE_PAD_H);
         assert_eq!(l.hit(resume.x + 5.0, resume.y + 5.0), ListHit::TileButton(7, TileButton::Resume));
-        // The link is the only play: no play among the hover glyphs.
-        assert_eq!(l.rows[1].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread]);
-        assert_eq!(l.rows[2].glyphs.iter().map(|(b, _)| *b).collect::<Vec<_>>(), vec![TileButton::Close, TileButton::Minimize, TileButton::MarkUnread]);
+        // The link is the only play: no play among the hover glyphs (as many
+        // as leave the name TITLE_MIN_W, the leftmost giving way first).
+        let all = [TileButton::Close, TileButton::Minimize, TileButton::MarkUnread];
+        for r in [&l.rows[1], &l.rows[2]] {
+            let got: Vec<TileButton> = r.glyphs.iter().map(|(b, _)| *b).collect();
+            assert!(!got.is_empty() && got[..] == all[..got.len()], "{got:?}");
+        }
         assert_eq!(l.rows[2].actions[0].0, TileButton::StartClaude);
         assert_eq!(l.rows[1].frame.h, l.rows[2].frame.h);
     }
