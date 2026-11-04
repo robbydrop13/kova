@@ -13,7 +13,7 @@ in `src/window/sidebar_ui.rs`.
 
 | From | What |
 |---|---|
-| Cmd+click in a pane | an http(s) link, or a `.md` / `.markdown` / `.html` / `.htm` path (relative to the pane's directory, `~/`, absolute, `file://`, a `:line[:col]` suffix ignored). Cmd+hover underlines both. Cmd+Shift+click keeps the old way: the default browser. A link of another scheme still goes to the system |
+| Cmd+click in a pane | an http(s) link, or a `.md` / `.markdown` / `.html` / `.htm` path (relative to the pane's directory, then to its parents up to `$HOME`, the nearest existing file first; `~/`, absolute, `file://`, a `:line[:col]` suffix ignored; a path the printing program broke over rows, the next row indented, counts as one, `hard_wrapped_doc_path`). Cmd+hover underlines both. Cmd+Shift+click keeps the old way: the default browser. A link of another scheme still goes to the system |
 | The ask card | Open on a `New decision` card (`kova ask --decision <url>`, or `--decisions <file.json>` for a native sheet) |
 | The Asks view | Open on a card tagged `Decision` |
 | IPC | `open-panel` with `target` (`docs/ipc.md`) |

@@ -3030,6 +3030,24 @@ impl TerminalState {
         if !docs {
             return None;
         }
+        // A path the program itself broke over two rows (a TUI wrapping its
+        // own text, the next row indented): rows of their own, joined here.
+        if first_row == last_row
+            && doc_path_span(&chars, logical_col).is_none()
+            && let Some(found) = hard_wrapped_doc_path(
+                |r| {
+                    let r = visible_row.checked_add_signed(r)?;
+                    if r != visible_row && self.visible_row_wrapped(r) {
+                        return None;
+                    }
+                    display.get(r).map(|cells| cells.iter().map(|c| c.c).collect())
+                },
+                col,
+            )
+        {
+            let segments = found.1.iter().map(|&(dr, s, e)| ((visible_row as isize + dr) as usize, s as u16, e as u16)).collect();
+            return Some((segments, found.0));
+        }
         if let Some((start, end)) = doc_path_span(&chars, logical_col) {
             let path: String = chars[start..end].iter().filter(|&&c| c != '\0').collect();
             let mut segments = Vec::new();
@@ -3111,6 +3129,90 @@ fn scroll_crossed_page(old: i32, new: i32, rows: u16) -> bool {
     new > old && new / page > old / page
 }
 
+/// A document path a program broke over rows itself (hard line breaks, the
+/// next row indented), around column `col` of row 0: `row(d)` gives the row
+/// `d` rows away (`None` past the screen, or for a row that is not on its own
+/// logical line). A piece that reaches the end of its row's text continues
+/// with the first word of the next row; one that starts its row's text
+/// continues the last word of the previous row. Up to four rows. Returns the
+/// joined path and, per row, `(row offset, start col, end col)`; `None` when
+/// the word does not span rows, or the joined word is not a document path.
+pub fn hard_wrapped_doc_path(row: impl Fn(isize) -> Option<Vec<char>>, col: usize) -> Option<(String, Vec<(isize, usize, usize)>)> {
+    let stop = |c: char| path_stop(c);
+    let text_end = |chars: &[char]| chars.iter().rposition(|&c| c != ' ' && c != '\0').map_or(0, |i| i + 1);
+    let text_start = |chars: &[char]| chars.iter().position(|&c| c != ' ' && c != '\0').unwrap_or(chars.len());
+    let here = row(0)?;
+    if col >= here.len() || stop(here[col]) {
+        return None;
+    }
+    let mut s = col;
+    while s > 0 && !stop(here[s - 1]) {
+        s -= 1;
+    }
+    let mut e = col + 1;
+    while e < here.len() && !stop(here[e]) {
+        e += 1;
+    }
+    let mut pieces: std::collections::VecDeque<(isize, usize, usize, Vec<char>)> = std::collections::VecDeque::new();
+    pieces.push_back((0, s, e, here[s..e].to_vec()));
+    // Backward: this piece opens its row, the previous row's text ends on a word.
+    while pieces.len() < 4 {
+        let (d, s, _, _) = pieces.front().cloned()?;
+        let this = row(d)?;
+        if s != text_start(&this) {
+            break;
+        }
+        let Some(prev) = row(d - 1) else { break };
+        let pe = text_end(&prev);
+        if pe == 0 || stop(prev[pe - 1]) {
+            break;
+        }
+        let mut ps = pe - 1;
+        while ps > 0 && !stop(prev[ps - 1]) {
+            ps -= 1;
+        }
+        pieces.push_front((d - 1, ps, pe, prev[ps..pe].to_vec()));
+    }
+    // Forward: this piece closes its row, the next row's text opens on a word.
+    while pieces.len() < 4 {
+        let (d, _, e, _) = pieces.back().cloned()?;
+        let this = row(d)?;
+        if e != text_end(&this) {
+            break;
+        }
+        let Some(next) = row(d + 1) else { break };
+        let ns = text_start(&next);
+        if ns >= next.len() || stop(next[ns]) {
+            break;
+        }
+        let mut ne = ns + 1;
+        while ne < next.len() && !stop(next[ne]) {
+            ne += 1;
+        }
+        pieces.push_back((d + 1, ns, ne, next[ns..ne].to_vec()));
+    }
+    if pieces.len() < 2 {
+        return None;
+    }
+    let joined: Vec<char> = pieces.iter().flat_map(|p| p.3.iter().copied()).filter(|&c| c != '\0').collect();
+    let (js, je) = doc_path_span(&joined, 0)?;
+    if js != 0 {
+        return None;
+    }
+    // Trailing punctuation trimmed off the joined word comes off the last piece.
+    let trimmed = joined.len() - je;
+    let mut segments: Vec<(isize, usize, usize)> = pieces.iter().map(|p| (p.0, p.1, p.2)).collect();
+    if let Some(last) = segments.last_mut() {
+        last.2 = last.2.saturating_sub(trimmed).max(last.1);
+    }
+    Some((joined[..je].iter().collect(), segments))
+}
+
+/// A character that ends a path word.
+fn path_stop(c: char) -> bool {
+    c <= ' ' && c != '\0' || matches!(c, '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | ',' | ';')
+}
+
 /// The span of a document path around `col` in a logical line: a word ending
 /// in `.md`, `.markdown`, `.html` or `.htm` (case-insensitive), optionally
 /// followed by a `:line` or `:line:col` suffix, which stays inside the span
@@ -3118,7 +3220,7 @@ fn scroll_crossed_page(old: i32, new: i32, rows: u16) -> bool {
 /// not a path, unless it is a `file://` one. Wide-char continuation cells
 /// (`\0`) belong to the word.
 pub fn doc_path_span(chars: &[char], col: usize) -> Option<(usize, usize)> {
-    let stop = |c: char| c <= ' ' && c != '\0' || matches!(c, '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | ',' | ';');
+    let stop = path_stop;
     if col >= chars.len() || stop(chars[col]) {
         return None;
     }
@@ -4654,6 +4756,25 @@ mod tests {
             assert_eq!(super::super::doc_path_span(&code, text.find("host").unwrap()), None);
             assert!(super::super::doc_path_span(&code, text.find("tmp").unwrap()).is_some());
             assert_eq!(super::super::doc_path_span(&code, text.rfind(".md").unwrap() + 1), None);
+        }
+
+        #[test]
+        fn a_path_a_program_wrapped_over_two_rows_is_one_path() {
+            let rows = [
+                "  Written to Claap/Product/docs/night-pr-triage-2026-11-",
+                "  04-qa-webapp-toasts.md. Next: review",
+                "  nothing here",
+            ];
+            let want = "Claap/Product/docs/night-pr-triage-2026-11-04-qa-webapp-toasts.md".to_string();
+            // Clicked on the first piece, or on the second.
+            let (p, segs) = super::super::hard_wrapped_doc_path(|r| rows.get(r as usize).map(|s| s.chars().collect()), 20).unwrap();
+            assert_eq!(p, want);
+            assert_eq!(segs, vec![(0, 13, 56), (1, 2, 24)]);
+            let (p, segs) = super::super::hard_wrapped_doc_path(|r| rows.get((1 + r) as usize).map(|s| s.chars().collect()), 5).unwrap();
+            assert_eq!(p, want);
+            assert_eq!(segs, vec![(-1, 13, 56), (0, 2, 24)]);
+            // A word that ends its row and is no document path stays alone.
+            assert_eq!(super::super::hard_wrapped_doc_path(|r| rows.get((1 + r) as usize).map(|s| s.chars().collect()), 33), None);
         }
 
         #[test]

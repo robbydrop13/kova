@@ -197,7 +197,26 @@ pub fn target_for(raw: &str, cwd: Option<&Path>, home: Option<&Path>, exists: im
     }
     let path = resolve_path(raw, cwd, home)?;
     let make = file_kind(&path)?;
-    exists(&path).then(|| make(path))
+    if exists(&path) {
+        return Some(make(path));
+    }
+    // A relative path printed from a parent folder (`Claap/Product/docs/x.md`
+    // in a pane at `~/AI directory/Claap`): the pane's ancestors, up to and
+    // including `$HOME`, the nearest existing file first.
+    let rel = strip_location(raw.strip_prefix("file://").unwrap_or(raw));
+    if rel.starts_with('/') || rel.starts_with('~') {
+        return None;
+    }
+    let (cwd, home) = (cwd?, home?);
+    if !cwd.starts_with(home) {
+        return None;
+    }
+    cwd.ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(home))
+        .map(|dir| dir.join(rel))
+        .find(|p| exists(p))
+        .map(make)
 }
 
 /// `target_for` against the real filesystem and `$HOME`.
@@ -1263,6 +1282,26 @@ mod tests {
         assert_eq!(target_for("plan.md", Some(cwd), None, |_| false), None);
         assert_eq!(target_for("plan.md", None, None, all), None);
         assert_eq!(target_for("javascript:alert(1)", Some(cwd), None, all), None);
+    }
+
+    #[test]
+    fn a_relative_path_is_also_looked_for_in_the_pane_s_ancestors_up_to_home() {
+        let home = Path::new("/Users/me");
+        let cwd = Path::new("/Users/me/AI/Claap");
+        let only = |want: &'static str| move |p: &Path| p == Path::new(want);
+        // Printed from the parent folder.
+        assert_eq!(
+            target_for("Claap/Product/docs/x.md", Some(cwd), Some(home), only("/Users/me/AI/Claap/Product/docs/x.md")),
+            Some(PanelTarget::Markdown("/Users/me/AI/Claap/Product/docs/x.md".into()))
+        );
+        // The pane's own directory wins over an ancestor.
+        let both = |p: &Path| p == Path::new("/Users/me/AI/Claap/a.md") || p == Path::new("/Users/me/AI/a.md");
+        assert_eq!(target_for("a.md:3", Some(cwd), Some(home), both), Some(PanelTarget::Markdown("/Users/me/AI/Claap/a.md".into())));
+        // Then the nearest ancestor, $HOME included, nothing above it.
+        assert_eq!(target_for("n.md", Some(cwd), Some(home), only("/Users/me/n.md")), Some(PanelTarget::Markdown("/Users/me/n.md".into())));
+        assert_eq!(target_for("n.md", Some(cwd), Some(home), only("/Users/n.md")), None);
+        // A pane outside $HOME looks in its own directory only.
+        assert_eq!(target_for("n.md", Some(Path::new("/tmp/x")), Some(home), only("/tmp/n.md")), None);
     }
 
     #[test]
