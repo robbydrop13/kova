@@ -276,10 +276,48 @@ impl KovaView {
                 }
             }
         }
-        if !rect_eq(self.frame(), my_frame) {
+        let resized = !rect_eq(self.frame(), my_frame);
+        if resized {
+            // Before the frame changes: the resize reads the pinned widths.
+            self.side_panel_pins(panel_frame.map(|f| f.size.width), my_frame.size.width);
             self.setFrame(my_frame);
+            let screen_w = self.drawable_viewport().width;
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            if let Some(tab) = tabs.get_mut(self.ivars().active_tab.get()) {
+                let focused = tab.focused_pane;
+                self.scroll_to_reveal_pane(tab, focused, screen_w);
+            }
         }
         self.mark_dirty();
+    }
+
+    /// The side panel does not squash the panes: while it is open, every tab
+    /// keeps the width it would have without it and scrolls horizontally
+    /// (`panel_pin`). A width the user set themselves is left alone; the pins
+    /// Kova set come off when the panel closes.
+    fn side_panel_pins(&self, panel_w: Option<f64>, term_w: f64) {
+        let min_w = self.ivars().config.get().map(|c| c.splits.min_width).unwrap_or(300.0);
+        let scale = self.backing_scale();
+        let wide = (term_w + panel_w.unwrap_or(0.0)) as f32;
+        let mut pins = self.ivars().panel_pins.borrow_mut();
+        let mut tabs = self.ivars().tabs.borrow_mut();
+        let mut next = Vec::new();
+        for tab in tabs.iter_mut() {
+            let ours = pins.iter().find(|(id, _)| *id == tab.id).map(|(_, v)| *v);
+            let now = tab.virtual_width_override;
+            let wide_vw = {
+                tab.virtual_width_override = 0.0;
+                let vw = tab.virtual_width(wide, min_w);
+                tab.virtual_width_override = now;
+                vw
+            };
+            let (set, keep) = panel_pin(now, ours, wide_vw, term_w as f32, scale, panel_w.is_some());
+            tab.virtual_width_override = set;
+            if let Some(v) = keep {
+                next.push((tab.id, v));
+            }
+        }
+        *pins = next;
     }
 
     /// Show `target` in this window's side panel.
@@ -1418,6 +1456,25 @@ fn split_frames(
     (s.sidebar, sidebar_frame, my_frame, s.panel.map(|(x, w)| rect(x, w)))
 }
 
+/// One tab's width override as the side panel opens, resizes or closes:
+/// `(override, pin)`, the pin being the override Kova set and must undo later.
+/// `now` is the tab's override, `ours` the pin Kova set last time, `wide_vw`
+/// the tab's width without the panel (logical points, like `term_w`).
+fn panel_pin(now: f32, ours: Option<f32>, wide_vw: f32, term_w: f32, scale: f32, open: bool) -> (f32, Option<f32>) {
+    let mine = ours.is_some_and(|v| (now - v).abs() < 0.5);
+    if now > 0.0 && !mine {
+        return (now, None);
+    }
+    let unpinned = if mine { 0.0 } else { now };
+    if !open {
+        return (unpinned, None);
+    }
+    match crate::pane::pinned_virtual_width(wide_vw, term_w, scale) {
+        Some(px) => (px, Some(px)),
+        None => (unpinned, None),
+    }
+}
+
 /// The room right of the sidebar in the window `view` sits in: what the
 /// panel's fraction is a share of.
 pub(super) fn room_right_of_sidebar(view: &objc2_app_kit::NSView) -> f64 {
@@ -1536,6 +1593,23 @@ mod tests {
 
     fn bounds(w: f64, h: f64) -> CGRect {
         CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w, height: h } }
+    }
+
+    #[test]
+    fn the_panel_pins_the_width_the_tab_had_without_it() {
+        // 1600 pt of terminal, the panel takes 800: the tab keeps 1600 pt (3200 px at 2x).
+        assert_eq!(panel_pin(0.0, None, 1600.0, 800.0, 2.0, true), (3200.0, Some(3200.0)));
+        // Dragging the panel: the pin follows the width without the panel.
+        assert_eq!(panel_pin(3200.0, Some(3200.0), 1700.0, 700.0, 2.0, true), (3400.0, Some(3400.0)));
+        // Closing it takes Kova's pin off.
+        assert_eq!(panel_pin(3400.0, Some(3400.0), 1700.0, 1700.0, 2.0, false), (0.0, None));
+    }
+
+    #[test]
+    fn the_panel_leaves_a_width_the_user_set_alone() {
+        assert_eq!(panel_pin(5000.0, None, 1600.0, 800.0, 2.0, true), (5000.0, None));
+        // Pinned by Kova, then changed by the user (a split, a resize): theirs now.
+        assert_eq!(panel_pin(4000.0, Some(3200.0), 1600.0, 800.0, 2.0, false), (4000.0, None));
     }
 
     #[test]

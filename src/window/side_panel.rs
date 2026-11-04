@@ -925,23 +925,118 @@ define_class!(
     }
 
     unsafe impl WKUIDelegate for PanelWebDelegate {
-        /// A link that asks for a new window (`target=_blank`, `window.open`)
-        /// opens in the panel itself: it has one page.
+        /// A page that opens a window. A plain `target=_blank` link (no
+        /// script waiting on it) opens in the panel itself. A `window.open`
+        /// (a sign-in with Google, an OAuth consent) gets a real popup window,
+        /// built on the configuration WebKit hands over: that is what keeps
+        /// `window.opener`, through which the popup reports the login back to
+        /// the page. The popup shares the panel's persistent data store.
         #[unsafe(method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
         fn create_web_view(
             &self,
             web_view: &WKWebView,
-            _configuration: &WKWebViewConfiguration,
+            configuration: &WKWebViewConfiguration,
             action: &WKNavigationAction,
-            _features: &WKWindowFeatures,
+            features: &WKWindowFeatures,
         ) -> *mut WKWebView {
-            if unsafe { action.targetFrame() }.is_none() {
+            let mtm = MainThreadMarker::from(self);
+            let size = popup_size(
+                unsafe { features.width() }.map(|n| n.doubleValue()),
+                unsafe { features.height() }.map(|n| n.doubleValue()),
+            );
+            let is_link = unsafe { action.navigationType() } == WKNavigationType::LinkActivated;
+            if is_link && size.is_none() {
                 unsafe { web_view.loadRequest(&action.request()) };
+                return std::ptr::null_mut();
             }
-            std::ptr::null_mut()
+            let (w, h) = size.unwrap_or(POPUP_DEFAULT);
+            open_popup(mtm, self, web_view, configuration, w, h)
+        }
+
+        /// The popup closed itself (`window.close()`, the end of a sign-in).
+        #[unsafe(method(webViewDidClose:))]
+        fn web_view_did_close(&self, web_view: &WKWebView) {
+            close_popup(web_view);
         }
     }
 );
+
+/// A popup's size when the page gives none.
+const POPUP_DEFAULT: (f64, f64) = (520.0, 680.0);
+
+/// The size a page asked for its popup, kept on screen: `None` when it asked
+/// for none (a plain link).
+fn popup_size(w: Option<f64>, h: Option<f64>) -> Option<(f64, f64)> {
+    if w.is_none() && h.is_none() {
+        return None;
+    }
+    let clamp = |v: Option<f64>, d: f64| v.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(d).clamp(320.0, 1200.0);
+    Some((clamp(w, POPUP_DEFAULT.0), clamp(h, POPUP_DEFAULT.1)))
+}
+
+thread_local! {
+    /// The popups open now, kept alive until they close.
+    static POPUPS: RefCell<Vec<(Retained<objc2_app_kit::NSWindow>, Retained<WKWebView>)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn open_popup(
+    mtm: MainThreadMarker,
+    delegate: &PanelWebDelegate,
+    opener: &WKWebView,
+    configuration: &WKWebViewConfiguration,
+    w: f64,
+    h: f64,
+) -> *mut WKWebView {
+    use objc2_app_kit::{NSBackingStoreType, NSWindow, NSWindowStyleMask};
+    // Drop the popups the user closed by hand.
+    POPUPS.with(|p| p.borrow_mut().retain(|(win, _)| win.isVisible()));
+    let frame = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w, height: h } };
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            mtm.alloc(),
+            frame,
+            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe { window.setReleasedWhenClosed(false) };
+    let web = unsafe { WKWebView::initWithFrame_configuration(mtm.alloc(), frame, configuration) };
+    web.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+    unsafe {
+        web.setNavigationDelegate(Some(ProtocolObject::from_ref(delegate)));
+        web.setUIDelegate(Some(ProtocolObject::from_ref(delegate)));
+        web.setInspectable(true);
+    }
+    window.setContentView(Some(&web));
+    // Over the window it came from.
+    match opener.window() {
+        Some(parent) => {
+            let pf = parent.frame();
+            window.setFrameOrigin(CGPoint {
+                x: pf.origin.x + (pf.size.width - w) / 2.0,
+                y: pf.origin.y + (pf.size.height - h) / 2.0,
+            });
+        }
+        None => window.center(),
+    }
+    window.makeKeyAndOrderFront(None);
+    let ptr = Retained::as_ptr(&web) as *mut WKWebView;
+    POPUPS.with(|p| p.borrow_mut().push((window, web)));
+    log::info!("side panel: opened a popup window ({w}x{h})");
+    ptr
+}
+
+fn close_popup(web: &WKWebView) {
+    let found = POPUPS.with(|p| {
+        let mut p = p.borrow_mut();
+        let i = p.iter().position(|(_, v)| std::ptr::eq(&**v, web))?;
+        Some(p.remove(i))
+    });
+    if let Some((window, _web)) = found {
+        window.close();
+    }
+}
 
 /// The panel a web view sits in.
 fn panel_of(web: &WKWebView) -> Option<Retained<SidePanelView>> {
@@ -962,6 +1057,14 @@ mod tests {
         assert!(s.sidebar);
         assert_eq!(s.panel, Some((1600.0 - 660.0, 660.0)));
         assert_eq!((s.term_x, s.term_w), (280.0, 660.0));
+    }
+
+    #[test]
+    fn a_popup_keeps_the_size_asked_within_the_screen() {
+        assert_eq!(popup_size(None, None), None, "a plain link: no popup");
+        assert_eq!(popup_size(Some(500.0), Some(600.0)), Some((500.0, 600.0)));
+        assert_eq!(popup_size(Some(5000.0), None), Some((1200.0, POPUP_DEFAULT.1)));
+        assert_eq!(popup_size(Some(10.0), Some(f64::NAN)), Some((320.0, POPUP_DEFAULT.1)));
     }
 
     #[test]

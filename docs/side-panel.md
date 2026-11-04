@@ -39,6 +39,12 @@ not fit, the sidebar yields first, then the panel. Dragging the edge sets the
 share live; it is saved on mouse up as `panel_fraction` in
 `~/.config/kova/prefs.json`. Closing keeps the page: the toggle brings it back.
 
+The panel never squashes the panes: while it is open, each tab keeps the
+width it has without it (`virtual_width_override` pinned, `panel_pin` in
+`sidebar_ui.rs`) and scrolls horizontally; the focused pane is scrolled into
+view. A width the user set themselves is left alone, and Kova's pins come off
+when the panel closes.
+
 ## Web content
 
 - WebKit's default data store, persistent: a login made in the panel stays
@@ -46,9 +52,11 @@ share live; it is saved on mouse up as `panel_fraction` in
   password or approves a consent screen.
 - The user agent ends with Safari's tokens, so sites treat the panel as
   Safari.
-- A link that asks for a new window opens in the panel itself. A sign-in that
-  needs a real popup (some Google flows) may not work there: use the site's
-  email login, or open the page in the browser.
+- A plain `target=_blank` link opens in the panel itself. A `window.open`
+  (Sign in with Google, an OAuth consent) gets a real popup window built on
+  the configuration WebKit hands over, so `window.opener` works and the login
+  reaches the page; it closes itself at the end (`webViewDidClose:`) and
+  shares the panel's data store.
 - `mailto:`, `slack:` and other schemes go to the system only when the user
   clicked a link in the main frame; a page that redirects to one on its own is
   cancelled (logged). A clicked `file://` link to a markdown file is rendered

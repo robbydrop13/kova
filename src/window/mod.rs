@@ -85,6 +85,9 @@ pub struct KovaViewIvars {
     /// alone cannot say that, and it may change on a later event than the move
     /// (see `handle_resize`).
     last_screen_w: Cell<f32>,
+    /// The tabs whose width Kova pinned when the side panel opened, with the
+    /// override it set (`side_panel_pins`): undone when the panel closes.
+    panel_pins: RefCell<Vec<(crate::pane::TabId, f32)>>,
     /// A `resize_all_panes` is due at the start of the next frame
     /// (`request_resize_all_panes`).
     resize_pending: Cell<bool>,
@@ -1188,6 +1191,7 @@ impl KovaView {
             metal_layer: OnceCell::new(),
             last_scale: Cell::new(0.0),
             last_screen_w: Cell::new(0.0),
+            panel_pins: RefCell::new(Vec::new()),
             resize_pending: Cell::new(false),
             subject_strip_shown: Cell::new(false),
             offscreen_resize_stale: Cell::new(None),
