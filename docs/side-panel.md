@@ -18,6 +18,7 @@ in `src/window/sidebar_ui.rs`.
 | The Asks view | Open on a card tagged `Decision` |
 | IPC | `open-panel` with `target` (`docs/ipc.md`) |
 | View > Side Panel, Cmd+Option+B (`toggle_side_panel`, `toggle-side-panel`) | hides it, or brings back the last page |
+| View > Panel History, Cmd+Option+Y (`panel_history`, `panel-history`), or the header's clock button | the list of what the panel opened lately, opening the panel if closed |
 
 A library host's panes keep `url_at` (URLs only): path links are Kova.app's
 (`TerminalState::link_at`).
@@ -27,7 +28,8 @@ A library host's panes keep `url_at` (URLs only): path links are Kova.app's
 Header 38 pt (the sidebar's top row): the page title and, for a web page,
 always its host (`Claude · claude.ai`, `header_title`), so a page cannot pass
 for another site by its title alone; Inter 13 medium. Then
-three ghost buttons at the right, 26 pt square, radius 6: back (disabled when
+four ghost buttons at the right, 26 pt square, radius 6: history (lit while
+the history shows), back (disabled when
 there is nothing to go back to), open in the default browser (the URL the
 panel is on now, or the file), close. A double click on the header zooms the
 window, a drag moves it. A 1 pt `b3` separator down the left edge, a 5 pt
@@ -66,6 +68,19 @@ when the panel closes.
   Cmd+A/C/V/X/Z are routed to it (Kova has no Edit menu). Only three Kova
   shortcuts stay Kova's there: the side panel toggle, the sidebar toggle and
   Cmd+J.
+
+## History
+
+Every page, artifact, markdown or HTML file and decision sheet the panel
+opens goes to the top of its history (`src/window/panel_history.rs`, pure and
+tested): one entry per target, its title once the page names itself, the time
+it was opened, at most 50, in `~/.config/kova/panel-history.json` (written
+atomically, re-read on launch keeping only what the panel would open: http(s)
+URLs, absolute paths, plain question ids). The history page lists them most
+recent first (name, host or `~/` path, `12 min ago`), each a
+`kova-history:<n>` link the panel catches: a click opens the entry again. The
+page has no script. A sheet already answered reopens on its "no longer
+waiting" page.
 
 ## Decision sheets
 

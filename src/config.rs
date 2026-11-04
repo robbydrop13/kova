@@ -552,6 +552,8 @@ pub struct KeysConfig {
     pub toggle_sidebar: String,
     /// Show or hide the side panel (the web view at the right).
     pub toggle_side_panel: String,
+    /// The side panel on its history of what it opened.
+    pub panel_history: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -626,6 +628,7 @@ impl Default for KeysConfig {
             history_forward: "cmd+shift+option+right".into(),
             toggle_sidebar: "cmd+option+s".into(),
             toggle_side_panel: "cmd+option+b".into(),
+            panel_history: "cmd+option+y".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

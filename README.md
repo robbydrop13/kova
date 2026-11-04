@@ -25,7 +25,7 @@ Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that w
 
 ### Clickable URLs and the side panel
 
-Cmd+hover highlights URLs and `.md` / `.html` paths with an underline and pointer cursor. Cmd+click opens them in the side panel, a web view at the right of the window (Cmd+Shift+click: the default browser). The panel keeps its logins across launches, renders markdown in the window's colours and follows the file as it changes; Cmd+Option+B shows or hides it. See [`docs/side-panel.md`](docs/side-panel.md).
+Cmd+hover highlights URLs and `.md` / `.html` paths with an underline and pointer cursor. Cmd+click opens them in the side panel, a web view at the right of the window (Cmd+Shift+click: the default browser). The panel keeps its logins across launches, renders markdown in the window's colours and follows the file as it changes; Cmd+Option+B shows or hides it; its clock button (Cmd+Option+Y) lists what it opened lately, kept across launches. See [`docs/side-panel.md`](docs/side-panel.md).
 
 ### Scrollback search
 

@@ -327,6 +327,13 @@ impl KovaView {
         }
     }
 
+    /// The side panel on its history list, opened if closed.
+    pub(super) fn show_panel_history(&self) {
+        if let Some(panel) = self.ivars().side_panel.get() {
+            panel.show_history();
+        }
+    }
+
     /// A decision sheet was answered: a panel showing it shows what was sent.
     pub(crate) fn side_panel_sheet_closed(&self, id: &str, title: &str, summary: Option<&str>) {
         if let Some(panel) = self.ivars().side_panel.get() {

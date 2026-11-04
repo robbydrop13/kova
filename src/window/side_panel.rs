@@ -111,6 +111,8 @@ pub enum PanelTarget {
     /// A decision sheet Kova renders itself (`kova ask --decisions`), by
     /// the id of its question.
     Sheet(String),
+    /// What the panel opened lately (`panel_history`).
+    History,
 }
 
 impl PanelTarget {
@@ -122,6 +124,7 @@ impl PanelTarget {
                 p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
             }
             PanelTarget::Sheet(_) => "Decision".to_string(),
+            PanelTarget::History => "History".to_string(),
         }
     }
 
@@ -139,7 +142,7 @@ impl PanelTarget {
         match self {
             PanelTarget::Web(url) => url.clone(),
             PanelTarget::Markdown(p) | PanelTarget::Html(p) => p.to_string_lossy().into_owned(),
-            PanelTarget::Sheet(_) => String::new(),
+            PanelTarget::Sheet(_) | PanelTarget::History => String::new(),
         }
     }
 }
@@ -290,6 +293,7 @@ pub fn fraction_for(panel_w: f64, room: f64) -> f32 {
 pub enum PanelHit {
     #[default]
     None,
+    History,
     Back,
     External,
     Close,
@@ -300,21 +304,23 @@ pub enum PanelHit {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeaderLayout {
     pub title: Rect,
+    pub history: Rect,
     pub back: Rect,
     pub external: Rect,
     pub close: Rect,
 }
 
 impl HeaderLayout {
-    /// The header of a panel `w` wide: the three ghost buttons at the right
-    /// (back, open in the browser, close), the title on the rest.
+    /// The header of a panel `w` wide: the four ghost buttons at the right
+    /// (history, back, open in the browser, close), the title on the rest.
     pub fn new(w: f64) -> Self {
         let y = (HEADER_H - BTN_H) / 2.0;
         let close = Rect::new(w - PAD_RIGHT - BTN_W, y, BTN_W, BTN_H);
         let external = Rect::new(close.x - BTN_GAP - BTN_W, y, BTN_W, BTN_H);
         let back = Rect::new(external.x - BTN_GAP - BTN_W, y, BTN_W, BTN_H);
-        let title = Rect::new(TITLE_X, 0.0, (back.x - 8.0 - TITLE_X).max(0.0), HEADER_H);
-        HeaderLayout { title, back, external, close }
+        let history = Rect::new(back.x - BTN_GAP - BTN_W, y, BTN_W, BTN_H);
+        let title = Rect::new(TITLE_X, 0.0, (history.x - 8.0 - TITLE_X).max(0.0), HEADER_H);
+        HeaderLayout { title, history, back, external, close }
     }
 
     /// What a point of the panel (flipped, panel coordinates) is on.
@@ -331,6 +337,8 @@ impl HeaderLayout {
             PanelHit::External
         } else if self.back.contains(x, y) {
             PanelHit::Back
+        } else if self.history.contains(x, y) {
+            PanelHit::History
         } else {
             PanelHit::None
         }
@@ -609,6 +617,7 @@ define_class!(
             let (x, y) = self.local(event);
             if pressed != PanelHit::None && self.header().hit(x, y) == pressed {
                 match pressed {
+                    PanelHit::History => self.show_history(),
                     PanelHit::Back => self.go_back(),
                     PanelHit::External => self.open_externally(),
                     PanelHit::Close => self.close(),
@@ -677,7 +686,14 @@ impl SidePanelView {
                 // whose script may post to Kova (`did_receive_script_message`).
                 unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
             }
+            PanelTarget::History => {
+                let html = super::panel_history::page();
+                unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
+            }
         }
+        let title = self.ivars().title.borrow().clone();
+        let fallback = target.fallback_title();
+        super::panel_history::record(&target, if title == fallback { "" } else { &title });
         *self.ivars().current.borrow_mut() = Some(target);
         self.ivars().open.set(true);
         self.relayout();
@@ -693,6 +709,12 @@ impl SidePanelView {
         let Some(web) = self.ivars().web.get() else { return };
         let html = crate::decision_sheet::render_closed(title, summary, tokens::get());
         unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
+    }
+
+    /// The panel's history list, opening the panel on it (the header's clock
+    /// button, View > Panel History).
+    pub fn show_history(&self) {
+        self.open_target(PanelTarget::History);
     }
 
     /// The id of the sheet the panel shows, if it shows one.
@@ -735,6 +757,10 @@ impl SidePanelView {
         let host = unsafe { web.URL() }.and_then(|u| u.absoluteString()).map(|s| s.to_string());
         if let Some(title) = header_title(page.as_deref(), host.as_deref()) {
             if *self.ivars().title.borrow() != title {
+                if let Some(current) = self.ivars().current.borrow().as_ref() {
+                    // The page's own name, without the host the header adds.
+                    super::panel_history::retitle(current, page.as_deref().unwrap_or(&title));
+                }
                 *self.ivars().title.borrow_mut() = title;
                 self.setNeedsDisplay(true);
             }
@@ -865,7 +891,7 @@ impl SidePanelView {
         let url = match (live, current) {
             (Some(url), _) => NSURL::URLWithString(&NSString::from_str(&url)),
             (None, Some(PanelTarget::Web(url))) => NSURL::URLWithString(&NSString::from_str(&url)),
-            (None, Some(PanelTarget::Sheet(_))) => None,
+            (None, Some(PanelTarget::Sheet(_) | PanelTarget::History)) => None,
             (None, Some(target)) => Some(NSURL::fileURLWithPath(&NSString::from_str(&target.external()))),
             (None, None) => None,
         };
@@ -887,17 +913,21 @@ impl SidePanelView {
         let hovered = self.ivars().hovered.get();
         let pressed = self.ivars().pressed.get();
         let back_enabled = self.can_go_back();
+        let on_history = matches!(self.ivars().current.borrow().as_ref(), Some(PanelTarget::History));
         for (hit, rect, icon) in [
+            (PanelHit::History, header.history, Icon::Clock),
             (PanelHit::Back, header.back, Icon::ChevronLeft),
             (PanelHit::External, header.external, Icon::Open),
             (PanelHit::Close, header.close, Icon::X),
         ] {
             let enabled = hit != PanelHit::Back || back_enabled;
             let hot = enabled && (hovered == hit || pressed == hit);
-            if hot {
+            // The history button stays lit while the history shows.
+            let on = hit == PanelHit::History && on_history;
+            if hot || on {
                 fill_round(&rect, BTN_RADIUS, p.white, if pressed == hit { 0.16 } else { 0.10 });
             }
-            let ink = if hot { p.text_primary } else { p.text_tertiary };
+            let ink = if hot || on { p.text_primary } else { p.text_tertiary };
             stroke_icon(icon, &rect, BTN_ICON, ink, if enabled { 1.0 } else { 0.35 });
         }
     }
@@ -966,8 +996,21 @@ define_class!(
             let clicked = unsafe { action.navigationType() } == WKNavigationType::LinkActivated
                 && unsafe { action.targetFrame() }.is_none_or(|f| unsafe { f.isMainFrame() });
             let scheme = url.as_deref().and_then(|u| u.scheme()).map(|s| s.to_string().to_ascii_lowercase());
-            let on_sheet = panel_of(web_view).is_some_and(|p| p.sheet_id().is_some());
+            let panel = panel_of(web_view);
+            let on_sheet = panel.as_ref().is_some_and(|p| p.sheet_id().is_some());
+            let on_history = panel.as_ref().is_some_and(|p| matches!(p.ivars().current.borrow().as_ref(), Some(PanelTarget::History)));
             let policy = match (scheme.as_deref(), url.as_deref()) {
+                // An entry of the history page: open it again.
+                (Some(super::panel_history::LINK_SCHEME), Some(u)) => {
+                    let index = u.resourceSpecifier().and_then(|s| s.to_string().parse::<usize>().ok());
+                    if on_history
+                        && clicked
+                        && let (Some(panel), Some(target)) = (panel.as_ref(), index.and_then(super::panel_history::entry))
+                    {
+                        panel.open_target(target);
+                    }
+                    WKNavigationActionPolicy::Cancel
+                }
                 // The sheet stays the panel's page: its links open in the browser.
                 (Some("http" | "https"), Some(u)) if on_sheet && clicked => {
                     NSWorkspace::sharedWorkspace().openURL(u);
@@ -1247,6 +1290,8 @@ mod tests {
         assert_eq!(h.hit(h.close.x + 4.0, h.close.y + 4.0), PanelHit::Close);
         assert_eq!(h.hit(h.back.x + 4.0, h.back.y + 4.0), PanelHit::Back);
         assert_eq!(h.hit(h.external.x + 4.0, h.external.y + 4.0), PanelHit::External);
+        assert_eq!(h.hit(h.history.x + 4.0, h.history.y + 4.0), PanelHit::History);
+        assert!(h.history.right() < h.back.x && h.title.right() < h.history.x);
         assert_eq!(h.hit(100.0, 10.0), PanelHit::None);
         assert_eq!(h.hit(h.close.x + 4.0, HEADER_H + 4.0), PanelHit::None);
         assert!(h.title.right() < h.back.x);

@@ -1846,6 +1846,21 @@ fn setup_menu(mtm: MainThreadMarker, config: &Config) {
         }
         view_menu.addItem(&item);
     }
+    {
+        let (key_eq, mask) = menu_key_equivalent(&config.keys.panel_history);
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &NSString::from_str("Panel History"),
+                Some(objc2::sel!(panelHistoryFromMenu:)),
+                &NSString::from_str(&key_eq),
+            )
+        };
+        if !key_eq.is_empty() {
+            item.setKeyEquivalentModifierMask(mask);
+        }
+        view_menu.addItem(&item);
+    }
     view_menu_item.setSubmenu(Some(&view_menu));
     menu_bar.addItem(&view_menu_item);
 

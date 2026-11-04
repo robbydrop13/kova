@@ -81,6 +81,8 @@ pub enum Action {
     ToggleSidebar,
     /// Show or hide the side panel at the right.
     ToggleSidePanel,
+    /// The side panel on its list of what it opened lately.
+    PanelHistory,
     /// Cmd+U: the focused pane's unread mark.
     ToggleUnread,
 }
@@ -371,6 +373,7 @@ impl Keybindings {
         bind(&keys.history_forward, Action::HistoryForward);
         bind(&keys.toggle_sidebar, Action::ToggleSidebar);
         bind(&keys.toggle_side_panel, Action::ToggleSidePanel);
+        bind(&keys.panel_history, Action::PanelHistory);
         bind(&keys.toggle_unread, Action::ToggleUnread);
 
         // Hard-coded debug binding (not user-configurable)
@@ -476,6 +479,7 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "history-forward" => Action::HistoryForward,
         "toggle-sidebar" => Action::ToggleSidebar,
         "toggle-side-panel" => Action::ToggleSidePanel,
+        "panel-history" => Action::PanelHistory,
         "toggle-unread" => Action::ToggleUnread,
 
         _ => return None,

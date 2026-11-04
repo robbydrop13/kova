@@ -24,6 +24,7 @@ mod sidebar_ui;
 pub(super) mod sidebar_sched;
 mod sidebar_view;
 pub(crate) mod side_panel;
+pub(crate) mod panel_history;
 use sidebar_ui::SidebarState;
 mod switcher;
 mod tabs;
@@ -652,7 +653,7 @@ define_class!(
             if in_panel
                 && !matches!(
                     keybindings.window_map.get(&combo),
-                    Some(Action::ToggleSidePanel | Action::ToggleSidebar | Action::NextAttention)
+                    Some(Action::ToggleSidePanel | Action::PanelHistory | Action::ToggleSidebar | Action::NextAttention)
                 )
             {
                 return objc2::runtime::Bool::NO;
@@ -1017,6 +1018,12 @@ define_class!(
         #[unsafe(method(toggleSidePanelFromMenu:))]
         fn toggle_side_panel_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
             self.toggle_side_panel();
+        }
+
+        /// View menu: `Panel History` (Cmd+Option+Y).
+        #[unsafe(method(panelHistoryFromMenu:))]
+        fn panel_history_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
+            self.show_panel_history();
         }
 
         #[unsafe(method(renamePaneFromMenu:))]
@@ -1925,6 +1932,7 @@ impl KovaView {
             Action::HistoryForward => do_history_step(true),
             Action::ToggleSidebar => self.toggle_layout_mode(),
             Action::ToggleSidePanel => self.toggle_side_panel(),
+            Action::PanelHistory => self.show_panel_history(),
             Action::PrevTab => self.do_switch_tab_relative(-1),
             Action::NextTab => self.do_switch_tab_relative(1),
             Action::RenameTab => self.start_rename_tab(),

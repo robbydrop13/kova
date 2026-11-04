@@ -344,7 +344,10 @@ Shows a page at the right of the front Kova window: an http(s) URL, or an absolu
 an existing `.md` (rendered by Kova, raw HTML shown as text, re-rendered when the file changes) or
 `.html` file. The panel keeps its logins across launches. The user gets the same thing with
 Cmd+click on a link or a `.md` / `.html` path in a pane (Cmd+Shift+click keeps the browser), and
-toggles it with Cmd+Option+B (`dispatch-action` `toggle-side-panel`). It brings the window forward:
+toggles it with Cmd+Option+B (`dispatch-action` `toggle-side-panel`). Everything the panel opened is
+in its history (the header's clock button, Cmd+Option+Y, `dispatch-action` `panel-history`, kept in
+`~/.config/kova/panel-history.json`): to point the user back to a file, name it there rather than
+reopening it. It brings the window forward:
 open it when the user asked to see something, not on your own. Kova.app only.
 
 ## Traps and rules of conduct
