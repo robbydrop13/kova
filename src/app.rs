@@ -382,8 +382,18 @@ impl AppDelegate {
                         asks.refresh_card(MainThreadMarker::new_unchecked());
                     }
                     // Decision sheets opened from the card: the front window's side panel.
-                    for link in crate::ask_card::take_panel_opens() {
-                        open_in_front_panel(&ivars.windows, window::side_panel::PanelTarget::from_link(&link));
+                    let opens = crate::ask_card::take_panel_opens();
+                    if !opens.is_empty() {
+                        {
+                            let mut asks = ivars.asks.borrow_mut();
+                            for (id, _) in &opens {
+                                asks.opened_in_panel(id);
+                            }
+                            asks.refresh_card(MainThreadMarker::new_unchecked());
+                        }
+                        for (_, link) in opens {
+                            open_in_front_panel(&ivars.windows, window::side_panel::PanelTarget::from_link(&link));
+                        }
                     }
                     // Answers posted by a decision sheet in a side panel.
                     let posts = window::side_panel::take_sheet_posts();

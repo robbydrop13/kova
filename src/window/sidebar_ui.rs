@@ -1027,9 +1027,9 @@ impl KovaView {
             focus_pane_anywhere(pane_id);
         }
         if let AsksHit::OpenDoc(key) = hit {
-            let url = self.ivars().sidebar.borrow().asks.card(key).and_then(|card| card.decision_url.clone());
-            if let Some(url) = url {
-                self.open_in_side_panel(super::side_panel::PanelTarget::from_link(&url));
+            let open = self.ivars().sidebar.borrow().asks.card(key).and_then(|card| Some((card.id.clone(), card.decision_url.clone()?)));
+            if let Some((id, url)) = open {
+                crate::ask_card::open_in_panel(id, url);
             }
         }
     }

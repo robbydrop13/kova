@@ -109,7 +109,7 @@ static ANSWERS: Mutex<Vec<CardAnswer>> = Mutex::new(Vec::new());
 /// Snoozes chosen since the last [`take_snoozes`], same reasoning as `ANSWERS`.
 static SNOOZES: Mutex<Vec<CardSnooze>> = Mutex::new(Vec::new());
 /// Decision sheets the user asked to open, since the last [`take_panel_opens`].
-static PANEL_OPENS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static PANEL_OPENS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// The card, built on the first `show`. Kept for the life of the process:
@@ -224,12 +224,10 @@ define_class!(
         #[unsafe(method(openDecision:))]
         fn open_decision(&self, _sender: &NSButton) {
             let Some(card) = card() else { return };
-            let url = card.current.borrow().as_ref().and_then(|c| c.decision_url.clone());
-            if let Some(url) = url {
+            let open = card.current.borrow().as_ref().and_then(|c| Some((c.id.clone(), c.decision_url.clone()?)));
+            if let Some((id, url)) = open {
                 log::info!("Ask card: open decision {}", url);
-                if let Ok(mut opens) = PANEL_OPENS.lock() {
-                    opens.push(url);
-                }
+                open_in_panel(id, url);
             }
         }
 
@@ -877,9 +875,18 @@ pub fn take_answers() -> Vec<CardAnswer> {
     }
 }
 
+/// Queue question `id`'s sheet (`link`) for the front window's side panel.
+/// Opened, it leaves the floating card: it is answered on the sheet, and
+/// stays in the sidebar's Asks.
+pub fn open_in_panel(id: String, link: String) {
+    if let Ok(mut opens) = PANEL_OPENS.lock() {
+        opens.push((id, link));
+    }
+}
+
 /// Decision sheets the user clicked Open on since the last call: the tick
 /// shows each in the front window's side panel.
-pub fn take_panel_opens() -> Vec<String> {
+pub fn take_panel_opens() -> Vec<(String, String)> {
     match PANEL_OPENS.lock() {
         Ok(mut opens) => std::mem::take(&mut *opens),
         Err(_) => Vec::new(),

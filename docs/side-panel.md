@@ -86,6 +86,11 @@ loses nothing. Done answers the question with the summary and the panel shows
 what was sent. A link in the sheet opens in the default browser: the sheet
 stays the panel's page.
 
+Open (on the floating card or in the Asks view) takes the decision off the
+floating card, which moves on to the next question: it is answered on the
+sheet, and stays in the sidebar's Asks until then. Not kept across a restart:
+a relaunch puts it back on the card.
+
 ## Markdown
 
 Rendered by Kova (`pulldown-cmark`: tables, task lists, strikethrough,

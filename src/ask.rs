@@ -979,6 +979,9 @@ pub struct Board {
     owner_tried: std::time::Instant,
     /// The card must be redrawn on the next tick.
     dirty: bool,
+    /// Decisions opened in the side panel: off the floating card, answered
+    /// on their sheet (still in the sidebar's Asks). Not kept across a restart.
+    opened: std::collections::HashSet<String>,
 }
 
 impl Board {
@@ -995,7 +998,7 @@ impl Board {
             );
         }
         OWNS_STORE.store(owner.is_some(), std::sync::atomic::Ordering::Relaxed);
-        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false }
+        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default() }
     }
 
     /// A Kova that started while another held the lock takes it over once that
@@ -1113,6 +1116,7 @@ impl Board {
         let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return false };
         let (question, responder) = self.pending.remove(index);
         self.dirty = true;
+        self.opened.remove(id);
         // A sheet answers with its summary, whichever way it was closed: a
         // choice on the card (one decision), or Done with what the sheet holds.
         let (action, text) = match &question.sheet {
@@ -1142,6 +1146,14 @@ impl Board {
             spawn_late(self.store.clone(), question, answer);
         }
         true
+    }
+
+    /// The user opened `id`'s sheet in the side panel: the floating card lets
+    /// it go and shows the next question, if any.
+    pub fn opened_in_panel(&mut self, id: &str) {
+        if self.pending.iter().any(|(q, _)| q.id == id) && self.opened.insert(id.to_string()) {
+            self.dirty = true;
+        }
     }
 
     /// The answers given so far on a sheet, kept with its question (on disk
@@ -1280,7 +1292,7 @@ impl Board {
         let now = now_epoch();
         // Snoozed questions leave the card entirely, the queue count included:
         // "2 more" must not count what the user has put off.
-        let due: Vec<&Question> = self.pending.iter().map(|(q, _)| q).filter(|q| q.due(now)).collect();
+        let due: Vec<&Question> = self.pending.iter().map(|(q, _)| q).filter(|q| q.due(now) && !self.opened.contains(&q.id)).collect();
         let head = due.first().copied();
         let buttons = head.map(|q| q.buttons()).unwrap_or_default();
         let link = head.and_then(|q| q.panel_link());
@@ -2217,7 +2229,7 @@ mod tests {
     fn board_with(q: Question) -> (Board, std::sync::mpsc::Receiver<crate::ipc::IpcResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = std::env::temp_dir().join(format!("kova-board-test-{}", new_question_id()));
-        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false };
+        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default() };
         (board, rx)
     }
 
@@ -2238,7 +2250,10 @@ mod tests {
         let answers = sheet.answers_from(&serde_json::json!({"decisions": {"D1": {"choice": "B", "note": "next week"}}}));
         assert!(board.save_draft(&id, answers.clone()));
         assert_eq!(board.sheet(&id).unwrap().1, answers, "the draft is kept with the question");
+        board.opened_in_panel(&id);
+        assert!(board.opened.contains(&id), "off the floating card");
         assert!(board.answer(&id, DECISION_DONE.into(), String::new()));
+        assert!(board.opened.is_empty());
         let a = answered(&rx);
         assert_eq!(a.action, "Done");
         assert_eq!(a.text, "D1: B (Later). Note: next week\nD2: open");
