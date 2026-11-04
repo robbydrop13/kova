@@ -143,6 +143,14 @@ pub struct Question {
     /// Open button shows it in Kova's side panel. http(s) only ([`is_panel_url`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// A decision sheet Kova shows natively (`kova ask --decisions`): the
+    /// card's Open button shows it in the side panel, rendered by Kova.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<crate::decision_sheet::Sheet>,
+    /// The answers given so far on that sheet. Kova's, like `snoozed_until`:
+    /// kept with the question so a restart does not lose them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<crate::decision_sheet::SheetAnswers>,
 }
 
 /// The kind of a question that carries a decision sheet.
@@ -188,6 +196,18 @@ impl Question {
     /// A decision sheet to fill in: the card says `New decision` and offers to open it.
     pub fn is_decision(&self) -> bool {
         self.kind.as_deref() == Some(KIND_DECISION)
+    }
+
+    /// What the card's Open button shows in the side panel: the sheet's
+    /// artifact, or `kova-sheet:<id>` for a sheet Kova renders itself.
+    pub fn panel_link(&self) -> Option<String> {
+        if !self.is_decision() {
+            return None;
+        }
+        if self.sheet.is_some() {
+            return Some(format!("{}{}", crate::decision_sheet::LINK_SCHEME, self.id));
+        }
+        self.url.clone()
     }
 
     pub fn due(&self, now: u64) -> bool {
@@ -1093,6 +1113,18 @@ impl Board {
         let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return false };
         let (question, responder) = self.pending.remove(index);
         self.dirty = true;
+        // A sheet answers with its summary, whichever way it was closed: a
+        // choice on the card (one decision), or Done with what the sheet holds.
+        let (action, text) = match &question.sheet {
+            Some(sheet) => {
+                let answers = sheet
+                    .answers_from_card(&action, &text)
+                    .or_else(|| question.draft.clone())
+                    .unwrap_or_default();
+                (DECISION_DONE.to_string(), sheet.summary(&answers))
+            }
+            None => (action, text),
+        };
         let answer = Answer { id: id.to_string(), action, text };
         log::info!("ask {}: answered: {}", id, answer.line());
         // On disk before the question leaves it: a quit from here on still delivers it.
@@ -1110,6 +1142,27 @@ impl Board {
             spawn_late(self.store.clone(), question, answer);
         }
         true
+    }
+
+    /// The answers given so far on a sheet, kept with its question (on disk
+    /// too). False when no such sheet waits.
+    pub fn save_draft(&mut self, id: &str, answers: crate::decision_sheet::SheetAnswers) -> bool {
+        let Some((question, _)) = self.pending.iter_mut().find(|(q, _)| q.id == id && q.sheet.is_some()) else { return false };
+        if question.draft.as_ref() == Some(&answers) {
+            return true;
+        }
+        question.draft = Some(answers);
+        let saved = question.clone();
+        if self.owns_store() {
+            self.store.save_question(&saved);
+        }
+        true
+    }
+
+    /// A sheet waiting for its answers, with the answers so far and who asks.
+    pub fn sheet(&self, id: &str) -> Option<(crate::decision_sheet::Sheet, crate::decision_sheet::SheetAnswers, String)> {
+        let (q, _) = self.pending.iter().find(|(q, _)| q.id == id)?;
+        Some((q.sheet.clone()?, q.draft.clone().unwrap_or_default(), q.from.name.clone()))
     }
 
     /// An answer given somewhere other than the card: KovaLink, from the phone,
@@ -1230,6 +1283,7 @@ impl Board {
         let due: Vec<&Question> = self.pending.iter().map(|(q, _)| q).filter(|q| q.due(now)).collect();
         let head = due.first().copied();
         let buttons = head.map(|q| q.buttons()).unwrap_or_default();
+        let link = head.and_then(|q| q.panel_link());
         let card = head.map(|q| crate::ask_card::CardQuestion {
             id: &q.id,
             from: &q.from.name,
@@ -1237,7 +1291,7 @@ impl Board {
             buttons: &buttons,
             input: q.input,
             asked_at: q.asked_at,
-            decision_url: q.url.as_deref().filter(|_| q.is_decision()),
+            decision_url: link.as_deref(),
         });
         crate::ask_card::show(mtm, card.as_ref(), due.len().saturating_sub(1));
     }
@@ -1268,7 +1322,7 @@ fn spawn_late(store: AskStore, question: Question, answer: Answer) {
 // ─── The client: `kova ask` ────────────────────────────────────────────────────
 
 pub const USAGE: &str = "\
-usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--decision <url>] [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
+usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--decision <url> | --decisions <file.json>] [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
 
 Shows a card in Kova with the message, one button per action and a text field, then waits for
 the user and prints the answer on stdout: the action, or \"action: text\" when they typed something.
@@ -1282,6 +1336,13 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
                 \"New decision\", its Open button shows the page in Kova's side panel, and the
                 answer comes when the user clicks Done (default actions: Done; no text field
                 unless --actions is given too)
+  --decisions   a decision sheet Kova shows itself, from a JSON file (the decision-sheet skill's
+                format: title, intro, links, decisions with options, one marked reco). The card
+                says \"New decision\" (the message defaults to \"<title>: <N> decisions\"), Open shows
+                the sheet in the side panel, answers are saved as they are given, and Done prints
+                them, one line per decision: \"D1: A (label)\", \". Note: ...\", \"D2: other: ...\",
+                \"D3: open\", then \"Note: ...\". A single decision of up to three short options is
+                also answerable from the card's buttons
   --from        the name shown on the card (default: the working directory's name)
   --timeout     seconds to wait. Default: 540 inside a Claude Code conversation (under the Bash tool's
                 600 s limit; run kova ask with the Bash timeout set to 600000), no limit anywhere else,
@@ -1304,10 +1365,11 @@ struct CliArgs {
     json: bool,
     socket: Option<String>,
     decision: Option<String>,
+    sheet: Option<crate::decision_sheet::Sheet>,
 }
 
 fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
-    let mut out = CliArgs { message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None, decision: None };
+    let mut out = CliArgs { message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None, decision: None, sheet: None };
     let mut message: Option<String> = None;
     let mut actions_given = false;
     let mut input_given = false;
@@ -1329,6 +1391,10 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
                     return Err(format!("kova ask: --decision takes an http(s) URL, got '{}'", url));
                 }
                 out.decision = Some(url);
+            }
+            "--decisions" => {
+                let path = value()?;
+                out.sheet = Some(read_sheet(Path::new(&path))?);
             }
             "--from" => out.from = Some(value()?),
             "--timeout" => {
@@ -1352,7 +1418,29 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
             }
         }
     }
+    if out.sheet.is_some() && out.decision.is_some() {
+        return Err("kova ask: --decision and --decisions are two kinds of sheet, pick one".to_string());
+    }
+    if message.is_none()
+        && let Some(sheet) = &out.sheet
+    {
+        let n = sheet.decisions.len();
+        message = Some(format!("{}: {} decision{}", sheet.title, n, if n == 1 { "" } else { "s" }));
+    }
     out.message = message.filter(|m| !m.trim().is_empty()).ok_or_else(|| USAGE.to_string())?;
+    if let Some(sheet) = &out.sheet {
+        // Answered on the sheet; one short decision on the card too.
+        match sheet.card_choices() {
+            Some(choices) => {
+                out.actions = choices;
+                out.input = true;
+            }
+            None => {
+                out.actions = vec![DECISION_DONE.to_string()];
+                out.input = false;
+            }
+        }
+    }
     // A decision is answered on its sheet: the card only says when it is done.
     if out.decision.is_some() {
         if !actions_given {
@@ -1363,6 +1451,16 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
         }
     }
     Ok(out)
+}
+
+/// A sheet file for `--decisions`, read and checked.
+fn read_sheet(path: &Path) -> Result<crate::decision_sheet::Sheet, String> {
+    let size = std::fs::metadata(path).map_err(|e| format!("kova ask: cannot read {}: {}", path.display(), e))?.len();
+    if size > crate::decision_sheet::MAX_FILE {
+        return Err(format!("kova ask: {} is larger than {} KiB", path.display(), crate::decision_sheet::MAX_FILE / 1024));
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("kova ask: cannot read {}: {}", path.display(), e))?;
+    crate::decision_sheet::Sheet::from_json(&raw).map_err(|e| format!("kova ask: {}: {}", path.display(), e))
 }
 
 /// The executable path of `pid`.
@@ -1492,8 +1590,10 @@ pub fn run_cli(args: &[String]) -> i32 {
         from: asker,
         asked_at: now_epoch(),
         snoozed_until: 0,
-        kind: cli.decision.as_ref().map(|_| KIND_DECISION.to_string()),
+        kind: (cli.decision.is_some() || cli.sheet.is_some()).then(|| KIND_DECISION.to_string()),
         url: cli.decision.clone(),
+        sheet: cli.sheet.clone(),
+        draft: None,
     };
 
     let body = serde_json::json!({"cmd": "ask", "question": question});
@@ -1627,7 +1727,7 @@ mod tests {
     }
 
     fn question(id: &str) -> Question {
-        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None }
+        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None, sheet: None, draft: None }
     }
 
     #[test]
@@ -2075,6 +2175,84 @@ mod tests {
         assert!(parse_cli(&args(&["a", "--timeout", "0"])).is_err());
         assert!(parse_cli(&args(&["a", "--bogus"])).is_err());
         assert!(parse_cli(&args(&["a", "--from"])).is_err());
+    }
+
+    fn sheet_file(json: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("kova-sheet-test-{}", new_question_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.json");
+        std::fs::write(&path, json).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    const TWO: &str = r#"{"title":"Plan","decisions":[
+        {"id":"D1","title":"When?","options":[{"id":"A","label":"Now","reco":true},{"id":"B","label":"Later"}]},
+        {"id":"D2","title":"Who?","options":[{"id":"A","label":"Me"},{"id":"B","label":"You"}]}]}"#;
+
+    #[test]
+    fn a_native_sheet_is_read_from_its_file_and_answered_in_the_panel() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let path = sheet_file(TWO);
+        let c = parse_cli(&args(&["--decisions", &path])).unwrap();
+        assert_eq!(c.message, "Plan: 2 decisions", "the message defaults to the title");
+        assert_eq!((c.actions.clone(), c.input), (vec!["Done".to_string()], false));
+        assert!(parse_cli(&args(&["x", "--decisions", &path, "--decision", "https://a.b/c"])).is_err());
+        assert!(parse_cli(&args(&["x", "--decisions", "/nonexistent/d.json"])).is_err());
+        assert!(parse_cli(&args(&["x", "--decisions", &sheet_file(r#"{"title":"t","decisions":[]}"#)])).is_err());
+        // One short decision: its options on the card, the recommendation first.
+        let one = sheet_file(r#"{"title":"Go?","decisions":[{"id":"D1","title":"Ship?","options":[{"id":"A","label":"No"},{"id":"B","label":"Yes","reco":true}]}]}"#);
+        let c = parse_cli(&args(&["--decisions", &one])).unwrap();
+        assert_eq!((c.actions, c.input), (vec!["Yes".to_string(), "No".to_string()], true));
+    }
+
+    fn sheet_question() -> Question {
+        let mut q = question("6f1c0000-0000-4000-8000-000000000000");
+        q.kind = Some(KIND_DECISION.into());
+        q.sheet = Some(crate::decision_sheet::Sheet::from_json(TWO).unwrap());
+        q.actions = vec![DECISION_DONE.into()];
+        q.input = false;
+        q
+    }
+
+    fn board_with(q: Question) -> (Board, std::sync::mpsc::Receiver<crate::ipc::IpcResponse>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = std::env::temp_dir().join(format!("kova-board-test-{}", new_question_id()));
+        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false };
+        (board, rx)
+    }
+
+    fn answered(rx: &std::sync::mpsc::Receiver<crate::ipc::IpcResponse>) -> Answer {
+        match rx.try_recv() {
+            Ok(crate::ipc::IpcResponse::Ok { data: Some(d) }) => serde_json::from_value(d).unwrap(),
+            _ => panic!("no answer"),
+        }
+    }
+
+    #[test]
+    fn done_on_a_sheet_answers_with_its_summary() {
+        let q = sheet_question();
+        let id = q.id.clone();
+        assert_eq!(q.panel_link().as_deref(), Some(&*format!("kova-sheet:{id}")));
+        let (mut board, rx) = board_with(q);
+        let sheet = board.sheet(&id).unwrap().0;
+        let answers = sheet.answers_from(&serde_json::json!({"decisions": {"D1": {"choice": "B", "note": "next week"}}}));
+        assert!(board.save_draft(&id, answers.clone()));
+        assert_eq!(board.sheet(&id).unwrap().1, answers, "the draft is kept with the question");
+        assert!(board.answer(&id, DECISION_DONE.into(), String::new()));
+        let a = answered(&rx);
+        assert_eq!(a.action, "Done");
+        assert_eq!(a.text, "D1: B (Later). Note: next week\nD2: open");
+        assert!(board.sheet(&id).is_none());
+    }
+
+    #[test]
+    fn a_choice_on_the_card_answers_a_one_decision_sheet() {
+        let mut q = sheet_question();
+        q.sheet.as_mut().unwrap().decisions.truncate(1);
+        let id = q.id.clone();
+        let (mut board, rx) = board_with(q);
+        assert!(board.answer(&id, "Later".into(), "after the launch".into()));
+        assert_eq!(answered(&rx).text, "D1: B (Later). Note: after the launch");
     }
 
     #[test]

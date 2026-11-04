@@ -310,6 +310,13 @@ action, or `action: text` when the user typed something.
   says "New decision"; its Open button shows the page in Kova's side panel without answering, and
   the answer is `Done` once the user has filled it in (then read the answers where the page stores
   them). Only http(s) URLs are accepted.
+- **A decision sheet Kova shows itself**, no page to publish:
+  `kova ask --decisions decisions.json` (the message defaults to `<title>: <N> decisions`). The
+  file: `{"title", "intro", "links": [{"label","url"}], "decisions": [{"id","title","group",
+  "context","options": [{"id","label","detail","reco"}]}]}`. Open shows the sheet in the side
+  panel, answers are kept as they are given, and Done returns them, one line per decision:
+  `D1: A (label)`, `D2: B (label). Note: …`, `D3: other: …`, `D4: open`, then `Note: …`. One
+  decision of up to three short options is answerable from the card's buttons too.
 - `--no-input` (buttons only), `--from <name>` (name on the card), `--json`, `--socket <path>`.
   Outside a Kova pane the client finds Kova.app's socket on its own; from a pane of a library host
   (an app embedding Kova), it falls back to Kova.app too.

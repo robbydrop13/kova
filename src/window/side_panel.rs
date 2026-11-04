@@ -32,7 +32,8 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSDictionary, NSObject, NSObjectProtocol, NSString, NSURL, NSURLRequest};
 use objc2_web_kit::{
-    WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationType, WKUIDelegate,
+    WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationType, WKScriptMessage,
+    WKScriptMessageHandler, WKUIDelegate, WKUserContentController,
     WKWebView, WKWebpagePreferences,
     WKWebViewConfiguration, WKWebsiteDataStore, WKWindowFeatures,
 };
@@ -107,6 +108,9 @@ pub enum PanelTarget {
     Markdown(PathBuf),
     /// A local HTML file, loaded as is.
     Html(PathBuf),
+    /// A decision sheet Kova renders itself (`kova ask --decisions`), by
+    /// the id of its question.
+    Sheet(String),
 }
 
 impl PanelTarget {
@@ -117,6 +121,16 @@ impl PanelTarget {
             PanelTarget::Markdown(p) | PanelTarget::Html(p) => {
                 p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
             }
+            PanelTarget::Sheet(_) => "Decision".to_string(),
+        }
+    }
+
+    /// What a card's Open link names: `kova-sheet:<id>` for a native sheet,
+    /// else an http(s) page.
+    pub fn from_link(link: &str) -> PanelTarget {
+        match link.strip_prefix(crate::decision_sheet::LINK_SCHEME) {
+            Some(id) => PanelTarget::Sheet(id.to_string()),
+            None => PanelTarget::Web(link.to_string()),
         }
     }
 
@@ -125,6 +139,7 @@ impl PanelTarget {
         match self {
             PanelTarget::Web(url) => url.clone(),
             PanelTarget::Markdown(p) | PanelTarget::Html(p) => p.to_string_lossy().into_owned(),
+            PanelTarget::Sheet(_) => String::new(),
         }
     }
 }
@@ -631,11 +646,42 @@ impl SidePanelView {
                 let read = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
                 unsafe { web.loadFileURL_allowingReadAccessToURL(&file, &read) };
             }
+            PanelTarget::Sheet(id) => {
+                let html = match crate::app::sheet_page(mtm, id) {
+                    Some((sheet, answers, from)) => {
+                        *self.ivars().title.borrow_mut() = sheet.title.clone();
+                        crate::decision_sheet::render(&sheet, &answers, &from, tokens::get())
+                    }
+                    None => crate::decision_sheet::render_closed("Decision", None, tokens::get()),
+                };
+                // No base URL: the page is `about:blank`, the one origin
+                // whose script may post to Kova (`did_receive_script_message`).
+                unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
+            }
         }
         *self.ivars().current.borrow_mut() = Some(target);
         self.ivars().open.set(true);
         self.relayout();
         self.setNeedsDisplay(true);
+    }
+
+    /// The sheet `id` was answered (or is gone): if the panel shows it, it
+    /// shows what was sent instead of the form.
+    pub fn sheet_closed(&self, id: &str, title: &str, summary: Option<&str>) {
+        if !matches!(self.ivars().current.borrow().as_ref(), Some(PanelTarget::Sheet(s)) if s == id) {
+            return;
+        }
+        let Some(web) = self.ivars().web.get() else { return };
+        let html = crate::decision_sheet::render_closed(title, summary, tokens::get());
+        unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
+    }
+
+    /// The id of the sheet the panel shows, if it shows one.
+    fn sheet_id(&self) -> Option<String> {
+        match self.ivars().current.borrow().as_ref() {
+            Some(PanelTarget::Sheet(id)) => Some(id.clone()),
+            _ => None,
+        }
     }
 
     /// Hide the panel, keeping its page: the toggle brings it back as it was.
@@ -737,6 +783,11 @@ impl SidePanelView {
             web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             web.setUIDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             web.setInspectable(true);
+            // The decision sheet's answers (`did_receive_script_message` checks who posts).
+            config.userContentController().addScriptMessageHandler_name(
+                ProtocolObject::from_ref(&*delegate),
+                &NSString::from_str(crate::decision_sheet::HANDLER),
+            );
         }
         self.addSubview(&web);
         let _ = self.ivars().delegate.set(delegate);
@@ -795,6 +846,7 @@ impl SidePanelView {
         let url = match (live, current) {
             (Some(url), _) => NSURL::URLWithString(&NSString::from_str(&url)),
             (None, Some(PanelTarget::Web(url))) => NSURL::URLWithString(&NSString::from_str(&url)),
+            (None, Some(PanelTarget::Sheet(_))) => None,
             (None, Some(target)) => Some(NSURL::fileURLWithPath(&NSString::from_str(&target.external()))),
             (None, None) => None,
         };
@@ -895,7 +947,13 @@ define_class!(
             let clicked = unsafe { action.navigationType() } == WKNavigationType::LinkActivated
                 && unsafe { action.targetFrame() }.is_none_or(|f| unsafe { f.isMainFrame() });
             let scheme = url.as_deref().and_then(|u| u.scheme()).map(|s| s.to_string().to_ascii_lowercase());
+            let on_sheet = panel_of(web_view).is_some_and(|p| p.sheet_id().is_some());
             let policy = match (scheme.as_deref(), url.as_deref()) {
+                // The sheet stays the panel's page: its links open in the browser.
+                (Some("http" | "https"), Some(u)) if on_sheet && clicked => {
+                    NSWorkspace::sharedWorkspace().openURL(u);
+                    WKNavigationActionPolicy::Cancel
+                }
                 (Some("http" | "https" | "about" | "data" | "blob"), _) => WKNavigationActionPolicy::Allow,
                 (Some("file"), Some(u)) => {
                     unsafe { preferences.setAllowsContentJavaScript(false) };
@@ -921,6 +979,35 @@ define_class!(
                 _ => WKNavigationActionPolicy::Allow,
             };
             handler.call((policy, std::ptr::NonNull::from(preferences)));
+        }
+    }
+
+    unsafe impl WKScriptMessageHandler for PanelWebDelegate {
+        /// The decision sheet posting its answers: a draft as they are given,
+        /// `done` on Done. Taken only from the panel's own web view, its main
+        /// frame, on `about:blank` (the page Kova loads without a base URL),
+        /// while the panel shows a sheet; the tick then keeps them to what
+        /// that sheet asks (`Sheet::answers_from`).
+        #[unsafe(method(userContentController:didReceiveScriptMessage:))]
+        fn did_receive_script_message(&self, _controller: &WKUserContentController, message: &WKScriptMessage) {
+            let Some(web) = (unsafe { message.webView() }) else { return };
+            let Some(panel) = panel_of(&web) else { return };
+            let Some(id) = panel.sheet_id() else { return };
+            let frame = unsafe { message.frameInfo() };
+            let frame_url = unsafe { frame.request() }.URL().and_then(|u| u.absoluteString()).map(|s| s.to_string());
+            let page_url = unsafe { web.URL() }.and_then(|u| u.absoluteString()).map(|s| s.to_string());
+            if !unsafe { frame.isMainFrame() } || !is_blank(frame_url.as_deref()) || !is_blank(page_url.as_deref()) {
+                log::warn!("side panel: ignored a sheet message from {:?}", frame_url);
+                return;
+            }
+            let body = unsafe { message.body() };
+            let Some(text) = body.downcast_ref::<NSString>().map(|s| s.to_string()) else { return };
+            if text.len() > 512 * 1024 {
+                return;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+            let done = value.get("type").and_then(|t| t.as_str()) == Some("done");
+            SHEET_POSTS.with(|p| p.borrow_mut().push(SheetPost { id, done, answers: value }));
         }
     }
 
@@ -960,6 +1047,27 @@ define_class!(
         }
     }
 );
+
+/// What a sheet page posted: the tick saves it, and answers on `done`.
+pub struct SheetPost {
+    pub id: String,
+    pub done: bool,
+    pub answers: serde_json::Value,
+}
+
+thread_local! {
+    static SHEET_POSTS: RefCell<Vec<SheetPost>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The sheet posts since the last call.
+pub fn take_sheet_posts() -> Vec<SheetPost> {
+    SHEET_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()))
+}
+
+/// `about:blank`, or no URL yet (a page loaded from a string).
+fn is_blank(url: Option<&str>) -> bool {
+    url.is_none_or(|u| u == "about:blank" || u.is_empty())
+}
 
 /// A popup's size when the page gives none.
 const POPUP_DEFAULT: (f64, f64) = (520.0, 680.0);

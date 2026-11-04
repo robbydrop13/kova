@@ -339,6 +339,16 @@ and no text field). A `url` that is not http(s), 2 KiB at most, without control
 characters, is refused: `"question.url" must be an http(s) URL`. Both fields are
 listed by `list-asks` as they were asked, absent on a plain question.
 
+A **native sheet** is a decision with `"sheet"` in place of `url`: the
+decision-sheet JSON (`title`, `intro`, `links`, `decisions` with `options`, one
+`reco` at most), checked on arrival (`"question.sheet": …` on a refusal: plain
+ids, bounded texts, http(s) links). Kova renders it in the side panel, keeps the
+answers given so far in `draft` (Kova's field: one sent with the question is
+dropped), and answers `Done` with their summary as `text`, one line per decision
+(`D1: A (label)`, `. Note: …`, `D2: other: …`, `D3: open`, then `Note: …`). A
+sheet of one decision with up to three short options also takes its options as
+buttons on the card. `kova ask --decisions <file.json>` builds it.
+
 Not meant to be spoken by hand: `kova ask "<message>" [--actions OK,KO]` builds it
 from its environment (`CLAUDE_CODE_SESSION_ID`, or `PI_SESSION_FILE` /
 `PI_SESSION_ID` for Pi and omp, plus `OMPCODE` to tell omp from Pi; `KOVA_PANE_ID`,

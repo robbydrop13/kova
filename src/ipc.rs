@@ -1206,6 +1206,12 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             if question.url.as_deref().is_some_and(|u| !crate::ask::is_panel_url(u)) {
                 return Err("\"question.url\" must be an http(s) URL".to_string());
             }
+            if let Some(sheet) = &question.sheet {
+                sheet.validate().map_err(|e| format!("\"question.sheet\": {}", e))?;
+            }
+            // Kova's own field: the answers given on the sheet, never the asker's.
+            let mut question = question;
+            question.draft = None;
             Ok(IpcCommand::Ask(Box::new(question)))
         }
         "list-asks" => Ok(IpcCommand::ListAsks),
@@ -1662,6 +1668,16 @@ mod tests {
             err(r#"{"cmd":"list-asks","id":"x"}"#),
             "unknown field \"id\" for command \"list-asks\""
         );
+        // A sheet is checked on arrival, and its draft is Kova's, never the asker's.
+        let q = |sheet: &str| format!(
+            r#"{{"cmd":"ask","question":{{"id":"0f8fad5b-d9cb-469f-a165-70867728950e","message":"m","from":{{"name":"a","cwd":"/"}},"kind":"decision","sheet":{sheet},"draft":{{"decisions":[{{"id":"D1","choice":"A"}}]}}}}}}"#
+        );
+        match parse_command(&q(r#"{"title":"t","decisions":[{"id":"D1","title":"x","options":[{"id":"A","label":"a"}]}]}"#)) {
+            Ok(IpcCommand::Ask(question)) => assert!(question.sheet.is_some() && question.draft.is_none()),
+            Ok(_) => panic!("ask with a sheet"),
+            Err(e) => panic!("ask with a sheet: {e}"),
+        }
+        assert!(err(&q(r#"{"title":"t","decisions":[]}"#)).starts_with("\"question.sheet\""));
         let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
         match parse_command(&format!(
             r#"{{"cmd":"answer-ask","id":"{id}","action":"OK","text":"go"}}"#

@@ -327,6 +327,13 @@ impl KovaView {
         }
     }
 
+    /// A decision sheet was answered: a panel showing it shows what was sent.
+    pub(crate) fn side_panel_sheet_closed(&self, id: &str, title: &str, summary: Option<&str>) {
+        if let Some(panel) = self.ivars().side_panel.get() {
+            panel.sheet_closed(id, title, summary);
+        }
+    }
+
     /// The View menu's toggle. Nothing to reopen yet: says so in the log.
     pub(super) fn toggle_side_panel(&self) {
         if let Some(panel) = self.ivars().side_panel.get()
@@ -1022,7 +1029,7 @@ impl KovaView {
         if let AsksHit::OpenDoc(key) = hit {
             let url = self.ivars().sidebar.borrow().asks.card(key).and_then(|card| card.decision_url.clone());
             if let Some(url) = url {
-                self.open_in_side_panel(super::side_panel::PanelTarget::Web(url));
+                self.open_in_side_panel(super::side_panel::PanelTarget::from_link(&url));
             }
         }
     }

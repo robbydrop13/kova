@@ -14,7 +14,7 @@ in `src/window/sidebar_ui.rs`.
 | From | What |
 |---|---|
 | Cmd+click in a pane | an http(s) link, or a `.md` / `.markdown` / `.html` / `.htm` path (relative to the pane's directory, `~/`, absolute, `file://`, a `:line[:col]` suffix ignored). Cmd+hover underlines both. Cmd+Shift+click keeps the old way: the default browser. A link of another scheme still goes to the system |
-| The ask card | Open on a `New decision` card (`kova ask --decision <url>`) |
+| The ask card | Open on a `New decision` card (`kova ask --decision <url>`, or `--decisions <file.json>` for a native sheet) |
 | The Asks view | Open on a card tagged `Decision` |
 | IPC | `open-panel` with `target` (`docs/ipc.md`) |
 | View > Side Panel, Cmd+Option+B (`toggle_side_panel`, `toggle-side-panel`) | hides it, or brings back the last page |
@@ -66,6 +66,25 @@ when the panel closes.
   Cmd+A/C/V/X/Z are routed to it (Kova has no Edit menu). Only three Kova
   shortcuts stay Kova's there: the side panel toggle, the sidebar toggle and
   Cmd+J.
+
+## Decision sheets
+
+`kova ask --decisions <file.json>` (`src/decision_sheet.rs`, pure and tested):
+Kova renders the decision-sheet JSON as a page in the design system's colours:
+title, who asks, intro, links, one card per decision (options with the
+recommendation tagged, Other, a note), a progress bar, Open only, "Take the
+recommendation on the N left" (with a confirm), a general note, Done. Every
+text of the sheet is escaped into the HTML by Rust.
+
+It is the one page in the panel that runs a script, and the script only reads
+the form and posts it (`window.webkit.messageHandlers.kovaSheet`). A post is
+taken only from the panel's own web view, its main frame, on `about:blank` (the
+page is loaded from a string with no base URL), while the panel shows a sheet;
+the tick keeps it to what the sheet asks (`Sheet::answers_from`). Drafts are
+saved on the question, on disk with it, so closing the panel or quitting Kova
+loses nothing. Done answers the question with the summary and the panel shows
+what was sent. A link in the sheet opens in the default browser: the sheet
+stays the panel's page.
 
 ## Markdown
 

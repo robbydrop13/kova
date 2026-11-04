@@ -382,8 +382,38 @@ impl AppDelegate {
                         asks.refresh_card(MainThreadMarker::new_unchecked());
                     }
                     // Decision sheets opened from the card: the front window's side panel.
-                    for url in crate::ask_card::take_panel_opens() {
-                        open_in_front_panel(&ivars.windows, window::side_panel::PanelTarget::Web(url));
+                    for link in crate::ask_card::take_panel_opens() {
+                        open_in_front_panel(&ivars.windows, window::side_panel::PanelTarget::from_link(&link));
+                    }
+                    // Answers posted by a decision sheet in a side panel.
+                    let posts = window::side_panel::take_sheet_posts();
+                    if !posts.is_empty() {
+                        let mut closed = Vec::new();
+                        {
+                            let mut asks = ivars.asks.borrow_mut();
+                            for post in posts {
+                                let Some((sheet, _, _)) = asks.sheet(&post.id) else {
+                                    closed.push((post.id, "Decision".to_string(), None));
+                                    continue;
+                                };
+                                let answers = sheet.answers_from(&post.answers);
+                                let summary = sheet.summary(&answers);
+                                asks.save_draft(&post.id, answers);
+                                if post.done {
+                                    asks.answer(&post.id, crate::ask::DECISION_DONE.to_string(), String::new());
+                                    closed.push((post.id, sheet.title.clone(), Some(summary)));
+                                }
+                            }
+                            asks.refresh_card(MainThreadMarker::new_unchecked());
+                        }
+                        let windows: Vec<_> = ivars.windows.borrow().clone();
+                        for (id, title, summary) in &closed {
+                            for win in &windows {
+                                if let Some(view) = kova_view(win) {
+                                    view.side_panel_sheet_closed(id, title, summary.as_deref());
+                                }
+                            }
+                        }
                     }
 
                     // Focus the panes whose notification was clicked. Done here
@@ -1565,6 +1595,17 @@ fn handle_ipc_set_subject_color(
 /// window, else the main one, else the first Kova window), and bring that
 /// window forward: Open is clicked on the floating card, often while another
 /// app is in front. Returns whether a window took it.
+/// A decision sheet still waiting, for the side panel to render: the sheet,
+/// its answers so far, who asks. `None` once it is answered or withdrawn.
+pub(crate) fn sheet_page(
+    mtm: MainThreadMarker,
+    id: &str,
+) -> Option<(crate::decision_sheet::Sheet, crate::decision_sheet::SheetAnswers, String)> {
+    let delegate = app_delegate(mtm);
+    let asks = delegate.ivars().asks.try_borrow().ok()?;
+    asks.sheet(id)
+}
+
 fn open_in_front_panel(windows: &RefCell<Vec<Retained<NSWindow>>>, target: window::side_panel::PanelTarget) -> bool {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);

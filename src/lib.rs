@@ -14,6 +14,7 @@ mod anchors;
 mod appkit_input;
 mod ask;
 mod ask_card;
+mod decision_sheet;
 mod bookmarks;
 mod claude_history;
 mod claude_session;

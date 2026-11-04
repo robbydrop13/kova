@@ -258,7 +258,7 @@ impl AskCardVm {
             snoozed,
             back_at: if snoozed { local_hhmm(question.snoozed_until) } else { String::new() },
             permission: None,
-            decision_url: question.url.clone().filter(|_| question.is_decision()),
+            decision_url: question.panel_link(),
         }
     }
 
@@ -1846,6 +1846,8 @@ mod tests {
             snoozed_until: 0,
             kind: Some(crate::ask::KIND_DECISION.into()),
             url: Some("https://claude.ai/artifact/x".into()),
+            sheet: None,
+            draft: None,
         };
         let vm = AskCardVm::from_question(&q, None, false, 10);
         assert_eq!(vm.decision_url.as_deref(), Some("https://claude.ai/artifact/x"));
@@ -2054,6 +2056,8 @@ mod tests {
             snoozed_until: 0,
             kind: None,
             url: None,
+            sheet: None,
+            draft: None,
         }
     }
 
