@@ -402,16 +402,10 @@ impl AppDelegate {
                         {
                             let mut asks = ivars.asks.borrow_mut();
                             for post in posts {
-                                let Some((sheet, _, _)) = asks.sheet(&post.id) else {
-                                    closed.push((post.id, "Decision".to_string(), None));
-                                    continue;
-                                };
-                                let answers = sheet.answers_from(&post.answers);
-                                let summary = sheet.summary(&answers);
-                                asks.save_draft(&post.id, answers);
-                                if post.done {
-                                    asks.answer(&post.id, crate::ask::DECISION_DONE.to_string(), String::new());
-                                    closed.push((post.id, sheet.title.clone(), Some(summary)));
+                                match asks.post_sheet(&post.id, &post.answers, post.done) {
+                                    Ok(p) if p.done => closed.push((post.id, p.title, Some(p.summary))),
+                                    Ok(_) => {}
+                                    Err(_) => closed.push((post.id, "Decision".to_string(), None)),
                                 }
                             }
                             asks.refresh_card(MainThreadMarker::new_unchecked());
@@ -552,6 +546,39 @@ fn drain_ipc(ivars: &AppDelegateIvars, fps: u32) {
                 let withdrawn = ivars.asks.borrow_mut().withdraw(session_id);
                 let _ = responder
                     .send(crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "withdrawn": withdrawn })) });
+                continue;
+            }
+            crate::ipc::IpcCommand::GetSheet { ref id } => {
+                let result = ivars.asks.borrow().sheet_json(id);
+                let _ = responder.send(match result {
+                    Ok(data) => crate::ipc::IpcResponse::Ok { data: Some(data) },
+                    Err(message) => crate::ipc::IpcResponse::Error { message },
+                });
+                continue;
+            }
+            crate::ipc::IpcCommand::AnswerSheet { ref id, ref answers, done } => {
+                let result = {
+                    let mut asks = ivars.asks.borrow_mut();
+                    let r = asks.post_sheet(id, answers, done);
+                    // The IPC is served on the main thread.
+                    asks.refresh_card(unsafe { MainThreadMarker::new_unchecked() });
+                    r
+                };
+                if let Ok(p) = &result
+                    && p.done
+                {
+                    // A Mac panel showing the sheet shows what was sent.
+                    let windows: Vec<_> = ivars.windows.borrow().clone();
+                    for win in &windows {
+                        if let Some(view) = kova_view(win) {
+                            view.side_panel_sheet_closed(id, &p.title, Some(&p.summary));
+                        }
+                    }
+                }
+                let _ = responder.send(match result {
+                    Ok(p) => crate::ipc::IpcResponse::Ok { data: serde_json::to_value(&p).ok() },
+                    Err(message) => crate::ipc::IpcResponse::Error { message },
+                });
                 continue;
             }
             crate::ipc::IpcCommand::DropAsk { ref id } => {
@@ -1047,7 +1074,9 @@ fn handle_ipc_command_sync(
         | IpcCommand::AnswerAsk { .. }
         | IpcCommand::SnoozeAsk { .. }
         | IpcCommand::WithdrawAsks { .. }
-        | IpcCommand::DropAsk { .. } => {
+        | IpcCommand::DropAsk { .. }
+        | IpcCommand::GetSheet { .. }
+        | IpcCommand::AnswerSheet { .. } => {
             log::error!("IPC: an ask command reached the generic dispatcher");
             crate::ipc::IpcResponse::Error {
                 message: "internal: an ask command was not intercepted".to_string(),

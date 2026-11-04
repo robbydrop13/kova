@@ -229,6 +229,11 @@ pub enum IpcCommand {
     /// Take one question off the Asks, unanswered: its asker says it no longer
     /// matters (`kova ask --drop`).
     DropAsk { id: String },
+    /// A native decision sheet and its answers so far (KovaLink renders it).
+    GetSheet { id: String },
+    /// Answers to a native sheet from a remote client, in the panel page's
+    /// shape; `done` answers the question as Done on the Mac does.
+    AnswerSheet { id: String, answers: serde_json::Value, done: bool },
     /// Every subject of every tab, with the panes filed under it, in the order
     /// Cmd+P draws them.
     ListSubjects,
@@ -714,6 +719,8 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "snooze-ask" => &["id", "seconds"],
         "withdraw-asks" => &["session_id"],
         "drop-ask" => &["id"],
+        "get-sheet" => &["id"],
+        "answer-sheet" => &["id", "answers", "done"],
         "list-subjects" => &[],
         "set-pane-subject" => &["pane_id", "subject"],
         "rename-subject" => &["tab_id", "name", "new_name"],
@@ -1262,6 +1269,21 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             Ok(IpcCommand::WithdrawAsks { session_id })
         }
         "drop-ask" => Ok(IpcCommand::DropAsk { id: ask_id(&v)? }),
+        "get-sheet" => Ok(IpcCommand::GetSheet { id: ask_id(&v)? }),
+        "answer-sheet" => {
+            let id = ask_id(&v)?;
+            let answers = match v.get("answers") {
+                Some(a @ serde_json::Value::Object(_)) => a.clone(),
+                None | Some(serde_json::Value::Null) => serde_json::json!({}),
+                Some(_) => return Err("\"answers\" must be an object: {\"decisions\": {\"D1\": {\"choice\", \"note\"}}, \"note\"}".to_string()),
+            };
+            let done = match v.get("done") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => return Err("\"done\" must be a boolean".to_string()),
+            };
+            Ok(IpcCommand::AnswerSheet { id, answers, done })
+        }
         "list-subjects" => Ok(IpcCommand::ListSubjects),
         "set-pane-subject" => {
             let pane_id = required_u32(&v, "pane_id")?;
@@ -1674,6 +1696,18 @@ mod tests {
             err(r#"{"cmd":"list-asks","id":"x"}"#),
             "unknown field \"id\" for command \"list-asks\""
         );
+        match parse_command(r#"{"cmd":"answer-sheet","id":"0f8fad5b-d9cb-469f-a165-70867728950e","answers":{"decisions":{"D1":{"choice":"A"}}},"done":true}"#) {
+            Ok(IpcCommand::AnswerSheet { answers, done, .. }) => assert!(done && answers["decisions"]["D1"]["choice"] == "A"),
+            _ => panic!("answer-sheet"),
+        }
+        match parse_command(r#"{"cmd":"answer-sheet","id":"0f8fad5b-d9cb-469f-a165-70867728950e"}"#) {
+            Ok(IpcCommand::AnswerSheet { done, .. }) => assert!(!done, "a draft by default"),
+            _ => panic!("answer-sheet without done"),
+        }
+        assert!(err(r#"{"cmd":"answer-sheet","id":"0f8fad5b-d9cb-469f-a165-70867728950e","answers":[1]}"#).starts_with("\"answers\" must be an object"));
+        assert!(err(r#"{"cmd":"answer-sheet","id":"0f8fad5b-d9cb-469f-a165-70867728950e","done":"yes"}"#).starts_with("\"done\""));
+        assert!(matches!(parse_command(r#"{"cmd":"get-sheet","id":"0f8fad5b-d9cb-469f-a165-70867728950e"}"#), Ok(IpcCommand::GetSheet { .. })));
+        assert_eq!(err(r#"{"cmd":"get-sheet","id":"../x"}"#), "\"id\" must be a UUID");
         // A sheet is checked on arrival, and its draft is Kova's, never the asker's.
         let q = |sheet: &str| format!(
             r#"{{"cmd":"ask","question":{{"id":"0f8fad5b-d9cb-469f-a165-70867728950e","message":"m","from":{{"name":"a","cwd":"/"}},"kind":"decision","sheet":{sheet},"draft":{{"decisions":[{{"id":"D1","choice":"A"}}]}}}}}}"#

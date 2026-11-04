@@ -326,8 +326,11 @@ action, or `action: text` when the user typed something.
 - Pending questions can also be listed and answered over the socket, for a remote client:
   `{"cmd":"list-asks"}` returns `data.asks` (each question with its `buttons`), and
   `{"cmd":"answer-ask","id":"<uuid>","action":"OK","text":"…"}` answers exactly like a click. **A
-  session never answers in the user's place**: these two are for the user's other devices, not for
-  an agent.
+  session never answers in the user's place**: these are for the user's other devices, not for
+  an agent. A native decision sheet is read with `{"cmd":"get-sheet","id":"<uuid>"}` (its JSON and
+  the draft) and answered with `{"cmd":"answer-sheet","id":"<uuid>","answers":{"decisions":{"D1":
+  {"choice":"A","note":""}},"note":""},"done":false}` (the whole state, replacing the draft; `done:
+  true` is Done). Shapes in `docs/ipc.md` § `ask`.
 - **The card is visible to anyone looking at the screen.** Never put private content on it
   (health, intimate matters, other people's affairs, secrets). For those, ask in the text of your
   reply, inside the pane, which the user can hide.

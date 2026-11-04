@@ -972,6 +972,18 @@ fn resume(
 
 // ─── Kova.app's side: the questions on screen ─────────────────────────────────
 
+/// What `post_sheet` did.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SheetPosted {
+    pub title: String,
+    pub summary: String,
+    pub answered: usize,
+    pub total: usize,
+    pub done: bool,
+    /// The follow-up question keeping the decisions left open at Done.
+    pub follow_up: Option<String>,
+}
+
 /// The questions waiting for the user, oldest first, each with the channel to
 /// the connection still waiting for it (`None` for a question reloaded after a
 /// restart: its asker is gone, the answer is delivered late). Main thread only.
@@ -1205,6 +1217,49 @@ impl Board {
         Ok(())
     }
 
+    /// `get-sheet`: a native sheet and its answers so far, for a remote
+    /// client to render (KovaLink).
+    pub fn sheet_json(&self, id: &str) -> Result<serde_json::Value, String> {
+        let (q, _) = self.pending.iter().find(|(q, _)| q.id == id).ok_or_else(|| format!("no question {}", id))?;
+        let sheet = q.sheet.as_ref().ok_or_else(|| format!("question {} is not a decision sheet", id))?;
+        Ok(serde_json::json!({
+            "id": q.id,
+            "from": q.from.name,
+            "message": q.message,
+            "asked_at": q.asked_at,
+            "follow_up": q.follow_up,
+            "sheet": sheet,
+            "draft": q.draft.clone().unwrap_or_default(),
+        }))
+    }
+
+    /// Answers posted to a sheet, from the panel's page or a remote client
+    /// (`answer-sheet`), in the page's shape: `{"decisions": {"D1": {"choice",
+    /// "note"}}, "note"}`. They replace the draft, kept to what the sheet asks;
+    /// `done` then answers the question as Done does. Returns the sheet's
+    /// title and the summary sent, and the id of the follow-up holding what
+    /// stayed open, if any.
+    pub fn post_sheet(&mut self, id: &str, raw: &serde_json::Value, done: bool) -> Result<SheetPosted, String> {
+        let (sheet, _, _) = self.sheet(id).ok_or_else(|| format!("no decision sheet {} waiting", id))?;
+        let answers = sheet.answers_from(raw);
+        let posted = SheetPosted {
+            title: sheet.title.clone(),
+            summary: sheet.summary(&answers),
+            answered: sheet.answered(&answers),
+            total: sheet.decisions.len(),
+            done,
+            follow_up: None,
+        };
+        self.save_draft(id, answers);
+        if !done {
+            return Ok(posted);
+        }
+        let before: std::collections::HashSet<String> = self.pending.iter().map(|(q, _)| q.id.clone()).collect();
+        self.answer(id, DECISION_DONE.to_string(), String::new());
+        let follow_up = self.pending.iter().map(|(q, _)| q.id.clone()).find(|q| !before.contains(q));
+        Ok(SheetPosted { follow_up, ..posted })
+    }
+
     /// The user opened `id`'s sheet in the side panel: the floating card lets
     /// it go and shows the next question, if any.
     pub fn opened_in_panel(&mut self, id: &str) {
@@ -1307,6 +1362,13 @@ impl Board {
                     "waiting": waiting.contains(q.id.as_str()),
                     "session_id": q.from.session_id,
                     "cwd": q.from.cwd,
+                    "kind": q.kind,
+                    "url": q.url,
+                    // A native sheet: `get-sheet` gives its content.
+                    "sheet": q.sheet.is_some(),
+                    "decisions": q.sheet.as_ref().map(|s| s.decisions.len()),
+                    "answered": q.sheet.as_ref().map(|s| s.answered(&q.draft.clone().unwrap_or_default())),
+                    "follow_up": q.follow_up,
                 })
             })
             .collect();
@@ -2365,6 +2427,35 @@ mod tests {
         assert_eq!(board.withdraw(rest.from.session_id.as_deref().unwrap_or("s")), 0);
         assert!(board.drop_question(&rest.id).is_ok());
         assert!(board.questions().is_empty());
+    }
+
+    #[test]
+    fn a_remote_client_reads_a_sheet_and_answers_it_like_the_panel() {
+        let q = sheet_question();
+        let id = q.id.clone();
+        let (mut board, rx) = board_with(q);
+        let got = board.sheet_json(&id).unwrap();
+        assert_eq!(got["sheet"]["decisions"][1]["id"], "D2");
+        assert_eq!(got["draft"]["decisions"], serde_json::json!([]));
+        assert_eq!(board.list_json()["asks"][0]["sheet"], true);
+        assert_eq!(board.list_json()["asks"][0]["decisions"], 2);
+        // A draft from the phone: saved, the question still waits.
+        let draft = serde_json::json!({"decisions": {"D1": {"choice": "A", "note": ""}, "D9": {"choice": "A"}}});
+        let p = board.post_sheet(&id, &draft, false).unwrap();
+        assert_eq!((p.answered, p.total, p.done, p.follow_up.clone()), (1, 2, false, None));
+        assert_eq!(board.sheet_json(&id).unwrap()["draft"]["decisions"][0]["choice"], "A");
+        assert_eq!(board.list_json()["asks"][0]["answered"], 1);
+        assert!(rx.try_recv().is_err(), "a draft answers nothing");
+        // Done: the asker gets the summary, D2 stays open as a follow-up.
+        let p = board.post_sheet(&id, &draft, true).unwrap();
+        assert!(p.done && p.summary.starts_with("D1: A (Now)\nD2: open"));
+        let follow = p.follow_up.unwrap();
+        assert!(answered(&rx).text.contains(&follow));
+        assert!(board.sheet_json(&follow).is_ok());
+        assert!(board.post_sheet(&id, &draft, true).is_err(), "answered already");
+        let plain = question("7f1c0000-0000-4000-8000-000000000000");
+        let (board, _rx) = board_with(plain.clone());
+        assert!(board.sheet_json(&plain.id).is_err(), "not a sheet");
     }
 
     #[test]

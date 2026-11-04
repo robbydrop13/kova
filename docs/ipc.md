@@ -356,6 +356,24 @@ by `withdraw-asks`), answered late; the summary ends with
 `drop-ask` with `id` takes a question off unanswered (`kova ask --drop <id>`); a
 `kova ask` still waiting on it exits 3.
 
+For a remote client (KovaLink) a native sheet is read and answered over the
+socket, with the same semantics as the panel:
+
+- `list-asks` gives each question `kind`, `url`, `sheet` (true for a native
+  sheet), `decisions` and `answered` (counts, `null` without a sheet) and
+  `follow_up`.
+- `get-sheet` with `id` → `{"id", "from", "message", "asked_at", "follow_up",
+  "sheet": <the decision-sheet JSON>, "draft": {"decisions": [{"id", "choice",
+  "note"}], "note"}}`. `choice` is an option id or `"other"`, absent when only
+  a note was written. Error `question <id> is not a decision sheet` otherwise.
+- `answer-sheet` with `id`, `answers` and `done` (default false):
+  `answers` is `{"decisions": {"D1": {"choice": "A", "note": "…"}}, "note": "…"}`,
+  the whole state of the sheet (it replaces the draft), kept to what the sheet
+  asks (unknown ids and choices dropped, notes capped at 8000 characters).
+  `done: true` answers the question as Done does: the asker gets the summary,
+  what stayed open becomes a follow-up. Reply `{"title", "summary", "answered",
+  "total", "done", "follow_up": <id or null>}`. Error when no such sheet waits.
+
 Not meant to be spoken by hand: `kova ask "<message>" [--actions OK,KO]` builds it
 from its environment (`CLAUDE_CODE_SESSION_ID`, or `PI_SESSION_FILE` /
 `PI_SESSION_ID` for Pi and omp, plus `OMPCODE` to tell omp from Pi; `KOVA_PANE_ID`,
