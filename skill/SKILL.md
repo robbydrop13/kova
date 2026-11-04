@@ -316,7 +316,10 @@ action, or `action: text` when the user typed something.
   "context","options": [{"id","label","detail","reco"}]}]}`. Open shows the sheet in the side
   panel, answers are kept as they are given, and Done returns them, one line per decision:
   `D1: A (label)`, `D2: B (label). Note: …`, `D3: other: …`, `D4: open`, then `Note: …`. One
-  decision of up to three short options is answerable from the card's buttons too.
+  decision of up to three short options is answerable from the card's buttons too. Decisions left
+  unanswered at Done stay in the user's Asks; the answer ends with `Still open … (question <id>)`,
+  their answer comes later as a message, and `kova ask --drop <id>` takes them off once they no
+  longer matter.
 - `--no-input` (buttons only), `--from <name>` (name on the card), `--json`, `--socket <path>`.
   Outside a Kova pane the client finds Kova.app's socket on its own; from a pane of a library host
   (an app embedding Kova), it falls back to Kova.app too.

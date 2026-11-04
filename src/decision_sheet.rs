@@ -257,6 +257,13 @@ impl Sheet {
         lines.join("\n")
     }
 
+    /// The decisions with no answer at all, as a sheet of their own (same
+    /// title, intro and links), or `None` when every one has an answer.
+    pub fn still_open(&self, answers: &SheetAnswers) -> Option<Sheet> {
+        let open: Vec<SheetDecision> = self.decisions.iter().filter(|d| answers.get(&d.id).is_none()).cloned().collect();
+        (!open.is_empty()).then(|| Sheet { decisions: open, ..self.clone() })
+    }
+
     /// How many decisions have an answer (a choice or a note).
     pub fn answered(&self, answers: &SheetAnswers) -> usize {
         self.decisions.iter().filter(|d| answers.get(&d.id).is_some()).count()

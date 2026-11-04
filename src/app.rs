@@ -554,6 +554,14 @@ fn drain_ipc(ivars: &AppDelegateIvars, fps: u32) {
                     .send(crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "withdrawn": withdrawn })) });
                 continue;
             }
+            crate::ipc::IpcCommand::DropAsk { ref id } => {
+                let result = ivars.asks.borrow_mut().drop_question(id);
+                let _ = responder.send(match result {
+                    Ok(()) => crate::ipc::IpcResponse::Ok { data: None },
+                    Err(message) => crate::ipc::IpcResponse::Error { message },
+                });
+                continue;
+            }
             crate::ipc::IpcCommand::SnoozeAsk { ref id, seconds } => {
                 let until = crate::ask::snooze_until(crate::ask::now_epoch(), seconds);
                 let result = ivars.asks.borrow_mut().snooze(id, until);
@@ -1038,7 +1046,8 @@ fn handle_ipc_command_sync(
         | IpcCommand::ListAsks
         | IpcCommand::AnswerAsk { .. }
         | IpcCommand::SnoozeAsk { .. }
-        | IpcCommand::WithdrawAsks { .. } => {
+        | IpcCommand::WithdrawAsks { .. }
+        | IpcCommand::DropAsk { .. } => {
             log::error!("IPC: an ask command reached the generic dispatcher");
             crate::ipc::IpcResponse::Error {
                 message: "internal: an ask command was not intercepted".to_string(),

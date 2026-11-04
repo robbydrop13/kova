@@ -226,6 +226,9 @@ pub enum IpcCommand {
     /// from a remote client), so the card would only deliver a stale answer.
     /// Nothing is delivered late; a `kova ask` still waiting exits with code 3.
     WithdrawAsks { session_id: String },
+    /// Take one question off the Asks, unanswered: its asker says it no longer
+    /// matters (`kova ask --drop`).
+    DropAsk { id: String },
     /// Every subject of every tab, with the panes filed under it, in the order
     /// Cmd+P draws them.
     ListSubjects,
@@ -710,6 +713,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "answer-ask" => &["id", "action", "text"],
         "snooze-ask" => &["id", "seconds"],
         "withdraw-asks" => &["session_id"],
+        "drop-ask" => &["id"],
         "list-subjects" => &[],
         "set-pane-subject" => &["pane_id", "subject"],
         "rename-subject" => &["tab_id", "name", "new_name"],
@@ -1212,6 +1216,7 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             // Kova's own field: the answers given on the sheet, never the asker's.
             let mut question = question;
             question.draft = None;
+            question.follow_up = false;
             Ok(IpcCommand::Ask(Box::new(question)))
         }
         "list-asks" => Ok(IpcCommand::ListAsks),
@@ -1256,6 +1261,7 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             }
             Ok(IpcCommand::WithdrawAsks { session_id })
         }
+        "drop-ask" => Ok(IpcCommand::DropAsk { id: ask_id(&v)? }),
         "list-subjects" => Ok(IpcCommand::ListSubjects),
         "set-pane-subject" => {
             let pane_id = required_u32(&v, "pane_id")?;

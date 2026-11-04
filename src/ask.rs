@@ -151,6 +151,11 @@ pub struct Question {
     /// kept with the question so a restart does not lose them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<crate::decision_sheet::SheetAnswers>,
+    /// Kova's too: the decisions a sheet still had open when the user clicked
+    /// Done, kept in the Asks until answered or dropped (`kova ask --drop`).
+    /// A message in the conversation does not withdraw it: it did not answer them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub follow_up: bool,
 }
 
 /// The kind of a question that carries a decision sheet.
@@ -1093,7 +1098,7 @@ impl Board {
     /// waiting gets [`WITHDRAWN`] and exits 3. Returns how many were withdrawn.
     pub fn withdraw(&mut self, session_id: &str) -> usize {
         let (gone, kept): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.pending).into_iter().partition(|(q, _)| asked_from(q, session_id));
+            std::mem::take(&mut self.pending).into_iter().partition(|(q, _)| !q.follow_up && asked_from(q, session_id));
         self.pending = kept;
         for (question, responder) in &gone {
             log::info!("ask {}: withdrawn, the user answered in the conversation", question.id);
@@ -1119,16 +1124,50 @@ impl Board {
         self.opened.remove(id);
         // A sheet answers with its summary, whichever way it was closed: a
         // choice on the card (one decision), or Done with what the sheet holds.
+        let mut follow_up = None;
         let (action, text) = match &question.sheet {
             Some(sheet) => {
                 let answers = sheet
                     .answers_from_card(&action, &text)
                     .or_else(|| question.draft.clone())
                     .unwrap_or_default();
-                (DECISION_DONE.to_string(), sheet.summary(&answers))
+                let mut text = sheet.summary(&answers);
+                // What is still open stays in the Asks, a sheet of its own,
+                // answered late to the same conversation.
+                if let Some(rest) = sheet.still_open(&answers) {
+                    let n = rest.decisions.len();
+                    let ids: Vec<String> = rest.decisions.iter().map(|d| d.id.clone()).collect();
+                    let q = Question {
+                        id: new_question_id(),
+                        message: format!("{}: {} decision{} left", sheet.title, n, if n == 1 { "" } else { "s" }),
+                        actions: vec![DECISION_DONE.to_string()],
+                        input: false,
+                        from: question.from.clone(),
+                        asked_at: question.asked_at,
+                        snoozed_until: 0,
+                        kind: Some(KIND_DECISION.to_string()),
+                        url: None,
+                        sheet: Some(rest),
+                        draft: None,
+                        follow_up: true,
+                    };
+                    text.push_str(&format!(
+                        "\nStill open in the user's Kova Asks: {} (question {}). Their answer will come later as a message; if it no longer matters, drop it: kova ask --drop {}",
+                        ids.join(", "), q.id, q.id
+                    ));
+                    follow_up = Some(q);
+                }
+                (DECISION_DONE.to_string(), text)
             }
             None => (action, text),
         };
+        if let Some(q) = follow_up {
+            log::info!("ask {}: {} kept in the Asks as {}", id, q.message, q.id);
+            if self.owns_store() {
+                self.store.save_question(&q);
+            }
+            self.pending.push((q, None));
+        }
         let answer = Answer { id: id.to_string(), action, text };
         log::info!("ask {}: answered: {}", id, answer.line());
         // On disk before the question leaves it: a quit from here on still delivers it.
@@ -1146,6 +1185,24 @@ impl Board {
             spawn_late(self.store.clone(), question, answer);
         }
         true
+    }
+
+    /// Take `id` off the Asks without answering it: the asker says it no
+    /// longer matters (`kova ask --drop`). A `kova ask` still waiting on it
+    /// exits 3, as on a withdrawal.
+    pub fn drop_question(&mut self, id: &str) -> Result<(), String> {
+        let index = self.pending.iter().position(|(q, _)| q.id == id).ok_or_else(|| format!("no question {}", id))?;
+        let (question, responder) = self.pending.remove(index);
+        log::info!("ask {}: dropped by its asker", question.id);
+        if self.owns_store() {
+            self.store.remove_question(&question.id);
+        }
+        if let Some(tx) = responder {
+            let _ = tx.send(crate::ipc::IpcResponse::Error { message: WITHDRAWN.to_string() });
+        }
+        self.opened.remove(id);
+        self.dirty = true;
+        Ok(())
     }
 
     /// The user opened `id`'s sheet in the side panel: the floating card lets
@@ -1292,7 +1349,7 @@ impl Board {
         let now = now_epoch();
         // Snoozed questions leave the card entirely, the queue count included:
         // "2 more" must not count what the user has put off.
-        let due: Vec<&Question> = self.pending.iter().map(|(q, _)| q).filter(|q| q.due(now) && !self.opened.contains(&q.id)).collect();
+        let due: Vec<&Question> = self.pending.iter().map(|(q, _)| q).filter(|q| q.due(now) && !q.follow_up && !self.opened.contains(&q.id)).collect();
         let head = due.first().copied();
         let buttons = head.map(|q| q.buttons()).unwrap_or_default();
         let link = head.and_then(|q| q.panel_link());
@@ -1348,6 +1405,8 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
                 \"New decision\", its Open button shows the page in Kova's side panel, and the
                 answer comes when the user clicks Done (default actions: Done; no text field
                 unless --actions is given too)
+  --drop <id>   (alone) take a question off the user's Asks unanswered: a decision a sheet left
+                open (its id is in the answer) that no longer matters
   --decisions   a decision sheet Kova shows itself, from a JSON file (the decision-sheet skill's
                 format: title, intro, links, decisions with options, one marked reco). The card
                 says \"New decision\" (the message defaults to \"<title>: <N> decisions\"), Open shows
@@ -1565,6 +1624,38 @@ fn run_withdraw(args: &[String]) -> i32 {
     0
 }
 
+/// `kova ask --drop <id>`: take a question off the Asks, unanswered (a
+/// decision left open that no longer matters).
+fn run_drop(args: &[String]) -> i32 {
+    let (Some(id), None) = (args.first(), args.get(1)) else {
+        eprintln!("usage: kova ask --drop <question id>");
+        return 1;
+    };
+    if !is_safe_question_id(id) {
+        eprintln!("kova ask: '{}' is not a question id", id);
+        return 1;
+    }
+    let Some(socket) = std::env::var("KOVA_SOCKET").ok().filter(|s| !s.is_empty()).or_else(discover_socket) else {
+        eprintln!("kova ask: no running Kova found");
+        return 1;
+    };
+    let body = serde_json::json!({"cmd": "drop-ask", "id": id});
+    let mut reply = request(&socket, body.clone(), Duration::from_secs(2));
+    let unsupported = reply.as_ref().and_then(|r| r.get("error")).and_then(|e| e.as_str())
+        .is_some_and(|e| e == "command not supported by this host");
+    if unsupported && let Some(app) = discover_socket().filter(|s| *s != socket) {
+        reply = request(&app, body, Duration::from_secs(2));
+    }
+    if reply_ok(&reply) {
+        println!("dropped");
+        0
+    } else {
+        let err = reply.as_ref().and_then(|r| r.get("error")).and_then(|e| e.as_str()).unwrap_or("no answer from Kova");
+        eprintln!("kova ask: {}", err);
+        1
+    }
+}
+
 /// `kova ask …`: returns the process exit code.
 pub fn run_cli(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("--withdraw") {
@@ -1573,6 +1664,9 @@ pub fn run_cli(args: &[String]) -> i32 {
             return 0;
         }
         return run_withdraw(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("--drop") {
+        return run_drop(&args[1..]);
     }
     let fail = |msg: &str, code: i32| -> i32 {
         eprintln!("{}", msg);
@@ -1606,6 +1700,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         url: cli.decision.clone(),
         sheet: cli.sheet.clone(),
         draft: None,
+        follow_up: false,
     };
 
     let body = serde_json::json!({"cmd": "ask", "question": question});
@@ -1739,7 +1834,7 @@ mod tests {
     }
 
     fn question(id: &str) -> Question {
-        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None, sheet: None, draft: None }
+        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None, sheet: None, draft: None, follow_up: false }
     }
 
     #[test]
@@ -2256,8 +2351,20 @@ mod tests {
         assert!(board.opened.is_empty());
         let a = answered(&rx);
         assert_eq!(a.action, "Done");
-        assert_eq!(a.text, "D1: B (Later). Note: next week\nD2: open");
+        let (summary, still) = a.text.split_once("\nStill open").unwrap();
+        assert_eq!(summary, "D1: B (Later). Note: next week\nD2: open");
         assert!(board.sheet(&id).is_none());
+        // D2 stays in the Asks, a sheet of its own, delivered late.
+        let rest = board.questions()[0].clone();
+        assert!(still.contains(&format!("kova ask --drop {}", rest.id)));
+        assert!(rest.follow_up && rest.is_decision());
+        assert_eq!(rest.message, "Plan: 1 decision left");
+        assert_eq!(rest.sheet.as_ref().unwrap().decisions.len(), 1);
+        assert_eq!(rest.sheet.as_ref().unwrap().decisions[0].id, "D2");
+        // A message in the conversation does not take it back; its asker can drop it.
+        assert_eq!(board.withdraw(rest.from.session_id.as_deref().unwrap_or("s")), 0);
+        assert!(board.drop_question(&rest.id).is_ok());
+        assert!(board.questions().is_empty());
     }
 
     #[test]

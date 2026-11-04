@@ -349,6 +349,13 @@ dropped), and answers `Done` with their summary as `text`, one line per decision
 sheet of one decision with up to three short options also takes its options as
 buttons on the card. `kova ask --decisions <file.json>` builds it.
 
+Done with decisions left unanswered keeps them in the Asks as a new sheet
+question (`follow_up: true`, Kova's field, off the floating card, not taken back
+by `withdraw-asks`), answered late; the summary ends with
+`Still open in the user's Kova Asks: D3 (question <id>) …`.
+`drop-ask` with `id` takes a question off unanswered (`kova ask --drop <id>`); a
+`kova ask` still waiting on it exits 3.
+
 Not meant to be spoken by hand: `kova ask "<message>" [--actions OK,KO]` builds it
 from its environment (`CLAUDE_CODE_SESSION_ID`, or `PI_SESSION_FILE` /
 `PI_SESSION_ID` for Pi and omp, plus `OMPCODE` to tell omp from Pi; `KOVA_PANE_ID`,

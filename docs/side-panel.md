@@ -91,6 +91,13 @@ floating card, which moves on to the next question: it is answered on the
 sheet, and stays in the sidebar's Asks until then. Not kept across a restart:
 a relaunch puts it back on the card.
 
+Done with decisions still unanswered (on the sheet, or on the card): the
+asker gets what was answered, and the rest stays in the sidebar's Asks as a
+sheet of its own (`<title>: N decisions left`, `follow_up`), off the floating
+card and not withdrawn by a message in the conversation. Its answer reaches
+the same conversation later, as a message. The answer names it, so the asker
+can drop it once it no longer matters: `kova ask --drop <id>` (`drop-ask`).
+
 ## Markdown
 
 Rendered by Kova (`pulldown-cmark`: tables, task lists, strikethrough,

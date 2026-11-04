@@ -1848,6 +1848,7 @@ mod tests {
             url: Some("https://claude.ai/artifact/x".into()),
             sheet: None,
             draft: None,
+            follow_up: false,
         };
         let vm = AskCardVm::from_question(&q, None, false, 10);
         assert_eq!(vm.decision_url.as_deref(), Some("https://claude.ai/artifact/x"));
@@ -2058,6 +2059,7 @@ mod tests {
             url: None,
             sheet: None,
             draft: None,
+            follow_up: false,
         }
     }
 
