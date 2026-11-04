@@ -196,6 +196,8 @@ pub enum IpcCommand {
     /// a restart (colors, pane fade, focus outline). Font, keybindings and
     /// terminal geometry keep the values they were started with.
     ReloadConfig,
+    /// Show a page or a document in the side panel of the front window.
+    OpenPanel { target: String },
     /// Turn this connection into an event stream for the given topics.
     /// The main thread answers with a snapshot of the current state; every
     /// change after that is pushed as its own line. See `topic`.
@@ -701,6 +703,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "set-anchor" => &["pane_id", "cwd", "session_id", "agent", "label"],
         "clear-anchors" => &[],
         "reload-config" => &[],
+        "open-panel" => &["target"],
         "subscribe" => &["events"],
         "ask" => &["question"],
         "list-asks" => &[],
@@ -1137,6 +1140,13 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
         }
         "clear-anchors" => Ok(IpcCommand::ClearAnchors),
         "reload-config" => Ok(IpcCommand::ReloadConfig),
+        "open-panel" => match v.get("target") {
+            Some(serde_json::Value::String(t)) if !t.trim().is_empty() => {
+                Ok(IpcCommand::OpenPanel { target: t.trim().to_string() })
+            }
+            None | Some(serde_json::Value::Null) => Err("missing \"target\" field".to_string()),
+            Some(_) => Err("\"target\" must be a non-empty string".to_string()),
+        },
         "subscribe" => {
             // Omitted / null = every topic. An explicit list is validated name by
             // name: a typo must fail loudly, exactly like an unknown field, rather
@@ -1191,6 +1201,10 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .is_some_and(|s| !crate::ask::is_safe_session_id(s))
             {
                 return Err("\"question.from.session_id\" must be a plain session id".to_string());
+            }
+            // Shown in the side panel, where the user's logins live.
+            if question.url.as_deref().is_some_and(|u| !crate::ask::is_panel_url(u)) {
+                return Err("\"question.url\" must be an http(s) URL".to_string());
             }
             Ok(IpcCommand::Ask(Box::new(question)))
         }
@@ -1965,6 +1979,12 @@ mod tests {
             Ok(IpcCommand::ReloadConfig)
         ));
         assert!(parse_command(r#"{"cmd":"reload-config","path":"/tmp/x"}"#).is_err());
+        assert!(matches!(
+            parse_command(r#"{"cmd":"open-panel","target":"https://claude.ai/artifact/x"}"#),
+            Ok(IpcCommand::OpenPanel { target }) if target == "https://claude.ai/artifact/x"
+        ));
+        assert!(parse_command(r#"{"cmd":"open-panel"}"#).is_err());
+        assert!(parse_command(r#"{"cmd":"open-panel","target":3}"#).is_err());
     }
 
     #[test]

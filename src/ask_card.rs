@@ -1,7 +1,15 @@
 //! The card an agent's question appears on (`crate::ask`).
 //!
-//! A port of an earlier Swift prototype's `QuestionCard.swift`, whose look the user validated:
-//! same classes, sizes, colours, fonts and corner radii — do not redesign it here.
+//! A port of an earlier Swift prototype's `QuestionCard.swift`. Its structure
+//! stays (header, message, field, buttons, one card at a time); its look moved
+//! to the Claap design system on 04/11/2026 at the user's request, the same
+//! tokens and type as the sidebar's Asks cards (`sidebar::tokens`, Inter): a
+//! `bg1` card with a `b3` rim and a 12 pt radius, the asker's colour on a dot,
+//! the primary answer on the accent fill, the others secondary.
+//!
+//! A decision question (`kova ask --decision <url>`) says `New decision` and
+//! adds an Open button that shows the sheet in the side panel without
+//! answering; the agent hears back when the user clicks Done.
 //!
 //! The card sits top-right of the screen, over everything, without taking the
 //! keyboard until the user clicks into it. One question at a time; the others
@@ -15,10 +23,9 @@
 //! select and Cmd+C, as anywhere else. The rest of the look is Kova Float's
 //! and stays as it is.
 //!
-//! Layout: a borderless rounded panel on a translucent HUD background, the
-//! asker's colour washing down from the top edge and rimming the card. Header
-//! (badge, who asks, time, how many wait), the message, the answer field, then
-//! the buttons right-aligned with the first one as the default (tinted, Enter).
+//! Layout: a borderless rounded panel. Header (the asker's dot, who asks, time,
+//! how many wait), the message, the answer field, then the buttons
+//! right-aligned with the first one as the default (accent, Enter).
 //!
 //! Main thread only. The answers are queued here and drained by Kova's render
 //! tick through [`take_answers`]: AppKit calls the button and field callbacks
@@ -31,14 +38,13 @@ use objc2_app_kit::{
     NSApplication, NSAttributedStringNSExtendedStringDrawing, NSAttributedStringNSStringDrawing,
     NSBackingStoreType, NSButton, NSColor, NSControl, NSControlTextEditingDelegate,
     NSEvent, NSEventModifierFlags, NSFloatingWindowLevel, NSFocusRingType, NSFont,
-    NSFontAttributeName, NSFontWeightRegular, NSFontWeightSemibold,
+    NSFontAttributeName,
     NSForegroundColorAttributeName, NSLayoutAttribute, NSLayoutConstraint,
     NSMenu, NSMenuItem,
     NSLayoutConstraintOrientation, NSLayoutManager, NSLayoutPriorityRequired, NSLineBreakMode,
     NSPanel, NSRequestUserAttentionType, NSResponder, NSScreen, NSSound, NSStackView,
-    NSStringDrawingOptions, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTextView,
-    NSUserInterfaceLayoutOrientation, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSWindow, NSWindowCollectionBehavior,
+    NSStringDrawingOptions, NSTextField, NSTextFieldDelegate, NSTextView,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowCollectionBehavior,
     NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
@@ -47,7 +53,6 @@ use objc2_foundation::{
     NSDateFormatter, NSDateFormatterStyle, NSDictionary, NSEdgeInsets, NSNotification, NSObject,
     NSObjectProtocol, NSString,
 };
-use objc2_quartz_core::{CAGradientLayer, CATransaction};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -64,6 +69,8 @@ pub struct CardQuestion<'a> {
     pub input: bool,
     /// Epoch seconds; shown as the local short time.
     pub asked_at: u64,
+    /// A decision sheet's URL: the card says `New decision` and offers Open.
+    pub decision_url: Option<&'a str>,
 }
 
 /// What the user answered: the button (or the first one, for Enter) and the
@@ -86,7 +93,13 @@ const WIDTH: CGFloat = 400.0;
 const INSET: CGFloat = 20.0;
 /// Beyond this the field stops growing and scrolls.
 const MAX_LINES: CGFloat = 8.0;
-const FIELD_FONT_SIZE: CGFloat = 14.0;
+const FIELD_FONT_SIZE: CGFloat = 13.0;
+/// The design system's card radius (`xl`), button and input radius (`lg`).
+const CARD_RADIUS: CGFloat = 12.0;
+const CONTROL_RADIUS: CGFloat = 8.0;
+/// The asker's dot, as the sidebar's awaiting dot.
+const DOT_D: CGFloat = 8.0;
+const BUTTON_H: CGFloat = 32.0;
 const PLACEHOLDER: &str = "Type an answer, or just click a button";
 
 /// Answers given since the last [`take_answers`]. A `Mutex` although only the
@@ -95,6 +108,8 @@ const PLACEHOLDER: &str = "Type an answer, or just click a button";
 static ANSWERS: Mutex<Vec<CardAnswer>> = Mutex::new(Vec::new());
 /// Snoozes chosen since the last [`take_snoozes`], same reasoning as `ANSWERS`.
 static SNOOZES: Mutex<Vec<CardSnooze>> = Mutex::new(Vec::new());
+/// Decision sheets the user asked to open, since the last [`take_panel_opens`].
+static PANEL_OPENS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// The card, built on the first `show`. Kept for the life of the process:
@@ -204,6 +219,20 @@ define_class!(
             }
         }
 
+        /// Open: the decision sheet in the side panel. The question stays on
+        /// the card: the sheet is answered there, then Done.
+        #[unsafe(method(openDecision:))]
+        fn open_decision(&self, _sender: &NSButton) {
+            let Some(card) = card() else { return };
+            let url = card.current.borrow().as_ref().and_then(|c| c.decision_url.clone());
+            if let Some(url) = url {
+                log::info!("Ask card: open decision {}", url);
+                if let Ok(mut opens) = PANEL_OPENS.lock() {
+                    opens.push(url);
+                }
+            }
+        }
+
         /// A button: its tag is its index in the question's buttons.
         #[unsafe(method(pressed:))]
         fn pressed(&self, sender: &NSButton) {
@@ -260,6 +289,7 @@ struct Current {
     buttons: Vec<String>,
     /// What the copy control puts on the pasteboard.
     message: String,
+    decision_url: Option<String>,
 }
 
 /// Everything `show` last drew, to skip a redraw when nothing changed: the tick
@@ -274,13 +304,15 @@ struct Shown {
     input: bool,
     asked_at: u64,
     waiting: usize,
+    decision_url: Option<String>,
+    /// The palette the card was drawn with: a theme change redraws it.
+    light: bool,
 }
 
 struct Card {
     panel: Retained<CardPanel>,
     target: Retained<CardTarget>,
-    background: Retained<objc2_app_kit::NSVisualEffectView>,
-    wash: Retained<CAGradientLayer>,
+    background: Retained<NSView>,
     badge_holder: Retained<NSView>,
     who: Retained<NSTextField>,
     meta: Retained<NSTextField>,
@@ -291,13 +323,13 @@ struct Card {
     /// answer gets longer.
     field_height: Retained<NSLayoutConstraint>,
     buttons: Retained<NSStackView>,
+    snooze_button: Retained<NSButton>,
     line_height: CGFloat,
     current: RefCell<Option<Current>>,
     shown: RefCell<Option<Shown>>,
     /// The last question answered: it stays hidden even if `show` is called
     /// with it again before the caller has drained the answer.
     answered: RefCell<Option<String>>,
-    tint: RefCell<Retained<NSColor>>,
 }
 
 fn card() -> Option<Rc<Card>> {
@@ -314,7 +346,20 @@ fn card_or_build(mtm: MainThreadMarker) -> Rc<Card> {
 }
 
 fn field_font() -> Retained<NSFont> {
-    NSFont::systemFontOfSize(FIELD_FONT_SIZE)
+    crate::window::fonts::inter(crate::window::fonts::Face::Regular, FIELD_FONT_SIZE)
+}
+
+/// A design-system colour token as an `NSColor`.
+fn token(c: [f32; 3]) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(c[0] as f64, c[1] as f64, c[2] as f64, 1.0)
+}
+
+fn palette() -> &'static crate::window::sidebar::tokens::Palette {
+    crate::window::sidebar::tokens::get()
+}
+
+fn light() -> bool {
+    std::ptr::eq(palette(), &crate::window::sidebar::tokens::LIGHT)
 }
 
 fn ns(s: &str) -> Retained<NSString> {
@@ -329,23 +374,9 @@ fn attributed(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttribut
     unsafe { NSAttributedString::new_with_attributes(&ns(text), &attrs) }
 }
 
-/// `[c1, c2]` as the untyped array `CAGradientLayer.colors` takes.
-fn cg_colors(colors: &[&NSColor]) -> Retained<NSArray> {
-    let cg: Vec<Retained<AnyObject>> = colors
-        .iter()
-        // A CGColor is an Objective-C object; the cast only erases its type.
-        .map(|c| unsafe { Retained::cast_unchecked::<AnyObject>(c.CGColor()) })
-        .collect();
-    NSArray::from_retained_slice(&cg)
-}
-
 /// The attributed title of a small control, in the card's secondary style.
 fn small_title(text: &str) -> Retained<NSAttributedString> {
-    attributed(
-        text,
-        &NSFont::systemFontOfSize_weight(11.0, unsafe { NSFontWeightRegular }),
-        &NSColor::whiteColor().colorWithAlphaComponent(0.75),
-    )
+    attributed(text, &crate::window::fonts::inter(crate::window::fonts::Face::Medium, 12.0), &token(palette().text_secondary))
 }
 
 /// A small secondary pill ("Later"), drawn by hand for the same reason as the
@@ -360,16 +391,16 @@ fn small_button(
     let button = unsafe { NSButton::buttonWithTitle_target_action(&ns(title), Some(target), Some(action), mtm) };
     button.setBordered(false);
     button.setWantsLayer(true);
+    // The design system's ghost button: no ground, the secondary ink.
     if let Some(layer) = button.layer() {
-        layer.setCornerRadius(6.0);
-        layer.setBackgroundColor(Some(&NSColor::whiteColor().colorWithAlphaComponent(0.10).CGColor()));
+        layer.setCornerRadius(CONTROL_RADIUS);
     }
     button.setAttributedTitle(&small_title(title));
     button.setTranslatesAutoresizingMaskIntoConstraints(false);
     activate(&[
-        // Hugs its title with 16 points of padding.
-        button.widthAnchor().constraintEqualToConstant(button.attributedTitle().size().width + 16.0),
-        button.heightAnchor().constraintEqualToConstant(22.0),
+        // Hugs its title with 20 points of padding.
+        button.widthAnchor().constraintEqualToConstant(button.attributedTitle().size().width + 20.0),
+        button.heightAnchor().constraintEqualToConstant(BUTTON_H - 4.0),
     ]);
     button
 }
@@ -396,15 +427,6 @@ fn copy_payload(selection: &str, message: &str) -> String {
 
 fn activate(constraints: &[Retained<NSLayoutConstraint>]) {
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(constraints));
-}
-
-/// Set a layer property with Core Animation's implicit animation off, as
-/// Swift's `CATransaction.setDisableActions(true)` blocks do.
-fn without_animation(f: impl FnOnce()) {
-    CATransaction::begin();
-    CATransaction::setDisableActions(true);
-    f();
-    CATransaction::commit();
 }
 
 impl Card {
@@ -440,41 +462,28 @@ impl Card {
             unsafe { msg_send![super(this), init] }
         };
 
-        let background = objc2_app_kit::NSVisualEffectView::new(mtm);
-        background.setMaterial(NSVisualEffectMaterial::HUDWindow);
-        background.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
-        background.setState(NSVisualEffectState::Active);
+        // A plain layer-backed card: the design system paints surfaces flat,
+        // no vibrancy. Its colours are set in `show`, from the palette in use.
+        let background = NSView::new(mtm);
         background.setWantsLayer(true);
-        let wash = CAGradientLayer::new();
         if let Some(layer) = background.layer() {
-            layer.setCornerRadius(16.0);
+            layer.setCornerRadius(CARD_RADIUS);
             layer.setMasksToBounds(true);
-            // The asker's colour washes down from the top edge, and rims the card.
-            wash.setStartPoint(CGPoint::new(0.5, 1.0));
-            wash.setEndPoint(CGPoint::new(0.5, 0.25));
-            layer.addSublayer(&wash);
             layer.setBorderWidth(1.0);
         }
         panel.setContentView(Some(&background));
 
-        // Header: a round badge, who asks, and on the right the time and the queue.
-        let badge = NSTextField::labelWithString(&ns("📎"), mtm);
-        badge.setFont(Some(&NSFont::systemFontOfSize(15.0)));
-        badge.setAlignment(NSTextAlignment::Center);
+        // Header: the asker's dot, who asks, and on the right the time and the queue.
         let badge_holder = NSView::new(mtm);
         badge_holder.setWantsLayer(true);
         if let Some(layer) = badge_holder.layer() {
-            layer.setCornerRadius(14.0);
+            layer.setCornerRadius(DOT_D / 2.0);
         }
-        badge.setTranslatesAutoresizingMaskIntoConstraints(false);
-        badge_holder.addSubview(&badge);
         let who = NSTextField::labelWithString(&ns(""), mtm);
-        who.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, unsafe { NSFontWeightSemibold })));
-        who.setTextColor(Some(&NSColor::labelColor()));
+        who.setFont(Some(&crate::window::fonts::inter(crate::window::fonts::Face::Semibold, 13.0)));
         who.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         let meta = NSTextField::labelWithString(&ns(""), mtm);
-        meta.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        meta.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        meta.setFont(Some(&crate::window::fonts::inter(crate::window::fonts::Face::Regular, 11.0)));
         meta.setContentCompressionResistancePriority_forOrientation(
             NSLayoutPriorityRequired,
             NSLayoutConstraintOrientation::Horizontal,
@@ -489,8 +498,7 @@ impl Card {
         header.setAlignment(NSLayoutAttribute::CenterY);
 
         let body = NSTextField::wrappingLabelWithString(&ns(""), mtm);
-        body.setFont(Some(&NSFont::systemFontOfSize(14.0)));
-        body.setTextColor(Some(&NSColor::labelColor()));
+        body.setFont(Some(&crate::window::fonts::inter(crate::window::fonts::Face::Regular, 13.0)));
         body.setSelectable(true);
         body.setPreferredMaxLayoutWidth(WIDTH - 2.0 * INSET);
 
@@ -503,7 +511,6 @@ impl Card {
         field.setDrawsBackground(false);
         field.setFocusRingType(NSFocusRingType::None);
         field.setFont(Some(&field_font()));
-        field.setTextColor(Some(&NSColor::labelColor()));
         field.setUsesSingleLineMode(false);
         if let Some(cell) = field.cell() {
             cell.setWraps(true);
@@ -515,7 +522,7 @@ impl Card {
         let field_box = NSView::new(mtm);
         field_box.setWantsLayer(true);
         if let Some(layer) = field_box.layer() {
-            layer.setCornerRadius(10.0);
+            layer.setCornerRadius(CONTROL_RADIUS);
             layer.setBorderWidth(1.0);
         }
         field_box.addSubview(&field);
@@ -564,17 +571,14 @@ impl Card {
             body.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
             field_box.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
             footer.widthAnchor().constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET),
-            badge_holder.widthAnchor().constraintEqualToConstant(28.0),
-            badge_holder.heightAnchor().constraintEqualToConstant(28.0),
-            badge.centerXAnchor().constraintEqualToAnchor(&badge_holder.centerXAnchor()),
-            badge.centerYAnchor().constraintEqualToAnchor(&badge_holder.centerYAnchor()),
+            badge_holder.widthAnchor().constraintEqualToConstant(DOT_D),
+            badge_holder.heightAnchor().constraintEqualToConstant(DOT_D),
         ]);
 
         Card {
             panel,
             target,
             background,
-            wash,
             badge_holder,
             who,
             meta,
@@ -583,11 +587,11 @@ impl Card {
             field_box,
             field_height,
             buttons,
+            snooze_button,
             line_height,
             current: RefCell::new(None),
             shown: RefCell::new(None),
             answered: RefCell::new(None),
-            tint: RefCell::new(NSColor::controlAccentColor()),
         }
     }
 
@@ -663,6 +667,8 @@ impl Card {
             input: question.input,
             asked_at: question.asked_at,
             waiting,
+            decision_url: question.decision_url.map(str::to_string),
+            light: light(),
         };
         if self.shown.borrow().as_ref() == Some(&shown) && self.panel.isVisible() {
             return;
@@ -672,56 +678,69 @@ impl Card {
             id: shown.id.clone(),
             buttons: shown.buttons.clone(),
             message: shown.message.clone(),
+            decision_url: shown.decision_url.clone(),
         });
         *self.shown.borrow_mut() = Some(shown);
 
-        self.who.setStringValue(&ns(question.from));
+        let p = palette();
+        // The panel's appearance follows the palette, so the field's caret and
+        // selection read on the card's ground.
+        let appearance_name = unsafe {
+            if light() { objc2_app_kit::NSAppearanceNameAqua } else { objc2_app_kit::NSAppearanceNameDarkAqua }
+        };
+        objc2_app_kit::NSAppearanceCustomization::setAppearance::<>(self.panel.as_ref() as &NSWindow, objc2_app_kit::NSAppearance::appearanceNamed(appearance_name).as_deref());
+        if let Some(layer) = self.background.layer() {
+            layer.setBackgroundColor(Some(&token(p.tile).CGColor()));
+            layer.setBorderColor(Some(&token(p.border_subtle).CGColor()));
+        }
+        let decision = question.decision_url.is_some();
+        // A decision names what it is; the asker moves to the meta line.
+        self.who.setStringValue(&ns(if decision { "New decision" } else { question.from }));
+        self.who.setTextColor(Some(&token(p.text_primary)));
         let (r, g, b) = crate::ask::agent_rgb(question.from);
         let tint = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
         if let Some(layer) = self.badge_holder.layer() {
-            layer.setBackgroundColor(Some(&tint.CGColor()));
+            let dot = if decision { token(p.awaiting) } else { tint };
+            layer.setBackgroundColor(Some(&dot.CGColor()));
         }
-        self.who.setTextColor(tint.blendedColorWithFraction_ofColor(0.35, &NSColor::whiteColor()).as_deref());
-        if let Some(layer) = self.background.layer() {
-            layer.setBorderColor(Some(&tint.colorWithAlphaComponent(0.55).CGColor()));
-        }
-        let colors = cg_colors(&[&tint.colorWithAlphaComponent(0.42), &tint.colorWithAlphaComponent(0.0)]);
-        unsafe { self.wash.setColors(Some(&colors)) };
         let time = short_time(question.asked_at);
-        let meta = if waiting > 0 { format!("{} · {} more", time, waiting) } else { time };
+        let mut meta = if decision { format!("{} · {}", question.from, time) } else { time };
+        if waiting > 0 {
+            meta = format!("{} · {} more", meta, waiting);
+        }
         self.meta.setStringValue(&ns(&meta));
+        self.meta.setTextColor(Some(&token(p.text_tertiary)));
         self.body.setStringValue(&ns(question.message));
+        self.body.setTextColor(Some(&token(p.text_primary)));
         if is_new {
             self.field.setStringValue(&ns(""));
             self.field_height.setConstant(self.line_height);
         }
         self.field_box.setHidden(!question.input);
+        self.field.setTextColor(Some(&token(p.text_primary)));
         if let Some(layer) = self.field_box.layer() {
-            let fill = NSColor::whiteColor()
-                .colorWithAlphaComponent(0.10)
-                .blendedColorWithFraction_ofColor(0.12, &tint);
-            layer.setBackgroundColor(fill.map(|c| c.CGColor()).as_deref());
-            layer.setBorderColor(Some(&tint.colorWithAlphaComponent(0.6).CGColor()));
+            layer.setBackgroundColor(Some(&token(p.ground).CGColor()));
+            layer.setBorderColor(Some(&token(p.border_strong).CGColor()));
         }
-        self.field.setPlaceholderAttributedString(Some(&attributed(
-            PLACEHOLDER,
-            &NSFont::systemFontOfSize(14.0),
-            &NSColor::whiteColor().colorWithAlphaComponent(0.45),
-        )));
-        *self.tint.borrow_mut() = tint;
+        self.field.setPlaceholderAttributedString(Some(&attributed(PLACEHOLDER, &field_font(), &token(p.text_tertiary))));
+        self.snooze_button.setAttributedTitle(&small_title("Later"));
 
         for view in self.buttons.arrangedSubviews().iter() {
             view.removeFromSuperview();
         }
         // Right-aligned, the default (first action) last, as macOS dialogs do.
+        // A decision's Open comes first: it does not answer.
+        if decision {
+            let open = self.make_button(mtm, "Open", None);
+            self.buttons.addArrangedSubview(&open);
+        }
         for (index, title) in question.buttons.iter().enumerate().rev() {
-            let button = self.make_button(mtm, title, index);
+            let button = self.make_button(mtm, title, Some(index));
             self.buttons.addArrangedSubview(&button);
         }
 
         self.background.layoutSubtreeIfNeeded();
         let fitting = self.background.fittingSize();
-        without_animation(|| self.wash.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), fitting)));
         let size = CGSize::new(WIDTH, fitting.height);
         let screen = NSScreen::mainScreen(mtm)
             .map(|s| s.visibleFrame())
@@ -746,24 +765,30 @@ impl Card {
 
     /// Drawn by hand: macOS paints its default button blue only in the key
     /// window, and the card never takes the keyboard on its own, so system
-    /// buttons all came out grey.
-    fn make_button(&self, mtm: MainThreadMarker, title: &str, index: usize) -> Retained<NSButton> {
-        let primary = index == 0;
-        let tint = self.tint.borrow();
-        let button = unsafe {
-            NSButton::buttonWithTitle_target_action(&ns(title), Some(&self.target), Some(sel!(pressed:)), mtm)
-        };
-        button.setTag(index as isize);
+    /// buttons all came out grey. The design system's two variants: the first
+    /// answer is primary (accent fill), the others secondary (`btn2` fill, a
+    /// `b2` rim). `index` is the answer's index; `None` is a decision's Open.
+    fn make_button(&self, mtm: MainThreadMarker, title: &str, index: Option<usize>) -> Retained<NSButton> {
+        let primary = index == Some(0);
+        let p = palette();
+        let action = if index.is_some() { sel!(pressed:) } else { sel!(openDecision:) };
+        let button = unsafe { NSButton::buttonWithTitle_target_action(&ns(title), Some(&self.target), Some(action), mtm) };
+        button.setTag(index.map_or(-1, |i| i as isize));
         button.setBordered(false);
         button.setWantsLayer(true);
         if let Some(layer) = button.layer() {
-            layer.setCornerRadius(8.0);
-            let fill = if primary { tint.clone() } else { NSColor::whiteColor().colorWithAlphaComponent(0.12) };
-            layer.setBackgroundColor(Some(&fill.CGColor()));
+            layer.setCornerRadius(CONTROL_RADIUS);
+            if primary {
+                layer.setBackgroundColor(Some(&token(p.accent).CGColor()));
+            } else {
+                layer.setBackgroundColor(Some(&token(p.tile_hover).CGColor()));
+                layer.setBorderWidth(1.0);
+                layer.setBorderColor(Some(&token(p.border_strong).CGColor()));
+            }
         }
-        let weight = unsafe { if primary { NSFontWeightSemibold } else { NSFontWeightRegular } };
-        let color = if primary { NSColor::whiteColor() } else { NSColor::labelColor() };
-        button.setAttributedTitle(&attributed(title, &NSFont::systemFontOfSize_weight(13.0, weight), &color));
+        let face = if primary { crate::window::fonts::Face::Semibold } else { crate::window::fonts::Face::Medium };
+        let color = if primary { token(p.text_on_fill) } else { token(p.text_primary) };
+        button.setAttributedTitle(&attributed(title, &crate::window::fonts::inter(face, 13.0), &color));
         if primary {
             button.setKeyEquivalent(&ns("\r"));
         }
@@ -771,7 +796,7 @@ impl Card {
         let width = button.attributedTitle().size().width + 28.0;
         activate(&[
             button.widthAnchor().constraintEqualToConstant(width.max(72.0)),
-            button.heightAnchor().constraintEqualToConstant(30.0),
+            button.heightAnchor().constraintEqualToConstant(BUTTON_H),
         ]);
         button
     }
@@ -807,7 +832,6 @@ impl Card {
         frame.origin.y = frame.origin.y + frame.size.height - new_height;
         frame.size.height = new_height;
         self.panel.setFrame_display(frame, true);
-        without_animation(|| self.wash.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), frame.size)));
     }
 }
 
@@ -849,6 +873,15 @@ pub fn show(mtm: MainThreadMarker, question: Option<&CardQuestion>, waiting: usi
 pub fn take_answers() -> Vec<CardAnswer> {
     match ANSWERS.lock() {
         Ok(mut answers) => std::mem::take(&mut *answers),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Decision sheets the user clicked Open on since the last call: the tick
+/// shows each in the front window's side panel.
+pub fn take_panel_opens() -> Vec<String> {
+    match PANEL_OPENS.lock() {
+        Ok(mut opens) => std::mem::take(&mut *opens),
         Err(_) => Vec::new(),
     }
 }

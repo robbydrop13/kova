@@ -26,6 +26,8 @@ pub enum Icon {
     ChevronDown,
     /// `chevron-right`: a folded group.
     ChevronRight,
+    /// `chevron-left`: back, in the side panel.
+    ChevronLeft,
     /// `plus`: add a pane.
     Plus,
     /// `x`: close.
@@ -86,9 +88,10 @@ pub enum Icon {
 
 /// Every icon, walked by the grid test so a new variant is never forgotten.
 #[cfg(test)]
-pub const ALL: [Icon; 30] = [
+pub const ALL: [Icon; 31] = [
     Icon::ChevronDown,
     Icon::ChevronRight,
+    Icon::ChevronLeft,
     Icon::Plus,
     Icon::X,
     Icon::Play,
@@ -142,6 +145,7 @@ impl Icon {
         match self {
             Icon::ChevronDown => vec![Polyline(vec![(6.0, 9.0), (12.0, 15.0), (18.0, 9.0)])],
             Icon::ChevronRight => vec![Polyline(vec![(9.0, 18.0), (15.0, 12.0), (9.0, 6.0)])],
+            Icon::ChevronLeft => vec![Polyline(vec![(15.0, 18.0), (9.0, 12.0), (15.0, 6.0)])],
             Icon::Plus => vec![
                 Polyline(vec![(12.0, 5.0), (12.0, 19.0)]),
                 Polyline(vec![(5.0, 12.0), (19.0, 12.0)]),
@@ -463,7 +467,7 @@ mod tests {
 
     #[test]
     fn every_icon_stays_on_the_grid() {
-        assert_eq!(ALL.len(), 30);
+        assert_eq!(ALL.len(), 31);
         for icon in ALL {
             let segments = icon.segments();
             assert!(!segments.is_empty(), "{icon:?} draws nothing");

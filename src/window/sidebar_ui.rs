@@ -230,10 +230,13 @@ impl KovaView {
         let width = sidebar::width_pt() as f64;
         let min_split = self.ivars().config.get().map(|c| c.splits.min_width).unwrap_or(300.0) as f64;
         let wanted = sidebar::layout_mode() == LayoutMode::Sidebar;
-        let (show, sidebar_frame, my_frame) = split_layout(bounds, width, min_split, wanted);
+        let panel = self.ivars().side_panel.get();
+        let panel_wanted = panel.is_some_and(|p| p.wanted());
+        let (show, sidebar_frame, my_frame, panel_frame) =
+            split_frames(bounds, width, min_split, wanted, panel_wanted, super::side_panel::fraction());
         self.ivars().sidebar_shown.set(show);
         log::debug!(
-            "apply_layout: container {}x{} sidebar {} at x={} w={} kova at x={} w={} h={}",
+            "apply_layout: container {}x{} sidebar {} at x={} w={} kova at x={} w={} h={} panel {:?}",
             bounds.size.width,
             bounds.size.height,
             if show { "shown" } else { "hidden" },
@@ -241,7 +244,8 @@ impl KovaView {
             sidebar_frame.size.width,
             my_frame.origin.x,
             my_frame.size.width,
-            my_frame.size.height
+            my_frame.size.height,
+            panel_frame.map(|f| (f.origin.x, f.size.width))
         );
         if sidebar.isHidden() == show {
             sidebar.setHidden(!show);
@@ -249,10 +253,49 @@ impl KovaView {
         if !rect_eq(sidebar.frame(), sidebar_frame) {
             sidebar.setFrame(sidebar_frame);
         }
+        if let Some(panel) = panel {
+            match panel_frame {
+                Some(frame) => {
+                    if !rect_eq(panel.frame(), frame) {
+                        panel.setFrame(frame);
+                    }
+                    if panel.isHidden() {
+                        panel.setHidden(false);
+                    }
+                }
+                None => {
+                    if !panel.isHidden() {
+                        panel.setHidden(true);
+                        // The keyboard goes back to the terminal with the panel.
+                        if let Some(win) = self.window()
+                            && win.firstResponder().is_some_and(|r| panel.holds(&r))
+                        {
+                            win.makeFirstResponder(Some(self));
+                        }
+                    }
+                }
+            }
+        }
         if !rect_eq(self.frame(), my_frame) {
             self.setFrame(my_frame);
         }
         self.mark_dirty();
+    }
+
+    /// Show `target` in this window's side panel.
+    pub(crate) fn open_in_side_panel(&self, target: super::side_panel::PanelTarget) {
+        if let Some(panel) = self.ivars().side_panel.get() {
+            panel.open_target(target);
+        }
+    }
+
+    /// The View menu's toggle. Nothing to reopen yet: says so in the log.
+    pub(super) fn toggle_side_panel(&self) {
+        if let Some(panel) = self.ivars().side_panel.get()
+            && !panel.toggle()
+        {
+            log::info!("side panel: nothing to show yet (Cmd+click a link or a .md file, or open a decision)");
+        }
     }
 
     /// Switch the whole app between the tab bar and the sidebar, remember
@@ -938,6 +981,12 @@ impl KovaView {
         if let AsksHit::Open(pane_id) = hit {
             focus_pane_anywhere(pane_id);
         }
+        if let AsksHit::OpenDoc(key) = hit {
+            let url = self.ivars().sidebar.borrow().asks.card(key).and_then(|card| card.decision_url.clone());
+            if let Some(url) = url {
+                self.open_in_side_panel(super::side_panel::PanelTarget::Web(url));
+            }
+        }
     }
 
     /// Answer a permission prompt from its card: the pane reads its screen
@@ -1344,21 +1393,39 @@ impl KovaView {
 /// `min_split` for the terminal next to it), its frame, and the Metal view's.
 /// Both frames sit at y = 0 and take the full height; the Metal view takes
 /// the whole container when the sidebar is hidden.
+#[cfg(test)]
 fn split_layout(bounds: CGRect, width: f64, min_split: f64, wanted: bool) -> (bool, CGRect, CGRect) {
-    let show = wanted && bounds.size.width - width >= min_split;
-    let sidebar_frame = CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize { width, height: bounds.size.height },
-    };
-    let my_frame = if show {
-        CGRect {
-            origin: CGPoint { x: width, y: 0.0 },
-            size: CGSize { width: (bounds.size.width - width).max(1.0), height: bounds.size.height },
-        }
-    } else {
-        bounds
-    };
-    (show, sidebar_frame, my_frame)
+    let (show, sidebar, kova, _) = split_frames(bounds, width, min_split, wanted, false, 0.5);
+    (show, sidebar, kova)
+}
+
+/// `split_layout` with the side panel at the right: the frames of the
+/// sidebar, the Metal view and the panel (when shown), from
+/// `side_panel::split`. Without a panel it is the sidebar's split exactly.
+fn split_frames(
+    bounds: CGRect,
+    width: f64,
+    min_split: f64,
+    wanted: bool,
+    panel_wanted: bool,
+    fraction: f32,
+) -> (bool, CGRect, CGRect, Option<CGRect>) {
+    let h = bounds.size.height;
+    let s = super::side_panel::split(bounds.size.width, width, wanted, panel_wanted, fraction, min_split);
+    let rect = |x: f64, w: f64| CGRect { origin: CGPoint { x, y: 0.0 }, size: CGSize { width: w, height: h } };
+    let sidebar_frame = rect(0.0, width);
+    let my_frame = if s.sidebar || s.panel.is_some() { rect(s.term_x, s.term_w) } else { bounds };
+    (s.sidebar, sidebar_frame, my_frame, s.panel.map(|(x, w)| rect(x, w)))
+}
+
+/// The room right of the sidebar in the window `view` sits in: what the
+/// panel's fraction is a share of.
+pub(super) fn room_right_of_sidebar(view: &objc2_app_kit::NSView) -> f64 {
+    let Some(win) = view.window() else { return 0.0 };
+    let Some(kova) = crate::app::kova_view(&win) else { return 0.0 };
+    let Some(container) = (unsafe { kova.superview() }) else { return 0.0 };
+    let w = container.bounds().size.width;
+    if kova.ivars().sidebar_shown.get() { w - sidebar::width_pt() as f64 } else { w }
 }
 
 fn rect_eq(a: CGRect, b: CGRect) -> bool {
@@ -1413,7 +1480,7 @@ fn focus_pane_anywhere(pane_id: PaneId) {
 /// Run `f` on the pane with `id`, in whatever window holds it. A permission
 /// card can belong to any window's pane (the list shows them all), and the
 /// click has to reach the pane itself, not just the window.
-fn with_pane<R>(pane_id: PaneId, f: impl FnOnce(&Pane) -> R) -> Option<R> {
+pub(super) fn with_pane<R>(pane_id: PaneId, f: impl FnOnce(&Pane) -> R) -> Option<R> {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);
     let ns_windows = app.windows();

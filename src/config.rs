@@ -247,6 +247,10 @@ pub struct LayoutPrefs {
     pub mode: Option<LayoutMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<u16>,
+    /// The side panel's share of the room right of the sidebar (0.2..0.8),
+    /// set by dragging its edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_fraction: Option<f32>,
 }
 
 fn prefs_path() -> PathBuf {
@@ -546,6 +550,8 @@ pub struct KeysConfig {
     pub history_back: String,
     pub history_forward: String,
     pub toggle_sidebar: String,
+    /// Show or hide the side panel (the web view at the right).
+    pub toggle_side_panel: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -619,6 +625,7 @@ impl Default for KeysConfig {
             history_back: "cmd+shift+option+left".into(),
             history_forward: "cmd+shift+option+right".into(),
             toggle_sidebar: "cmd+option+s".into(),
+            toggle_side_panel: "cmd+option+b".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }
@@ -656,16 +663,16 @@ mod tests {
     fn layout_prefs_override_the_toml_table_field_by_field() {
         let mut config = Config::default();
         config.layout.sidebar_width = 300;
-        config.apply_layout_prefs(&LayoutPrefs { mode: Some(LayoutMode::Sidebar), sidebar_width: None });
+        config.apply_layout_prefs(&LayoutPrefs { mode: Some(LayoutMode::Sidebar), sidebar_width: None, panel_fraction: None });
         assert_eq!(config.layout.mode, LayoutMode::Sidebar);
         assert_eq!(config.layout.sidebar_width, 300);
         // An out-of-range width in the prefs is snapped, not refused.
-        config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(900) });
+        config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(900), panel_fraction: None });
         assert_eq!(config.layout.mode, LayoutMode::Sidebar);
         assert_eq!(config.layout.sidebar_width, 520);
         // A v2 width in cells (a prefs.json from before the AppKit sidebar)
         // is read as about 8 pt per cell.
-        config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(32) });
+        config.apply_layout_prefs(&LayoutPrefs { mode: None, sidebar_width: Some(32), panel_fraction: None });
         assert_eq!(config.layout.sidebar_width, 256);
         assert_eq!(clamp_sidebar_width(4), 200);
     }
@@ -700,7 +707,7 @@ mod tests {
 
     #[test]
     fn layout_prefs_serialize_only_what_is_set() {
-        let json = serde_json::to_string(&LayoutPrefs { mode: Some(LayoutMode::Tabs), sidebar_width: None }).unwrap();
+        let json = serde_json::to_string(&LayoutPrefs { mode: Some(LayoutMode::Tabs), sidebar_width: None, panel_fraction: None }).unwrap();
         assert_eq!(json, "{\"mode\":\"tabs\"}");
         let prefs: LayoutPrefs = serde_json::from_str("{\"sidebar_width\": 22}").unwrap();
         assert_eq!(prefs.mode, None);

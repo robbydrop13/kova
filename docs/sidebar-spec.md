@@ -60,8 +60,10 @@ Code:
 
 ## 2. Window structure
 
-The window's content view is a plain container holding two siblings: the
-`SidebarView` at the left and the `KovaView` (Metal) at the right.
+The window's content view is a plain container holding three siblings: the
+`SidebarView` at the left, the `KovaView` (Metal) in the middle, and the side
+panel at the right, hidden until something is opened in it
+(`docs/side-panel.md`).
 `KovaView::apply_layout` splits the container: sidebar `[0, width]`, Metal
 view the rest; in tabs mode, or when `container_w - width < splits.min_width`
 (the narrow fallback), the sidebar is hidden and the Metal view takes the
@@ -467,6 +469,13 @@ ignores further clicks; when the board drops the question the card reads
 `Sent to <from>` (check-circle, `ok` colour) for 1.5 s before it disappears.
 A sending click that the board never takes gives up after 3 s, so the card
 is clickable again.
+
+A decision card (`kova ask --decision <url>`, `AskCardVm::decision_url`)
+carries a `Decision` tag in its header (the permission tag's chip), and its
+action row reads Open (a text button on the `ACCENT` fill, `AsksHit::OpenDoc`),
+OK and Brief: no KO. Open shows the sheet in the window's side panel
+(`docs/side-panel.md`) and answers nothing; OK sends the first action, `Done`
+by default. The note line says `Done once the sheet is filled in`.
 
 The Moon opens a row of three small buttons under the actions: `1 h`,
 `Tonight 20:00`, `Tomorrow 9:00`. Tonight is the next local 20:00 (tomorrow

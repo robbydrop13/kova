@@ -331,6 +331,14 @@ queued for that handler; a library host that registered none answers
               "kova_socket": "/tmp/kova-123.sock", "cwd": "/Users/…/project" } } }
 ```
 
+Two optional fields make it a **decision**: `"kind": "decision"` and `"url"`, the
+http(s) page to fill in (a decision sheet). The card then says `New decision`, and
+its Open button shows `url` in the side panel without answering; the answer comes
+from a button as usual (`kova ask --decision <url>` defaults to a single `Done`
+and no text field). A `url` that is not http(s), 2 KiB at most, without control
+characters, is refused: `"question.url" must be an http(s) URL`. Both fields are
+listed by `list-asks` as they were asked, absent on a plain question.
+
 Not meant to be spoken by hand: `kova ask "<message>" [--actions OK,KO]` builds it
 from its environment (`CLAUDE_CODE_SESSION_ID`, or `PI_SESSION_FILE` /
 `PI_SESSION_ID` for Pi and omp, plus `OMPCODE` to tell omp from Pi; `KOVA_PANE_ID`,
@@ -560,6 +568,24 @@ the outside says the day is over. Bookmarks are untouched — a conversation tha
 was in both lists is simply a bookmark again.
 
 Response: `{ "ok": true, "data": { "removed": 3 } }`.
+
+---
+
+### `open-panel` — show a page or a document in the side panel
+
+```json
+{ "cmd": "open-panel", "target": "https://claude.ai/artifact/…" }
+```
+
+`target` is an http(s) URL (2 KiB at most, no control character), or an
+absolute or `~/` path to an existing `.md` / `.markdown` / `.html` / `.htm`
+file. Kova shows it in the side panel of the key window (else the main one,
+else the first window), opening the panel and bringing the window forward.
+A markdown file is rendered by Kova with raw HTML shown as text, and rendered
+again when it changes on disk. `{"ok":true}`. Errors: `"target" must be an
+http(s) URL or an existing .md / .html file (absolute or ~/ path)`, `no Kova
+window is open`. Kova.app only: a library host answers `command not supported
+by this host`. See `docs/side-panel.md`.
 
 ---
 
@@ -821,6 +847,7 @@ toggle-anchor  focus-anchor         (anchor the focused pane; jump to the first 
 copy  copy-raw  paste  toggle-filter
 toggle-help  mem-report
 toggle-sidebar                     (switch the layout between the tab bar and the sidebar, see sidebar-spec.md)
+toggle-side-panel                  (show or hide the side panel at the right, see side-panel.md)
 ```
 
 Note: a few actions open an **interactive overlay** that then expects keyboard input — `merge-tab`, `merge-window`, `detach-tab` (when several windows exist), `rename-tab`, `rename-pane`, `open-recent-project`, `open-search`, `open-pane-switcher`, `open-unread-switcher`. For headless automation, prefer the deterministic typed commands where one exists (e.g. `merge-window` with explicit indices, `rename-pane` with a title).

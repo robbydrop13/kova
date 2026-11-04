@@ -100,6 +100,7 @@ define_class!(
             let config = self.ivars().config.get().expect("config must be set before applicationDidFinishLaunching");
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
             window::sidebar::init(&config.layout);
+            window::side_panel::init(crate::config::LayoutPrefs::load().panel_fraction);
             window::sidebar::tokens::set_background(config.colors.background);
             crate::team::set_command(&config.sidebar.roster_command);
             setup_menu(mtm, config);
@@ -379,6 +380,10 @@ impl AppDelegate {
                             }
                         }
                         asks.refresh_card(MainThreadMarker::new_unchecked());
+                    }
+                    // Decision sheets opened from the card: the front window's side panel.
+                    for url in crate::ask_card::take_panel_opens() {
+                        open_in_front_panel(&ivars.windows, window::side_panel::PanelTarget::Web(url));
                     }
 
                     // Focus the panes whose notification was clicked. Done here
@@ -964,6 +969,7 @@ fn handle_ipc_command_sync(
         IpcCommand::ReloadConfig => {
             handle_ipc_reload_config(windows)
         }
+        IpcCommand::OpenPanel { target } => handle_ipc_open_panel(windows, &target),
         // Run by `crate::ipc::host::dispatch` before this dispatcher. Reaching
         // here means that routing was lost in a refactor.
         IpcCommand::ListPanes
@@ -1555,6 +1561,43 @@ fn handle_ipc_set_subject_color(
 /// IPC: re-read the config file and push its appearance half into every open
 /// window. Answers with what was left alone, since a reload that silently
 /// ignores a font change would read as a broken command.
+/// Show `target` in the side panel of the window the user is on (the key
+/// window, else the main one, else the first Kova window), and bring that
+/// window forward: Open is clicked on the floating card, often while another
+/// app is in front. Returns whether a window took it.
+fn open_in_front_panel(windows: &RefCell<Vec<Retained<NSWindow>>>, target: window::side_panel::PanelTarget) -> bool {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let front = app
+        .keyWindow()
+        .filter(|w| kova_view(w).is_some())
+        .or_else(|| app.mainWindow().filter(|w| kova_view(w).is_some()))
+        .or_else(|| windows.borrow().iter().find(|w| kova_view(w).is_some()).cloned());
+    let Some(win) = front else {
+        log::warn!("side panel: no Kova window to open {:?} in", target);
+        return false;
+    };
+    let Some(view) = kova_view(&win) else { return false };
+    view.open_in_side_panel(target);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    win.makeKeyAndOrderFront(None);
+    true
+}
+
+fn handle_ipc_open_panel(windows: &RefCell<Vec<Retained<NSWindow>>>, target: &str) -> crate::ipc::IpcResponse {
+    let Some(target) = window::side_panel::target_on_disk(target, None) else {
+        return crate::ipc::IpcResponse::Error {
+            message: "\"target\" must be an http(s) URL or an existing .md / .html file (absolute or ~/ path)".to_string(),
+        };
+    };
+    if open_in_front_panel(windows, target) {
+        crate::ipc::IpcResponse::Ok { data: None }
+    } else {
+        crate::ipc::IpcResponse::Error { message: "no Kova window is open".to_string() }
+    }
+}
+
 fn handle_ipc_reload_config(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
 ) -> crate::ipc::IpcResponse {
@@ -1727,6 +1770,22 @@ fn setup_menu(mtm: MainThreadMarker, config: &Config) {
     };
     view_menu.addItem(&layout_item("Show Tab Bar", LAYOUT_MENU_TAG_TABS, None));
     view_menu.addItem(&layout_item("Show Sidebar", LAYOUT_MENU_TAG_SIDEBAR, Some(&config.keys.toggle_sidebar)));
+    view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    {
+        let (key_eq, mask) = menu_key_equivalent(&config.keys.toggle_side_panel);
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &NSString::from_str("Side Panel"),
+                Some(objc2::sel!(toggleSidePanelFromMenu:)),
+                &NSString::from_str(&key_eq),
+            )
+        };
+        if !key_eq.is_empty() {
+            item.setKeyEquivalentModifierMask(mask);
+        }
+        view_menu.addItem(&item);
+    }
     view_menu_item.setSubmenu(Some(&view_menu));
     menu_bar.addItem(&view_menu_item);
 

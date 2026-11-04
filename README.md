@@ -23,9 +23,9 @@ Every frame is drawn on the GPU via Apple's Metal API. Glyph atlas with on-deman
 
 Layout (tabs, splits, CWD) is saved on quit and restored on launch. Panes that were running Claude Code, Codex, Pi or omp resume their conversation by themselves after a relaunch, each one the first time it is on screen in the active tab (focused or not), so fifty restored agents do not all start at once; a tab reopened with Cmd+O pre-types the resume line and waits for Enter. A pane whose agent the snapshot could not name — a Kova built before that agent existed, a probe that missed at that instant — still comes back with its conversation when the title the agent wrote on the pane matches exactly one transcript of its directory, which is what an omp pane keeps. Window position is remembered automatically.
 
-### Clickable URLs
+### Clickable URLs and the side panel
 
-Cmd+hover highlights URLs with an underline and pointer cursor. Cmd+click opens them in your browser. The hovered URL is shown in the status bar.
+Cmd+hover highlights URLs and `.md` / `.html` paths with an underline and pointer cursor. Cmd+click opens them in the side panel, a web view at the right of the window (Cmd+Shift+click: the default browser). The panel keeps its logins across launches, renders markdown in the window's colours and follows the file as it changes; Cmd+Option+B shows or hides it. See [`docs/side-panel.md`](docs/side-panel.md).
 
 ### Scrollback search
 

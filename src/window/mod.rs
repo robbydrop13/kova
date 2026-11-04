@@ -1,6 +1,6 @@
 mod attention;
 mod feather;
-mod fonts;
+pub(crate) mod fonts;
 use attention::{do_history_step, pane_history_state};
 mod duplicates;
 mod geometry;
@@ -23,6 +23,7 @@ mod sidebar_model;
 mod sidebar_ui;
 pub(super) mod sidebar_sched;
 mod sidebar_view;
+pub(crate) mod side_panel;
 use sidebar_ui::SidebarState;
 mod switcher;
 mod tabs;
@@ -208,6 +209,9 @@ pub struct KovaViewIvars {
     sidebar_view: OnceCell<Retained<sidebar_view::SidebarView>>,
     /// Whether the sidebar is on screen right now (`apply_layout`).
     sidebar_shown: Cell<bool>,
+    /// The side panel at the right (a web view), a sibling of this view,
+    /// hidden until something is opened in it. See `side_panel`.
+    side_panel: OnceCell<Retained<side_panel::SidePanelView>>,
 }
 
 #[derive(Clone, Copy)]
@@ -532,10 +536,13 @@ define_class!(
             // editor would beep on every one of them: those go down the
             // responder chain from here. Every other combo falls through to
             // the normal map, so Cmd+J and the rest still work in the field.
-            if self
-                .window()
-                .and_then(|win| win.firstResponder())
-                .is_some_and(|responder| responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())
+            let responder = self.window().and_then(|win| win.firstResponder());
+            let in_panel = responder.as_ref().is_some_and(|r| {
+                self.ivars().side_panel.get().is_some_and(|panel| panel.holds(r))
+            });
+            if responder
+                .as_ref()
+                .is_some_and(|responder| in_panel || responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())
                 && let Some(edit) = text_edit(&combo)
             {
                 let mtm = unsafe { MainThreadMarker::new_unchecked() };
@@ -636,6 +643,17 @@ define_class!(
                 return objc2::runtime::Bool::NO;
             }
 
+            // The side panel's web view has the keyboard: its page owns the
+            // shortcuts (Cmd+W, Cmd+F, Cmd+R…). Only the few that move between
+            // the panel and the terminal stay Kova's.
+            if in_panel
+                && !matches!(
+                    keybindings.window_map.get(&combo),
+                    Some(Action::ToggleSidePanel | Action::ToggleSidebar | Action::NextAttention)
+                )
+            {
+                return objc2::runtime::Bool::NO;
+            }
             if let Some(action) = keybindings.window_map.get(&combo) {
                 log::debug!("performKeyEquivalent: combo={:?} action={:?}", combo, action);
                 let action = action.clone();
@@ -739,6 +757,15 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
+            // A click on the terminal takes the keyboard back from the side
+            // panel's web view, whatever AppKit decided on its own.
+            if let Some(win) = self.window()
+                && self.ivars().side_panel.get().is_some_and(|panel| {
+                    win.firstResponder().is_some_and(|r| panel.holds(&r))
+                })
+            {
+                win.makeFirstResponder(Some(self));
+            }
             let (px, py) = self.event_to_pixel(event);
 
             // The search palette covers the window: a click there never
@@ -780,14 +807,35 @@ define_class!(
                 return;
             }
 
-            // Cmd+Click opens URL
+            // Cmd+Click opens the link in the side panel: a web page, or a
+            // `.md` / `.html` file resolved against the pane's directory.
+            // Cmd+Shift+Click keeps the old way, the default browser.
             let modifiers = event.modifierFlags();
             if modifiers.contains(NSEventModifierFlags::Command) {
                 // Re-validate: the cached hover may be stale if output arrived
                 // since the last mouse move (content shifted under the cursor).
                 self.update_hovered_url(event);
-                if let Some(url) = self.ivars().hovered_url.borrow().as_ref().map(|h| h.2.clone()) {
-                    let _ = std::process::Command::new("open").arg(&url).spawn();
+                let hovered = self.ivars().hovered_url.borrow().as_ref().map(|h| (h.0, h.2.clone()));
+                if let Some((pane_id, url)) = hovered {
+                    let cwd = sidebar_ui::with_pane(pane_id, |pane| {
+                        pane.terminal.read().cwd.clone().or_else(|| pane.cwd())
+                    })
+                    .flatten();
+                    let target = side_panel::target_on_disk(&url, cwd.as_deref().map(std::path::Path::new));
+                    match target {
+                        Some(target) if !modifiers.contains(NSEventModifierFlags::Shift) => {
+                            self.open_in_side_panel(target);
+                        }
+                        Some(target) => {
+                            let _ = std::process::Command::new("open").arg(target.external()).spawn();
+                        }
+                        // A link the panel does not show (another scheme), or a
+                        // path that is not there: the system, as before, for a URL.
+                        None if crate::terminal::doc_path_span(&url.chars().collect::<Vec<_>>(), 0).is_none() => {
+                            let _ = std::process::Command::new("open").arg(&url).spawn();
+                        }
+                        None => log::info!("side panel: no file {:?} from {:?}", url, cwd),
+                    }
                     return;
                 }
             }
@@ -962,6 +1010,12 @@ define_class!(
         }
 
         /// Pane menu: `Rename Pane`.
+        /// View menu: `Side Panel` (Cmd+Option+B).
+        #[unsafe(method(toggleSidePanelFromMenu:))]
+        fn toggle_side_panel_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
+            self.toggle_side_panel();
+        }
+
         #[unsafe(method(renamePaneFromMenu:))]
         fn rename_pane_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
             self.start_rename_pane();
@@ -1183,6 +1237,7 @@ impl KovaView {
             tab_backup: RefCell::new(std::collections::HashMap::new()),
             sidebar: RefCell::new(SidebarState::new()),
             sidebar_view: OnceCell::new(),
+            side_panel: OnceCell::new(),
             sidebar_shown: Cell::new(false),
         });
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
@@ -1531,7 +1586,7 @@ impl KovaView {
 
         if let Some((visible_row, col)) = self.pixel_to_visible_row_col(px, py, pane, &vp) {
             let term = pane.terminal.read();
-            if let Some((segments, url)) = term.url_at(visible_row, col) {
+            if let Some((segments, url)) = term.link_at(visible_row, col) {
                 let old = self.ivars().hovered_url.borrow().clone();
                 // Same cells, other text (output slid another URL under a
                 // still pointer) is a new hover too: Cmd+click opens `url`.
@@ -1865,6 +1920,7 @@ impl KovaView {
             Action::HistoryBack => do_history_step(false),
             Action::HistoryForward => do_history_step(true),
             Action::ToggleSidebar => self.toggle_layout_mode(),
+            Action::ToggleSidePanel => self.toggle_side_panel(),
             Action::PrevTab => self.do_switch_tab_relative(-1),
             Action::NextTab => self.do_switch_tab_relative(1),
             Action::RenameTab => self.start_rename_tab(),
@@ -2532,9 +2588,13 @@ pub fn create_window(
     // split and the narrow fallback.
     sidebar.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewMaxXMargin);
     view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+    let panel = side_panel::SidePanelView::new(mtm, content_rect);
+    panel.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewMinXMargin);
     container.addSubview(&sidebar);
     container.addSubview(&view);
+    container.addSubview(&panel);
     view.ivars().sidebar_view.set(sidebar).ok();
+    view.ivars().side_panel.set(panel).ok();
     // The window paints its own background wherever a view does not: make it
     // the terminal's, so a resize can never flash the light grey default.
     let bg = config.colors.background;

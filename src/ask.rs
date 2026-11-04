@@ -135,6 +135,31 @@ pub struct Question {
     /// restart does not bring back what was just put off.
     #[serde(default)]
     pub snoozed_until: u64,
+    /// What the question is about, when it is not a plain question: `"decision"`
+    /// is a decision sheet to fill in, at `url`. Absent on a plain question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The page the question is about (a decision sheet's artifact): the card's
+    /// Open button shows it in Kova's side panel. http(s) only ([`is_panel_url`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// The kind of a question that carries a decision sheet.
+pub const KIND_DECISION: &str = "decision";
+
+/// The button a decision question answers with when the asker names none.
+pub const DECISION_DONE: &str = "Done";
+
+/// Whether `url` may be shown in the side panel: an http(s) URL of printable
+/// characters, 2 KiB at most. Anyone who reaches the socket can post a
+/// question, so no `file:`, `javascript:` or control character gets through.
+pub fn is_panel_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && url.len() <= 2048
+        && url.len() > "https://".len()
+        && url.chars().all(|c| !c.is_control() && !c.is_whitespace())
 }
 
 fn default_true() -> bool {
@@ -160,6 +185,11 @@ impl Question {
 
     /// Whether the card may show it now: never snoozed, or snoozed and the
     /// delay has run out.
+    /// A decision sheet to fill in: the card says `New decision` and offers to open it.
+    pub fn is_decision(&self) -> bool {
+        self.kind.as_deref() == Some(KIND_DECISION)
+    }
+
     pub fn due(&self, now: u64) -> bool {
         self.snoozed_until == 0 || self.snoozed_until <= now
     }
@@ -1207,6 +1237,7 @@ impl Board {
             buttons: &buttons,
             input: q.input,
             asked_at: q.asked_at,
+            decision_url: q.url.as_deref().filter(|_| q.is_decision()),
         });
         crate::ask_card::show(mtm, card.as_ref(), due.len().saturating_sub(1));
     }
@@ -1237,7 +1268,7 @@ fn spawn_late(store: AskStore, question: Question, answer: Answer) {
 // ─── The client: `kova ask` ────────────────────────────────────────────────────
 
 pub const USAGE: &str = "\
-usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
+usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--decision <url>] [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
 
 Shows a card in Kova with the message, one button per action and a text field, then waits for
 the user and prints the answer on stdout: the action, or \"action: text\" when they typed something.
@@ -1247,6 +1278,10 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
   --no-input    no text field, buttons only. Brief (in the Asks view) can still attach an
                 instruction to the answer: \"<button>: text\" with the button it names, or
                 \"Other: text\" when none was picked
+  --decision    a decision sheet to fill in at this http(s) URL (an artifact): the card says
+                \"New decision\", its Open button shows the page in Kova's side panel, and the
+                answer comes when the user clicks Done (default actions: Done; no text field
+                unless --actions is given too)
   --from        the name shown on the card (default: the working directory's name)
   --timeout     seconds to wait. Default: 540 inside a Claude Code conversation (under the Bash tool's
                 600 s limit; run kova ask with the Bash timeout set to 600000), no limit anywhere else,
@@ -1268,19 +1303,33 @@ struct CliArgs {
     timeout: Option<u64>,
     json: bool,
     socket: Option<String>,
+    decision: Option<String>,
 }
 
 fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
-    let mut out = CliArgs { message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None };
+    let mut out = CliArgs { message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None, decision: None };
     let mut message: Option<String> = None;
+    let mut actions_given = false;
+    let mut input_given = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || it.next().cloned().ok_or_else(|| format!("kova ask: {} needs a value\n\n{}", a, USAGE));
         match a.as_str() {
             "--actions" => {
+                actions_given = true;
                 out.actions = value()?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
             }
-            "--no-input" => out.input = false,
+            "--no-input" => {
+                input_given = true;
+                out.input = false
+            }
+            "--decision" => {
+                let url = value()?;
+                if !is_panel_url(&url) {
+                    return Err(format!("kova ask: --decision takes an http(s) URL, got '{}'", url));
+                }
+                out.decision = Some(url);
+            }
             "--from" => out.from = Some(value()?),
             "--timeout" => {
                 let raw = value()?;
@@ -1304,6 +1353,15 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
         }
     }
     out.message = message.filter(|m| !m.trim().is_empty()).ok_or_else(|| USAGE.to_string())?;
+    // A decision is answered on its sheet: the card only says when it is done.
+    if out.decision.is_some() {
+        if !actions_given {
+            out.actions = vec![DECISION_DONE.to_string()];
+            if !input_given {
+                out.input = false;
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -1434,6 +1492,8 @@ pub fn run_cli(args: &[String]) -> i32 {
         from: asker,
         asked_at: now_epoch(),
         snoozed_until: 0,
+        kind: cli.decision.as_ref().map(|_| KIND_DECISION.to_string()),
+        url: cli.decision.clone(),
     };
 
     let body = serde_json::json!({"cmd": "ask", "question": question});
@@ -1567,7 +1627,7 @@ mod tests {
     }
 
     fn question(id: &str) -> Question {
-        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0 }
+        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None }
     }
 
     #[test]
@@ -2015,6 +2075,41 @@ mod tests {
         assert!(parse_cli(&args(&["a", "--timeout", "0"])).is_err());
         assert!(parse_cli(&args(&["a", "--bogus"])).is_err());
         assert!(parse_cli(&args(&["a", "--from"])).is_err());
+    }
+
+    #[test]
+    fn a_decision_defaults_to_a_single_done_button_without_a_field() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = parse_cli(&args(&["3 decisions", "--decision", "https://claude.ai/artifact/abc"])).unwrap();
+        assert_eq!(c.decision.as_deref(), Some("https://claude.ai/artifact/abc"));
+        assert_eq!(c.actions, vec![DECISION_DONE]);
+        assert!(!c.input);
+        // Actions given by the asker win, and keep the field.
+        let c = parse_cli(&args(&["x", "--decision", "https://a.b/c", "--actions", "Done,Later"])).unwrap();
+        assert_eq!(c.actions, vec!["Done", "Later"]);
+        assert!(c.input);
+        assert!(parse_cli(&args(&["x", "--decision", "file:///etc/passwd"])).is_err());
+        assert!(parse_cli(&args(&["x", "--decision", "javascript:alert(1)"])).is_err());
+    }
+
+    #[test]
+    fn only_plain_http_urls_reach_the_panel() {
+        assert!(is_panel_url("https://claude.ai/artifact/J3pD9M5bWtsiXEcCZ6GZjV"));
+        assert!(is_panel_url("HTTP://localhost:3000/x"));
+        assert!(!is_panel_url("https://"));
+        assert!(!is_panel_url("https://a.b/c d"));
+        assert!(!is_panel_url("https://a.b/\nrm"));
+        assert!(!is_panel_url("file:///Users/x"));
+        assert!(!is_panel_url(&format!("https://a.b/{}", "x".repeat(3000))));
+    }
+
+    #[test]
+    fn a_plain_question_serializes_without_kind_or_url() {
+        let q = question("6f1c0000-0000-4000-8000-000000000000");
+        let v = serde_json::to_value(&q).unwrap();
+        assert!(v.get("kind").is_none() && v.get("url").is_none());
+        let back: Question = serde_json::from_value(v).unwrap();
+        assert!(!back.is_decision());
     }
 
     #[test]

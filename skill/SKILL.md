@@ -305,6 +305,11 @@ action, or `action: text` when the user typed something.
   list as one item per line. The card shows line breaks as they are, but only real ones: inside
   `"…"` a `\n` stays a backslash and an `n` on the card. Put actual line breaks inside the quotes,
   or use `$'Sort done.\n\nArchive 8: …\nKeep 15: …\n\nGo?'`.
+- **A decision to fill in on a page** (a decision sheet published as an artifact):
+  `kova ask "4 decisions on voice typing" --decision https://claude.ai/artifact/<id>`. The card
+  says "New decision"; its Open button shows the page in Kova's side panel without answering, and
+  the answer is `Done` once the user has filled it in (then read the answers where the page stores
+  them). Only http(s) URLs are accepted.
 - `--no-input` (buttons only), `--from <name>` (name on the card), `--json`, `--socket <path>`.
   Outside a Kova pane the client finds Kova.app's socket on its own; from a pane of a library host
   (an app embedding Kova), it falls back to Kova.app too.
@@ -318,6 +323,19 @@ action, or `action: text` when the user typed something.
   reply, inside the pane, which the user can hide.
 - Protocol: `docs/ipc.md` § `ask`, `list-asks`, `answer-ask`; code: `src/ask.rs` (logic, delivery,
   client) and `src/ask_card.rs` (the card).
+
+## The side panel — `open-panel`
+
+```bash
+printf '%s\n' '{"cmd":"open-panel","target":"https://example.com/report"}' | nc -U "$KOVA_SOCKET"
+```
+
+Shows a page at the right of the front Kova window: an http(s) URL, or an absolute or `~/` path to
+an existing `.md` (rendered by Kova, raw HTML shown as text, re-rendered when the file changes) or
+`.html` file. The panel keeps its logins across launches. The user gets the same thing with
+Cmd+click on a link or a `.md` / `.html` path in a pane (Cmd+Shift+click keeps the browser), and
+toggles it with Cmd+Option+B (`dispatch-action` `toggle-side-panel`). It brings the window forward:
+open it when the user asked to see something, not on your own. Kova.app only.
 
 ## Traps and rules of conduct
 

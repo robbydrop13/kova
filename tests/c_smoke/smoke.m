@@ -16,7 +16,7 @@
 //   cargo build --lib
 //   clang -fobjc-arc -Wall -Iinclude tests/c_smoke/smoke.m \
 //     ~/.cargo/target/debug/libkova.a \
-//     -framework UserNotifications -framework AppKit -framework CoreData \
+//     -framework WebKit -framework UserNotifications -framework AppKit -framework CoreData \
 //     -framework CoreText -framework CoreImage -framework CloudKit \
 //     -framework QuartzCore -framework CoreVideo -framework CoreGraphics \
 //     -framework Metal -framework Foundation -framework CoreFoundation \

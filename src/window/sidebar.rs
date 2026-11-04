@@ -69,7 +69,12 @@ pub fn set_width_pt(pts: u16) -> bool {
 
 /// Write the runtime layout state to `prefs.json`.
 pub fn persist() {
-    LayoutPrefs { mode: Some(layout_mode()), sidebar_width: Some(width_pt()) }.save();
+    LayoutPrefs {
+        mode: Some(layout_mode()),
+        sidebar_width: Some(width_pt()),
+        panel_fraction: Some(super::side_panel::fraction()),
+    }
+    .save();
 }
 
 // ---------------------------------------------------------------

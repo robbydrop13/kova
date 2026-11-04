@@ -2884,6 +2884,17 @@ impl TerminalState {
     /// Returns per-row highlight segments and the full URL string.
     /// Checks OSC 8 hyperlinks first, then falls back to auto-detection.
     pub fn url_at(&self, visible_row: usize, col: u16) -> Option<(Vec<(usize, u16, u16)>, String)> {
+        self.link_or_url_at(visible_row, col, false)
+    }
+
+    /// `url_at`, then a document path (`docs/plan.md`) when no URL is there:
+    /// what Kova.app's Cmd+click opens in the side panel. A library host keeps
+    /// `url_at`, which knows nothing of paths.
+    pub fn link_at(&self, visible_row: usize, col: u16) -> Option<(Vec<(usize, u16, u16)>, String)> {
+        self.link_or_url_at(visible_row, col, true)
+    }
+
+    fn link_or_url_at(&self, visible_row: usize, col: u16, docs: bool) -> Option<(Vec<(usize, u16, u16)>, String)> {
         let display = self.visible_lines();
         let cells = display.get(visible_row)?;
         let col = col as usize;
@@ -3012,6 +3023,27 @@ impl TerminalState {
 
             i = if end > start { end } else { start + 1 };
         }
+
+        // --- Then a document path (`docs/plan.md`, `~/x.html`): Cmd+click opens
+        // it in the side panel. Pure here: the window resolves it against the
+        // pane's directory and checks it exists.
+        if !docs {
+            return None;
+        }
+        if let Some((start, end)) = doc_path_span(&chars, logical_col) {
+            let path: String = chars[start..end].iter().filter(|&&c| c != '\0').collect();
+            let mut segments = Vec::new();
+            for r in first_row..=last_row {
+                let row_start_in_logical = (r - first_row) * cols_per_row;
+                let row_end_in_logical = row_start_in_logical + cols_per_row;
+                let seg_start = start.max(row_start_in_logical);
+                let seg_end = end.min(row_end_in_logical);
+                if seg_start < seg_end {
+                    segments.push((r, (seg_start - row_start_in_logical) as u16, (seg_end - row_start_in_logical) as u16));
+                }
+            }
+            return Some((segments, path));
+        }
         None
     }
 
@@ -3077,6 +3109,53 @@ impl TerminalState {
 fn scroll_crossed_page(old: i32, new: i32, rows: u16) -> bool {
     let page = (rows as i32).max(1);
     new > old && new / page > old / page
+}
+
+/// The span of a document path around `col` in a logical line: a word ending
+/// in `.md`, `.markdown`, `.html` or `.htm` (case-insensitive), optionally
+/// followed by a `:line` or `:line:col` suffix, which stays inside the span
+/// (the window strips it). A word holding `://` is a URL of another scheme,
+/// not a path, unless it is a `file://` one. Wide-char continuation cells
+/// (`\0`) belong to the word.
+pub fn doc_path_span(chars: &[char], col: usize) -> Option<(usize, usize)> {
+    let stop = |c: char| c <= ' ' && c != '\0' || matches!(c, '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | ',' | ';');
+    if col >= chars.len() || stop(chars[col]) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && !stop(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < chars.len() && !stop(chars[end]) {
+        end += 1;
+    }
+    // Trailing punctuation of the sentence the path sits in.
+    while end > start && matches!(chars[end - 1], '.' | ':' | '!' | '?') {
+        end -= 1;
+    }
+    if col >= end {
+        return None;
+    }
+    let word: String = chars[start..end].iter().filter(|&&c| c != '\0').collect();
+    if word.contains("://") && !word.starts_with("file://") {
+        return None;
+    }
+    // Strip a `:12` / `:12:3` location for the extension test only.
+    let mut bare = word.as_str();
+    for _ in 0..2 {
+        if let Some((head, tail)) = bare.rsplit_once(':')
+            && !tail.is_empty()
+            && tail.chars().all(|c| c.is_ascii_digit())
+        {
+            bare = head;
+        }
+    }
+    let lower = bare.to_ascii_lowercase();
+    let is_doc = [".md", ".markdown", ".html", ".htm"]
+        .iter()
+        .any(|ext| lower.ends_with(ext) && lower.len() > ext.len() && !lower.ends_with(&format!("/{}", ext)));
+    is_doc.then_some((start, end))
 }
 
 #[cfg(test)]
@@ -4557,6 +4636,24 @@ mod tests {
             let (segs, url) = t.url_at(1, 5).unwrap();
             assert_eq!(url, "https://x.example");
             assert_eq!(segs, vec![(0, 0, 3), (1, 4, 7)]);
+        }
+
+        #[test]
+        fn a_document_path_is_found_around_the_click() {
+            let line: Vec<char> = "see docs/plan.md:12, then ~/x.HTML.".chars().collect();
+            let at = |needle: &str| line.iter().collect::<String>().find(needle).unwrap();
+            let (s, e) = super::super::doc_path_span(&line, at("plan")).unwrap();
+            assert_eq!(line[s..e].iter().collect::<String>(), "docs/plan.md:12");
+            let (s, e) = super::super::doc_path_span(&line, at("~/x")).unwrap();
+            assert_eq!(line[s..e].iter().collect::<String>(), "~/x.HTML");
+            assert_eq!(super::super::doc_path_span(&line, at("see")), None);
+            assert_eq!(super::super::doc_path_span(&line, at(" then")), None);
+            let code: Vec<char> = "src/main.rs ssh://host/a.md file:///tmp/r.md .md".chars().collect();
+            let text: String = code.iter().collect();
+            assert_eq!(super::super::doc_path_span(&code, text.find("main").unwrap()), None);
+            assert_eq!(super::super::doc_path_span(&code, text.find("host").unwrap()), None);
+            assert!(super::super::doc_path_span(&code, text.find("tmp").unwrap()).is_some());
+            assert_eq!(super::super::doc_path_span(&code, text.rfind(".md").unwrap() + 1), None);
         }
 
         #[test]

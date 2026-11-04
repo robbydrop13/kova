@@ -41,6 +41,26 @@ pub fn inter_name(weight: Weight) -> &'static str {
     }
 }
 
+/// A face of the bundled Inter, for views outside the sidebar (the ask card).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Face {
+    Regular,
+    Medium,
+    Semibold,
+}
+
+/// Inter at `size` in `face`, the system font when the face did not register.
+pub fn inter(face: Face, size: f64) -> objc2::rc::Retained<objc2_app_kit::NSFont> {
+    register_inter();
+    let weight = match face {
+        Face::Regular => Weight::Regular,
+        Face::Medium => Weight::Medium,
+        Face::Semibold => Weight::Semibold,
+    };
+    objc2_app_kit::NSFont::fontWithName_size(&objc2_foundation::NSString::from_str(inter_name(weight)), size)
+        .unwrap_or_else(|| objc2_app_kit::NSFont::systemFontOfSize(size))
+}
+
 fn register_all() -> bool {
     let mut failed = Vec::new();
     for (name, bytes) in INTER {

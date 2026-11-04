@@ -103,6 +103,9 @@ const TAG_H: f64 = 16.0;
 const TAG_PAD_H: f64 = 5.0;
 const TAG_RADIUS: f64 = 4.0;
 const TAG_TEXT: &str = "Permission";
+const DECISION_TAG_TEXT: &str = "Decision";
+/// A decision card's Open: a text button on the action row, accent ink.
+const OPEN_DOC_TEXT: &str = "Open";
 /// Between the question and the code block, and the block and the actions.
 const CODE_GAP: f64 = 8.0;
 const CODE_RADIUS: f64 = 4.0;
@@ -215,6 +218,9 @@ pub struct AskCardVm {
     /// A permission prompt read off a pane's screen: this card replaces the
     /// question's, with its own buttons and no Brief, Snooze or note.
     pub permission: Option<PermissionCard>,
+    /// A decision sheet (`kova ask --decision`): a `Decision` tag, Open (the
+    /// sheet in the side panel) in place of KO, OK answers Done.
+    pub decision_url: Option<String>,
 }
 
 /// The key the hit enum carries for a question id.
@@ -252,6 +258,7 @@ impl AskCardVm {
             snoozed,
             back_at: if snoozed { local_hhmm(question.snoozed_until) } else { String::new() },
             permission: None,
+            decision_url: question.url.clone().filter(|_| question.is_decision()),
         }
     }
 
@@ -279,6 +286,7 @@ impl AskCardVm {
             snoozed: false,
             back_at: String::new(),
             permission: Some(permission),
+            decision_url: None,
         }
     }
 }
@@ -509,6 +517,8 @@ pub enum AsksHit {
     BriefCancel(u64),
     /// Focus the pane the question came from.
     Open(PaneId),
+    /// Show a decision card's sheet in the side panel. Does not answer.
+    OpenDoc(u64),
     /// Open or close the three-choice snooze row.
     SnoozeMenu(u64),
     Snooze(u64, SnoozeChoice),
@@ -571,7 +581,7 @@ pub fn click(state: &mut AsksState, hit: AsksHit, now_ms: u64) -> Option<AskActi
             }
             None
         }
-        AsksHit::Open(_) => None,
+        AsksHit::Open(_) | AsksHit::OpenDoc(_) => None,
         AsksHit::SnoozeMenu(key) => {
             let id = state.card(key)?.id.clone();
             state.snooze_open = if state.snooze_open.as_deref() == Some(id.as_str()) { None } else { Some(id) };
@@ -968,12 +978,23 @@ fn open_card(
         Some(status)
     } else {
         let action_y = next;
-        let ok = Rect::new(inner_x, action_y, AB_W, AB_H);
-        let ko = Rect::new(ok.right() + AB_GAP, action_y, AB_W, AB_H);
-        let brief = Rect::new(ko.right() + AB_GAP, action_y, AB_W, AB_H);
-        buttons.push((AsksHit::Ok(card.key), ok));
-        buttons.push((AsksHit::Ko(card.key), ko));
-        buttons.push((AsksHit::Brief(card.key), brief));
+        if card.decision_url.is_some() {
+            // A decision: Open the sheet first (it does not answer), then Done
+            // (OK, the first action) and Brief. No KO: the sheet is the answer.
+            let open = Rect::new(inner_x, action_y, m.width(OPEN_DOC_TEXT, Style::Chip) + 2.0 * ALWAYS_PAD + 8.0, AB_H);
+            let ok = Rect::new(open.right() + AB_GAP, action_y, AB_W, AB_H);
+            let brief = Rect::new(ok.right() + AB_GAP, action_y, AB_W, AB_H);
+            buttons.push((AsksHit::OpenDoc(card.key), open));
+            buttons.push((AsksHit::Ok(card.key), ok));
+            buttons.push((AsksHit::Brief(card.key), brief));
+        } else {
+            let ok = Rect::new(inner_x, action_y, AB_W, AB_H);
+            let ko = Rect::new(ok.right() + AB_GAP, action_y, AB_W, AB_H);
+            let brief = Rect::new(ko.right() + AB_GAP, action_y, AB_W, AB_H);
+            buttons.push((AsksHit::Ok(card.key), ok));
+            buttons.push((AsksHit::Ko(card.key), ko));
+            buttons.push((AsksHit::Brief(card.key), brief));
+        }
         let moon = Rect::new(inner_x + inner_w - GHOST_W, action_y, GHOST_W, AB_H);
         buttons.push((AsksHit::SnoozeMenu(card.key), moon));
         if let Some(pane_id) = card.pane_id {
@@ -1016,7 +1037,7 @@ fn open_card(
             header,
             message,
             message_lines: lines,
-            tag: None,
+            tag: header_columns(card, header, m).1,
             code: None,
             code_lines: Vec::new(),
             flash: None,
@@ -1040,13 +1061,27 @@ fn header_columns(card: &AskCardVm, header: Rect, m: &dyn TextMetrics) -> (f64, 
     let age_w = m.width(&card.age, Style::Number);
     let text_x = header.x + HEADER_TEXT_X;
     let room = (header.right() - age_w - 8.0 - text_x).max(0.0);
-    let tag_w = if card.permission.is_some() { m.width(TAG_TEXT, Style::Hint) + 2.0 * TAG_PAD_H } else { 0.0 };
+    let tag_w = match tag_text(card) {
+        Some(text) => m.width(text, Style::Hint) + 2.0 * TAG_PAD_H,
+        None => 0.0,
+    };
     let tab_w = if card.tab.is_empty() { 0.0 } else { m.width(&card.tab, Style::Summary).min(room * 0.45) };
     let gap = if tag_w > 0.0 { HEADER_TAB_GAP } else { 0.0 };
     let tab_gap = if tab_w > 0.0 { HEADER_TAB_GAP } else { 0.0 };
     let from_w = (room - tag_w - gap - tab_w - tab_gap).max(0.0);
     let tag = (tag_w > 0.0).then(|| Rect::new(text_x + from_w + gap, header.y + (HEADER_H - TAG_H) / 2.0, tag_w, TAG_H));
     (from_w, tag, tab_w)
+}
+
+/// The tag a card's header carries: `Permission`, `Decision`, or none.
+fn tag_text(card: &AskCardVm) -> Option<&'static str> {
+    if card.permission.is_some() {
+        Some(TAG_TEXT)
+    } else if card.decision_url.is_some() {
+        Some(DECISION_TAG_TEXT)
+    } else {
+        None
+    }
 }
 
 /// The code block's lines: hard-wrapped at Menlo 11's advance, at most
@@ -1413,7 +1448,8 @@ fn draw_header(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f64
         Some(tag) => {
             fill_round(&tag, TAG_RADIUS, tokens::get().white, 0.08 * alpha);
             stroke_round(&tag, TAG_RADIUS, 1.0, tokens::get().border_subtle, alpha);
-            draw_text(sh, TAG_TEXT, &tag, Style::Hint, tokens::get().text_tertiary, alpha, Align::Center, false);
+            let text = tag_text(&card.card).unwrap_or(TAG_TEXT);
+            draw_text(sh, text, &tag, Style::Hint, tokens::get().text_tertiary, alpha, Align::Center, false);
             tag.right() + HEADER_TAB_GAP
         }
         None => text_x + from_w + HEADER_TAB_GAP,
@@ -1525,6 +1561,14 @@ fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f6
         options_right = x - 8.0;
     }
     let [check, first, cross, second] = note_options(*note, options_right, m, &card.card.options);
+    if card.card.decision_url.is_some() {
+        // The one answer a decision has: Done, once the sheet is filled in.
+        let first = Rect::new(first.x, first.y, (options_right - first.x).max(0.0), first.h);
+        stroke_icon(super::feather::Icon::Check, &check, NOTE_ICON, tokens::get().ok_dot, alpha);
+        let label = format!("{} once the sheet is filled in", card.card.options[0]);
+        draw_text(sh, &label, &first, Style::Hint, tokens::get().text_tertiary, alpha, Align::Left, false);
+        return;
+    }
     stroke_icon(super::feather::Icon::Check, &check, NOTE_ICON, tokens::get().ok_dot, alpha);
     draw_text(
         sh,
@@ -1588,6 +1632,12 @@ fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: List
             let ground = if down || hot { tokens::get().tile_pressed } else { tokens::get().tile_hover };
             fill_round(rect, SNOOZE_RADIUS, ground, alpha);
             draw_text(sh, "Always", rect, Style::Chip, tokens::get().text_secondary, alpha, Align::Center, false);
+        }
+        AsksHit::OpenDoc(_) => {
+            // The design system's primary button: what the card is for.
+            let ground = if down || hot { tokens::get().accent_pressed } else { tokens::get().accent };
+            fill_round(rect, AB_RADIUS, ground, alpha);
+            draw_text(sh, OPEN_DOC_TEXT, rect, Style::Chip, tokens::get().text_on_fill, alpha, Align::Center, false);
         }
         AsksHit::ShowNow(_) => {
             let ground = if down || hot { tokens::get().tile_pressed } else { tokens::get().tile_hover };
@@ -1727,6 +1777,7 @@ mod tests {
             snoozed: false,
             back_at: String::new(),
             permission: None,
+            decision_url: None,
         }
     }
 
@@ -1754,6 +1805,54 @@ mod tests {
         assert_eq!(three.cards[0].frame.h, 145.0);
         assert_eq!(eight.cards[0].frame.h, 190.0);
         assert_eq!(eight.cards[0].frame.h, six.cards[0].frame.h);
+    }
+
+    #[test]
+    fn a_decision_card_opens_its_sheet_and_answers_done_without_ko() {
+        let mut c = card(7, "a", "3 decisions on the side panel");
+        c.decision_url = Some("https://claude.ai/artifact/x".into());
+        c.options = ["Done".into(), "No".into()];
+        let mut st = state(vec![c]);
+        let l = layout(&st, W, &FakeMetrics);
+        let card = &l.cards[0];
+        assert!(card.tag.is_some(), "the Decision tag");
+        let hits: Vec<AsksHit> = card.buttons.iter().map(|(hit, _)| *hit).collect();
+        assert!(hits.contains(&AsksHit::OpenDoc(7)) && hits.contains(&AsksHit::Ok(7)));
+        assert!(!hits.contains(&AsksHit::Ko(7)));
+        let rect_of = |want: AsksHit| card.buttons.iter().find(|(hit, _)| *hit == want).map(|(_, r)| *r).expect("a button");
+        assert_eq!(rect_of(AsksHit::OpenDoc(7)).x, card.frame.x + CARD_PAD_H);
+        assert_eq!(rect_of(AsksHit::Ok(7)).x, rect_of(AsksHit::OpenDoc(7)).right() + AB_GAP);
+        for (hit, rect) in &card.buttons {
+            assert_eq!(l.hit(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0), Some(*hit));
+        }
+        // Open answers nothing; OK answers Done.
+        assert_eq!(click(&mut st, AsksHit::OpenDoc(7), NOW_MS), None);
+        assert!(st.transient.is_none());
+        assert_eq!(
+            click(&mut st, AsksHit::Ok(7), NOW_MS),
+            Some(AskAction::Answer { id: "a".into(), action: "Done".into(), text: String::new() })
+        );
+    }
+
+    #[test]
+    fn a_decision_question_carries_its_url_into_the_card() {
+        let mut q = crate::ask::Question {
+            id: "6f1c0000-0000-4000-8000-000000000000".into(),
+            message: "Pick".into(),
+            actions: vec!["Done".into()],
+            input: false,
+            from: crate::ask::Asker::from_env(|_| None, Some("pm".into()), "/tmp"),
+            asked_at: 1,
+            snoozed_until: 0,
+            kind: Some(crate::ask::KIND_DECISION.into()),
+            url: Some("https://claude.ai/artifact/x".into()),
+        };
+        let vm = AskCardVm::from_question(&q, None, false, 10);
+        assert_eq!(vm.decision_url.as_deref(), Some("https://claude.ai/artifact/x"));
+        assert_eq!(vm.options[0], "Done");
+        // A url without the decision kind is not a decision.
+        q.kind = None;
+        assert_eq!(AskCardVm::from_question(&q, None, false, 10).decision_url, None);
     }
 
     #[test]
@@ -1953,6 +2052,8 @@ mod tests {
             from: crate::ask::Asker { name: "cli".into(), ..Default::default() },
             asked_at,
             snoozed_until: 0,
+            kind: None,
+            url: None,
         }
     }
 

@@ -4,7 +4,7 @@
  * Link libkova.a (cargo build --lib, in ~/.cargo/target/<profile>/) and
  * what it needs, as `cargo rustc --lib --crate-type staticlib -- --print
  * native-static-libs` lists it:
- *   -framework UserNotifications -framework AppKit -framework CoreData
+ *   -framework WebKit -framework UserNotifications -framework AppKit -framework CoreData
  *   -framework CoreText -framework CoreImage -framework CloudKit
  *   -framework QuartzCore -framework CoreVideo -framework CoreGraphics
  *   -framework Metal -framework Foundation -framework CoreFoundation

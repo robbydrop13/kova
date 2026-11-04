@@ -296,6 +296,9 @@ impl KovaView {
         // The AppKit sidebar (sidebar mode only): reads the tabs into its
         // model before the renderer lock, redraws only on a change.
         self.sync_sidebar();
+        if let Some(panel) = ivars.side_panel.get() {
+            panel.tick();
+        }
         let show_tab_bar = !self.sidebar_active();
         // Output or a scroll may have slid other text under a still pointer.
         self.refresh_stale_url_hover();
