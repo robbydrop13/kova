@@ -10,7 +10,10 @@
     "needs": "Pick one of the two plans",
     "action": "https://example.com/plan",
     "topic": "launch",
-    "src": ["ticket:T-1"]
+    "src": ["ticket:T-1"],
+    "scope": "perso",
+    "prio": 1,
+    "draft": {"to": "The accountant", "channel": "Email", "subject": "October statements", "text": "Hello,\nThey follow this week."}
   },
   {
     "op": "add",
@@ -23,6 +26,8 @@
     "needs": "",
     "action": "/tmp/kova-fixture/draft.md#P1",
     "topic": "supplier",
+    "prio": 7,
+    "draft": {"to": "Supplier", "channel": "Email", "text": "  "},
     "updated": "2026-11-05T15:10:00+01:00"
   },
   {
@@ -32,7 +37,9 @@
     "level": "point",
     "kind": "test",
     "title": "Try the new build",
-    "topic": "launch"
+    "topic": "launch",
+    "scope": "pro",
+    "prio": 3
   },
   {
     "id": "a-100004",

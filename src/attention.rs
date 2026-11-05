@@ -52,6 +52,28 @@ impl Level {
     }
 }
 
+/// Which queue an entry comes from: the work one or the personal one
+/// (`attn list --scope all` reads both). Absent means work, as before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    #[default]
+    Pro,
+    Perso,
+}
+
+/// A reply an agent drafted for the user to approve or correct. Kova shows
+/// it and passes the click on; whoever receives the click sends it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Draft {
+    #[serde(default)]
+    pub to: String,
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub subject: Option<String>,
+    pub text: String,
+}
+
 /// One open entry, as the CLI prints it. Fields Kova does not show are
 /// ignored, so the CLI can grow without breaking the list.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +91,10 @@ pub struct Entry {
     /// A URL, a file path (with an optional `#anchor`), or plain words.
     pub action: Option<String>,
     pub topic: Option<String>,
+    pub scope: Scope,
+    /// 1 urgent, 2 today, 3 this week; `None` when the entry does not say.
+    pub prio: Option<u8>,
+    pub draft: Option<Draft>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +114,12 @@ struct Raw {
     action: Option<String>,
     #[serde(default)]
     topic: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    prio: Option<serde_json::Value>,
+    #[serde(default)]
+    draft: Option<serde_json::Value>,
 }
 
 /// Parse the CLI's answer. `None` when it is not a JSON array at all; an
@@ -112,6 +144,14 @@ pub fn parse(text: &str) -> Option<Vec<Entry>> {
                     needs: nonempty(raw.needs),
                     action: nonempty(raw.action),
                     topic: nonempty(raw.topic),
+                    scope: if raw.scope.as_deref() == Some("perso") { Scope::Perso } else { Scope::Pro },
+                    // Read leniently: a priority or a draft that does not
+                    // read is none, the entry still shows.
+                    prio: raw.prio.and_then(|p| p.as_u64()).filter(|p| (1..=3).contains(p)).map(|p| p as u8),
+                    draft: raw
+                        .draft
+                        .and_then(|d| serde_json::from_value::<Draft>(d).ok())
+                        .filter(|d| !d.text.trim().is_empty()),
                 })
             })
             .collect(),
@@ -326,6 +366,10 @@ pub enum Verb {
     Done,
     /// `close_command <id> --note "Ignoré (Kova)"`.
     Ignore,
+    /// A draft approved as it is: `act_command <id> Valider`.
+    Validate,
+    /// A draft the user rewrote: `act_command <id> Corriger --text=<text>`.
+    Correct,
 }
 
 impl Verb {
@@ -335,6 +379,8 @@ impl Verb {
             Verb::Send => "Envoyer",
             Verb::Done => "Fait",
             Verb::Ignore => "Ignorer",
+            Verb::Validate => "Valider",
+            Verb::Correct => "Corriger",
         }
     }
 }
@@ -370,16 +416,23 @@ fn set_outcome(id: &str, outcome: Outcome) {
 /// The argv a click runs: the configured command, the id, then fixed words.
 /// `None` when the command for that verb is not configured or the id is not
 /// one Kova passes on.
-fn verb_argv(act: &[String], close: &[String], id: &str, verb: Verb) -> Option<(String, Vec<String>)> {
+/// A correction carries its text as one `--text=...` element, never as a
+/// word of its own, so the CLI can never read it as an option.
+fn verb_argv(act: &[String], close: &[String], id: &str, verb: Verb, text: Option<&str>) -> Option<(String, Vec<String>)> {
     if !valid_id(id) {
         return None;
     }
-    let base = if verb == Verb::Send { act } else { close };
+    let acts = matches!(verb, Verb::Send | Verb::Validate | Verb::Correct);
+    let base = if acts { act } else { close };
     let (bin, words) = base.split_first()?;
     let mut args: Vec<String> = words.to_vec();
     args.push(id.to_string());
     match verb {
-        Verb::Send => args.push(Verb::Send.label().to_string()),
+        Verb::Send | Verb::Validate => args.push(verb.label().to_string()),
+        Verb::Correct => {
+            let text = text.filter(|t| !t.trim().is_empty())?;
+            args.extend([verb.label().to_string(), format!("--text={text}")]);
+        }
         Verb::Done => args.extend(["--note".to_string(), "Fait (Kova)".to_string()]),
         Verb::Ignore => args.extend(["--note".to_string(), "Ignoré (Kova)".to_string()]),
     }
@@ -390,13 +443,21 @@ fn verb_argv(act: &[String], close: &[String], id: &str, verb: Verb) -> Option<(
 /// not in the last read, when a click on it already runs, or when the
 /// command is not configured; the row then keeps its buttons.
 pub fn perform(id: &str, verb: Verb) -> Result<(), String> {
+    perform_with(id, verb, None)
+}
+
+/// `perform` with the text a correction sends. The text is the user's own,
+/// typed on the Cockpit's card: control characters but tab and newline are
+/// dropped, and it is capped at `MAX_TEXT`.
+pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), String> {
+    let text = text.map(clean_text);
     let known = CACHE.read().as_ref().is_some_and(|entries| entries.iter().any(|e| e.id == id));
     if !known {
         return Err(format!("attention: no open entry {id:?}"));
     }
     let (bin, args) = {
         let commands = COMMANDS.read();
-        verb_argv(&commands.act, &commands.close, id, verb)
+        verb_argv(&commands.act, &commands.close, id, verb, text.as_deref())
     }
     .ok_or_else(|| format!("attention: no command for {}", verb.label()))?;
     {
@@ -420,7 +481,10 @@ pub fn perform(id: &str, verb: Verb) -> Result<(), String> {
                 }
             });
         match result {
-            Ok(()) => set_outcome(&id, if verb == Verb::Send { Outcome::Sent } else { Outcome::Closed }),
+            Ok(()) => set_outcome(
+                &id,
+                if matches!(verb, Verb::Send | Verb::Validate | Verb::Correct) { Outcome::Sent } else { Outcome::Closed },
+            ),
             Err(words) => {
                 log::warn!("attention {} {id}: {words}", verb.label());
                 set_outcome(&id, Outcome::Failed { words, until_ms: now_ms() + FAILED_MS });
@@ -429,6 +493,22 @@ pub fn perform(id: &str, verb: Verb) -> Result<(), String> {
         refresh();
     });
     Ok(())
+}
+
+/// The most a correction carries: a long email, with room to spare.
+pub const MAX_TEXT: usize = 16 * 1024;
+
+/// A correction as it goes into the argv: no control character but tab and
+/// newline, `MAX_TEXT` bytes at most (cut on a character boundary).
+pub fn clean_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(MAX_TEXT));
+    for c in text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t') {
+        if out.len() + c.len_utf8() > MAX_TEXT {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Forget the click state of entries the queue no longer holds: a closed
@@ -499,21 +579,57 @@ mod tests {
         let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
         let close: Vec<String> = ["/bin/attn", "close", "--by", "me"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
-            verb_argv(&act, &close, "a-1", Verb::Send),
+            verb_argv(&act, &close, "a-1", Verb::Send, None),
             Some(("/bin/attn".to_string(), vec!["act".into(), "a-1".into(), "Envoyer".into()]))
         );
         assert_eq!(
-            verb_argv(&act, &close, "a-1", Verb::Done),
+            verb_argv(&act, &close, "a-1", Verb::Done, None),
             Some((
                 "/bin/attn".to_string(),
                 vec!["close".into(), "--by".into(), "me".into(), "a-1".into(), "--note".into(), "Fait (Kova)".into()]
             ))
         );
-        assert_eq!(verb_argv(&act, &close, "a-1", Verb::Ignore).map(|(_, a)| a[5].clone()), Some("Ignoré (Kova)".into()));
+        assert_eq!(verb_argv(&act, &close, "a-1", Verb::Ignore, None).map(|(_, a)| a[5].clone()), Some("Ignoré (Kova)".into()));
         // No close command: Fait and Ignorer have nothing to run.
-        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Done), None);
+        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Done, None), None);
         // An id that could be read as an option never reaches the argv.
-        assert_eq!(verb_argv(&act, &close, "--help", Verb::Send), None);
+        assert_eq!(verb_argv(&act, &close, "--help", Verb::Send, None), None);
+    }
+
+    #[test]
+    fn a_draft_is_validated_or_corrected_and_the_text_is_one_argv_element() {
+        let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            verb_argv(&act, &[], "a-1", Verb::Validate, None).map(|(_, a)| a),
+            Some(vec!["act".into(), "a-1".into(), "Valider".into()])
+        );
+        // A text that looks like an option stays inside its `--text=` element.
+        assert_eq!(
+            verb_argv(&act, &[], "a-1", Verb::Correct, Some("--by evil\nBonjour")).map(|(_, a)| a),
+            Some(vec!["act".into(), "a-1".into(), "Corriger".into(), "--text=--by evil\nBonjour".into()])
+        );
+        // A correction with nothing in it is not one.
+        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Correct, Some("  ")), None);
+        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Correct, None), None);
+        assert_eq!(clean_text("a\x1b[201~b\u{7}\nc\td"), "a[201~b\nc\td");
+        assert_eq!(clean_text(&"é".repeat(MAX_TEXT)).len(), MAX_TEXT);
+    }
+
+    #[test]
+    fn scope_prio_and_draft_are_read_and_a_bad_one_is_none() {
+        let entries = parse(FIXTURE).expect("an array");
+        assert_eq!(entries[0].scope, Scope::Perso);
+        assert_eq!(entries[0].prio, Some(1));
+        let draft = entries[0].draft.as_ref().expect("a draft");
+        assert_eq!((draft.to.as_str(), draft.channel.as_str()), ("The accountant", "Email"));
+        assert_eq!(draft.subject.as_deref(), Some("October statements"));
+        assert_eq!(draft.text, "Hello,\nThey follow this week.");
+        // No scope is work; a priority out of range and a draft without text
+        // are none.
+        assert_eq!(entries[1].scope, Scope::Pro);
+        assert_eq!(entries[1].prio, None);
+        assert_eq!(entries[1].draft, None);
+        assert_eq!(entries[2].prio, Some(3));
     }
 
     #[test]
