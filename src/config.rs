@@ -18,6 +18,7 @@ pub struct Config {
     pub keys: KeysConfig,
     pub agent: AgentConfig,
     pub sidebar: SidebarConfig,
+    pub attention: AttentionConfig,
 }
 
 /// How Kova rebuilds an agent's command line when it puts a conversation back.
@@ -240,6 +241,24 @@ pub struct SidebarConfig {
     pub roster_command: Vec<String>,
 }
 
+/// The attention queue the Asks view lists above the questions
+/// (`crate::attention`): three argv, never a shell line. Absent `command`
+/// turns the whole feature off; an absent `act_command` or `close_command`
+/// only leaves out the buttons that need it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AttentionConfig {
+    /// Prints the open entries as a JSON array
+    /// (`["/usr/local/bin/attn", "list", "--open", "--json"]`).
+    pub command: Vec<String>,
+    /// Records a click: Kova appends the entry id and the button
+    /// (`["/usr/local/bin/attn", "act"]`).
+    pub act_command: Vec<String>,
+    /// Closes an entry: Kova appends the id, then `--note` and its words
+    /// (`["/usr/local/bin/attn", "close", "--by", "me"]`).
+    pub close_command: Vec<String>,
+}
+
 /// The layout settings Kova changes at runtime (View menu, the sidebar edge
 /// drag), kept in their own small file rather than written back into
 /// `config.toml`: rewriting the user's TOML would need a comment-preserving
@@ -348,6 +367,7 @@ impl Default for Config {
             keys: KeysConfig::default(),
             agent: AgentConfig::default(),
             sidebar: SidebarConfig::default(),
+            attention: AttentionConfig::default(),
         }
     }
 }
@@ -697,6 +717,19 @@ mod tests {
         assert!(Config::default().sidebar.roster_command.is_empty());
         let empty: Config = toml::from_str("[sidebar]\nroster_command = []\n").unwrap();
         assert!(empty.sidebar.roster_command.is_empty());
+    }
+
+    #[test]
+    fn the_attention_commands_parse_as_argv_and_default_to_off() {
+        let config: Config = toml::from_str(
+            "[attention]\ncommand = [\"/usr/local/bin/attn\", \"list\", \"--open\", \"--json\"]\nact_command = [\"/usr/local/bin/attn\", \"act\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.attention.command, ["/usr/local/bin/attn", "list", "--open", "--json"]);
+        assert_eq!(config.attention.act_command, ["/usr/local/bin/attn", "act"]);
+        assert!(config.attention.close_command.is_empty());
+        let none = Config::default();
+        assert!(none.attention.command.is_empty() && none.attention.act_command.is_empty());
     }
 
     #[test]

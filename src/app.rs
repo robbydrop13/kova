@@ -103,6 +103,7 @@ define_class!(
             window::side_panel::init(crate::config::LayoutPrefs::load().panel_fraction);
             window::sidebar::tokens::set_background(config.colors.background);
             crate::team::set_command(&config.sidebar.roster_command);
+            crate::attention::set_commands(&config.attention.command, &config.attention.act_command, &config.attention.close_command);
             setup_menu(mtm, config);
 
             // Restore session (all windows) or create a single fresh window
@@ -1755,10 +1756,12 @@ fn handle_ipc_reload_config(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
 ) -> crate::ipc::IpcResponse {
     let config = Config::load();
-    // The sidebar follows the terminal background, and the roster command is
-    // read here too: both are re-picked on a reload, not only on a restart.
+    // The sidebar follows the terminal background, and the roster and
+    // attention commands are read here too: all are re-picked on a reload,
+    // not only on a restart.
     window::sidebar::tokens::set_background(config.colors.background);
     crate::team::set_command(&config.sidebar.roster_command);
+    crate::attention::set_commands(&config.attention.command, &config.attention.act_command, &config.attention.close_command);
     let mut applied = 0usize;
     for win in windows.borrow().iter() {
         if let Some(view) = kova_view(win) {

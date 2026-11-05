@@ -1,0 +1,71 @@
+[
+  {
+    "op": "add",
+    "id": "a-100001",
+    "ts": "2026-11-05T16:22:48+01:00",
+    "from": "alpha-manager",
+    "level": "now",
+    "kind": "decision",
+    "title": "Plan for the launch",
+    "needs": "Pick one of the two plans",
+    "action": "https://example.com/plan",
+    "topic": "launch",
+    "src": ["ticket:T-1"]
+  },
+  {
+    "op": "add",
+    "id": "a-100002",
+    "ts": "2026-11-05T15:00:00+01:00",
+    "from": "beta-coach",
+    "level": "point",
+    "kind": "would",
+    "title": "Reply to the supplier",
+    "needs": "",
+    "action": "/tmp/kova-fixture/draft.md#P1",
+    "topic": "supplier",
+    "updated": "2026-11-05T15:10:00+01:00"
+  },
+  {
+    "id": "a-100003",
+    "ts": "2026-11-05T14:00:00+01:00",
+    "from": "gamma-project",
+    "level": "point",
+    "kind": "test",
+    "title": "Try the new build",
+    "topic": "launch"
+  },
+  {
+    "id": "a-100004",
+    "ts": "2026-11-05T13:00:00+01:00",
+    "from": "alpha-manager",
+    "level": "memo",
+    "kind": "auto",
+    "title": "Merged the fix"
+  },
+  {
+    "title": "No id at all",
+    "level": "now"
+  },
+  {
+    "id": "a-bad001",
+    "ts": "2026-11-05T13:00:00+01:00",
+    "level": "someday",
+    "kind": "info",
+    "title": "An unknown level"
+  },
+  {
+    "id": "-a-dash",
+    "ts": "2026-11-05T13:00:00+01:00",
+    "level": "now",
+    "kind": "info",
+    "title": "A leading dash"
+  },
+  {
+    "id": "a-100005",
+    "ts": "not a date",
+    "from": "delta-project",
+    "level": "memo",
+    "kind": "info",
+    "title": "Routine ran"
+  }
+]
