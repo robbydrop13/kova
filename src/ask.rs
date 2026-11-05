@@ -1147,11 +1147,10 @@ impl Board {
                 // What is still open stays in the Asks, a sheet of its own,
                 // answered late to the same conversation.
                 if let Some(rest) = sheet.still_open(&answers) {
-                    let n = rest.decisions.len();
                     let ids: Vec<String> = rest.decisions.iter().map(|d| d.id.clone()).collect();
                     let q = Question {
                         id: new_question_id(),
-                        message: format!("{}: {} decision{} left", sheet.title, n, if n == 1 { "" } else { "s" }),
+                        message: rest.card_message(" left"),
                         actions: vec![DECISION_DONE.to_string()],
                         input: false,
                         from: question.from.clone(),
@@ -1557,8 +1556,7 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
     if message.is_none()
         && let Some(sheet) = &out.sheet
     {
-        let n = sheet.decisions.len();
-        message = Some(format!("{}: {} decision{}", sheet.title, n, if n == 1 { "" } else { "s" }));
+        message = Some(sheet.card_message(""));
     }
     out.message = message.filter(|m| !m.trim().is_empty()).ok_or_else(|| USAGE.to_string())?;
     if let Some(sheet) = &out.sheet {
@@ -2363,7 +2361,7 @@ mod tests {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let path = sheet_file(TWO);
         let c = parse_cli(&args(&["--decisions", &path])).unwrap();
-        assert_eq!(c.message, "Plan: 2 decisions", "the message defaults to the title");
+        assert!(c.message.starts_with("Plan: 2 decisions\n\u{2022} "), "the message defaults to the title and the decisions");
         assert_eq!((c.actions.clone(), c.input), (vec!["Done".to_string()], false));
         assert!(parse_cli(&args(&["x", "--decisions", &path, "--decision", "https://a.b/c"])).is_err());
         assert!(parse_cli(&args(&["x", "--decisions", "/nonexistent/d.json"])).is_err());
@@ -2420,7 +2418,7 @@ mod tests {
         let rest = board.questions()[0].clone();
         assert!(still.contains(&format!("kova ask --drop {}", rest.id)));
         assert!(rest.follow_up && rest.is_decision());
-        assert_eq!(rest.message, "Plan: 1 decision left");
+        assert_eq!(rest.message, "Plan: 1 decision left\n\u{2022} Who?");
         assert_eq!(rest.sheet.as_ref().unwrap().decisions.len(), 1);
         assert_eq!(rest.sheet.as_ref().unwrap().decisions[0].id, "D2");
         // A message in the conversation does not take it back; its asker can drop it.
