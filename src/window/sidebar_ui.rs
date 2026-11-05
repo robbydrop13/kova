@@ -7,9 +7,10 @@
 
 use super::*;
 use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
-use super::needs::{self, AskNeed, NeedInput, NeedItem, NeedKind, PaneNeed, RoutineNeed};
+use super::needs::{self, AskNeed, AttentionNeed, NeedInput, NeedItem, NeedKind, PaneNeed, RoutineNeed};
 use super::sidebar_asks::{self, AskCardVm, AsksHit, AsksState, Highlight};
 use super::sidebar_agents;
+use super::sidebar_attention;
 use super::sidebar_model::{asks_summary, header_title, next_pill, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
 use super::sidebar_sched::{self, SchedButton, SchedHit, SchedState};
 use crate::config::LayoutMode;
@@ -540,7 +541,28 @@ impl KovaView {
                 detail: Some(rest_of(&question.message)),
             });
         });
-        NeedInput { panes, routines, asks, attention: Vec::new(), now }
+        // The queue as last read: `now` entries are needs, the model drops
+        // the other levels. Read here, every tick, so the badge and Next
+        // count them whichever list is up.
+        let attention = crate::attention::snapshot()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| AttentionNeed {
+                        id: entry.id.clone(),
+                        since: entry.since,
+                        level: match entry.level {
+                            crate::attention::Level::Now => "now",
+                            crate::attention::Level::Point => "point",
+                            crate::attention::Level::Memo => "memo",
+                        }
+                        .to_string(),
+                        title: entry.title.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        NeedInput { panes, routines, asks, attention, now }
     }
 
     /// The Asks cards at `now`: every question the board holds and every
@@ -662,8 +684,10 @@ impl KovaView {
         }
         if list == SidebarList::Asks {
             let cards = self.ask_cards(now);
+            let attention = attention_vm(now);
             let mut st = self.ivars().sidebar.borrow_mut();
             st.asks.set_cards(cards);
+            st.asks.attention = attention;
             // A need row's `Answer` on a permission named its pane: the card
             // for that pane exists only now, so it is this read that lights it.
             if let Some(pane) = st.asks.highlight_pane.take()
@@ -676,7 +700,7 @@ impl KovaView {
                 });
             }
             model.asks = st.asks.clone();
-            model.summary = asks_summary(model.asks.open_count());
+            model.summary = asks_summary(model.asks.open_count() + model.asks.attention.now.len());
         }
         if list == SidebarList::Agents {
             // The roster is read only while this list is up; the clock marks
@@ -1038,10 +1062,43 @@ impl KovaView {
         if let AsksHit::Open(pane_id) = hit {
             focus_pane_anywhere(pane_id);
         }
+        if let AsksHit::Attention(sidebar_attention::AttnHit::Button(key, button)) = hit {
+            self.sidebar_attention_button(key, button);
+        }
         if let AsksHit::OpenDoc(key) = hit {
             let open = self.ivars().sidebar.borrow().asks.card(key).and_then(|card| Some((card.id.clone(), card.decision_url.clone()?)));
             if let Some((id, url)) = open {
                 crate::ask_card::open_in_panel(id, url);
+            }
+        }
+    }
+
+    /// A button on a row of the attention queue: `Ouvrir` shows the link or
+    /// the file in the side panel, the others run their command in the
+    /// background (`crate::attention::perform`). The row shows the click at
+    /// once rather than on the next read.
+    fn sidebar_attention_button(&self, key: u64, button: sidebar_attention::Button) {
+        let row = self.ivars().sidebar.borrow().asks.attention.row(key).cloned();
+        let Some(row) = row else { return };
+        match button {
+            sidebar_attention::Button::Open => {
+                if let Some(target) = row.open {
+                    self.open_in_side_panel(target);
+                }
+            }
+            sidebar_attention::Button::Verb(verb) => {
+                if let Err(why) = crate::attention::perform(&row.id, verb) {
+                    log::warn!("{why}");
+                }
+                let attention = attention_vm(now_epoch_secs());
+                let asks = {
+                    let mut st = self.ivars().sidebar.borrow_mut();
+                    st.asks.attention = attention;
+                    st.asks.clone()
+                };
+                if let Some(view) = self.ivars().sidebar_view.get() {
+                    view.adopt_asks(asks);
+                }
             }
         }
     }
@@ -1512,6 +1569,26 @@ fn rect_eq(a: CGRect, b: CGRect) -> bool {
 }
 
 /// Wall-clock seconds since the epoch, for the awaiting age.
+/// The attention rows at `now`, from the last read and the clicks' states.
+/// Off (`[attention]` absent): an empty, disabled model, and the Asks view is
+/// as it was.
+fn attention_vm(now: u64) -> sidebar_attention::AttentionVm {
+    let entries = crate::attention::snapshot();
+    if let Some(entries) = &entries {
+        crate::attention::prune(entries);
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    sidebar_attention::build(
+        entries.as_deref().map(Vec::as_slice),
+        &crate::attention::outcomes(),
+        now,
+        crate::attention::can_act(),
+        crate::attention::can_close(),
+        home.as_deref(),
+        &|path| path.is_file(),
+    )
+}
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

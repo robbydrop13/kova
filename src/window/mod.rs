@@ -21,6 +21,7 @@ pub(super) mod sidebar_asks;
 pub mod ds_tokens;
 mod sidebar_model;
 mod sidebar_ui;
+mod sidebar_attention;
 pub(super) mod sidebar_sched;
 mod sidebar_view;
 pub(crate) mod side_panel;

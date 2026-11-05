@@ -23,6 +23,7 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSDictionary, NSString};
 
 use super::sidebar::{format_age, tokens};
+use super::sidebar_attention::{self, AttentionVm, AttnFold, AttnHit, AttnLayout};
 use super::sidebar_view::{
     AppKitMetrics, Align, EDGE_TOLERANCE, LIST_BOTTOM, LIST_TOP, ListHit, PAD_H, Rect, Shared, Style, TextMetrics,
     draw_text, draw_wrapped, fill_dot, fill_round, stroke_icon, stroke_round,
@@ -328,6 +329,10 @@ pub struct AsksState {
     /// What was typed in the Brief field, by question id. Kept after the
     /// overlay closes, so reopening Brief on the same ask restores it.
     pub drafts: HashMap<String, String>,
+    /// The attention queue around the cards (`sidebar_attention`); empty
+    /// and off when `[attention]` is not configured.
+    pub attention: AttentionVm,
+    pub attention_fold: AttnFold,
 }
 
 impl Default for AsksState {
@@ -342,6 +347,8 @@ impl Default for AsksState {
             highlight_pane: None,
             brief: None,
             drafts: HashMap::new(),
+            attention: AttentionVm::default(),
+            attention_fold: AttnFold::default(),
         }
     }
 }
@@ -545,6 +552,8 @@ pub enum AsksHit {
     PermissionApprove(u64),
     PermissionReject(u64),
     PermissionAlways(u64),
+    /// A button or a section header of the attention queue.
+    Attention(AttnHit),
 }
 
 impl AsksHit {
@@ -615,6 +624,17 @@ pub fn click(state: &mut AsksState, hit: AsksHit, now_ms: u64) -> Option<AskActi
         // which holds the pane: only a click that really reached the PTY
         // moves the card (`permission_sending`).
         AsksHit::PermissionApprove(_) | AsksHit::PermissionReject(_) | AsksHit::PermissionAlways(_) => None,
+        AsksHit::Attention(AttnHit::TogglePoint) => {
+            state.attention_fold.point_open = !state.attention_fold.point_open;
+            None
+        }
+        AsksHit::Attention(AttnHit::ToggleMemo) => {
+            state.attention_fold.memo_open = !state.attention_fold.memo_open;
+            None
+        }
+        // A row's button runs a command or opens the panel: served by
+        // `sidebar_ui::sidebar_ask_hit`, which owns both.
+        AsksHit::Attention(AttnHit::Button(..)) => None,
     }
 }
 
@@ -783,6 +803,9 @@ pub struct AsksLayout {
     /// The Brief overlay, when a question is being briefed. It covers the
     /// list: nothing under it is clickable.
     pub brief: Option<BriefLayout>,
+    /// The attention queue above the cards and under them.
+    pub attention_top: AttnLayout,
+    pub attention_bottom: AttnLayout,
     pub content_h: f64,
 }
 
@@ -806,6 +829,9 @@ impl AsksLayout {
             // The field is a native subview and sees its own clicks; the
             // rest of the card is text.
             return None;
+        }
+        if let Some(hit) = self.attention_top.hit(x, y).or_else(|| self.attention_bottom.hit(x, y)) {
+            return Some(AsksHit::Attention(hit));
         }
         for card in self.cards.iter().chain(self.snoozed_cards.iter()) {
             if !card.frame.contains(x, y) {
@@ -836,6 +862,8 @@ impl AsksLayout {
             .flat_map(|card| card.buttons.iter().map(|(_, rect)| *rect))
             .collect();
         rects.extend(self.snoozed_header);
+        rects.extend(self.attention_top.button_rects());
+        rects.extend(self.attention_bottom.button_rects());
         rects
     }
 
@@ -848,19 +876,31 @@ impl AsksLayout {
     }
 }
 
-/// Lay the Asks list out at `width`. The open cards come newest first, then
-/// the folded or open `Snoozed N` section.
+/// Lay the Asks list out at `width`. With an attention queue, its `now` rows
+/// come first under `À toi maintenant (N)`; then the open cards, newest first,
+/// then the folded or open `Snoozed N` section, then the queue's folded
+/// `Au prochain point` and `Pour mémoire`.
 pub fn layout(state: &AsksState, width: f64, m: &dyn TextMetrics) -> AsksLayout {
     let x0 = PAD_H;
     let x1 = (width - (PAD_H - EDGE_TOLERANCE)).max(x0 + 40.0);
     let w = x1 - x0;
     let mut y = LIST_TOP;
     let mut out = AsksLayout { shown: true, ..Default::default() };
-    if state.cards.is_empty() && state.transient.is_none() {
-        out.empty = Some(Rect::new(x0, y, w, EMPTY_H));
-        out.content_h = y + EMPTY_H + LIST_BOTTOM;
+    if state.cards.is_empty() && state.transient.is_none() && state.attention.is_empty() {
+        // With a queue configured, nothing waiting is nothing drawn.
+        if !state.attention.enabled {
+            out.empty = Some(Rect::new(x0, y, w, EMPTY_H));
+            out.content_h = y + EMPTY_H + LIST_BOTTOM;
+        } else {
+            out.content_h = y + LIST_BOTTOM;
+        }
         return out;
     }
+    let asks = state.open_count()
+        + usize::from(state.transient.as_ref().is_some_and(|t| !state.open().any(|card| card.key == t.card.key)));
+    let (top, after) = sidebar_attention::layout_top(&state.attention, asks, x0, y, w, m);
+    out.attention_top = top;
+    y = after;
 
     let mut open: Vec<&AskCardVm> = state.open().collect();
     if let Some(t) = &state.transient
@@ -893,6 +933,9 @@ pub fn layout(state: &AsksState, width: f64, m: &dyn TextMetrics) -> AsksLayout 
             }
         }
     }
+    let (bottom, after) = sidebar_attention::layout_bottom(&state.attention, state.attention_fold, x0, y, w, m);
+    out.attention_bottom = bottom;
+    y = after;
     out.brief = brief_layout(state, width, m);
     out.content_h = y + LIST_BOTTOM;
     if let Some(brief) = &out.brief {
@@ -1274,6 +1317,7 @@ pub(super) fn draw(
         draw_empty(sh, &empty);
         return;
     }
+    sidebar_attention::draw(sh, &layout.attention_top, state.attention_fold, hovered, pressed);
     for card in &layout.cards {
         draw_card(sh, &m, card, hovered, pressed);
     }
@@ -1283,6 +1327,7 @@ pub(super) fn draw(
     for card in &layout.snoozed_cards {
         draw_card(sh, &m, card, hovered, pressed);
     }
+    sidebar_attention::draw(sh, &layout.attention_bottom, state.attention_fold, hovered, pressed);
     if let Some(brief) = &layout.brief {
         draw_overlay(sh, &m, brief, &scrim, hovered, pressed);
     }
@@ -1681,7 +1726,12 @@ fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: List
             draw_text(sh, "Show now", rect, Style::Chip, tokens::get().text_primary, alpha, Align::Center, false);
         }
         // The overlay's chips and buttons are drawn whole by `draw_overlay`.
-        AsksHit::BriefChip(_, _) | AsksHit::BriefSend(_) | AsksHit::BriefCancel(_) | AsksHit::ToggleSnoozed => {}
+        // The queue's buttons and headers are drawn by `sidebar_attention`.
+        AsksHit::BriefChip(_, _)
+        | AsksHit::BriefSend(_)
+        | AsksHit::BriefCancel(_)
+        | AsksHit::ToggleSnoozed
+        | AsksHit::Attention(_) => {}
     }
 }
 
