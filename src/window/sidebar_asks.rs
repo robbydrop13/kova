@@ -1338,7 +1338,22 @@ fn draw_card(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, hovered: Lis
     }
 
     for (hit, rect) in &card.buttons {
-        draw_button(sh, *hit, rect, alpha, hovered, pressed);
+        draw_button(sh, *hit, rect, alpha, hovered, pressed, &card.card);
+    }
+}
+
+/// The icons of a card's OK and KO, and of the two options the note names.
+/// A handoff's OK is its step (`Ouvrir`, `Lancer`) and its KO is `Fait`:
+/// the step takes the open or play arrow, `Fait` the positive check, never
+/// the red cross of a refusal.
+fn answer_icons(card: &AskCardVm) -> [(super::feather::Icon, [f32; 3]); 2] {
+    use super::feather::Icon;
+    match card.step.as_deref() {
+        Some(step) => {
+            let icon = if step == crate::handoff::RUN { Icon::Play } else { Icon::Open };
+            [(icon, tokens::get().text_primary), (Icon::Check, tokens::get().ok_dot)]
+        }
+        None => [(Icon::Check, tokens::get().ok_dot), (Icon::X, tokens::get().interrupt)],
     }
 }
 
@@ -1586,7 +1601,8 @@ fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f6
         draw_text(sh, &label, &first, Style::Hint, tokens::get().text_tertiary, alpha, Align::Left, false);
         return;
     }
-    stroke_icon(super::feather::Icon::Check, &check, NOTE_ICON, tokens::get().ok_dot, alpha);
+    let [(first_icon, first_ink), (second_icon, second_ink)] = answer_icons(&card.card);
+    stroke_icon(first_icon, &check, NOTE_ICON, first_ink, alpha);
     draw_text(
         sh,
         &card.card.options[0],
@@ -1597,7 +1613,7 @@ fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f6
         Align::Left,
         false,
     );
-    stroke_icon(super::feather::Icon::X, &cross, NOTE_ICON, tokens::get().interrupt, alpha);
+    stroke_icon(second_icon, &cross, NOTE_ICON, second_ink, alpha);
     draw_text(
         sh,
         &card.card.options[1],
@@ -1610,7 +1626,7 @@ fn draw_options(sh: &Shared, m: &AppKitMetrics<'_>, card: &CardLayout, alpha: f6
     );
 }
 
-fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: ListHit, pressed: ListHit) {
+fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: ListHit, pressed: ListHit, card: &AskCardVm) {
     let hot = matches!(hovered, ListHit::Ask(h) if h == hit);
     let down = matches!(pressed, ListHit::Ask(h) if h == hit);
     match hit {
@@ -1621,9 +1637,12 @@ fn draw_button(sh: &Shared, hit: AsksHit, rect: &Rect, alpha: f64, hovered: List
         | AsksHit::PermissionReject(_) => {
             let ground = if down || hot { tokens::get().tile_pressed } else { tokens::get().tile_hover };
             fill_round(rect, AB_RADIUS, ground, alpha);
+            let [ok, ko] = answer_icons(card);
             let (icon, fg) = match hit {
-                AsksHit::Ok(_) | AsksHit::PermissionApprove(_) => (super::feather::Icon::Check, tokens::get().ok_dot),
-                AsksHit::Ko(_) | AsksHit::PermissionReject(_) => (super::feather::Icon::X, tokens::get().interrupt),
+                AsksHit::Ok(_) => ok,
+                AsksHit::Ko(_) => ko,
+                AsksHit::PermissionApprove(_) => (super::feather::Icon::Check, tokens::get().ok_dot),
+                AsksHit::PermissionReject(_) => (super::feather::Icon::X, tokens::get().interrupt),
                 _ => (super::feather::Icon::Edit, tokens::get().text_primary),
             };
             stroke_icon(icon, rect, AB_ICON, fg, alpha);
@@ -2468,5 +2487,23 @@ mod tests {
         assert!(st.transient.is_none(), "click alone sends nothing: the pane decides");
         assert!(st.brief.is_none());
         assert_eq!(st.snooze_open, None);
+    }
+
+    #[test]
+    fn a_handoffs_fait_is_drawn_as_a_check_not_the_red_cross_of_ko() {
+        use super::super::feather::Icon;
+        let mut handoff = card(1, "q1", "Merge the PR");
+        handoff.options = [crate::handoff::OPEN.into(), crate::handoff::DONE.into()];
+        handoff.step = Some(crate::handoff::OPEN.into());
+        let [(step, _), (done, done_ink)] = answer_icons(&handoff);
+        assert_eq!(step, Icon::Open);
+        assert_eq!((done, done_ink), (Icon::Check, tokens::get().ok_dot));
+        handoff.step = Some(crate::handoff::RUN.into());
+        assert_eq!(answer_icons(&handoff)[0].0, Icon::Play);
+        // Any other question keeps OK and KO as they were.
+        let plain = card(2, "q2", "Ship it?");
+        let [(ok, _), (ko, ko_ink)] = answer_icons(&plain);
+        assert_eq!(ok, Icon::Check);
+        assert_eq!((ko, ko_ink), (Icon::X, tokens::get().interrupt));
     }
 }
