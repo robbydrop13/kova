@@ -147,12 +147,18 @@ pub fn epoch_of(ts: &str) -> Option<u64> {
         let digits = frac.chars().take_while(char::is_ascii_digit).count();
         rest = &frac[digits..];
     }
-    let offset = match rest {
-        "Z" => 0,
-        _ if rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-')) && &rest[3..4] == ":" => {
-            let h: i64 = rest[1..3].parse().ok()?;
-            let m: i64 = rest[4..6].parse().ok()?;
-            let sign = if rest.starts_with('-') { -1 } else { 1 };
+    // Bytes, not string slices: a byte index inside a multibyte character
+    // would panic, and the date comes from outside.
+    let r = rest.as_bytes();
+    let offset = match r {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] if [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()) => {
+            let h = i64::from(h1 - b'0') * 10 + i64::from(h2 - b'0');
+            let m = i64::from(m1 - b'0') * 10 + i64::from(m2 - b'0');
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let sign = if *sign == b'-' { -1 } else { 1 };
             sign * (h * 3600 + m * 60)
         }
         _ => return None,
@@ -192,8 +198,11 @@ pub fn set_commands(list: &[String], act: &[String], close: &[String]) {
         return;
     }
     *COMMANDS.write() = next;
-    // What was read belongs to the old command.
+    // What was read, and the clicks on it, belong to the old command; a read
+    // still running under it is stale once `CHANGED` moved.
     *CACHE.write() = None;
+    *OUTCOMES.lock() = None;
+    CHANGED.fetch_add(1, Ordering::Relaxed);
     FILLED_AT.store(0, Ordering::Relaxed);
 }
 
@@ -227,19 +236,22 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-/// Clears `REFRESHING` however the read thread ends, a panic included.
+/// Clears `REFRESHING` however the read thread ends, a panic included, and
+/// marks the read time either way: a read that keeps failing is retried
+/// every `MAX_AGE_SECS`, not on every tick.
 struct RefreshDone;
 
 impl Drop for RefreshDone {
     fn drop(&mut self) {
+        FILLED_AT.store(now_secs(), Ordering::Relaxed);
         REFRESHING.store(false, Ordering::Release);
     }
 }
 
 /// The queue as last read, and a refresh in the background once it aged out.
 /// Returns at once: `None` while the feature is off or before the first read
-/// lands, and an empty list when the CLI failed (a broken CLI is not a reason
-/// to keep showing what it said a while ago).
+/// lands. A read that fails keeps the previous list (empty when there was
+/// none), and logs why.
 pub fn snapshot() -> Option<Arc<Vec<Entry>>> {
     if !configured() {
         return None;
@@ -251,9 +263,17 @@ pub fn snapshot() -> Option<Arc<Vec<Entry>>> {
             let _done = RefreshDone;
             let generation = CHANGED.load(Ordering::Relaxed);
             let argv = COMMANDS.read().list.clone();
-            let entries = read(&argv);
-            *CACHE.write() = Some(Arc::new(entries));
-            FILLED_AT.store(now_secs(), Ordering::Relaxed);
+            // A failed read keeps what the last good one said: an empty list
+            // would also forget which rows were sent or closed from here.
+            match read(&argv) {
+                Some(entries) => *CACHE.write() = Some(Arc::new(entries)),
+                None => {
+                    let mut cache = CACHE.write();
+                    if cache.is_none() {
+                        *cache = Some(Arc::new(Vec::new()));
+                    }
+                }
+            }
             READ_AT.store(generation, Ordering::Relaxed);
         });
     }
@@ -266,29 +286,30 @@ pub fn refresh() {
     FILLED_AT.store(0, Ordering::Relaxed);
 }
 
-/// Run the list command. A missing binary, a failure or an unreadable answer
-/// is an empty queue, logged.
-fn read(argv: &[String]) -> Vec<Entry> {
-    let Some((bin, args)) = argv.split_first() else { return Vec::new() };
+/// Run the list command. `None`, logged, for a missing binary, a failure or
+/// an unreadable answer: the caller keeps what it had.
+fn read(argv: &[String]) -> Option<Vec<Entry>> {
+    let (bin, args) = argv.split_first()?;
     if !Path::new(bin).is_file() {
         log::warn!("attention: {bin} is not a file");
-        return Vec::new();
+        return None;
     }
     let out = match crate::exec::run_with_deadline(std::process::Command::new(bin).args(args), LIST_DEADLINE) {
         Ok(out) => out,
         Err(e) => {
             log::warn!("attention: {e}");
-            return Vec::new();
+            return None;
         }
     };
     if !out.status.success() {
         log::warn!("attention: {bin} exited with {}", out.status);
-        return Vec::new();
+        return None;
     }
-    parse(&String::from_utf8_lossy(&out.stdout)).unwrap_or_else(|| {
+    let entries = parse(&String::from_utf8_lossy(&out.stdout));
+    if entries.is_none() {
         log::warn!("attention: cannot read the queue");
-        Vec::new()
-    })
+    }
+    entries
 }
 
 // ---------------------------------------------------------------
@@ -458,6 +479,11 @@ mod tests {
         assert_eq!(epoch_of("2026-11-05T16:22:48"), None);
         assert_eq!(epoch_of("2026-13-05T16:22:48Z"), None);
         assert_eq!(epoch_of("yesterday"), None);
+        // Multibyte characters where the offset goes: refused, never a panic.
+        assert_eq!(epoch_of("2026-11-05T16:22:48+1é00"), None);
+        assert_eq!(epoch_of("2026-11-05T16:22:48+€xx"), None);
+        assert_eq!(epoch_of("2026-11-05T16:22:48é+01:00"), None);
+        assert_eq!(epoch_of("2026-11-05T16:22:48+99:00"), None);
     }
 
     #[test]
@@ -491,6 +517,22 @@ mod tests {
     }
 
     #[test]
+    fn a_sent_or_closed_row_keeps_its_state_until_the_queue_drops_it() {
+        let entry = parse(FIXTURE).expect("an array").remove(0);
+        set_outcome("a-100001", Outcome::Sent);
+        set_outcome("a-gone", Outcome::Closed);
+        set_outcome("a-busy", Outcome::Running);
+        prune(std::slice::from_ref(&entry));
+        let states = outcomes();
+        assert_eq!(states.get("a-100001"), Some(&Outcome::Sent));
+        assert_eq!(states.get("a-gone"), None, "the queue no longer holds it");
+        assert_eq!(states.get("a-busy"), Some(&Outcome::Running), "a click in flight is kept");
+        // A failure's words run out on their own.
+        set_outcome("a-100001", Outcome::Failed { words: "boom".into(), until_ms: 1 });
+        assert_eq!(outcomes().get("a-100001"), None);
+    }
+
+    #[test]
     fn the_feature_is_off_without_a_command() {
         set_commands(&[], &[], &[]);
         assert!(!configured());
@@ -502,8 +544,11 @@ mod tests {
     fn the_list_command_runs_with_the_words_the_config_names() {
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/attention/list.json");
         let argv: Vec<String> = ["/bin/sh", "-c", &format!("cat '{fixture}'")].iter().map(|s| s.to_string()).collect();
-        assert_eq!(read(&argv).len(), 5);
+        assert_eq!(read(&argv).map(|e| e.len()), Some(5));
+        // A missing CLI or a failing one is no read at all, not an empty queue.
         let missing: Vec<String> = vec!["/nonexistent/attn".into()];
-        assert!(read(&missing).is_empty());
+        assert_eq!(read(&missing), None);
+        let failing: Vec<String> = ["/bin/sh", "-c", "exit 3"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(read(&failing), None);
     }
 }
