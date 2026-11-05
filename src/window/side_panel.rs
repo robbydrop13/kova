@@ -983,7 +983,8 @@ define_class!(
         /// rather than shown as raw text; another scheme (mailto:, slack:, an
         /// app's own) goes to the system, but only when the user clicked a link
         /// in the main frame: a page cannot launch an app on its own. Kova's
-        /// own pages (rendered markdown, local HTML, on `file:`) run no script.
+        /// own pages (rendered markdown, on `file:`) run no script; a local
+        /// `.html` file runs its own, as in a browser.
         #[unsafe(method(webView:decidePolicyForNavigationAction:preferences:decisionHandler:))]
         fn decide_policy(
             &self,
@@ -1018,9 +1019,17 @@ define_class!(
                 }
                 (Some("http" | "https" | "about" | "data" | "blob"), _) => WKNavigationActionPolicy::Allow,
                 (Some("file"), Some(u)) => {
-                    unsafe { preferences.setAllowsContentJavaScript(false) };
                     let path = u.path().map(|p| p.to_string()).unwrap_or_default();
-                    let is_md = matches!(file_kind(Path::new(&path)).map(|make| make(PathBuf::new())), Some(PanelTarget::Markdown(_)));
+                    let kind = file_kind(Path::new(&path)).map(|make| make(PathBuf::new()));
+                    // A local HTML file runs its scripts, as in a browser: an
+                    // artifact styled by a CDN script (Tailwind) is raw HTML
+                    // without them. It still reads only its own folder
+                    // (`allowingReadAccessToURL`). Anything else on `file:`
+                    // runs none.
+                    if !matches!(kind, Some(PanelTarget::Html(_))) {
+                        unsafe { preferences.setAllowsContentJavaScript(false) };
+                    }
+                    let is_md = matches!(kind, Some(PanelTarget::Markdown(_)));
                     if clicked && is_md && Path::new(&path).is_file() {
                         if let Some(panel) = panel_of(web_view) {
                             panel.open_target(PanelTarget::Markdown(PathBuf::from(path)));

@@ -62,8 +62,10 @@ when the panel closes.
 - `mailto:`, `slack:` and other schemes go to the system only when the user
   clicked a link in the main frame; a page that redirects to one on its own is
   cancelled (logged). A clicked `file://` link to a markdown file is rendered
-  rather than shown as raw text. Pages on `file:` (Kova's rendered markdown,
-  local HTML) run no JavaScript.
+  rather than shown as raw text. Kova's rendered markdown runs no JavaScript.
+  A local `.html` file runs its own scripts, as in a browser (an artifact
+  styled by the Tailwind CDN script is raw HTML without them), and reads only
+  its own folder.
 - With the web view focused, its page owns the shortcuts (Cmd+W, Cmd+F, Cmd+R…);
   Cmd+A/C/V/X/Z are routed to it (Kova has no Edit menu). Only three Kova
   shortcuts stay Kova's there: the side panel toggle, the sidebar toggle and
@@ -91,7 +93,7 @@ recommendation tagged, Other, a note), a progress bar, Open only, "Take the
 recommendation on the N left" (with a confirm), a general note, Done. Every
 text of the sheet is escaped into the HTML by Rust.
 
-It is the one page in the panel that runs a script, and the script only reads
+It is the one page Kova renders itself that runs a script, and the script only reads
 the form and posts it (`window.webkit.messageHandlers.kovaSheet`). A post is
 taken only from the panel's own web view, its main frame, on `about:blank` (the
 page is loaded from a string with no base URL), while the panel shows a sheet;
