@@ -19,7 +19,7 @@ use super::sidebar_view::{
     RowKind, Shared, Style, TextMetrics, EDGE_TOLERANCE, LIST_BOTTOM, LIST_TOP, PAD_H,
 };
 use crate::pane::PaneId;
-use crate::team::{self, State as RosterState};
+use crate::team::{self, State as RosterState, Status};
 
 // ---------------------------------------------------------------
 // Metrics (points)
@@ -50,6 +50,8 @@ const CHEVRON: f64 = 12.0;
 
 /// A pane, team or dedicated row: two 15 pt lines, 5 above and under them.
 pub const ROW_H: f64 = 40.0;
+/// A healthy working session: its one line, 5 above and under it.
+pub const ROW_ONE_H: f64 = 25.0;
 const ROW_GAP: f64 = 2.0;
 const ROW_PAD_X: f64 = 6.0;
 const ROW_PAD_Y: f64 = 5.0;
@@ -249,6 +251,41 @@ pub struct TeamRow {
     pub pane_state: Option<AgentSection>,
     /// The argv the CLI reports; `crate::team::reopen` validates it again.
     pub reopen: Vec<String>,
+    /// What the session says it is doing, and who it waits on.
+    pub status: Option<Status>,
+    pub waiting_on: Option<String>,
+}
+
+impl TeamRow {
+    /// A session at work that waits on nobody is healthy: one line, the
+    /// status at its right. Everything else keeps its second line.
+    pub fn one_line(&self) -> bool {
+        self.open && self.status == Some(Status::Working) && self.waiting_on.is_none()
+    }
+
+    pub fn height(&self) -> f64 {
+        if self.one_line() { ROW_ONE_H } else { ROW_H }
+    }
+
+    /// The status words, `<glyph> <word>`, and what follows them on the same
+    /// line: `attend : <waiting_on>` when it waits.
+    pub fn status_words(&self) -> Option<(String, String)> {
+        let status = self.status?;
+        let head = format!("{} {}", status.glyph(), status.word());
+        let tail = self.waiting_on.as_deref().map(|w| format!(" \u{b7} attend : {w}")).unwrap_or_default();
+        Some((head, tail))
+    }
+}
+
+/// The ink of a status word: what wants the user stands out, the rest reads
+/// as information.
+fn status_ink(status: Status) -> [f32; 3] {
+    match status {
+        Status::AwaitingYou => tokens::get().warn_text,
+        Status::Blocked => tokens::get().crit_text,
+        Status::Working => tokens::get().info_text,
+        Status::AwaitingReview | Status::Queued | Status::WaitingEvent | Status::Done => tokens::get().text_secondary,
+    }
 }
 
 /// Everything the Agents list shows for one window.
@@ -450,6 +487,8 @@ pub fn build(tabs: &[TabFacts], items: &[NeedItem], clock: &AgentsClock, now: u6
                 meta: if open && meta.is_empty() { "open".to_string() } else { meta },
                 pane_state,
                 reopen: entry.reopen.clone(),
+                status: entry.status,
+                waiting_on: entry.waiting_on.clone().filter(|w| !w.trim().is_empty()),
             });
         }
         for entry in &roster.dedicated {
@@ -464,6 +503,8 @@ pub fn build(tabs: &[TabFacts], items: &[NeedItem], clock: &AgentsClock, now: u6
                 meta: if open && meta.is_empty() { "open".to_string() } else { meta },
                 pane_state,
                 reopen: entry.reopen.clone(),
+                status: entry.status,
+                waiting_on: entry.waiting_on.clone().filter(|w| !w.trim().is_empty()),
             });
         }
     }
@@ -730,10 +771,10 @@ pub fn layout(vm: &AgentsVm, state: &AgentsState, width: f64, m: &dyn TextMetric
         } else {
             for (index, entry) in vm.team.iter().enumerate() {
                 y += ROW_GAP;
-                let frame = Rect::new(x0, y, x1 - x0, ROW_H);
+                let frame = Rect::new(x0, y, x1 - x0, entry.height());
                 place_open(&mut out, &frame, state, entry, RosterRef::Manager(index), m);
                 rows.push(row(RowKind::AgentTeam { index, pane_id: entry.pane_id }, frame));
-                y += ROW_H;
+                y += frame.h;
             }
         }
         // Dedicated sessions: open ones listed, closed ones folded away.
@@ -742,9 +783,9 @@ pub fn layout(vm: &AgentsVm, state: &AgentsState, width: f64, m: &dyn TextMetric
             y = place_header(&mut out, &mut rows, SectionKind::Dedicated, vm.dedicated.len(), x0, x1, y);
             for (index, entry) in vm.dedicated.iter().enumerate().filter(|(_, e)| e.open) {
                 y += ROW_GAP;
-                let frame = Rect::new(x0, y, x1 - x0, ROW_H);
+                let frame = Rect::new(x0, y, x1 - x0, entry.height());
                 rows.push(row(RowKind::AgentDedicated { index, pane_id: entry.pane_id }, frame));
-                y += ROW_H;
+                y += frame.h;
             }
             let closed: Vec<usize> = vm.dedicated.iter().enumerate().filter(|(_, e)| !e.open).map(|(i, _)| i).collect();
             if !closed.is_empty() {
@@ -754,10 +795,10 @@ pub fn layout(vm: &AgentsVm, state: &AgentsState, width: f64, m: &dyn TextMetric
                     for index in closed {
                         y += ROW_GAP;
                         let entry = &vm.dedicated[index];
-                        let frame = Rect::new(x0, y, x1 - x0, ROW_H);
+                        let frame = Rect::new(x0, y, x1 - x0, entry.height());
                         place_open(&mut out, &frame, state, entry, RosterRef::Dedicated(index), m);
                         rows.push(row(RowKind::AgentDedicated { index, pane_id: entry.pane_id }, frame));
-                        y += ROW_H;
+                        y += frame.h;
                     }
                 }
             }
@@ -1134,6 +1175,14 @@ fn draw_team(
         let w = m.width(words, Style::Chip);
         draw_text(sh, words, &Rect::new(right - w, frame.y, w, ROW_H), Style::Chip, tokens::get().crit_text, alpha, Align::Right, false);
         text_right = right - w - TEXT_GAP;
+    } else if let (true, Some((head, _))) = (entry.one_line(), entry.status_words()) {
+        // Healthy: the status takes the meta's place, the age after it.
+        let m = AppKitMetrics(sh);
+        let words = if entry.meta.is_empty() { head } else { format!("{head} \u{b7} {}", entry.meta) };
+        let w = m.width(&words, Style::Secondary);
+        let ink = entry.status.map_or(tokens::get().text_tertiary, status_ink);
+        draw_text(sh, &words, &Rect::new(right - w, frame.y + ROW_PAD_Y, w, LINE_H), Style::Secondary, ink, alpha, Align::Right, false);
+        text_right = right - w - TEXT_GAP;
     } else if entry.open && !entry.meta.is_empty() {
         let m = AppKitMetrics(sh);
         let w = m.width(&entry.meta, Style::Number);
@@ -1152,6 +1201,21 @@ fn draw_team(
     }
     let text_w = (text_right - (frame.x + TEXT_X)).max(20.0);
     draw_text_sh(sh, &entry.name, &Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y, text_w, LINE_H), Style::Title, tokens::get().text_primary, alpha);
+    if entry.one_line() {
+        return;
+    }
+    if let Some((head, tail)) = entry.status_words() {
+        // The status line replaces the role: the glyph and word in the
+        // status's ink, then whom it waits on, on the same line.
+        let line = Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y + LINE_H, text_w, LINE_H);
+        let ink = entry.status.map_or(tokens::get().text_tertiary, status_ink);
+        let used = draw_text_sh(sh, &head, &line, Style::Secondary, ink, a);
+        if !tail.is_empty() {
+            let rest = Rect::new(line.x + used, line.y, (line.w - used).max(0.0), line.h);
+            draw_text_sh(sh, &tail, &rest, Style::Secondary, tokens::get().text_tertiary, a);
+        }
+        return;
+    }
     let mut line = entry.role.clone();
     if let Some(project) = &entry.project {
         line = if line.is_empty() { project.clone() } else { format!("{line} \u{b7} {project}") };
@@ -1579,5 +1643,41 @@ mod tests {
         clock.observe(&[tab(0, "Alpha", vec![pane(1, "worker", idle())])], 950);
         assert_eq!(clock.age(1, Activity::Idle, 1_000), Some(50));
         assert_eq!(clock.age(1, Activity::Working, 1_000), None);
+    }
+
+    #[test]
+    fn a_session_shows_its_status_and_whom_it_waits_on_on_one_line() {
+        let roster = team::Team::from_json(
+            r#"{"managers": [
+                {"name": "alpha-manager", "state": "working", "status": "working"},
+                {"name": "beta-coach", "state": "open", "status": "awaiting-review", "waiting_on": "Ann : review"},
+                {"name": "gamma-coach", "state": "open", "status": null},
+                {"name": "delta-coach", "state": "open", "status": "working", "waiting_on": " "}
+            ], "dedicated": []}"#,
+        )
+        .expect("a roster");
+        let vm = built(Some(&roster));
+        let [alpha, beta, gamma, delta] = &vm.team[..] else { panic!("four managers") };
+        // Healthy: one line, the status at its right.
+        assert!(alpha.one_line());
+        assert_eq!(alpha.height(), ROW_ONE_H);
+        assert_eq!(alpha.status_words(), Some(("\u{25b8} au travail".to_string(), String::new())));
+        // Waiting on someone: two lines, glyph and word then `attend : X`.
+        assert!(!beta.one_line());
+        assert_eq!(
+            beta.status_words(),
+            Some(("\u{25d0} en revue".to_string(), " \u{b7} attend : Ann : review".to_string()))
+        );
+        // No status: as before, two lines and no status words.
+        assert_eq!((gamma.height(), gamma.status_words()), (ROW_H, None));
+        // A blank `waiting_on` waits on nobody.
+        assert!(delta.one_line());
+        let (_, rows) = layouts(&vm, &AgentsState::default(), 280.0);
+        let heights: Vec<f64> = rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::AgentTeam { .. }))
+            .map(|r| r.frame.h)
+            .collect();
+        assert_eq!(heights, [ROW_ONE_H, ROW_H, ROW_H, ROW_ONE_H]);
     }
 }
