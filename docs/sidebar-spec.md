@@ -596,7 +596,9 @@ the Asks list is exactly as described above.
   first, then the question cards. N counts both, so it is the number of rows
   under the header. The same `now` entries are need items
   (`NeedKind::Attention`): they count in the Asks badge and the `Needs you`
-  block, and Next steps over them (no pane).
+  block, but not in the Next pill nor the Agents `Need you` tile, which count
+  the panes they lead to (an entry has none). A row sent or closed from here
+  stops counting at once.
 - `Au prochain point (N)` sits under the cards and the snoozed section,
   folded, and opens on its rows grouped by `topic` (the topic with the oldest
   entry first, `Divers` last for entries that name none).
@@ -685,7 +687,9 @@ line 2 shows it instead of the role: one glyph and one word (`● à toi`,
 `✓ fini`), `warn` for à toi, `crit` for bloqué, `info` for au travail,
 secondary otherwise, then ` · attend : <waiting_on>` in tertiary. An open
 session at work that waits on nobody is healthy: a 25 pt row of one line, the
-status and its age at the right. Any other word, or none: as before. The
+status at the right, then the pane's working age when the roster entry has a
+pane. A closed session keeps `· not open`, whatever status it last declared.
+Any other word, or none: as before. The
 roster's `state` may say more than `open` (`working`): any word but `closed`
 is an open session.
 

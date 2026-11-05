@@ -296,8 +296,9 @@ pub struct AgentsVm {
     pub tabs: Vec<AgentTab>,
     pub team: Vec<TeamRow>,
     pub dedicated: Vec<TeamRow>,
-    /// `waits_on_you`: asks and permissions across the app, the stat tile's
-    /// number. A row only appears for a pane of this window.
+    /// Asks and permissions across the app, the stat tile's number: the panes
+    /// that need you (an attention entry has no pane, it is not counted). A
+    /// row only appears for a pane of this window.
     pub need_count: usize,
     /// False until the first roster read lands.
     pub team_loaded: bool,
@@ -1176,9 +1177,12 @@ fn draw_team(
         draw_text(sh, words, &Rect::new(right - w, frame.y, w, ROW_H), Style::Chip, tokens::get().crit_text, alpha, Align::Right, false);
         text_right = right - w - TEXT_GAP;
     } else if let (true, Some((head, _))) = (entry.one_line(), entry.status_words()) {
-        // Healthy: the status takes the meta's place, the age after it.
+        // Healthy: the status takes the meta's place, the pane's working age
+        // after it when there is one (the meta is otherwise a state word,
+        // which the status already says).
         let m = AppKitMetrics(sh);
-        let words = if entry.meta.is_empty() { head } else { format!("{head} \u{b7} {}", entry.meta) };
+        let age = entry.meta.starts_with(|c: char| c.is_ascii_digit());
+        let words = if age { format!("{head} \u{b7} {}", entry.meta) } else { head };
         let w = m.width(&words, Style::Secondary);
         let ink = entry.status.map_or(tokens::get().text_tertiary, status_ink);
         draw_text(sh, &words, &Rect::new(right - w, frame.y + ROW_PAD_Y, w, LINE_H), Style::Secondary, ink, alpha, Align::Right, false);
@@ -1204,7 +1208,7 @@ fn draw_team(
     if entry.one_line() {
         return;
     }
-    if let Some((head, tail)) = entry.status_words() {
+    if let Some((head, tail)) = entry.status_words().filter(|_| entry.open) {
         // The status line replaces the role: the glyph and word in the
         // status's ink, then whom it waits on, on the same line.
         let line = Rect::new(frame.x + TEXT_X, frame.y + ROW_PAD_Y + LINE_H, text_w, LINE_H);
