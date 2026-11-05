@@ -14,7 +14,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::feather::Icon;
 use super::side_panel::PanelTarget;
@@ -159,31 +159,21 @@ pub fn row_key(id: &str) -> u64 {
     h.finish()
 }
 
-/// What `Ouvrir` would show for an entry's action: an http(s) link, or a
-/// local `.md` / `.html` file that exists (the `#anchor` stripped for the
-/// check, `~/` read as the home folder). Plain words show nothing.
+/// What `Ouvrir` would show for an entry's action: the side panel's own rule
+/// (`side_panel::target_for`: an http(s) link, or an existing `.md` / `.html`
+/// file, `~/` read as home), after the `#anchor` of a file is stripped. No
+/// working folder: a relative path names nothing here. Plain words show
+/// nothing.
 pub fn open_target(action: &str, home: Option<&Path>, exists: &dyn Fn(&Path) -> bool) -> Option<PanelTarget> {
     let action = action.trim();
-    if action.starts_with("https://") || action.starts_with("http://") {
-        return (!action.contains(char::is_whitespace)).then(|| PanelTarget::Web(action.to_string()));
+    if crate::ask::is_panel_url(action) {
+        return Some(PanelTarget::Web(action.to_string()));
     }
     let file = match action.rfind('#') {
         Some(at) if !action[at..].contains('/') => &action[..at],
         _ => action,
     };
-    let path = match file.strip_prefix("~/") {
-        Some(rest) => home?.join(rest),
-        None => PathBuf::from(file),
-    };
-    if !path.is_absolute() || !exists(&path) {
-        return None;
-    }
-    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-    match ext.as_deref() {
-        Some("md" | "markdown") => Some(PanelTarget::Markdown(path)),
-        Some("html" | "htm") => Some(PanelTarget::Html(path)),
-        _ => None,
-    }
+    super::side_panel::target_for(file, None, home, exists)
 }
 
 /// The buttons a row carries, in order: `Ouvrir` when there is something to
@@ -415,6 +405,11 @@ fn place_row(out: &mut AttnLayout, row: &AttnRow, x: f64, y: f64, w: f64, m: &dy
         let mut right = foot.right();
         for button in row.buttons.iter().rev() {
             let bw = m.width(button.label(), Style::Chip) + 2.0 * BTN_PAD;
+            // A narrow sidebar drops the leftmost buttons (Ouvrir first)
+            // rather than draw them outside the row.
+            if right - bw < foot.x {
+                break;
+            }
             let rect = Rect::new(right - bw, foot.y, bw, FOOT_H);
             out.buttons.push((AttnHit::Button(row.key, *button), rect));
             right = rect.x - BTN_GAP;
@@ -537,6 +532,7 @@ fn draw_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     struct FakeMetrics;
 
@@ -631,6 +627,7 @@ mod tests {
         assert_eq!(open_target("/tmp/x/a.pdf", None, &yes), None);
         assert_eq!(open_target("call the bank", None, &yes), None);
         assert_eq!(open_target("https://example.com/a b", None, &yes), None);
+        assert_eq!(open_target("file:///tmp/x/a.md", None, &yes), Some(PanelTarget::Markdown(PathBuf::from("/tmp/x/a.md"))));
         // The anchor is checked off the file name only: a `#` in a folder stays.
         let seen = std::cell::RefCell::new(Vec::new());
         let record = |p: &Path| {
@@ -702,6 +699,28 @@ mod tests {
             assert!(rect.y == foot.y && rect.right() <= foot.right() + 0.01);
             assert_eq!(top.hit(rect.x + 1.0, rect.y + 1.0), Some(*hit));
         }
+    }
+
+    #[test]
+    fn a_narrow_row_drops_its_leftmost_buttons_instead_of_overflowing() {
+        let row = AttnRow {
+            key: 1,
+            id: "a-1".into(),
+            title: "t".into(),
+            buttons: vec![Button::Open, Button::Verb(Verb::Send), Button::Verb(Verb::Ignore)],
+            ..Default::default()
+        };
+        let vm = AttentionVm { enabled: true, now: vec![row], ..Default::default() };
+        // 150 pt of row: 130 pt of bottom line, room for Ignorer and Envoyer
+        // (58 pt each with their padding) but not Ouvrir.
+        let (top, _) = layout_top(&vm, 0, 0.0, 0.0, 150.0, &FakeMetrics);
+        let foot = top.rows[0].foot.expect("a foot line");
+        let kept: Vec<Button> = top.buttons.iter().map(|(hit, _)| match hit {
+            AttnHit::Button(_, b) => *b,
+            _ => unreachable!(),
+        }).collect();
+        assert_eq!(kept, [Button::Verb(Verb::Ignore), Button::Verb(Verb::Send)]);
+        assert!(top.buttons.iter().all(|(_, r)| r.x >= foot.x));
     }
 
     #[test]

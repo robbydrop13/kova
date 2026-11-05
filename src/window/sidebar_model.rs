@@ -157,13 +157,13 @@ pub fn need_rows_shown(needs: &[NeedRowVm], all: bool) -> usize {
 
 /// What the Next pill shows, the same rule as `Cmd+J`: a need item with a
 /// pane to land on comes first, then unread output. The count is what waits
-/// on you (asks, permissions and `now` attention entries, like the Asks
-/// badge), never zero while
+/// on you among the stops it walks (asks and permissions: an attention entry
+/// has no pane, Next never lands on it), never zero while
 /// there is a stop, and the unread count when nothing needs an answer.
 pub fn next_pill(needs: &[NeedItem], unread: usize) -> NextPill {
     if needs.iter().any(|item| item.pane_id.is_some()) {
         let waiting =
-            needs.iter().filter(|item| matches!(item.kind, NeedKind::Ask | NeedKind::Permission | NeedKind::Attention)).count();
+            needs.iter().filter(|item| matches!(item.kind, NeedKind::Ask | NeedKind::Permission)).count();
         NextPill::Next(waiting.max(1))
     } else {
         NextPill::of(unread)

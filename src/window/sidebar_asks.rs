@@ -2556,4 +2556,34 @@ mod tests {
         assert_eq!(ok, Icon::Check);
         assert_eq!((ko, ko_ink), (Icon::X, tokens::get().interrupt));
     }
+
+    #[test]
+    fn the_queue_heads_the_cards_and_its_count_covers_both() {
+        use super::super::sidebar_attention::{AttnRow, Button, Section};
+        let row = AttnRow {
+            key: 77,
+            id: "a-1".into(),
+            title: "Plan".into(),
+            buttons: vec![Button::Verb(crate::attention::Verb::Done)],
+            ..Default::default()
+        };
+        let mut st = AsksState { cards: vec![card(1, "q1", "Ship it?")], ..Default::default() };
+        st.attention = AttentionVm { enabled: true, now: vec![row], ..Default::default() };
+        let l = layout(&st, W, &FakeMetrics);
+        let (section, count, header) = st_header(&l);
+        assert_eq!((section, count), (Section::Now, 2), "one queue row and one card");
+        assert!(l.cards[0].frame.y > header.bottom(), "the card comes under the queue");
+        let (hit, rect) = l.attention_top.buttons[0];
+        assert_eq!(l.hit(rect.x + 1.0, rect.y + 1.0), Some(AsksHit::Attention(hit)));
+        assert!(l.button_rects().contains(&rect), "the hand cursor covers the queue's buttons");
+        // On, with nothing anywhere: no empty state, nothing drawn.
+        let quiet = AsksState { attention: AttentionVm { enabled: true, ..Default::default() }, ..Default::default() };
+        assert!(layout(&quiet, W, &FakeMetrics).empty.is_none());
+        // Off: the empty state as before.
+        assert!(layout(&AsksState::default(), W, &FakeMetrics).empty.is_some());
+    }
+
+    fn st_header(l: &AsksLayout) -> (super::super::sidebar_attention::Section, usize, Rect) {
+        l.attention_top.headers[0]
+    }
 }

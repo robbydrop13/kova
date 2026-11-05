@@ -3205,6 +3205,11 @@ mod tests {
             ListHit::NeedAll,
             ListHit::NeedAnswer(1),
             ListHit::Ask(AsksHit::ToggleSnoozed),
+            ListHit::Ask(AsksHit::Attention(crate::window::sidebar_attention::AttnHit::TogglePoint)),
+            ListHit::Ask(AsksHit::Attention(crate::window::sidebar_attention::AttnHit::Button(
+                1,
+                crate::window::sidebar_attention::Button::Verb(crate::attention::Verb::Done),
+            ))),
             ListHit::Agent(AgentsHit::Filter(sidebar_agents::AgentSection::Working)),
             ListHit::Agent(AgentsHit::Pane(1)),
             ListHit::Agent(AgentsHit::Need(0)),

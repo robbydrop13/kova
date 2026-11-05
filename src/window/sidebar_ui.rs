@@ -541,22 +541,26 @@ impl KovaView {
                 detail: Some(rest_of(&question.message)),
             });
         });
-        // The queue as last read: `now` entries are needs, the model drops
-        // the other levels. Read here, every tick, so the badge and Next
-        // count them whichever list is up.
+        // The queue as last read: only `now` entries are needs. Read here,
+        // every tick, so the badge counts them whichever list is up. A row
+        // sent or closed from here no longer waits on the user, even while
+        // the queue still holds it; a date that did not read is taken as now.
         let attention = crate::attention::snapshot()
             .map(|entries| {
+                let outcomes = crate::attention::outcomes();
                 entries
                     .iter()
+                    .filter(|entry| entry.level == crate::attention::Level::Now)
+                    .filter(|entry| {
+                        !matches!(
+                            outcomes.get(&entry.id),
+                            Some(crate::attention::Outcome::Sent | crate::attention::Outcome::Closed)
+                        )
+                    })
                     .map(|entry| AttentionNeed {
                         id: entry.id.clone(),
-                        since: entry.since,
-                        level: match entry.level {
-                            crate::attention::Level::Now => "now",
-                            crate::attention::Level::Point => "point",
-                            crate::attention::Level::Memo => "memo",
-                        }
-                        .to_string(),
+                        since: if entry.since == 0 { now } else { entry.since },
+                        level: "now".to_string(),
                         title: entry.title.clone(),
                     })
                     .collect()
@@ -1568,10 +1572,10 @@ fn rect_eq(a: CGRect, b: CGRect) -> bool {
         && (a.size.height - b.size.height).abs() < 0.01
 }
 
-/// Wall-clock seconds since the epoch, for the awaiting age.
 /// The attention rows at `now`, from the last read and the clicks' states.
 /// Off (`[attention]` absent): an empty, disabled model, and the Asks view is
-/// as it was.
+/// as it was. The file check behind `Ouvrir` is cached for `MAX_AGE_SECS`:
+/// this runs on every tick while the list is up.
 fn attention_vm(now: u64) -> sidebar_attention::AttentionVm {
     let entries = crate::attention::snapshot();
     if let Some(entries) = &entries {
@@ -1585,10 +1589,32 @@ fn attention_vm(now: u64) -> sidebar_attention::AttentionVm {
         crate::attention::can_act(),
         crate::attention::can_close(),
         home.as_deref(),
-        &|path| path.is_file(),
+        &|path| file_exists_cached(path, now),
     )
 }
 
+thread_local! {
+    /// `is_file` answers by path, with the second they were read at.
+    static FILE_CHECKS: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, (bool, u64)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn file_exists_cached(path: &std::path::Path, now: u64) -> bool {
+    FILE_CHECKS.with(|checks| {
+        let mut checks = checks.borrow_mut();
+        if let Some((exists, at)) = checks.get(path)
+            && now.saturating_sub(*at) < crate::attention::MAX_AGE_SECS
+        {
+            return *exists;
+        }
+        checks.retain(|_, (_, at)| now.saturating_sub(*at) < crate::attention::MAX_AGE_SECS);
+        let exists = path.is_file();
+        checks.insert(path.to_path_buf(), (exists, now));
+        exists
+    })
+}
+
+/// Wall-clock seconds since the epoch, for the awaiting age.
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

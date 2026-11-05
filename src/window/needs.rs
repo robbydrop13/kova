@@ -6,8 +6,9 @@
 //! the sidebar badges say, so the key and the icons cannot drift apart.
 //!
 //! `waits_on_you` is narrower than `need_items` on purpose. It counts only what
-//! a human has to answer, a permission prompt and an open question: those hold
-//! an agent that is already sitting at its prompt. An error and a failed
+//! a human has to answer, a permission prompt, an open question and a `now`
+//! attention entry: the first two hold an agent that is already sitting at
+//! its prompt, the last one holds someone the queue names. An error and a failed
 //! routine are need items so Next walks them, but they are not waiting on an
 //! answer, the turn or the run is simply over.
 //!
