@@ -1679,6 +1679,7 @@ impl SidebarView {
                 routines: Vec::new(),
                 routines_loaded: false,
                 asks_waiting: 0,
+                agents_working: 0,
                 routine_failed: false,
                 summary: Vec::new(),
                 sort: SidebarSort::Kova,
@@ -2065,8 +2066,12 @@ impl SidebarView {
                 fill_round(&r.inset(-SWITCH_BADGE_RING), radius + SWITCH_BADGE_RING, tokens::get().ground, 1.0);
             };
             match list {
-                SidebarList::Asks if sh.model.asks_waiting > 0 => {
-                    let label = sh.model.asks_waiting.to_string();
+                SidebarList::Asks | SidebarList::Agents
+                    if (list == SidebarList::Asks && sh.model.asks_waiting > 0)
+                        || (list == SidebarList::Agents && sh.model.agents_working > 0) =>
+                {
+                    let n = if list == SidebarList::Asks { sh.model.asks_waiting } else { sh.model.agents_working };
+                    let label = n.to_string();
                     let w = (AppKitMetrics(&sh).width(&label, Style::PillBadge) + 8.0).max(SWITCH_BADGE_H);
                     let r = switch_badge(rect, w, SWITCH_BADGE_H);
                     ring(r, SWITCH_BADGE_H / 2.0);
@@ -3283,6 +3288,7 @@ mod tests {
             routines: Vec::new(),
             routines_loaded: false,
             asks_waiting: 0,
+            agents_working: 0,
             routine_failed: false,
             summary: Vec::new(),
             sort: SidebarSort::Kova,

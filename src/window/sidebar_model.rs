@@ -198,6 +198,9 @@ pub struct SidebarModel {
     /// A scheduled routine's last run failed: the red dot on its icon. Same
     /// path as the count above.
     pub routine_failed: bool,
+    /// Panes of this window whose agent is working (`list-panes` `working`):
+    /// the count on the Agents icon.
+    pub agents_working: u32,
     /// `2 waiting · 3 working · 4 idle`, one coloured run at a time.
     pub summary: Vec<(String, SummaryRun)>,
     pub sort: SidebarSort,
@@ -507,9 +510,11 @@ impl SidebarModel {
         let mut working = 0;
         let mut idle_here = 0;
         let mut total_panes = 0;
+        let mut agents_working = 0;
         for tab in tabs {
             for p in &tab.panes {
                 total_panes += 1;
+                agents_working += u32::from(p.flags.working);
                 match TileState::from_flags(p.flags) {
                     TileState::Awaiting => waiting += 1,
                     TileState::Working | TileState::Starting => working += 1,
@@ -548,6 +553,7 @@ impl SidebarModel {
             // panes and the board: `sync_sidebar` sets them right after.
             asks_waiting: 0,
             routine_failed: false,
+            agents_working,
             summary: summary_runs(waiting, working, idle_here),
             sort,
             pill: next_pill(needs, unread),
@@ -856,6 +862,8 @@ mod tests {
         let m = SidebarModel::build(&tabs, SidebarSort::Kova, 2, SidebarList::default(), None, &[]);
         let text: String = m.summary.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(text, "1 waiting \u{b7} 1 working \u{b7} 1 idle");
+        // A folded group still counts: the Agents badge is every working pane.
+        assert_eq!(m.agents_working, 1);
         assert_eq!(m.pill, NextPill::Next(2));
         assert_eq!(m.groups.len(), 2);
         assert_eq!(m.groups[0].tiles.len(), 2);
