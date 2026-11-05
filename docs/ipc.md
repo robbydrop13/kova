@@ -401,7 +401,7 @@ the way and Kova delivers it to the conversation itself:
    descending from the pane's shell);
 3. if the conversation is open in another process, Kova waits for it to end
    (Claude only: the other agents keep no per-process registry);
-4. then reopens it in a new tab with the asker agent's resume line:
+4. then reopens it in a new tab (or, with `[agent] ask_resume_tab = "<title>"`, as a new column of the tab with that title, created when missing) with the asker agent's resume line:
    `claude --dangerously-skip-permissions --resume <session_id> '<the answer>'`,
    `codex resume <session_id> '<the answer>'`, `pi --session <session_id>
    '<the answer>'` or `omp --resume <session_id> '<the answer>'`. Claude is
