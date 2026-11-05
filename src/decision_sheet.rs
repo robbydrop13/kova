@@ -6,7 +6,8 @@
 //! (anyone who reaches the socket can post one), renders it as a page in the
 //! design system's colours, keeps the answers as they are given (a draft on
 //! the question, on disk with it), and hands them to the asker as text when
-//! the user clicks Done. Everything here is pure and unit-tested; the panel
+//! the user clicks Done. Everything here is unit-tested and pure but for
+//! `render`, which reads the option images from disk; the panel
 //! (`window/side_panel.rs`) loads the page and relays its messages.
 //!
 //! The page is the only one in the panel that runs a script, and the script
@@ -93,6 +94,7 @@ pub struct SheetImage {
     #[serde(default)]
     pub label: String,
     /// Absolute, or `~/` under the home.
+    #[serde(default)]
     pub path: String,
 }
 
@@ -188,6 +190,10 @@ impl Sheet {
                 }
                 text_ok("an option label", &o.label)?;
                 text_ok("an option detail", o.detail.as_deref().unwrap_or(""))?;
+                for img in &o.images {
+                    text_ok("an image label", &img.label)?;
+                    text_ok("an image path", &img.path)?;
+                }
             }
             if d.options.iter().filter(|o| o.reco).count() > 1 {
                 return Err(format!("decision {} recommends more than one option", d.id));
@@ -356,7 +362,7 @@ pub fn image_path(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        return home.map(|h| h.join(rest));
+        return home.map(|h| h.join(rest.trim_start_matches('/')));
     }
     raw.starts_with('/').then(|| PathBuf::from(raw))
 }
@@ -379,19 +385,26 @@ fn image_src(img: &SheetImage, home: Option<&Path>, budget: &mut u64) -> Result<
     let path = image_path(&img.path, home).ok_or("the path is not absolute")?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let mime = IMAGE_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, m)| *m).ok_or("not a png, jpg, webp or gif file")?;
-    let meta = std::fs::metadata(&path).map_err(|_| "the file is not there")?;
+    let too_large = || format!("larger than {} MB", MAX_IMAGE / (1024 * 1024));
+    let full = || format!("the page already holds the {} MB of images it can show", MAX_IMAGES_TOTAL / (1024 * 1024));
+    // Checked on the open file, and read no further than the cap: the path is
+    // the asker's, the file may change between a stat and a read.
+    let file = std::fs::File::open(&path).map_err(|_| "the file is not there")?;
+    let meta = file.metadata().map_err(|e| format!("unreadable ({})", e))?;
     if !meta.is_file() {
         return Err("not a file".into());
     }
     if meta.len() > MAX_IMAGE {
-        return Err(format!("larger than {} MB", MAX_IMAGE / (1024 * 1024)));
+        return Err(too_large());
     }
     if meta.len() > *budget {
-        return Err(format!("the sheet already shows {} MB of images", MAX_IMAGES_TOTAL / (1024 * 1024)));
+        return Err(full());
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("unreadable ({})", e))?;
-    if bytes.len() as u64 > MAX_IMAGE.min(*budget) {
-        return Err(format!("larger than {} MB", MAX_IMAGE / (1024 * 1024)));
+    let cap = MAX_IMAGE.min(*budget);
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, cap + 1), &mut bytes).map_err(|e| format!("unreadable ({})", e))?;
+    if bytes.len() as u64 > cap {
+        return Err(if cap < MAX_IMAGE { full() } else { too_large() });
     }
     *budget -= bytes.len() as u64;
     Ok(format!("data:{};base64,{}", mime, base64(&bytes)))
@@ -838,6 +851,7 @@ mod tests {
         assert_eq!(note(serde_json::json!({"label":"Rel","path":"shots/a.png"})), "Image Rel not shown: the path is not absolute");
         assert_eq!(note(serde_json::json!({"path":"x/<b>.png"})), "Image x/&lt;b&gt;.png not shown: the path is not absolute", "no label: the path, escaped");
         assert_eq!(note(serde_json::json!({"label":"Dir","path":format!("{}/sub.png", dir.display())})), "Image Dir not shown: the file is not there");
+        assert_eq!(note(serde_json::json!({"label":"No path"})), "Image No path not shown: the path is not absolute", "a missing path is a note, not a refused sheet");
     }
 
     #[test]
@@ -849,7 +863,7 @@ mod tests {
         let mut budget = 7;
         let html = images_html(&s.decisions[0].options[0].images, None, &mut budget);
         assert_eq!(html.matches("class=\"shot\"").count(), 1);
-        assert!(html.contains("Image B not shown: the sheet already shows 24 MB of images"));
+        assert!(html.contains("Image B not shown: the page already holds the 24 MB of images it can show"));
         assert_eq!(budget, 2);
     }
 
@@ -859,6 +873,7 @@ mod tests {
         let out = s.with_image_paths(Some(Path::new("/Users/me")));
         let paths: Vec<&str> = out.decisions[0].options[0].images.iter().map(|i| i.path.as_str()).collect();
         assert_eq!(paths, ["/Users/me/x/a.png", "/abs/b.png"]);
+        assert_eq!(image_path("~//etc/x.png", Some(Path::new("/Users/me"))), Some(PathBuf::from("/Users/me/etc/x.png")), "~/ stays under the home");
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["decisions"][0]["options"][0]["images"][0], serde_json::json!({"label":"A","path":"/Users/me/x/a.png"}));
     }

@@ -86,7 +86,8 @@ waiting" page.
 
 ## Decision sheets
 
-`kova ask --decisions <file.json>` (`src/decision_sheet.rs`, pure and tested):
+`kova ask --decisions <file.json>` (`src/decision_sheet.rs`, tested, pure but
+for the images `render` reads):
 Kova renders the decision-sheet JSON as a page in the design system's colours:
 title, who asks, intro, links, one card per decision (options with the
 recommendation tagged, Other, a note), a progress bar, Open only, "Take the
@@ -100,7 +101,8 @@ page (Escape or a click closes it) without picking the option. The page has
 no base URL, so Kova reads the files when it renders and embeds them as
 `data:` URIs. An absolute or `~/` path, png, jpg, jpeg, webp or gif, 3 MB at
 most each and 24 MB for the page; anything else is a note under the option
-saying why, never an error (`images_html`).
+saying why, never an error (`images_html`). They are read on the main
+thread each time the sheet opens: at most 24 MB, a known cost.
 
 It is the one page Kova renders itself that runs a script, and the script only reads
 the form and posts it (`window.webkit.messageHandlers.kovaSheet`). A post is
