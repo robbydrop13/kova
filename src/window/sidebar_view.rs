@@ -981,7 +981,7 @@ enum NeedTally {
 /// `2 need you · 1 error · 1 failed`, zero counts left out.
 fn needs_summary(needs: &[NeedRowVm]) -> Vec<(String, NeedTally)> {
     let count = |kinds: &[NeedKind]| needs.iter().filter(|row| kinds.contains(&row.kind)).count();
-    let you = count(&[NeedKind::Ask, NeedKind::Permission]);
+    let you = count(&[NeedKind::Ask, NeedKind::Permission, NeedKind::Attention]);
     let errors = count(&[NeedKind::Error]);
     let failed = count(&[NeedKind::FailedRoutine]);
     let mut runs = Vec::new();
@@ -2964,7 +2964,7 @@ impl SidebarListView {
         }
         let cy = frame.y + frame.h / 2.0;
         let dot_cx = frame.x + NEED_ROW_PAD_H + GLYPH_BOX_W / 2.0;
-        let waiting = matches!(need.kind, NeedKind::Ask | NeedKind::Permission);
+        let waiting = matches!(need.kind, NeedKind::Ask | NeedKind::Permission | NeedKind::Attention);
         if need.kind == NeedKind::FailedRoutine {
             // A scheduled run has no pane: the x-circle says the run died.
             let box_ = Rect::new(dot_cx - ICON_D / 2.0, cy - ICON_D / 2.0, ICON_D, ICON_D);

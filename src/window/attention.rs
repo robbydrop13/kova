@@ -513,6 +513,7 @@ mod tests {
             ],
             routines: Vec::new(),
             asks: Vec::new(),
+            attention: Vec::new(),
             now: 100,
         };
         let items = needs::need_items(&input);

@@ -137,5 +137,53 @@
       "asks": []
     },
     "expect": { "waits_on_you": 0, "order": ["routine:alpha", "routine:beta"] }
+  },
+  {
+    "name": "attention_now_merged_by_age",
+    "input": {
+      "now": 1000,
+      "panes": [
+        { "id": 5, "error_since": null, "permission_since": 30, "title": "web" }
+      ],
+      "routines": [],
+      "asks": [
+        { "id": "a1", "pane_id": 7, "created_at": 50, "snoozed_until": null, "answered": false, "title": "Ship the draft?" }
+      ],
+      "attention": [
+        { "id": "q-1", "since": 40, "level": "now", "title": "Review the plan" },
+        { "id": "q-2", "since": 10, "level": "point", "title": "Pick a name" }
+      ]
+    },
+    "expect": { "waits_on_you": 3, "order": ["pane:5", "attention:q-1", "ask:a1"] }
+  },
+  {
+    "name": "attention_tied_with_an_ask_comes_after_it",
+    "input": {
+      "now": 1000,
+      "panes": [],
+      "routines": [],
+      "asks": [
+        { "id": "a1", "pane_id": 7, "created_at": 40, "snoozed_until": null, "answered": false, "title": "Ship the draft?" }
+      ],
+      "attention": [
+        { "id": "q-1", "since": 40, "level": "now", "title": "Review the plan" }
+      ]
+    },
+    "expect": { "waits_on_you": 2, "order": ["ask:a1", "attention:q-1"] }
+  },
+  {
+    "name": "attention_only_now_counts",
+    "input": {
+      "now": 1000,
+      "panes": [],
+      "routines": [],
+      "asks": [],
+      "attention": [
+        { "id": "q-1", "since": 40, "level": "point", "title": "Pick a name" },
+        { "id": "q-2", "since": 20, "level": "memo", "title": "Merged" },
+        { "id": "q-3", "since": 30, "level": "now", "title": "Sign the form" }
+      ]
+    },
+    "expect": { "waits_on_you": 1, "order": ["attention:q-3"] }
   }
 ]

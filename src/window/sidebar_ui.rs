@@ -540,7 +540,7 @@ impl KovaView {
                 detail: Some(rest_of(&question.message)),
             });
         });
-        NeedInput { panes, routines, asks, now }
+        NeedInput { panes, routines, asks, attention: Vec::new(), now }
     }
 
     /// The Asks cards at `now`: every question the board holds and every
@@ -982,6 +982,11 @@ impl KovaView {
                 let mut st = self.ivars().sidebar.borrow_mut();
                 st.list = SidebarList::Scheduled;
                 st.open_routine = Some(item.title);
+            }
+            // An attention entry has no card to light: the Asks list opens on
+            // its section, at the top.
+            NeedKind::Attention => {
+                self.ivars().sidebar.borrow_mut().list = SidebarList::Asks;
             }
             NeedKind::Ask | NeedKind::Permission => {
                 let mut st = self.ivars().sidebar.borrow_mut();

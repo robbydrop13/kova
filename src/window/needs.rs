@@ -1,6 +1,7 @@
 //! What waits on the user, in the order `Cmd+J` walks it: a turn that died on
 //! a provider error, a scheduled routine whose last run failed, a permission
-//! prompt, an open `kova ask`. Pure: `sidebar_ui::sync_needs` does the live
+//! prompt, an open `kova ask`, an attention entry that wants the user now
+//! (`[attention]` in the config, `crate::attention`). Pure: `sidebar_ui::sync_needs` does the live
 //! reads once per tick, and this decides what counts, in which order, and what
 //! the sidebar badges say, so the key and the icons cannot drift apart.
 //!
@@ -27,13 +28,17 @@ pub enum NeedKind {
     Permission,
     /// An agent's `kova ask` is open.
     Ask,
+    /// An entry of the attention queue at level `now`: no pane, so Next
+    /// steps over it, but it is something to answer.
+    Attention,
 }
 
 /// One thing that wants the user, as the sidebar and Next see it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NeedItem {
     pub kind: NeedKind,
-    /// Stable across ticks: `pane:12`, `routine:<name>`, `ask:<id>`.
+    /// Stable across ticks: `pane:12`, `routine:<name>`, `ask:<id>`,
+    /// `attention:<id>`.
     pub key: String,
     /// The pane to land on when there is one; a failed routine has none.
     pub pane_id: Option<u64>,
@@ -104,6 +109,18 @@ pub struct AskNeed {
     pub detail: Option<String>,
 }
 
+/// An entry of the attention queue. Only level `now` is a need: `point` and
+/// `memo` wait for a later look, the Asks view lists them on their own.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionNeed {
+    pub id: String,
+    /// Epoch seconds the entry was added.
+    pub since: u64,
+    pub level: String,
+    pub title: String,
+}
+
 /// Everything the model needs to know, at one clock reading.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +131,8 @@ pub struct NeedInput {
     pub routines: Vec<RoutineNeed>,
     #[serde(default)]
     pub asks: Vec<AskNeed>,
+    #[serde(default)]
+    pub attention: Vec<AttentionNeed>,
     pub now: u64,
 }
 
@@ -130,8 +149,8 @@ fn by_age(a: &NeedItem, b: &NeedItem) -> std::cmp::Ordering {
 }
 
 /// Every need item, in the order `Next` walks them: errors oldest first, then
-/// failed routines oldest first, then permission prompts and open questions
-/// merged by age.
+/// failed routines oldest first, then permission prompts, open questions and
+/// `now` attention entries merged by age.
 ///
 /// A pane holding a permission prompt and an open question is one thing to
 /// deal with, not two: only the oldest of the two is kept, and the ask wins a
@@ -210,12 +229,21 @@ pub fn need_items(input: &NeedInput) -> Vec<NeedItem> {
         }
     }
 
+    let attention = input.attention.iter().filter(|entry| entry.level == "now").map(|entry| NeedItem {
+        kind: NeedKind::Attention,
+        key: format!("attention:{}", entry.id),
+        pane_id: None,
+        since: entry.since,
+        title: entry.title.clone(),
+        detail: String::new(),
+    });
     let mut merged: Vec<NeedItem> = permissions
         .into_iter()
         .zip(keep_permission)
         .filter(|(_, keep)| *keep)
         .map(|(item, _)| item)
         .chain(asks.into_iter().zip(keep_ask).filter(|(_, keep)| *keep).map(|(item, _)| item))
+        .chain(attention)
         .collect();
     merged.sort_by(by_age);
 
@@ -245,14 +273,14 @@ fn pane_items(
         .collect()
 }
 
-/// What a human has to answer right now, across the app: permission prompts
-/// and open questions, counted from the list the tick already built (asking
+/// What a human has to answer right now, across the app: permission prompts,
+/// open questions and `now` attention entries, counted from the list the tick already built (asking
 /// `need_items` a second time per window was pure waste). Errors and failed
 /// runs are not in it: they want a look, not an answer.
 pub fn waits_on_you(items: &[NeedItem]) -> u32 {
     items
         .iter()
-        .filter(|item| matches!(item.kind, NeedKind::Permission | NeedKind::Ask))
+        .filter(|item| matches!(item.kind, NeedKind::Permission | NeedKind::Ask | NeedKind::Attention))
         .count() as u32
 }
 
@@ -375,6 +403,7 @@ mod tests {
                 paused: false,
             }],
             asks: Vec::new(),
+            attention: Vec::new(),
             now: 100,
         };
         let items = need_items(&input);
@@ -438,6 +467,7 @@ mod tests {
                 from: Some("claude".into()),
                 detail: Some("The copy is ready.".into()),
             }],
+            attention: Vec::new(),
             now: 100,
         };
         let items = need_items(&input);
