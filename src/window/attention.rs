@@ -529,6 +529,49 @@ mod tests {
         assert_eq!(walk.next(&items, Some(7)), Some(1));
     }
 
+    /// Frozen before the `Needs you` block left the sidebar for the Cockpit
+    /// entry (05/11/2026): Cmd+J reads the tick's need items, never the
+    /// sidebar's rows, so the walk over every kind must not move.
+    #[test]
+    fn cmd_j_walks_every_need_kind_in_the_same_order_whatever_the_sidebar_shows() {
+        let input = needs::NeedInput {
+            panes: vec![
+                needs::PaneNeed { id: 1, error_since: Some(50), permission_since: None, title: "api".into(), from: None, detail: None },
+                needs::PaneNeed { id: 2, error_since: None, permission_since: Some(30), title: "build".into(), from: Some("agent-b".into()), detail: Some("git push".into()) },
+            ],
+            routines: vec![needs::RoutineNeed { name: "nightly".into(), failed_at: Some(5), paused: false }],
+            asks: vec![needs::AskNeed {
+                id: "q1".into(),
+                pane_id: Some(3),
+                created_at: 20,
+                snoozed_until: None,
+                answered: false,
+                title: "Ship it?".into(),
+                from: Some("agent-c".into()),
+                detail: None,
+            }],
+            attention: vec![needs::AttentionNeed { id: "a-1".into(), since: 10, level: "now".into(), title: "Read the plan".into() }],
+            now: 100,
+        };
+        let items = needs::need_items(&input);
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        // Errors, failed routines, then permissions, asks and `now` entries by age.
+        assert_eq!(keys, ["pane:1", "routine:nightly", "attention:a-1", "ask:q1", "pane:2"]);
+        // The badge counts the permission, the ask and the `now` entry.
+        assert_eq!(needs::waits_on_you(&items), 3);
+        assert_eq!(needs::first_failed_routine(&items), Some("nightly"));
+        // The walk lands on the panes only, in list order, once each, then
+        // hands the key to unread output and starts over.
+        let mut walk = needs::NeedWalk::new();
+        assert_eq!(walk.next(&items, None), Some(1));
+        assert_eq!(walk.next(&items, Some(1)), Some(3));
+        assert_eq!(walk.next(&items, Some(3)), Some(2));
+        assert_eq!(walk.next(&items, Some(2)), None);
+        assert_eq!(walk.next(&items, Some(2)), Some(1));
+        // The Next pill: a stop with a pane, counting the ask and the permission.
+        assert_eq!(super::super::sidebar_model::next_pill(&items, 7), super::super::sidebar::NextPill::Next(2));
+    }
+
     #[test]
     fn the_session_loop_walks_every_session_before_repeating_one() {
         // The ring drains nothing, so only the visit order keeps it moving: each
