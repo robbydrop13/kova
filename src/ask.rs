@@ -1055,6 +1055,8 @@ pub struct Board {
     /// Handoff steps pressed since the last `take_steps` (`crate::handoff`):
     /// the app performs them, the questions stay open.
     steps: Vec<crate::handoff::Step>,
+    /// The last step pressed and when: a double click runs it once.
+    last_step: Option<(String, std::time::Instant)>,
 }
 
 impl Board {
@@ -1071,7 +1073,7 @@ impl Board {
             );
         }
         OWNS_STORE.store(owner.is_some(), std::sync::atomic::Ordering::Relaxed);
-        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new() }
+        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new(), last_step: None }
     }
 
     /// A Kova that started while another held the lock takes it over once that
@@ -1190,7 +1192,13 @@ impl Board {
         // A handoff's step (Ouvrir, Lancer) does not answer: the app performs
         // it and the question waits for Fait.
         if let Some(step) = crate::handoff::step_for(&self.pending[index].0, &action) {
+            let repeat = self.last_step.as_ref().is_some_and(|(last, at)| last == id && at.elapsed() < STEP_REPEAT);
+            if repeat {
+                log::info!("ask {}: handoff step pressed again, ignored", id);
+                return true;
+            }
             log::info!("ask {}: handoff step {:?}, still waiting for {}", id, step, crate::handoff::DONE);
+            self.last_step = Some((id.to_string(), std::time::Instant::now()));
             self.steps.push(step);
             return true;
         }
@@ -1513,6 +1521,10 @@ pub const WITHDRAWN: &str = "withdrawn: the user answered in the conversation in
 pub fn asked_from(question: &Question, session_id: &str) -> bool {
     question.from.session_id.as_deref() == Some(session_id)
 }
+
+/// A handoff step pressed again within this delay is a double click: one
+/// `aws sso login`, not two.
+const STEP_REPEAT: Duration = Duration::from_secs(2);
 
 /// How often a Kova without the ask directory's lock tries to take it.
 const OWNER_RETRY: Duration = Duration::from_secs(10);
@@ -2522,7 +2534,7 @@ mod tests {
     fn board_with(q: Question) -> (Board, std::sync::mpsc::Receiver<crate::ipc::IpcResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = std::env::temp_dir().join(format!("kova-board-test-{}", new_question_id()));
-        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new() };
+        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new(), last_step: None };
         (board, rx)
     }
 
@@ -2711,6 +2723,7 @@ mod tests {
             assert!(board.answer(&id, step.into(), String::new()));
             assert!(rx.try_recv().is_err(), "the asker hears nothing on {}", step);
             assert_eq!(board.questions().len(), 1, "the question stays for Fait");
+            assert!(board.answer(&id, step.into(), String::new()), "a double click");
             assert_eq!(board.take_steps(), vec![expected]);
             assert!(board.take_steps().is_empty(), "a step is performed once");
             assert!(board.answer(&id, crate::handoff::DONE.into(), String::new()));

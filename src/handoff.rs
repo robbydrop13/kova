@@ -131,12 +131,25 @@ pub fn find<'a>(commands: &'a Commands, name: &str, path: &Path) -> Result<&'a C
     })
 }
 
-/// The entry `name` of the user's `handoff.toml`.
+/// The entry `name` of the user's `handoff.toml`. The sidebar asks on every
+/// tick, so the file is parsed again only when its modification time changes.
 pub fn resolve(name: &str) -> Result<Command, String> {
     let path = default_path();
-    let commands = load(&path)?;
-    find(&commands, name, &path).cloned()
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = matches!(&*cache, Some((t, _)) if mtime.is_some() && *t == mtime);
+    if !fresh {
+        *cache = Some((mtime, load(&path)));
+    }
+    match &cache.as_ref().expect("just filled").1 {
+        Ok(commands) => find(commands, name, &path).cloned(),
+        Err(e) => Err(e.clone()),
+    }
 }
+
+/// The last `handoff.toml` read, by modification time (`None`: no file).
+type Cached = (Option<std::time::SystemTime>, Result<Commands, String>);
+static CACHE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
 
 /// `cwd` with `~/` expanded, the home directory when absent.
 pub fn expand_cwd(cwd: Option<&str>, home: &str) -> String {

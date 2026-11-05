@@ -243,6 +243,15 @@ impl AskCardVm {
             if question.actions.is_empty() { vec!["Reply".to_string()] } else { question.actions.clone() };
         let first = choices[0].clone();
         let second = choices.get(1).cloned().unwrap_or_else(|| "No".to_string());
+        // A handoff: the step stays off the Brief's chips (it answers nothing,
+        // an instruction on it would be lost), and the card shows what it
+        // opens or runs, as the floating card does.
+        let step = crate::handoff::step_button(question);
+        let choices: Vec<String> = choices.into_iter().filter(|c| Some(c.as_str()) != step).collect();
+        let message = match crate::handoff::detail(question).map(|d| d.card_text()).filter(|d| !d.is_empty()) {
+            Some(detail) => format!("{}\n\n{}", question.message, detail),
+            None => question.message.clone(),
+        };
         let age_secs = now.saturating_sub(question.asked_at);
         let snoozed = question.snoozed_until > now;
         AskCardVm {
@@ -253,7 +262,7 @@ impl AskCardVm {
             pane_id: pane.as_ref().map(|(id, _)| *id),
             age: format_age(age_secs),
             urgent: age_secs >= URGENT_AFTER_SECS,
-            message: question.message.clone(),
+            message,
             options: [first, second],
             choices,
             created_at: question.asked_at,
@@ -262,7 +271,7 @@ impl AskCardVm {
             back_at: if snoozed { local_hhmm(question.snoozed_until) } else { String::new() },
             permission: None,
             decision_url: question.panel_link(),
-            step: crate::handoff::step_button(question).map(String::from),
+            step: step.map(String::from),
         }
     }
 
@@ -1959,6 +1968,18 @@ mod tests {
         let done = click(&mut st, AsksHit::Ko(7), NOW_MS + 16);
         assert_eq!(done, Some(AskAction::Answer { id: "a".into(), action: "Fait".into(), text: String::new() }));
         assert_eq!(st.transient.as_ref().map(|t| t.phase), Some(TransientPhase::Sending));
+    }
+
+    #[test]
+    fn a_handoff_card_shows_its_url_and_keeps_the_step_off_the_brief() {
+        let mut q = question(vec!["Ouvrir", "Fait"], 1);
+        q.kind = Some(crate::handoff::KIND.into());
+        q.url = Some("https://x.y/login".into());
+        let vm = AskCardVm::from_question(&q, None, false, 10);
+        assert_eq!(vm.options, ["Ouvrir".to_string(), "Fait".to_string()]);
+        assert_eq!(vm.choices, ["Fait"]);
+        assert_eq!(vm.step.as_deref(), Some("Ouvrir"));
+        assert_eq!(vm.message, "Ship it?\n\nhttps://x.y/login");
     }
 
     #[test]
