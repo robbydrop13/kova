@@ -921,6 +921,9 @@ toggle-help  mem-report
 toggle-sidebar                     (switch the layout between the tab bar and the sidebar, see sidebar-spec.md)
 toggle-side-panel                  (show or hide the side panel at the right, see side-panel.md)
 panel-history                      (the side panel on what it opened lately, see side-panel.md)
+toggle-chat                        (the focused pane's Claude conversation as a chat, or its terminal again;
+                                    with pane_id that pane is focused first. A pane without a Claude
+                                    conversation stays a terminal. See chat-mode.md)
 ```
 
 Note: a few actions open an **interactive overlay** that then expects keyboard input — `merge-tab`, `merge-window`, `detach-tab` (when several windows exist), `rename-tab`, `rename-pane`, `open-recent-project`, `open-search`, `open-pane-switcher`, `open-unread-switcher`. For headless automation, prefer the deterministic typed commands where one exists (e.g. `merge-window` with explicit indices, `rename-pane` with a title).

@@ -1,0 +1,115 @@
+# Chat mode
+
+A pane running Claude Code can show its conversation as a chat instead of
+its terminal grid, with an input box at the bottom and what waits on the
+user (its `kova ask` questions, a permission prompt) as cards in the thread.
+The terminal keeps running underneath: toggling back shows it as it is.
+
+Code: the pure half in `src/chat/` (transcript reader, chat model, banner,
+input gate, cards, page; all unit-tested), the AppKit half in
+`src/window/chat_view.rs` (the web view over the pane, not tested).
+
+## Toggling
+
+| From | What |
+|---|---|
+| Cmd+Option+C (`toggle_chat`), Pane > Show as Chat, IPC `dispatch-action` `toggle-chat` | the focused pane as a chat, or its terminal again |
+| The banner's Terminal button | the terminal again |
+
+A pane without a Claude conversation stays a terminal, with a note in the
+status bar. One chat pane per tab: turning one on turns the others of its
+tab off. The choice is saved with the session (`chat` on the saved pane), so
+a restored pane comes back as a chat; until its Claude is resumed the banner
+says `Offline` and the thread shows the transcript as it was.
+
+## Layout
+
+One `WKWebView` per window, created on first use, laid over the active
+tab's chat pane, the pane's status bar left visible. It hides when the tab
+has no chat pane, when the pane is minimized or too small, and while an
+overlay Kova draws in Metal needs the window (the switcher, the search
+palette, the filter, help, a rename). Its data store is non-persistent.
+
+The keyboard follows the focus: a click into the chat focuses its pane, the
+chat pane focused gives the box the keyboard, another pane focused takes it
+back. With the box focused, Cmd+A/C/V/X/Z edit its text; every other Kova
+shortcut stays Kova's.
+
+## The thread
+
+Read from `~/.claude/projects/<slug>/<sessionId>.jsonl` (under the
+session's `CLAUDE_CONFIG_DIR` when it has one; found in another project
+folder when the session started elsewhere), the last 4 MB at open, then
+only what is appended, every 200 ms. A line still missing its `\n` waits for
+it; a file rewritten in place (`/clear`) is read again. On KovaLink's rules
+(`link/daemon/src/transcript/jsonl.ts`): the lines of one request grouped by
+`requestId` and ordered by `apiBlockIndex`, tool results joined to their
+call by `tool_use_id`, a message sent mid-turn read from its
+`queued_command` attachment, the harness's own `user` lines (`isMeta`, a
+`<system-reminder>`…) never shown as the user's, sidechains and unknown line
+types ignored. A large tool result Claude Code moved to a file is shown as
+the transcript holds it, cut.
+
+Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
+
+- a banner at the top: `Working · 1 min 12 s` (pulsing), `Waiting for you`
+  (a card waits), `Done 3 min ago`, `Offline` (no Claude in the pane);
+- the assistant's text full width, rendered markdown, no bubble; the user's
+  message in a quiet bubble on the right;
+- tool calls as one-line rows (`Read  …/src/boot.ts`, `Run  npm test`,
+  `Edit  pair.tsx  +12 -3`), state at the right (running, ✓, ✕), a click
+  unfolds the result; consecutive calls form one run, folded into
+  `N actions` only past five; what was unfolded stays unfolded while the
+  page lives;
+- the last 20 exchanges at open, `Show earlier` above for more; the view
+  opens on the last user message; nothing folds by itself.
+
+Every text from the transcript is escaped by Rust. Markdown shows raw HTML
+as text, keeps a link only to http(s) or mailto (it opens in the default
+browser) and never loads an image. The page's content security policy runs
+only the script carrying the load's nonce.
+
+## The input box
+
+Enter sends, Shift+Enter is a new line. The text goes to the pane's PTY as
+a paste (bracketed when Claude Code asked for it), then Enter on its own
+300 ms later, only when Claude is idle with an empty prompt
+(`chat::input::gate`):
+
+| The pane | The message |
+|---|---|
+| idle, the `❯` line empty | sent |
+| working | queued, sent once idle (`Queued: …`, Cancel) |
+| a permission prompt on screen | queued |
+| no `❯` line in the first column (a menu, a dialog) | queued |
+| the `❯` line holds text (the user's draft in the terminal) | refused, back in the box |
+| no Claude | refused, back in the box |
+
+One message at a time. Control characters are removed (tab and newline
+kept), 8 KB at most. The empty prompt is read off the screen like KovaLink's
+daemon does (`composerIsEmpty`); Claude Code's start hint (`Try "…"`) counts
+as empty.
+
+## Cards
+
+At the bottom of the thread, above the box:
+
+- the pane's questions on the board (`kova ask` from this pane and this
+  conversation, not snoozed): their buttons, a field when they take text;
+  the answer goes through the board's queue like an Asks card's, checked
+  against the question's buttons (`ask::accepts_external_answer`);
+- a decision sheet: Open, which shows it in the side panel (the floating
+  card's path);
+- a handoff: its step (Ouvrir, Lancer) and Fait, the step performed by the
+  board without answering;
+- the permission prompt read on the pane's screen: Yes, the option that
+  always allows, No; the digit is typed only while the screen still shows
+  that prompt (`Pane::answer_permission`).
+
+## Not done yet
+
+- Other agents (omp, Codex): terminal only.
+- The page's colours follow the terminal's palette when it is loaded, not a
+  switch made while it is shown.
+- The expanded state of tool rows is lost when the page reloads (another
+  pane shown as a chat in the window).
