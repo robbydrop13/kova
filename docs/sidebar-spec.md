@@ -581,6 +581,45 @@ that pane on the same tick. With no card at all the list draws its own empty
 state, not the hint line: a check-circle, `No open questions` and `Agents
 ask here when they need you`, both tertiary and centred.
 
+#### Attention queue (`[attention]`)
+
+`src/window/sidebar_attention.rs` lays out, around the cards, the queue that
+`crate::attention` reads from `[attention] command`, an argv printing a JSON
+array of open entries (`id`, `ts` ISO with its offset, `from`, `level` `now` /
+`point` / `memo`, `kind`, `title`, optional `needs`, `action`, `topic`; other
+fields ignored, an entry that does not read is skipped alone). The read is
+cached and redone on a background thread every 10 s (`MAX_AGE_SECS`) and
+right after a click, never on the tick. Absent `command`: nothing runs and
+the Asks list is exactly as described above.
+
+- `À toi maintenant (N)` heads the list: the queue's `now` rows, oldest
+  first, then the question cards. N counts both, so it is the number of rows
+  under the header. The same `now` entries are need items
+  (`NeedKind::Attention`): they count in the Asks badge and the `Needs you`
+  block, and Next steps over them (no pane).
+- `Au prochain point (N)` sits under the cards and the snoozed section,
+  folded, and opens on its rows grouped by `topic` (the topic with the oldest
+  entry first, `Divers` last for entries that name none).
+- `Pour mémoire (N)` is a count line; open, its rows are the titles only.
+- An empty queue draws nothing, not even a header, and with the queue on the
+  `No open questions` empty state is gone too: a healthy queue takes no space.
+
+A row is a tighter card: the title (13 medium) and its age at the right,
+`needs` under it (12, up to three lines), then a bottom line with `from` on
+the left and the buttons on the right. `Ouvrir` (accent ground) shows in the
+side panel an http(s) `action`, or a local `.md` / `.html` file that exists
+(the `#anchor` stripped, `~/` read as home). By `kind`: `would` gets
+`Envoyer` (`act_command <id> Envoyer`) and `Ignorer`; `decision`, `review`
+and `test` get `Fait`; `Fait` and `Ignorer` run `close_command <id> --note
+"Fait (Kova)"` or `"Ignoré (Kova)"`. A verb whose command is not configured
+is left out. A click in flight shows `…` instead of the buttons, a sent row
+says `Envoyé` and cannot send twice, a closed row leaves at once, a failure
+shows the CLI's first stderr line in `crit` for 8 s with the buttons back.
+Every command is the configured argv plus the id and fixed words, never a
+shell line, and only for an id the last read returned (letters, digits, `-`,
+`_`, no leading dash). `tests/fixtures/attention/list.json` is the made-up
+queue the tests read.
+
 ### 3.7.4 Agents list (`SidebarList::Agents`)
 
 `src/window/sidebar_agents.rs` owns this list: the view state, the pure model
@@ -638,6 +677,17 @@ state dot when matched, a dimmed ring when closed, the name, the role in
 tertiary (`· not open` when closed), and on the right the pane's meta or a
 22 pt `Open` button, the Scheduled body's small button style: `bg.hover` at
 rest, `btn2.hover` under the mouse and the press, an 11 pt Medium label.
+
+When the roster gives a `status` from its closed list (`awaiting-you`,
+`awaiting-review`, `blocked`, `queued`, `waiting-event`, `working`, `done`),
+line 2 shows it instead of the role: one glyph and one word (`● à toi`,
+`◐ en revue`, `■ bloqué`, `⋯ en file`, `◷ en attente`, `▸ au travail`,
+`✓ fini`), `warn` for à toi, `crit` for bloqué, `info` for au travail,
+secondary otherwise, then ` · attend : <waiting_on>` in tertiary. An open
+session at work that waits on nobody is healthy: a 25 pt row of one line, the
+status and its age at the right. Any other word, or none: as before. The
+roster's `state` may say more than `open` (`working`): any word but `closed`
+is an open session.
 
 The closed dedicated sessions fold under a `Closed N` header, folded at
 start (`AgentsState::closed_folded`); every closed row has its own `Open`.
@@ -993,6 +1043,14 @@ sidebar_collapsed_default = false   # new tabs start folded when true
 # team roster as JSON. Absent or empty: the Agents view hides the Team and
 # Dedicated sections and spawns nothing.
 roster_command = ["/usr/local/bin/team", "list", "--json"]
+
+[attention]
+# The attention queue of the Asks view (3.7.3), three argv. Absent `command`:
+# off, nothing spawned. Kova appends `<id> Envoyer` to act_command and
+# `<id> --note <words>` to close_command; an absent one leaves its buttons out.
+command = ["/usr/local/bin/attn", "list", "--open", "--json"]
+act_command = ["/usr/local/bin/attn", "act"]
+close_command = ["/usr/local/bin/attn", "close", "--by", "me"]
 
 [keys]
 toggle_sidebar = "cmd+option+s"
