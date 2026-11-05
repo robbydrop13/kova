@@ -678,7 +678,8 @@ impl SidePanelView {
                 let html = match crate::app::sheet_page(mtm, id) {
                     Some((sheet, answers, from)) => {
                         *self.ivars().title.borrow_mut() = sheet.title.clone();
-                        crate::decision_sheet::render(&sheet, &answers, &from, tokens::get())
+                        let home = std::env::var_os("HOME").map(PathBuf::from);
+                        crate::decision_sheet::render(&sheet, &answers, &from, tokens::get(), home.as_deref())
                     }
                     None => crate::decision_sheet::render_closed("Decision", None, tokens::get()),
                 };

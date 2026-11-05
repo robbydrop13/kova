@@ -93,6 +93,15 @@ recommendation tagged, Other, a note), a progress bar, Open only, "Take the
 recommendation on the N left" (with a confirm), a general note, Done. Every
 text of the sheet is escaped into the HTML by Rust.
 
+An option can carry up to two images (`images: [{"label", "path"}]`, typically
+"Aujourd'hui" and "Avec la décision"): side by side under the option, stacked
+when the panel is narrow, the label above each, a click enlarges one in the
+page (Escape or a click closes it) without picking the option. The page has
+no base URL, so Kova reads the files when it renders and embeds them as
+`data:` URIs. An absolute or `~/` path, png, jpg, jpeg, webp or gif, 3 MB at
+most each and 24 MB for the page; anything else is a note under the option
+saying why, never an error (`images_html`).
+
 It is the one page Kova renders itself that runs a script, and the script only reads
 the form and posts it (`window.webkit.messageHandlers.kovaSheet`). A post is
 taken only from the panel's own web view, its main frame, on `about:blank` (the

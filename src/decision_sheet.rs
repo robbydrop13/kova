@@ -12,6 +12,13 @@
 //! The page is the only one in the panel that runs a script, and the script
 //! only reads the form and posts it back: every text of the sheet is escaped
 //! into the HTML by Rust, none goes through JavaScript.
+//!
+//! An option can show up to two images (a screenshot of today, a mock of the
+//! change). The page is loaded with no base URL, so Kova reads them when it
+//! renders and embeds them as `data:` URIs; an image it cannot show leaves a
+//! note in the page instead, never an error.
+
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +39,13 @@ const MAX_TEXT: usize = 4000;
 const MAX_NOTE: usize = 8000;
 /// The largest sheet file `kova ask` reads.
 pub const MAX_FILE: u64 = 512 * 1024;
+/// Images an option shows at most, and the largest one the page embeds.
+const MAX_IMAGES: usize = 2;
+pub const MAX_IMAGE: u64 = 3 * 1024 * 1024;
+/// What a page embeds in all: past it, images are left out with a note.
+const MAX_IMAGES_TOTAL: u64 = 24 * 1024 * 1024;
+const IMAGE_TYPES: [(&str, &str); 5] =
+    [("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"), ("webp", "image/webp"), ("gif", "image/gif")];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sheet {
@@ -68,6 +82,18 @@ pub struct SheetOption {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reco: bool,
+    /// Typically "Today" and "With the decision". Not validated with the
+    /// sheet: what cannot be shown is a note on the page (`render`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<SheetImage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheetImage {
+    #[serde(default)]
+    pub label: String,
+    /// Absolute, or `~/` under the home.
+    pub path: String,
 }
 
 /// The user's answers so far, in the sheet's order.
@@ -264,6 +290,20 @@ impl Sheet {
         (!open.is_empty()).then(|| Sheet { decisions: open, ..self.clone() })
     }
 
+    /// The sheet with each image path absolute (`~/` expanded), as a remote
+    /// client fetches them (`get-sheet`).
+    pub fn with_image_paths(&self, home: Option<&Path>) -> Sheet {
+        let mut sheet = self.clone();
+        for o in sheet.decisions.iter_mut().flat_map(|d| d.options.iter_mut()) {
+            for img in &mut o.images {
+                if let Some(p) = image_path(&img.path, home) {
+                    img.path = p.to_string_lossy().into_owned();
+                }
+            }
+        }
+        sheet
+    }
+
     /// The card text when the agent gives none: the title, the count, then
     /// one line per decision so the card says what it is about. `tail` is
     /// "" or " left" (a follow-up). At most `SHOWN` lines, then "+N more".
@@ -309,13 +349,91 @@ fn esc(s: &str) -> String {
     out
 }
 
+/// Where an image is on disk: an absolute path, or `~/` under `home`.
+pub fn image_path(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.map(|h| h.join(rest));
+    }
+    raw.starts_with('/').then(|| PathBuf::from(raw))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// An image as the page embeds it (a `data:` URI), or why it is left out.
+/// `budget` is what the page may still embed; a shown image takes from it.
+fn image_src(img: &SheetImage, home: Option<&Path>, budget: &mut u64) -> Result<String, String> {
+    let path = image_path(&img.path, home).ok_or("the path is not absolute")?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let mime = IMAGE_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, m)| *m).ok_or("not a png, jpg, webp or gif file")?;
+    let meta = std::fs::metadata(&path).map_err(|_| "the file is not there")?;
+    if !meta.is_file() {
+        return Err("not a file".into());
+    }
+    if meta.len() > MAX_IMAGE {
+        return Err(format!("larger than {} MB", MAX_IMAGE / (1024 * 1024)));
+    }
+    if meta.len() > *budget {
+        return Err(format!("the sheet already shows {} MB of images", MAX_IMAGES_TOTAL / (1024 * 1024)));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("unreadable ({})", e))?;
+    if bytes.len() as u64 > MAX_IMAGE.min(*budget) {
+        return Err(format!("larger than {} MB", MAX_IMAGE / (1024 * 1024)));
+    }
+    *budget -= bytes.len() as u64;
+    Ok(format!("data:{};base64,{}", mime, base64(&bytes)))
+}
+
+/// An option's images, side by side, and a note for each one left out.
+fn images_html(images: &[SheetImage], home: Option<&Path>, budget: &mut u64) -> String {
+    let mut shots = String::new();
+    let mut notes = String::new();
+    for img in images.iter().take(MAX_IMAGES) {
+        let label = img.label.trim();
+        match image_src(img, home, budget) {
+            Ok(src) => {
+                let caption = if label.is_empty() { String::new() } else { format!("<span class=\"shot-label\">{}</span>", esc(label)) };
+                shots.push_str(&format!(
+                    "<span class=\"shot\">{caption}<img src=\"{src}\" alt=\"{alt}\" title=\"Click to enlarge\"></span>",
+                    alt = esc(if label.is_empty() { "Image" } else { label }),
+                ));
+            }
+            Err(why) => {
+                let name = if label.is_empty() { esc(&img.path) } else { esc(label) };
+                notes.push_str(&format!("<span class=\"img-note\">Image {} not shown: {}</span>", name, esc(&why)));
+            }
+        }
+    }
+    if images.len() > MAX_IMAGES {
+        let n = images.len() - MAX_IMAGES;
+        notes.push_str(&format!("<span class=\"img-note\">{} more image{} left out: an option shows {} at most</span>", n, if n == 1 { "" } else { "s" }, MAX_IMAGES));
+    }
+    let shots = if shots.is_empty() { shots } else { format!("<span class=\"shots\">{}</span>", shots) };
+    shots + &notes
+}
+
 fn hex(c: [f32; 3]) -> String {
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", b(c[0]), b(c[1]), b(c[2]))
 }
 
 /// The sheet as a page, with the answers given so far already ticked.
-pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &tokens::Palette) -> String {
+/// Images are read from disk here (`home` expands their `~/`).
+pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &tokens::Palette, home: Option<&Path>) -> String {
+    let mut budget = MAX_IMAGES_TOTAL;
     let mut cards = String::new();
     for d in &sheet.decisions {
         if let Some(group) = d.group.as_deref().filter(|g| !g.trim().is_empty()) {
@@ -324,13 +442,14 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
         let a = answers.get(&d.id);
         let chosen = a.and_then(|a| a.choice.as_deref());
         let mut opts = String::new();
-        let other = SheetOption { id: OTHER.into(), label: "Other".into(), detail: Some("Say what in the note below".into()), reco: false };
+        let other = SheetOption { id: OTHER.into(), label: "Other".into(), detail: Some("Say what in the note below".into()), reco: false, images: Vec::new() };
         for o in d.options.iter().chain(std::iter::once(&other)) {
             let num = if o.id == OTHER { String::new() } else { format!("<span class=\"oid\">{}</span>", esc(&o.id)) };
             let reco = if o.reco { "<span class=\"badge\">Recommended</span>" } else { "" };
             let detail = o.detail.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<span class=\"detail\">{}</span>", esc(t))).unwrap_or_default();
+            let images = images_html(&o.images, home, &mut budget);
             opts.push_str(&format!(
-                "<label class=\"opt\"><input type=\"radio\" name=\"d-{did}\" value=\"{oid}\"{checked}{reco_attr}><span class=\"txt\"><span class=\"label\">{num}{label}</span>{reco}{detail}</span></label>\n",
+                "<label class=\"opt\"><input type=\"radio\" name=\"d-{did}\" value=\"{oid}\"{checked}{reco_attr}><span class=\"txt\"><span class=\"label\">{num}{label}</span>{reco}{detail}{images}</span></label>\n",
                 did = esc(&d.id),
                 oid = esc(&o.id),
                 checked = if chosen == Some(o.id.as_str()) { " checked" } else { "" },
@@ -448,11 +567,22 @@ h2.group { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; co
 .opt { display: grid; grid-template-columns: 16px 1fr; gap: 9px; padding: 8px 10px; border: 1px solid {b3}; border-radius: 8px; cursor: pointer; background: {bg}; }
 .opt:hover { border-color: {b2}; }
 .opt:has(input:checked) { background: {sel}; border-color: {accent}; }
-.opt input { margin: 2px 0 0; accent-color: {accent}; }
+.opt input { margin: 2px 0 0; accent-color: {accent}; align-self: start; }
 .label { font-weight: 500; }
 .oid { color: {t3}; font-weight: 600; margin-right: 6px; }
 .badge { display: inline-block; font-size: 11px; font-weight: 600; color: {ok}; border: 1px solid {ok}; border-radius: 5px; padding: 0 5px; margin-left: 6px; vertical-align: 1px; }
 .detail { color: {t2}; font-size: 13px; display: block; }
+.txt { min-width: 0; }
+.shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 8px; }
+.shot { display: grid; gap: 4px; min-width: 0; }
+.shot-label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: {t3}; font-weight: 600; }
+.shot img { display: block; width: 100%; max-height: 280px; object-fit: contain; background: {bg2}; border: 1px solid {b3}; border-radius: 8px; cursor: zoom-in; }
+.shot img:hover { border-color: {b2}; }
+.img-note { display: block; color: {t3}; font-size: 12px; margin-top: 4px; }
+.lightbox { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 24px; background: rgba(0, 0, 0, .82); cursor: zoom-out; }
+.lightbox[hidden] { display: none; }
+.lightbox img { max-width: 100%; max-height: calc(100vh - 80px); object-fit: contain; border-radius: 8px; }
+.lightbox span { color: #fff; font-size: 13px; font-weight: 500; }
 textarea { width: 100%; font: inherit; font-size: 13px; color: {t1}; background: {bg}; border: 1px solid {b3}; border-radius: 8px; padding: 7px 10px; min-height: 34px; resize: vertical; }
 textarea:focus { border-color: {accent}; outline: none; }
 .end { display: grid; gap: 10px; padding: 8px 0 40px; }
@@ -471,6 +601,7 @@ textarea:focus { border-color: {accent}; outline: none; }
 <textarea id="general" rows="3" placeholder="A default to challenge, a missing decision, an instruction for what comes next">@@NOTE@@</textarea>
 <div class="row"><button class="primary" id="done" type="button">Done</button><span class="hint" id="hint">Saved as you go</span></div>
 </section></div>
+<div class="lightbox" id="lightbox" hidden><img id="lbImg" alt=""><span id="lbCap"></span></div>
 <script>
 const $ = id => document.getElementById(id);
 const cards = [...document.querySelectorAll('.card')];
@@ -518,6 +649,16 @@ document.addEventListener('change', e => { if (e.target.type === 'radio') { prog
 document.addEventListener('input', e => { if (e.target.tagName === 'TEXTAREA') { progress(); later(); } });
 $('filter').onclick = () => { const on = document.body.classList.toggle('only-open'); $('filter').classList.toggle('on', on); };
 $('done').onclick = () => { clearTimeout(timer); post('done'); $('hint').textContent = 'Sending'; };
+// An image is in its option's label: enlarging it does not pick the option.
+document.addEventListener('click', e => {
+  const img = e.target.closest && e.target.closest('.shot img');
+  if (!img) return;
+  e.preventDefault();
+  $('lbImg').src = img.src; $('lbCap').textContent = img.alt; $('lightbox').hidden = false;
+});
+function shut() { $('lightbox').hidden = true; $('lbImg').removeAttribute('src'); }
+$('lightbox').onclick = shut;
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('lightbox').hidden) shut(); });
 progress();
 </script></body></html>"#;
 
@@ -620,7 +761,7 @@ mod tests {
         let mut s = sheet();
         s.decisions[1].title = "</script><script>alert(1)</script>{bg}".into();
         let a = SheetAnswers { decisions: vec![DecisionAnswer { id: "D1".into(), choice: Some("A".into()), note: "<i>".into() }], note: String::new() };
-        let html = render(&s, &a, "agent<x>", &tokens::DARK);
+        let html = render(&s, &a, "agent<x>", &tokens::DARK, None);
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;{bg}"), "a slot name in a text stays text");
         assert!(html.contains("Pick &lt;b&gt;one&lt;/b&gt;"));
@@ -629,5 +770,96 @@ mod tests {
         assert!(html.contains("&lt;i&gt;</textarea>"));
         assert!(html.contains("messageHandlers.kovaSheet"));
         assert_eq!(html.matches("<script>").count(), 1, "one script: Kova's");
+    }
+
+    fn image_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kova-sheet-images-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn with_images(images: serde_json::Value) -> Sheet {
+        let json = serde_json::json!({"title":"UI","decisions":[{"id":"D1","title":"Which?","options":[{"id":"A","label":"New","images":images}]}]});
+        Sheet::from_json(&json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(&[0xfb, 0xff, 0xfe]), "+//+");
+    }
+
+    #[test]
+    fn a_sheet_without_images_reads_and_writes_as_before() {
+        let s = sheet();
+        assert!(s.decisions[0].options.iter().all(|o| o.images.is_empty()));
+        assert!(!serde_json::to_string(&s).unwrap().contains("images"));
+        assert!(!render(&s, &SheetAnswers::default(), "a", &tokens::DARK, None).contains("class=\"shot"));
+    }
+
+    #[test]
+    fn an_option_shows_its_two_images_embedded_side_by_side() {
+        let dir = image_dir();
+        let before = dir.join("before.png");
+        std::fs::write(&before, b"png!").unwrap();
+        std::fs::write(dir.join("after.JPG"), b"jpg").unwrap();
+        let s = with_images(serde_json::json!([
+            {"label":"Aujourd'hui","path":before},
+            {"label":"Avec la d\u{e9}cision","path":"~/after.JPG"},
+            {"label":"Third","path":before}
+        ]));
+        assert_eq!(s.decisions[0].options[0].images[1].label, "Avec la d\u{e9}cision");
+        let html = render(&s, &SheetAnswers::default(), "a", &tokens::DARK, Some(&dir));
+        assert!(html.contains("<span class=\"shots\"><span class=\"shot\"><span class=\"shot-label\">Aujourd&#39;hui</span><img src=\"data:image/png;base64,cG5nIQ==\""));
+        assert!(html.contains("<img src=\"data:image/jpeg;base64,anBn\" alt=\"Avec la d\u{e9}cision\""), "~/ expanded, extension case ignored");
+        assert!(html.contains("1 more image left out: an option shows 2 at most"));
+        assert_eq!(html.matches("<script>").count(), 1);
+        assert!(html.contains("id=\"lightbox\""));
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_shown_is_a_note_not_an_error() {
+        let dir = image_dir();
+        std::fs::write(dir.join("doc.svg"), b"<svg/>").unwrap();
+        let big = dir.join("big.png");
+        std::fs::File::create(&big).unwrap().set_len(MAX_IMAGE + 1).unwrap();
+        let note = |img: serde_json::Value| {
+            let html = render(&with_images(serde_json::json!([img])), &SheetAnswers::default(), "a", &tokens::DARK, Some(&dir));
+            assert!(!html.contains("class=\"shot\""));
+            let start = html.find("<span class=\"img-note\">").expect("a note");
+            html[start..].split("</span>").next().unwrap().trim_start_matches("<span class=\"img-note\">").to_string()
+        };
+        assert_eq!(note(serde_json::json!({"label":"Svg","path":dir.join("doc.svg")})), "Image Svg not shown: not a png, jpg, webp or gif file");
+        assert_eq!(note(serde_json::json!({"label":"Gone","path":dir.join("gone.png")})), "Image Gone not shown: the file is not there");
+        assert_eq!(note(serde_json::json!({"label":"Big","path":big})), "Image Big not shown: larger than 3 MB");
+        assert_eq!(note(serde_json::json!({"label":"Rel","path":"shots/a.png"})), "Image Rel not shown: the path is not absolute");
+        assert_eq!(note(serde_json::json!({"path":"x/<b>.png"})), "Image x/&lt;b&gt;.png not shown: the path is not absolute", "no label: the path, escaped");
+        assert_eq!(note(serde_json::json!({"label":"Dir","path":format!("{}/sub.png", dir.display())})), "Image Dir not shown: the file is not there");
+    }
+
+    #[test]
+    fn a_page_stops_embedding_past_its_budget() {
+        let dir = image_dir();
+        let img = dir.join("budget.png");
+        std::fs::write(&img, b"12345").unwrap();
+        let s = with_images(serde_json::json!([{"label":"A","path":img},{"label":"B","path":img}]));
+        let mut budget = 7;
+        let html = images_html(&s.decisions[0].options[0].images, None, &mut budget);
+        assert_eq!(html.matches("class=\"shot\"").count(), 1);
+        assert!(html.contains("Image B not shown: the sheet already shows 24 MB of images"));
+        assert_eq!(budget, 2);
+    }
+
+    #[test]
+    fn get_sheet_gives_absolute_image_paths() {
+        let s = with_images(serde_json::json!([{"label":"A","path":"~/x/a.png"},{"label":"B","path":"/abs/b.png"}]));
+        let out = s.with_image_paths(Some(Path::new("/Users/me")));
+        let paths: Vec<&str> = out.decisions[0].options[0].images.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["/Users/me/x/a.png", "/abs/b.png"]);
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["decisions"][0]["options"][0]["images"][0], serde_json::json!({"label":"A","path":"/Users/me/x/a.png"}));
     }
 }
