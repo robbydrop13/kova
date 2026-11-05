@@ -56,6 +56,11 @@ impl Tail {
     }
 
     /// The lines added since the last read.
+    /// The file has not been seen yet (`inode` still 0).
+    pub fn waiting(&self) -> bool {
+        self.inode == 0
+    }
+
     pub fn read_more(&mut self) -> Read {
         let Ok(meta) = std::fs::metadata(&self.path) else { return Read::default() };
         if meta.ino() != self.inode || meta.len() < self.offset || !self.head_matches() {
@@ -101,8 +106,10 @@ impl Tail {
         let start = size.saturating_sub(MAX_INITIAL_BYTES);
         let bytes = read_range(&self.path, start, size).unwrap_or_default();
         self.offset = start + bytes.len() as u64;
-        // A window that starts mid-file starts mid-line: that first piece is dropped.
-        let skip = if start > 0 { bytes.iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| i + 1) } else { 0 };
+        // A window that starts mid-line drops that first piece.
+        // A window that starts on a line boundary keeps that line.
+        let on_boundary = start == 0 || read_range(&self.path, start - 1, start).is_some_and(|b| b == b"\n");
+        let skip = if on_boundary { 0 } else { bytes.iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| i + 1) };
         let (lines, rest) = split_lines(&bytes[skip..], start + skip as u64);
         self.carry_start = start + (skip + rest) as u64;
         self.carry = bytes[skip + rest..].to_vec();
@@ -198,6 +205,24 @@ mod tests {
         assert!(read.reopened);
         assert_eq!(read.lines.len(), 1);
         assert_eq!(read.lines[0]["n"], 3);
+    }
+
+    /// A line of `len` bytes, newline included.
+    fn line_of(kind: &str, len: usize) -> String {
+        let bare = format!("{{\"type\":\"{kind}\",\"pad\":\"\"}}\n");
+        format!("{{\"type\":\"{kind}\",\"pad\":\"{}\"}}\n", "x".repeat(len - bare.len()))
+    }
+
+    #[test]
+    fn the_initial_window_keeps_a_whole_first_line_and_drops_a_cut_one() {
+        let max = MAX_INITIAL_BYTES as usize;
+        let path = dir().join("s.jsonl");
+        append(&path, &(line_of("user", 100) + &line_of("assistant", max)));
+        assert_eq!(types(&Tail::open(&path).1), ["assistant"], "the window starts on a line boundary");
+
+        let path = dir().join("s.jsonl");
+        append(&path, &(line_of("user", 100) + &line_of("assistant", max - 10) + &line_of("system", 40)));
+        assert_eq!(types(&Tail::open(&path).1), ["system"], "the cut line is dropped");
     }
 
     #[test]

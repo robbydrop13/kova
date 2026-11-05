@@ -395,7 +395,7 @@ impl KovaView {
                             st.note = Some(reason.to_string());
                             st.restore = Some(text);
                         }
-                        input::Step::Enter | input::Step::Nothing => {}
+                        input::Step::Enter | input::Step::Stale | input::Step::Nothing => {}
                     },
                 }
                 Reply::Push
@@ -511,6 +511,9 @@ fn gate(pane: &Pane) -> input::Verdict {
     })
 }
 
+/// The note when the Enter after a paste was not written.
+const NOT_ENTERED: &str = "Not sent: the text is in the terminal's prompt, press Enter there";
+
 /// Read the transcript, the cards and the gate again; the update to push,
 /// if the page is ready and something changed.
 fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
@@ -531,13 +534,20 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
                 st.first = true;
             }
             st.conv.apply_all(&read.lines);
+            // Not there yet: the next poll looks for it again, in case it
+            // appears under another project folder than the guessed one.
+            if tail.waiting() {
+                st.tail = None;
+            }
         }
         (None, Some(id)) => {
             let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
             let cwd = pane.cached_cwd();
             if let Some(path) = crate::chat::transcript_path(&home, pane.claude_config_dir().as_deref(), cwd.as_deref(), id) {
                 let (tail, lines) = Tail::open(&path);
-                log::info!("pane {}: chat reads {} ({} lines)", pane.id, path.display(), lines.len());
+                if !tail.waiting() {
+                    log::info!("pane {}: chat reads {} ({} lines)", pane.id, path.display(), lines.len());
+                }
                 st.conv.apply_all(&lines);
                 st.tail = Some(tail);
             }
@@ -588,9 +598,18 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
     match st.outbox.poll(verdict, crate::surface::monotonic_ms()) {
         input::Step::Type(text) => type_into(pane, &text),
         input::Step::Enter => {
-            pane.pty.write(b"\r");
-            pane.clear_awaiting();
+            // Only onto the text just pasted: the prompt still holds it and
+            // nothing else came up meanwhile (a permission prompt, a menu).
+            let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+            let prompt = pane.has_permission_prompt() || crate::prompt_preview::parse_permission_prompt(&visible).is_some();
+            if !prompt && input::composer(&visible) == input::Composer::Typed {
+                pane.pty.write(b"\r");
+                pane.clear_awaiting();
+            } else {
+                st.note = Some(NOT_ENTERED.to_string());
+            }
         }
+        input::Step::Stale => st.note = Some(NOT_ENTERED.to_string()),
         input::Step::Refused { reason, text } => {
             st.note = Some(reason.to_string());
             st.restore = Some(text);
@@ -675,7 +694,7 @@ define_class!(
             let text = url.as_deref().and_then(|u| u.absoluteString()).map(|s| s.to_string()).unwrap_or_default();
             let clicked = unsafe { action.navigationType() } == WKNavigationType::LinkActivated;
             let lower = text.to_ascii_lowercase();
-            let policy = if text.is_empty() || lower == "about:blank" {
+            let policy = if !clicked && (text.is_empty() || lower == "about:blank") {
                 WKNavigationActionPolicy::Allow
             } else {
                 if clicked && (lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("mailto:"))

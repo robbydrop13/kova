@@ -17,6 +17,9 @@
 pub const TEXT_MAX: usize = 8 * 1024;
 /// Between the pasted text and its Enter.
 pub const ENTER_DELAY_MS: u64 = 300;
+/// An Enter not written this long after it was due (the pane was not shown
+/// as a chat meanwhile) is dropped: the screen it was meant for is gone.
+pub const ENTER_STALE_MS: u64 = 2_000;
 
 /// What Claude Code's input line shows, read off the pane's screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +142,9 @@ pub enum Step {
     /// Paste this into the PTY; Enter follows from `poll`.
     Type(String),
     Enter,
+    /// The Enter came too late and was dropped: the text waits in the
+    /// terminal's prompt.
+    Stale,
     /// Kept in the queue, for this reason.
     Queued(&'static str),
     /// Not sent: the text goes back to the box.
@@ -177,7 +183,7 @@ impl Outbox {
                 return Step::Nothing;
             }
             self.enter_due = None;
-            return Step::Enter;
+            return if now - due > ENTER_STALE_MS { Step::Stale } else { Step::Enter };
         }
         match (verdict, self.queued.is_some()) {
             (_, false) | (Verdict::Wait(_), true) => Step::Nothing,
@@ -245,6 +251,14 @@ mod tests {
         assert!(matches!(out.submit("again".into(), Verdict::Send, 1100), Step::Refused { .. }), "one at a time");
         assert_eq!(out.poll(Verdict::Wait("busy"), 1000 + ENTER_DELAY_MS), Step::Enter, "the Enter of a typed text always follows");
         assert_eq!(out.poll(Verdict::Send, 2000), Step::Nothing);
+    }
+
+    #[test]
+    fn a_late_enter_is_dropped() {
+        let mut out = Outbox::default();
+        out.submit("hi".into(), Verdict::Send, 0);
+        assert_eq!(out.poll(Verdict::Send, ENTER_DELAY_MS + ENTER_STALE_MS + 1), Step::Stale);
+        assert_eq!(out.poll(Verdict::Send, 60_000), Step::Nothing);
     }
 
     #[test]

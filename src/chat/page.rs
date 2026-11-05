@@ -86,14 +86,24 @@ fn fnv(s: &str) -> u64 {
 /// Markdown as an HTML fragment: raw HTML as text, a link only to http(s)
 /// or mailto, no image source.
 pub fn markdown(source: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser, Tag};
+    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    // Inside a link to another scheme: its text stays, the link goes.
+    let mut unsafe_link = false;
     let parser = Parser::new_ext(source, options).map(|event| match event {
         Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
         Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
             let lower = dest_url.trim().to_ascii_lowercase();
             let safe = lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:");
-            Event::Start(Tag::Link { link_type, dest_url: if safe { dest_url } else { "".into() }, title, id })
+            if !safe {
+                unsafe_link = true;
+                return Event::Text("".into());
+            }
+            Event::Start(Tag::Link { link_type, dest_url, title, id })
+        }
+        Event::End(TagEnd::Link) if unsafe_link => {
+            unsafe_link = false;
+            Event::Text("".into())
         }
         Event::Start(Tag::Image { link_type, title, id, .. }) => {
             Event::Start(Tag::Image { link_type, dest_url: "".into(), title, id })
@@ -446,7 +456,8 @@ body {{ display: flex; flex-direction: column; }}
     const keep = new Set();
     for (const e of list) {{
       let n = have.get(e.id);
-      if (!n || n.dataset.h !== e.h) {{
+      // Html sent again for the same hash is a card to enable again.
+      if (!n || n.dataset.h !== e.h || e.html !== undefined) {{
         if (e.html === undefined) {{ missing = true; if (!n) continue; }}
         else {{
           const fresh = nodeFrom(e.html);
@@ -484,7 +495,7 @@ body {{ display: flex; flex-direction: column; }}
     const q = $("queued");
     q.classList.toggle("on", !!m.queued);
     if (m.queued) {{ q.querySelector(".qtext").textContent = m.queued.text; q.querySelector(".qwhy").textContent = m.queued.reason; }}
-    if (m.restore && !box.value) {{ box.value = m.restore; grow(); }}
+    if (m.restore) {{ box.value = box.value ? box.value + "\n" + m.restore : m.restore; grow(); }}
     if (m.note) {{
       $("note").textContent = m.note;
       clearTimeout(noteTimer);
@@ -650,6 +661,8 @@ mod tests {
         assert!(!e[1].html.contains("<script>"));
         assert!(e[1].html.contains("&lt;script&gt;"), "raw HTML is shown as text");
         assert!(!e[1].html.contains("javascript:"));
+        assert!(e[1].html.contains("<p>x "), "a link to another scheme keeps its text, not the link");
+        assert!(!e[1].html.contains(r#"href="""#), "no empty link: clicking one would blank the page");
         assert!(!e[1].html.contains("tracker"), "no remote image is ever fetched");
         assert!(e[1].html.contains(r#"href="https://a.b""#));
     }
