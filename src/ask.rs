@@ -1276,7 +1276,8 @@ impl Board {
             "message": q.message,
             "asked_at": q.asked_at,
             "follow_up": q.follow_up,
-            "sheet": sheet,
+            // Image paths absolute: the client fetches them by path.
+            "sheet": sheet.with_image_paths(std::env::var_os("HOME").map(std::path::PathBuf::from).as_deref()),
             "draft": q.draft.clone().unwrap_or_default(),
         }))
     }

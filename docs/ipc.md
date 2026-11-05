@@ -366,6 +366,9 @@ socket, with the same semantics as the panel:
   "sheet": <the decision-sheet JSON>, "draft": {"decisions": [{"id", "choice",
   "note"}], "note"}}`. `choice` is an option id or `"other"`, absent when only
   a note was written. Error `question <id> is not a decision sheet` otherwise.
+  An option's `images` (`[{"label", "path"}]`) come with their paths made
+  absolute (`~/` expanded); the bytes are never in the reply, the client reads
+  the files itself.
 - `answer-sheet` with `id`, `answers` and `done` (default false):
   `answers` is `{"decisions": {"D1": {"choice": "A", "note": "…"}}, "note": "…"}`,
   the whole state of the sheet (it replaces the draft), kept to what the sheet
