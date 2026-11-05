@@ -24,6 +24,7 @@ mod sidebar_ui;
 pub(super) mod sidebar_sched;
 mod sidebar_view;
 pub(crate) mod side_panel;
+mod chat_view;
 pub(crate) mod panel_history;
 use sidebar_ui::SidebarState;
 mod switcher;
@@ -216,6 +217,8 @@ pub struct KovaViewIvars {
     /// The side panel at the right (a web view), a sibling of this view,
     /// hidden until something is opened in it. See `side_panel`.
     side_panel: OnceCell<Retained<side_panel::SidePanelView>>,
+    /// The web view laid over the active tab's chat pane. See `chat_view`.
+    chat: chat_view::ChatSlot,
 }
 
 #[derive(Clone, Copy)]
@@ -544,9 +547,11 @@ define_class!(
             let in_panel = responder.as_ref().is_some_and(|r| {
                 self.ivars().side_panel.get().is_some_and(|panel| panel.holds(r))
             });
+            // The chat's box edits text the same way; every other shortcut stays Kova's there.
+            let in_chat = responder.as_ref().is_some_and(|r| self.chat_holds(r));
             if responder
                 .as_ref()
-                .is_some_and(|responder| in_panel || responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())
+                .is_some_and(|responder| in_panel || in_chat || responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())
                 && let Some(edit) = text_edit(&combo)
             {
                 let mtm = unsafe { MainThreadMarker::new_unchecked() };
@@ -764,8 +769,8 @@ define_class!(
             // A click on the terminal takes the keyboard back from the side
             // panel's web view, whatever AppKit decided on its own.
             if let Some(win) = self.window()
-                && self.ivars().side_panel.get().is_some_and(|panel| {
-                    win.firstResponder().is_some_and(|r| panel.holds(&r))
+                && win.firstResponder().is_some_and(|r| {
+                    self.ivars().side_panel.get().is_some_and(|panel| panel.holds(&r)) || self.chat_holds(&r)
                 })
             {
                 win.makeFirstResponder(Some(self));
@@ -1020,6 +1025,12 @@ define_class!(
             self.toggle_side_panel();
         }
 
+        /// Pane menu: `Show as Chat` (Cmd+Option+C).
+        #[unsafe(method(toggleChatFromMenu:))]
+        fn toggle_chat_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
+            self.toggle_chat();
+        }
+
         /// View menu: `Panel History` (Cmd+Option+Y).
         #[unsafe(method(panelHistoryFromMenu:))]
         fn panel_history_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
@@ -1250,6 +1261,7 @@ impl KovaView {
             sidebar_view: OnceCell::new(),
             side_panel: OnceCell::new(),
             sidebar_shown: Cell::new(false),
+            chat: Default::default(),
         });
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         // Accept file drags from Finder (legacy filenames type; AppKit bridges
@@ -1928,6 +1940,7 @@ impl KovaView {
             Action::RepaintPane => self.do_repaint_pane(),
             Action::NextAttention => self.do_focus_next_attention(),
             Action::ToggleUnread => self.do_toggle_unread(),
+            Action::ToggleChat => self.toggle_chat(),
             Action::HistoryBack => do_history_step(false),
             Action::HistoryForward => do_history_step(true),
             Action::ToggleSidebar => self.toggle_layout_mode(),

@@ -558,6 +558,8 @@ pub struct KeysConfig {
     pub toggle_side_panel: String,
     /// The side panel on its history of what it opened.
     pub panel_history: String,
+    /// The focused pane as a chat, or as its terminal again.
+    pub toggle_chat: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -633,6 +635,7 @@ impl Default for KeysConfig {
             toggle_sidebar: "cmd+option+s".into(),
             toggle_side_panel: "cmd+option+b".into(),
             panel_history: "cmd+option+y".into(),
+            toggle_chat: "cmd+option+c".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

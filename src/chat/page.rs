@@ -269,9 +269,7 @@ pub fn card_html(card: &super::cards::Card) -> String {
 /// What one update tells the page.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Update {
-    /// Epoch seconds on Kova's clock, for the banner's own ticking.
-    pub now: u64,
-    pub banner: Option<super::banner::Banner>,
+    pub banner: Option<BannerWire>,
     pub working: bool,
     /// Every entry in order; `html` only for those the page does not hold.
     pub entries: Option<Vec<WireEntry>>,
@@ -287,6 +285,13 @@ pub struct Update {
     pub first: bool,
     /// Give the box the keyboard.
     pub focus: bool,
+}
+
+/// The banner as the page shows it: its state (a class) and its text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BannerWire {
+    pub state: &'static str,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -424,25 +429,7 @@ body {{ display: flex; flex-direction: column; }}
   const $ = (id) => document.getElementById(id);
   const log = $("log"), scroll = $("scroll"), box = $("box"), cardsEl = $("cards");
   const opened = new Set();
-  let banner = null, skew = 0, noteTimer = null;
-  const dur = (s) => s < 60 ? s + " s" : s < 3600 ? Math.floor(s / 60) + " min " + (s % 60) + " s"
-    : Math.floor(s / 3600) + " h " + String(Math.floor((s % 3600) / 60)).padStart(2, "0") + " min";
-  const ago = (s) => s < 60 ? "just now" : s < 3600 ? Math.floor(s / 60) + " min ago"
-    : s < 86400 ? Math.floor(s / 3600) + " h ago" : Math.floor(s / 86400) + " d ago";
-  function drawBanner() {{
-    if (!banner) return;
-    const now = Math.floor(Date.now() / 1000) + skew;
-    let text = "";
-    switch (banner.state) {{
-      case "working": text = banner.since ? "Working · " + dur(Math.max(0, now - banner.since)) : "Working"; break;
-      case "waiting": text = "Waiting for you"; break;
-      case "done": text = banner.at ? "Done " + ago(Math.max(0, now - banner.at)) : "Done"; break;
-      default: text = "Offline";
-    }}
-    $("state").textContent = text;
-    $("banner").className = banner.state;
-  }}
-  setInterval(drawBanner, 1000);
+  let noteTimer = null;
   function nodeFrom(html) {{
     const t = document.createElement("template");
     t.innerHTML = html;
@@ -483,8 +470,7 @@ body {{ display: flex; flex-direction: column; }}
     return missing;
   }}
   function update(m) {{
-    if (typeof m.now === "number") skew = m.now - Math.floor(Date.now() / 1000);
-    if (m.banner) {{ banner = m.banner; drawBanner(); }}
+    if (m.banner) {{ $("state").textContent = m.banner.text; $("banner").className = m.banner.state; }}
     const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 48;
     let missing = false;
     if (m.entries) {{

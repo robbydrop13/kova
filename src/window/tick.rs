@@ -299,6 +299,7 @@ impl KovaView {
         if let Some(panel) = ivars.side_panel.get() {
             panel.tick();
         }
+        self.tick_chat();
         let show_tab_bar = !self.sidebar_active();
         // Output or a scroll may have slid other text under a still pointer.
         self.refresh_stale_url_hover();

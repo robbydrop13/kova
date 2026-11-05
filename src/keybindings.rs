@@ -85,6 +85,8 @@ pub enum Action {
     PanelHistory,
     /// Cmd+U: the focused pane's unread mark.
     ToggleUnread,
+    /// Show the focused pane's Claude conversation as a chat, or its terminal again.
+    ToggleChat,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -375,6 +377,7 @@ impl Keybindings {
         bind(&keys.toggle_side_panel, Action::ToggleSidePanel);
         bind(&keys.panel_history, Action::PanelHistory);
         bind(&keys.toggle_unread, Action::ToggleUnread);
+        bind(&keys.toggle_chat, Action::ToggleChat);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);
@@ -481,6 +484,7 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "toggle-side-panel" => Action::ToggleSidePanel,
         "panel-history" => Action::PanelHistory,
         "toggle-unread" => Action::ToggleUnread,
+        "toggle-chat" => Action::ToggleChat,
 
         _ => return None,
     };

@@ -2,8 +2,6 @@
 //! is doing (KovaLink's readability rule 1): `Working · 1 min 12 s`,
 //! `Waiting for you`, `Done 3 min ago`, `Offline`.
 
-use serde::Serialize;
-
 /// What the pane says about its agent, read on the tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BannerInput {
@@ -19,10 +17,8 @@ pub struct BannerInput {
     pub last_activity: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Banner {
-    /// The page counts the time from `since` itself, every second.
     Working { since: Option<u64> },
     Waiting,
     Done { at: Option<u64> },
@@ -45,6 +41,18 @@ pub fn banner(input: BannerInput) -> Banner {
     Banner::Done { at: input.last_activity }
 }
 
+impl Banner {
+    /// The page's class for the state: its colour and its animation.
+    pub fn name(self) -> &'static str {
+        match self {
+            Banner::Working { .. } => "working",
+            Banner::Waiting => "waiting",
+            Banner::Done { .. } => "done",
+            Banner::Offline => "offline",
+        }
+    }
+}
+
 /// `1 min 12 s`, `45 s`, `2 h 03 min`: the duration the banner shows.
 pub fn duration(secs: u64) -> String {
     match secs {
@@ -64,9 +72,8 @@ pub fn ago(secs: u64) -> String {
     }
 }
 
-/// The banner's text at `now`. The page has the same rule in its script, to
-/// tick the clock without a round trip; this one is the reference the
-/// tests pin.
+/// The banner's text at `now`. The tick sends it again when it changes, so
+/// the clock moves once a second while the agent works.
 pub fn text(banner: Banner, now: u64) -> String {
     match banner {
         Banner::Working { since: Some(t) } => format!("Working · {}", duration(now.saturating_sub(t))),
@@ -112,9 +119,9 @@ mod tests {
     }
 
     #[test]
-    fn the_page_gets_the_state_and_the_clock_origin() {
-        let json = serde_json::to_value(Banner::Working { since: Some(5) }).unwrap();
-        assert_eq!(json, serde_json::json!({"state": "working", "since": 5}));
-        assert_eq!(serde_json::to_value(Banner::Offline).unwrap(), serde_json::json!({"state": "offline"}));
+    fn each_state_has_its_class_on_the_page() {
+        let names: Vec<&str> =
+            [Banner::Working { since: None }, Banner::Waiting, Banner::Done { at: None }, Banner::Offline].map(Banner::name).to_vec();
+        assert_eq!(names, ["working", "waiting", "done", "offline"]);
     }
 }

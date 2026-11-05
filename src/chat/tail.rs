@@ -55,10 +55,6 @@ impl Tail {
         (tail, lines)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// The lines added since the last read.
     pub fn read_more(&mut self) -> Read {
         let Ok(meta) = std::fs::metadata(&self.path) else { return Read::default() };
