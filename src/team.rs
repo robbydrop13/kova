@@ -22,13 +22,75 @@ use serde::Deserialize;
 /// closes a session, so a minute is plenty and cheap.
 pub const MAX_AGE_SECS: u64 = 60;
 
-/// Whether a roster entry has its session open.
+/// Whether a roster entry has its session open. The CLI may say more than
+/// open (`working`): any word but `closed` is an open session, so a new word
+/// never hides the whole roster.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
-    #[default]
-    Open,
     Closed,
+    #[default]
+    #[serde(other)]
+    Open,
+}
+
+/// What a session says it is doing, for the sessions board (`status` in the
+/// roster). A closed list; any other word is no status, and the row shows as
+/// it did before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    AwaitingYou,
+    AwaitingReview,
+    Blocked,
+    Queued,
+    WaitingEvent,
+    Working,
+    Done,
+}
+
+impl Status {
+    pub fn parse(word: &str) -> Option<Status> {
+        Some(match word {
+            "awaiting-you" => Status::AwaitingYou,
+            "awaiting-review" => Status::AwaitingReview,
+            "blocked" => Status::Blocked,
+            "queued" => Status::Queued,
+            "waiting-event" => Status::WaitingEvent,
+            "working" => Status::Working,
+            "done" => Status::Done,
+            _ => return None,
+        })
+    }
+
+    /// One glyph and one word, the row's status column.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Status::AwaitingYou => "\u{25cf}",
+            Status::AwaitingReview => "\u{25d0}",
+            Status::Blocked => "\u{25a0}",
+            Status::Queued => "\u{22ef}",
+            Status::WaitingEvent => "\u{25f7}",
+            Status::Working => "\u{25b8}",
+            Status::Done => "\u{2713}",
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Status::AwaitingYou => "à toi",
+            Status::AwaitingReview => "en revue",
+            Status::Blocked => "bloqué",
+            Status::Queued => "en file",
+            Status::WaitingEvent => "en attente",
+            Status::Working => "au travail",
+            Status::Done => "fini",
+        }
+    }
+}
+
+fn status_word<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Status>, D::Error> {
+    let word: Option<String> = Option::deserialize(d)?;
+    Ok(word.as_deref().and_then(Status::parse))
 }
 
 /// One manager or dedicated session, as the CLI reports it.
@@ -47,6 +109,12 @@ pub struct Entry {
     /// The argv that brings it back. Only `team reopen <name>` is ever run.
     #[serde(default)]
     pub reopen: Vec<String>,
+    /// What the session says it is doing, when it said.
+    #[serde(default, deserialize_with = "status_word")]
+    pub status: Option<Status>,
+    /// Who or what it waits on (`Ann : review`), when it waits.
+    #[serde(default)]
+    pub waiting_on: Option<String>,
 }
 
 /// The roster as last read. `available` is false when the CLI is missing or
@@ -332,6 +400,26 @@ mod tests {
         // An entry is found across both lists.
         assert_eq!(team.entry("delta-project").map(|e| e.role.as_str()), Some("delta"));
         assert_eq!(team.entry("nobody").map(|e| e.name.as_str()), None);
+    }
+
+    #[test]
+    fn a_session_status_and_a_new_state_word_read_without_hiding_the_roster() {
+        let team = Team::from_json(
+            r#"{"managers": [
+                {"name": "alpha-manager", "state": "working", "status": "awaiting-review",
+                 "doing": "the plan", "waiting_on": "Ann : review", "status_at": "2026-11-05T16:38:13+01:00"},
+                {"name": "beta-coach", "state": "closed", "status": null},
+                {"name": "gamma-coach", "state": "open", "status": "napping"}
+            ], "dedicated": []}"#,
+        )
+        .expect("a roster with statuses");
+        assert_eq!(team.managers[0].state, State::Open, "working is an open session");
+        assert_eq!(team.managers[0].status, Some(Status::AwaitingReview));
+        assert_eq!(team.managers[0].waiting_on.as_deref(), Some("Ann : review"));
+        assert_eq!(team.managers[1].state, State::Closed);
+        assert_eq!(team.managers[1].status, None);
+        assert_eq!(team.managers[2].status, None, "an unknown word is no status");
+        assert_eq!(Status::parse("waiting-event").map(Status::word), Some("en attente"));
     }
 
     #[test]
