@@ -17,6 +17,7 @@ mod ask_card;
 mod handoff;
 mod decision_sheet;
 mod bookmarks;
+mod chat;
 mod claude_history;
 mod claude_session;
 mod codex_session;
