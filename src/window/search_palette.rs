@@ -903,12 +903,15 @@ impl KovaView {
     }
 
     /// Have the pane `pane_id` of this window run its pending command once its
-    /// shell is up, instead of leaving it typed at the prompt.
-    fn run_pending_command_in(&self, pane_id: PaneId) {
+    /// shell is up, instead of leaving it typed at the prompt. True when this
+    /// window holds the pane.
+    pub(crate) fn run_pending_command_in(&self, pane_id: PaneId) -> bool {
         let tabs = self.ivars().tabs.borrow();
         if let Some(pane) = tabs.iter().find_map(|t| t.pane(pane_id)) {
             pane.run_pending_command();
+            return true;
         }
+        false
     }
 
     /// Open the search palette overlay (Cmd+Shift+F — global search across all panes).

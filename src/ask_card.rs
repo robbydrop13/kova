@@ -11,6 +11,11 @@
 //! adds an Open button that shows the sheet in the side panel without
 //! answering; the agent hears back when the user clicks Done.
 //!
+//! A handoff (`kova ask --open <url>` or `--run <name>`, `crate::handoff`)
+//! says `30 s pour toi`, shows the URL or the command under the message, and
+//! its first button (Ouvrir, Lancer) performs the step and keeps the card; the
+//! agent hears back on Fait.
+//!
 //! The card sits top-right of the screen, over everything, without taking the
 //! keyboard until the user clicks into it. One question at a time; the others
 //! wait behind it ("N more").
@@ -71,6 +76,11 @@ pub struct CardQuestion<'a> {
     pub asked_at: u64,
     /// A decision sheet's URL: the card says `New decision` and offers Open.
     pub decision_url: Option<&'a str>,
+    /// A handoff's step button (`crate::handoff`): the card says `30 s pour
+    /// toi`, and this button performs the step without answering.
+    pub step: Option<&'a str>,
+    /// Shown under the message: the URL a handoff opens or the command it runs.
+    pub detail: Option<&'a str>,
 }
 
 /// What the user answered: the button (or the first one, for Enter) and the
@@ -288,6 +298,7 @@ struct Current {
     /// What the copy control puts on the pasteboard.
     message: String,
     decision_url: Option<String>,
+    step: Option<String>,
 }
 
 /// Everything `show` last drew, to skip a redraw when nothing changed: the tick
@@ -303,6 +314,8 @@ struct Shown {
     asked_at: u64,
     waiting: usize,
     decision_url: Option<String>,
+    step: Option<String>,
+    detail: Option<String>,
     /// The palette the card was drawn with: a theme change redraws it.
     light: bool,
 }
@@ -600,12 +613,18 @@ impl Card {
     }
 
     /// Queue the answer and hide the card until the caller shows the next one.
+    /// A handoff's step is queued the same way but keeps the card: the board
+    /// performs it, and the question waits for `Fait`.
     fn answer(&self, action: String) {
-        let Some(id) = self.current.borrow().as_ref().map(|c| c.id.clone()) else { return };
+        let Some((id, step)) = self.current.borrow().as_ref().map(|c| (c.id.clone(), c.step.clone())) else { return };
         let text = self.field.stringValue().to_string().trim().to_string();
-        log::info!("Ask card: answered {} with {:?}", id, action);
+        let is_step = step.as_deref() == Some(action.as_str());
+        log::info!("Ask card: {} {} with {:?}", if is_step { "step on" } else { "answered" }, id, action);
         if let Ok(mut answers) = ANSWERS.lock() {
             answers.push(CardAnswer { id: id.clone(), action, text });
+        }
+        if is_step {
+            return;
         }
         *self.answered.borrow_mut() = Some(id);
         self.hide();
@@ -666,6 +685,8 @@ impl Card {
             asked_at: question.asked_at,
             waiting,
             decision_url: question.decision_url.map(str::to_string),
+            step: question.step.map(str::to_string),
+            detail: question.detail.map(str::to_string),
             light: light(),
         };
         if self.shown.borrow().as_ref() == Some(&shown) && self.panel.isVisible() {
@@ -677,6 +698,7 @@ impl Card {
             buttons: shown.buttons.clone(),
             message: shown.message.clone(),
             decision_url: shown.decision_url.clone(),
+            step: shown.step.clone(),
         });
         *self.shown.borrow_mut() = Some(shown);
 
@@ -692,23 +714,29 @@ impl Card {
             layer.setBorderColor(Some(&token(p.border_subtle).CGColor()));
         }
         let decision = question.decision_url.is_some();
-        // A decision names what it is; the asker moves to the meta line.
-        self.who.setStringValue(&ns(if decision { "New decision" } else { question.from }));
+        let handoff = question.step.is_some();
+        // A decision or a handoff names what it is; the asker moves to the meta line.
+        let header = if handoff { crate::handoff::HEADER } else if decision { "New decision" } else { question.from };
+        self.who.setStringValue(&ns(header));
         self.who.setTextColor(Some(&token(p.text_primary)));
         let (r, g, b) = crate::ask::agent_rgb(question.from);
         let tint = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
         if let Some(layer) = self.badge_holder.layer() {
-            let dot = if decision { token(p.awaiting) } else { tint };
+            let dot = if decision || handoff { token(p.awaiting) } else { tint };
             layer.setBackgroundColor(Some(&dot.CGColor()));
         }
         let time = short_time(question.asked_at);
-        let mut meta = if decision { format!("{} · {}", question.from, time) } else { time };
+        let mut meta = if decision || handoff { format!("{} · {}", question.from, time) } else { time };
         if waiting > 0 {
             meta = format!("{} · {} more", meta, waiting);
         }
         self.meta.setStringValue(&ns(&meta));
         self.meta.setTextColor(Some(&token(p.text_tertiary)));
-        self.body.setStringValue(&ns(question.message));
+        let body = match question.detail.filter(|d| !d.is_empty()) {
+            Some(detail) => format!("{}\n\n{}", question.message, detail),
+            None => question.message.to_string(),
+        };
+        self.body.setStringValue(&ns(&body));
         self.body.setTextColor(Some(&token(p.text_primary)));
         if is_new {
             self.field.setStringValue(&ns(""));

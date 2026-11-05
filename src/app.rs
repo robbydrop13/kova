@@ -382,6 +382,7 @@ impl AppDelegate {
                         }
                         asks.refresh_card(MainThreadMarker::new_unchecked());
                     }
+                    perform_handoff_steps(ivars);
                     // Decision sheets opened from the card: the front window's side panel.
                     let opens = crate::ask_card::take_panel_opens();
                     if !opens.is_empty() {
@@ -541,6 +542,8 @@ fn drain_ipc(ivars: &AppDelegateIvars, fps: u32) {
                     Ok(()) => crate::ipc::IpcResponse::Ok { data: None },
                     Err(message) => crate::ipc::IpcResponse::Error { message },
                 });
+                // Ouvrir or Lancer from the phone: performed on the Mac now.
+                perform_handoff_steps(ivars);
                 continue;
             }
             crate::ipc::IpcCommand::WithdrawAsks { ref session_id } => {
@@ -1653,6 +1656,59 @@ pub(crate) fn sheet_page(
     let delegate = app_delegate(mtm);
     let asks = delegate.ivars().asks.try_borrow().ok()?;
     asks.sheet(id)
+}
+
+/// Perform the handoff steps pressed since the last call, on the card, in
+/// the sidebar or from a remote client (`crate::handoff`): open the URL in the
+/// default browser, or run the declared command in a new tab of the front
+/// window. The questions stay open, waiting for `Fait`.
+fn perform_handoff_steps(ivars: &AppDelegateIvars) {
+    let steps = ivars.asks.borrow_mut().take_steps();
+    for step in steps {
+        match step {
+            crate::handoff::Step::Open { url } => crate::handoff::open_url(&url),
+            crate::handoff::Step::Run { name } => run_handoff_command(ivars, &name),
+        }
+    }
+}
+
+/// `Lancer`: the command of `handoff.toml`'s entry `name`, read now, in a new
+/// visible tab, run at once (the user pressed the button that says so).
+fn run_handoff_command(ivars: &AppDelegateIvars, name: &str) {
+    let entry = match crate::handoff::resolve(name) {
+        Ok(entry) => entry,
+        Err(e) => {
+            log::warn!("handoff: cannot run {}: {}", name, e);
+            return;
+        }
+    };
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let cwd = crate::handoff::expand_cwd(entry.cwd.as_deref(), &home);
+    if !std::path::Path::new(&cwd).is_dir() {
+        log::warn!("handoff: cannot run {}: {} is not a directory", name, cwd);
+        return;
+    }
+    let reply = handle_ipc_new_tab(&ivars.windows, &ivars.config, Some(cwd), Some(entry.command.clone()));
+    let crate::ipc::IpcResponse::Ok { data: Some(data) } = reply else {
+        log::warn!("handoff: cannot open a tab for {}", name);
+        return;
+    };
+    let Some(pane_id) = data.get("pane_id").and_then(|p| p.as_u64()).and_then(|p| u32::try_from(p).ok()) else { return };
+    if let Some(label) = entry.label {
+        handle_ipc_set_tab_title(&ivars.windows, pane_id, Some(label));
+    }
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let windows: Vec<_> = ivars.windows.borrow().clone();
+    for win in &windows {
+        if let Some(view) = kova_view(win)
+            && view.run_pending_command_in(pane_id)
+        {
+            #[allow(deprecated)]
+            NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+            win.makeKeyAndOrderFront(None);
+        }
+    }
+    log::info!("handoff: running {} in pane {}: {}", name, pane_id, entry.command);
 }
 
 fn open_in_front_panel(windows: &RefCell<Vec<Retained<NSWindow>>>, target: window::side_panel::PanelTarget) -> bool {

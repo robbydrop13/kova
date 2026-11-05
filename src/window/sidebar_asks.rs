@@ -221,6 +221,9 @@ pub struct AskCardVm {
     /// A decision sheet (`kova ask --decision`): a `Decision` tag, Open (the
     /// sheet in the side panel) in place of KO, OK answers Done.
     pub decision_url: Option<String>,
+    /// A handoff's step (`Ouvrir`, `Lancer`, `crate::handoff`): OK performs it
+    /// without answering, so the card stays as it is instead of `Sending`.
+    pub step: Option<String>,
 }
 
 /// The key the hit enum carries for a question id.
@@ -259,6 +262,7 @@ impl AskCardVm {
             back_at: if snoozed { local_hhmm(question.snoozed_until) } else { String::new() },
             permission: None,
             decision_url: question.panel_link(),
+            step: crate::handoff::step_button(question).map(String::from),
         }
     }
 
@@ -287,6 +291,7 @@ impl AskCardVm {
             back_at: String::new(),
             permission: Some(permission),
             decision_url: None,
+            step: None,
         }
     }
 }
@@ -609,11 +614,14 @@ fn answer(state: &mut AsksState, key: u64, option: usize, now_ms: u64) -> Option
         return None;
     }
     let card = state.card(key)?.clone();
-    state.transient = Some(TransientAsk {
-        card: card.clone(),
-        phase: TransientPhase::Sending,
-        until_ms: now_ms + SENDING_TIMEOUT_MS,
-    });
+    // A handoff's step leaves the question open: nothing to send.
+    if card.step.as_ref() != Some(&card.options[option]) {
+        state.transient = Some(TransientAsk {
+            card: card.clone(),
+            phase: TransientPhase::Sending,
+            until_ms: now_ms + SENDING_TIMEOUT_MS,
+        });
+    }
     Some(AskAction::Answer { id: card.id, action: card.options[option].clone(), text: String::new() })
 }
 
@@ -1778,6 +1786,7 @@ mod tests {
             back_at: String::new(),
             permission: None,
             decision_url: None,
+            step: None,
         }
     }
 
@@ -1846,6 +1855,7 @@ mod tests {
             snoozed_until: 0,
             kind: Some(crate::ask::KIND_DECISION.into()),
             url: Some("https://claude.ai/artifact/x".into()),
+            run: None,
             sheet: None,
             draft: None,
             follow_up: false,
@@ -1935,6 +1945,20 @@ mod tests {
         assert_eq!(sent.phase, TransientPhase::Sending);
         assert_eq!(queue.drain().len(), 1);
         assert_eq!(queue.drain().len(), 0);
+    }
+
+    #[test]
+    fn a_handoff_step_leaves_the_card_open_and_fait_sends_it() {
+        let mut handoff = card(7, "a", "Log in");
+        handoff.options = ["Ouvrir".into(), "Fait".into()];
+        handoff.step = Some("Ouvrir".into());
+        let mut st = state(vec![handoff]);
+        let step = click(&mut st, AsksHit::Ok(7), NOW_MS);
+        assert_eq!(step, Some(AskAction::Answer { id: "a".into(), action: "Ouvrir".into(), text: String::new() }));
+        assert!(st.transient.is_none(), "nothing is sent: the question stays");
+        let done = click(&mut st, AsksHit::Ko(7), NOW_MS + 16);
+        assert_eq!(done, Some(AskAction::Answer { id: "a".into(), action: "Fait".into(), text: String::new() }));
+        assert_eq!(st.transient.as_ref().map(|t| t.phase), Some(TransientPhase::Sending));
     }
 
     #[test]
@@ -2057,6 +2081,7 @@ mod tests {
             snoozed_until: 0,
             kind: None,
             url: None,
+            run: None,
             sheet: None,
             draft: None,
             follow_up: false,

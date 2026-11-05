@@ -320,12 +320,24 @@ action, or `action: text` when the user typed something.
   unanswered at Done stay in the user's Asks; the answer ends with `Still open … (question <id>)`,
   their answer comes later as a message, and `kova ask --drop <id>` takes them off once they no
   longer matter.
+- **A step only the user can do, so you can go on** (a browser login, a macOS setting): one card,
+  one button that does it, instead of a procedure in the chat.
+  `kova ask "Log in to the AWS console" --open https://<the login page>` or
+  `kova ask "Refresh the AWS session" --run <name>`. Exactly one of the two, no `--actions`. The
+  card says "30 s pour toi"; `Ouvrir` opens the http(s) URL in the default browser, `Lancer` runs
+  the command declared as `[commands.<name>]` (`command`, optional `cwd` and `label`) in
+  `~/.config/kova/handoff.toml` in a new Kova tab. Neither answers: the answer is `Fait` once the
+  user did it (or a snooze, as usual). `--run` takes a declared name only, never a command line,
+  and fails at once on an unknown name, listing the known ones; the user declares the command
+  himself, do not write that file.
 - `--no-input` (buttons only), `--from <name>` (name on the card), `--json`, `--socket <path>`.
   Outside a Kova pane the client finds Kova.app's socket on its own; from a pane of a library host
   (an app embedding Kova), it falls back to Kova.app too.
 - Pending questions can also be listed and answered over the socket, for a remote client:
   `{"cmd":"list-asks"}` returns `data.asks` (each question with its `buttons`), and
-  `{"cmd":"answer-ask","id":"<uuid>","action":"OK","text":"…"}` answers exactly like a click. **A
+  `{"cmd":"answer-ask","id":"<uuid>","action":"OK","text":"…"}` answers exactly like a click (on a
+  handoff, `kind: "handoff"` with a `handoff` block in `list-asks`, `Ouvrir` / `Lancer` perform
+  the step and keep the question open, `Fait` answers). **A
   session never answers in the user's place**: these are for the user's other devices, not for
   an agent. A native decision sheet is read with `{"cmd":"get-sheet","id":"<uuid>"}` (its JSON and
   the draft) and answered with `{"cmd":"answer-sheet","id":"<uuid>","answers":{"decisions":{"D1":

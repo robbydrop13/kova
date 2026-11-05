@@ -361,7 +361,10 @@ socket, with the same semantics as the panel:
 
 - `list-asks` gives each question `kind`, `url`, `sheet` (true for a native
   sheet), `decisions` and `answered` (counts, `null` without a sheet) and
-  `follow_up`.
+  `follow_up`. A handoff also carries `"handoff": {"step": "Ouvrir" | "Lancer",
+  "url", "run", "command", "label", "error"}`: `command` and `label` read from
+  `handoff.toml` at that moment, `error` when the entry can no longer be read
+  (`null` otherwise). Absent on any other question.
 - `get-sheet` with `id` → `{"id", "from", "message", "asked_at", "follow_up",
   "sheet": <the decision-sheet JSON>, "draft": {"decisions": [{"id", "choice",
   "note"}], "note"}}`. `choice` is an option id or `"other"`, absent when only
@@ -377,6 +380,32 @@ socket, with the same semantics as the panel:
   `done: true` answers the question as Done does: the asker gets the summary,
   what stayed open becomes a follow-up. Reply `{"title", "summary", "answered",
   "total", "done", "follow_up": <id or null>}`. Error when no such sheet waits.
+
+A **handoff** is one step only the user can do so that the agent can go on (a
+browser login, a macOS setting): `"kind": "handoff"` with exactly one of `"url"`
+(http(s), checked as above) and `"run"`, the name (`[A-Za-z0-9_-]`, 64 at most)
+of an entry of the user's `~/.config/kova/handoff.toml`:
+
+```toml
+[commands.aws-login]
+command = "aws sso login --profile dev"   # one line, no control character
+cwd = "~/work"                             # optional, the home directory by default
+label = "AWS login"                        # optional, the new tab's title
+```
+
+Unknown fields are refused, so is a name the file does not declare (`no handoff
+command '<name>' in <path>; known: a, b`), a missing or invalid file, a `run` on
+any other kind. **A command line never comes from the asker**: the question
+carries the name only, and Kova reads the command from the file each time it
+shows or runs it. The buttons are Kova's, whatever `actions` said: `["Ouvrir",
+"Fait"]` for a `url`, `["Lancer", "Fait"]` for a `run`, no text field. The card
+says `30 s pour toi` and shows the URL, or the command as the file writes it,
+under the message. `Ouvrir` opens the URL in the default browser (`open`);
+`Lancer` opens a new tab in the front window, in `cwd`, runs the command there
+and brings the window forward. Neither answers: the question stays, on the card
+too, until `Fait`, which answers it like any button (late delivery included).
+`kova ask "<message>" --open <url>` and `kova ask "<message>" --run <name>` build
+it; `--run` checks the name before sending.
 
 Not meant to be spoken by hand: `kova ask "<message>" [--actions OK,KO]` builds it
 from its environment (`CLAUDE_CODE_SESSION_ID`, or `PI_SESSION_FILE` /
@@ -478,7 +507,9 @@ included. `action` **must** be one of the buttons that question declared
 (`list-asks` lists them): the client picks among them and does not get to write
 the word the agent reads back, which is retyped into a terminal later. `text` is
 optional, 8 KiB at most, and trimmed. Errors: `no question <id>`, `"…" is not
-one of this question's buttons`.
+one of this question's buttons`. On a handoff, `Ouvrir` or `Lancer` performs the
+step on the Mac and keeps the question open (`{"ok":true}`, nothing reaches the
+asker); `Fait` answers it.
 
 ---
 

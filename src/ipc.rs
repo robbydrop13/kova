@@ -1222,6 +1222,8 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             }
             // Kova's own field: the answers given on the sheet, never the asker's.
             let mut question = question;
+            // A handoff names a declared command, never a command line; its buttons are Kova's.
+            crate::handoff::check_declared(&mut question)?;
             question.draft = None;
             question.follow_up = false;
             Ok(IpcCommand::Ask(Box::new(question)))
@@ -1718,6 +1720,20 @@ mod tests {
             Err(e) => panic!("ask with a sheet: {e}"),
         }
         assert!(err(&q(r#"{"title":"t","decisions":[]}"#)).starts_with("\"question.sheet\""));
+        // A handoff gets Kova's buttons whatever the asker sent, and its url is
+        // checked like a panel's; a run name on a plain question is refused.
+        let handoff = |fields: &str| format!(
+            r#"{{"cmd":"ask","question":{{"id":"0f8fad5b-d9cb-469f-a165-70867728950e","message":"m","from":{{"name":"a"}},"actions":["OK"],{fields}}}}}"#
+        );
+        match parse_command(&handoff(r#""kind":"handoff","url":"https://x.y/login""#)) {
+            Ok(IpcCommand::Ask(question)) => assert_eq!(question.actions, ["Ouvrir", "Fait"]),
+            Ok(_) => panic!("ask with a handoff"),
+            Err(e) => panic!("ask with a handoff: {e}"),
+        }
+        assert!(err(&handoff(r#""kind":"handoff","url":"file:///etc/passwd""#)).contains("http(s)"));
+        assert!(err(&handoff(r#""kind":"handoff""#)).contains("exactly one"));
+        assert!(err(&handoff(r#""run":"aws-login""#)).contains("handoff question only"));
+        assert!(err(&handoff(r#""kind":"handoff","run":"a; rm -rf ~""#)).contains("plain name"));
         let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
         match parse_command(&format!(
             r#"{{"cmd":"answer-ask","id":"{id}","action":"OK","text":"go"}}"#
