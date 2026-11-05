@@ -372,7 +372,9 @@ command = "open x-apple.systempreferences:com.apple.preference.security"
     fn an_invalid_handoff_toml_is_refused_with_its_reason() {
         assert!(parse("[commands.x]\ncwd = \"/\"").is_err(), "a command is required");
         assert!(parse("[commands.x]\ncommand = \"  \"").is_err());
-        assert!(parse("[commands.x]\ncommand = \"ls\nrm -rf ~\"").is_err(), "one line only");
+        let two_lines = parse(r#"[commands.x]
+command = "ls\nrm -rf ~""#).unwrap_err();
+        assert!(two_lines.contains("control characters"), "{}", two_lines);
         assert!(parse("[commands.x]\ncommand = \"ls\"\nshell = \"bash\"").is_err(), "unknown fields are typos");
         assert!(parse("[commands.\"a b\"]\ncommand = \"ls\"").is_err());
         assert!(parse("commands = 3").is_err());

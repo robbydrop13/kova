@@ -509,7 +509,9 @@ the word the agent reads back, which is retyped into a terminal later. `text` is
 optional, 8 KiB at most, and trimmed. Errors: `no question <id>`, `"…" is not
 one of this question's buttons`. On a handoff, `Ouvrir` or `Lancer` performs the
 step on the Mac and keeps the question open (`{"ok":true}`, nothing reaches the
-asker); `Fait` answers it.
+asker; an error when `Lancer` could not run, the entry gone or its `cwd` missing);
+`Fait` answers it, and `Other` is refused there (a handoff has no field). A second
+press of the step within 2 s is ignored (a double click runs it once).
 
 ---
 
