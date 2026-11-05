@@ -259,6 +259,7 @@ impl AppDelegate {
         // `[agent] claude_skip_permissions` applies to every resume line Kova
         // rebuilds, so it is set once here, where the config becomes active.
         crate::claude_session::set_skip_permissions(config.agent.claude_skip_permissions);
+        crate::ask::set_resume_tab(&config.agent.ask_resume_tab);
         let this = mtm.alloc::<Self>().set_ivars(AppDelegateIvars {
             windows: RefCell::new(Vec::new()),
             pending_close: RefCell::new(Vec::new()),

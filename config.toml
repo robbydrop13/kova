@@ -23,6 +23,8 @@
 # claude_skip_permissions = false   # add --dangerously-skip-permissions to every Claude resume line
 #                                   # (the flag survives on its own when the session was started with a
 #                                   #  plain `claude …`; it is lost when it was started through an alias)
+# ask_resume_tab = ""               # tab title where a conversation reopened for a late `kova ask` answer
+#                                   # goes, as a new column ("" = a new tab each time)
 
 # [splits]
 # min_width = 300.0            # minimum pane width before horizontal scroll kicks in

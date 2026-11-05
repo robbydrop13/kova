@@ -863,10 +863,60 @@ pub fn transcript_cwd(projects: &Path, session_id: &str) -> Option<String> {
         .find_map(|v| v.get("cwd").and_then(|c| c.as_str()).map(String::from))
 }
 
+/// `[agent] ask_resume_tab`: the tab title reopened conversations share, or
+/// empty for a new tab each time. Set once at startup.
+static RESUME_TAB: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn set_resume_tab(title: &str) {
+    if let Ok(mut t) = RESUME_TAB.lock() {
+        *t = title.trim().to_string();
+    }
+}
+
+fn resume_tab() -> String {
+    RESUME_TAB.lock().map(|t| t.clone()).unwrap_or_default()
+}
+
+/// In a `list-tabs` reply, a pane of the first tab titled `title`: where the
+/// next reopened conversation is split in.
+fn pane_of_tab_titled(tabs: &serde_json::Value, title: &str) -> Option<u64> {
+    tabs.get("data")?
+        .as_array()?
+        .iter()
+        .find(|t| t.get("title").and_then(|v| v.as_str()) == Some(title))?
+        .get("focused_pane_id")?
+        .as_u64()
+}
+
+/// Open a pane for `line` in `cwd`: a new column of the shared tab when
+/// `[agent] ask_resume_tab` names one, a new tab otherwise (or when the split
+/// fails). Returns the reply of the command that opened it.
+fn open_resume_pane(own_socket: &str, line: &str, cwd: Option<&str>) -> Option<serde_json::Value> {
+    let tab = resume_tab();
+    if tab.is_empty() {
+        return request(own_socket, serde_json::json!({"cmd": "new-tab", "command": line, "cwd": cwd}), Duration::from_secs(10));
+    }
+    let tabs = request(own_socket, serde_json::json!({"cmd": "list-tabs"}), Duration::from_secs(5));
+    if let Some(target) = tabs.as_ref().and_then(|t| pane_of_tab_titled(t, &tab)) {
+        let body = serde_json::json!({"cmd": "split", "direction": "horizontal", "pane_id": target, "command": line, "cwd": cwd});
+        let reply = request(own_socket, body, Duration::from_secs(10));
+        if reply.as_ref().and_then(|r| r.pointer("/data/pane_id")).is_some() {
+            return reply;
+        }
+        log::warn!("ask: could not split tab {:?} (reply {:?}), opening a new tab", tab, reply);
+    }
+    let reply = request(own_socket, serde_json::json!({"cmd": "new-tab", "command": line, "cwd": cwd}), Duration::from_secs(10));
+    if let Some(pane) = reply.as_ref().and_then(|r| r.pointer("/data/pane_id")).and_then(|v| v.as_u64()) {
+        request(own_socket, serde_json::json!({"cmd": "set-tab-title", "pane_id": pane, "title": tab}), Duration::from_secs(5));
+    }
+    reply
+}
+
 /// How long after Enter a reopened conversation must still be running.
 const RESUME_CHECK: Duration = Duration::from_secs(10);
 
-/// Reopen the conversation in a new tab of this Kova, in its directory, with
+/// Reopen the conversation in a new tab of this Kova (or a new column of the
+/// `[agent] ask_resume_tab` tab), in its directory, with
 /// the answer as its next prompt: visible, so the user sees the agent go on.
 fn resume(
     store: &AskStore,
@@ -907,8 +957,7 @@ fn resume(
         log::info!("ask {}: session {} ran in {}, not in the asker's cwd {}", id, session_id, dir, cwd.unwrap_or("-"));
     }
     let cwd = Some(dir.as_str());
-    let body = serde_json::json!({"cmd": "new-tab", "command": line, "cwd": cwd});
-    let reply = request(own_socket, body, Duration::from_secs(10));
+    let reply = open_resume_pane(own_socket, &line, cwd);
     let Some(pane) = reply.as_ref().and_then(|r| r.pointer("/data/pane_id")).and_then(|v| v.as_u64()) else {
         log::warn!("ask {}: could not reopen session {} (reply {:?}), {}", id, session_id, reply, kept());
         return;
@@ -1918,6 +1967,17 @@ mod tests {
         let mut anonymous = q.clone();
         anonymous.from.session_id = None;
         assert!(!asked_from(&anonymous, &own));
+    }
+
+    #[test]
+    fn a_reopened_conversation_finds_the_shared_tab_by_title() {
+        let tabs = serde_json::json!({"ok": true, "data": [
+            {"id": 1, "title": "claude", "focused_pane_id": 4},
+            {"id": 2, "title": "Kova ask", "focused_pane_id": 9},
+            {"id": 3, "title": "Kova ask", "focused_pane_id": 12}]});
+        assert_eq!(pane_of_tab_titled(&tabs, "Kova ask"), Some(9), "the first tab with that title");
+        assert_eq!(pane_of_tab_titled(&tabs, "Asks"), None);
+        assert_eq!(pane_of_tab_titled(&serde_json::json!({"ok": false}), "Kova ask"), None);
     }
 
     #[test]

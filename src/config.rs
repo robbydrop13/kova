@@ -33,6 +33,10 @@ pub struct AgentConfig {
     /// refuses to rewrite because it cannot know what the alias expands to.
     /// This setting says to put it back.
     pub claude_skip_permissions: bool,
+    /// The tab where a conversation reopened to receive a late `kova ask`
+    /// answer goes, as a new column. Empty (the default): a new tab each time.
+    /// The tab is found by its title and created with it when none has it.
+    pub ask_resume_tab: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
