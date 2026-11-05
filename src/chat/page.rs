@@ -123,35 +123,41 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
     let start = if users.len() > exchanges { users[users.len() - exchanges] } else { 0 };
     let mut out = Vec::new();
     let mut group: Vec<&Tool> = Vec::new();
-    let flush = |group: &mut Vec<&Tool>, out: &mut Vec<Entry>| {
+    // Only the current turn's calls can be running: one from an earlier turn
+    // that never got its result was stopped.
+    let last_user = users.last().copied();
+    let mut current = last_user.is_none();
+    let flush = |group: &mut Vec<&Tool>, out: &mut Vec<Entry>, live: bool| {
         if !group.is_empty() {
-            out.push(tool_group(group, working));
+            let entry = tool_group(group, live, out.len());
+            out.push(entry);
             group.clear();
         }
     };
-    for item in &conv.items[start..] {
+    for (n, item) in conv.items.iter().enumerate().skip(start) {
         match item {
             Item::User { id, text, .. } => {
-                flush(&mut group, &mut out);
+                flush(&mut group, &mut out, false);
+                current = Some(n) == last_user;
                 out.push(Entry {
                     id: format!("u:{id}"),
                     html: format!(r#"<div class="user"><div class="bubble">{}</div></div>"#, escape(text)),
                 });
             }
             Item::Note { id, text } => {
-                flush(&mut group, &mut out);
+                flush(&mut group, &mut out, working && current);
                 out.push(Entry { id: format!("n:{id}"), html: format!(r#"<div class="note">{}</div>"#, escape(text)) });
             }
             Item::Assistant { id, blocks, .. } => {
                 for (k, block) in blocks.iter().enumerate() {
                     match &block.kind {
                         BlockKind::Text(text) => {
-                            flush(&mut group, &mut out);
+                            flush(&mut group, &mut out, working && current);
                             out.push(Entry { id: format!("t:{id}:{k}"), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) });
                         }
                         BlockKind::Tool(tool) => group.push(tool),
                         BlockKind::Image => {
-                            flush(&mut group, &mut out);
+                            flush(&mut group, &mut out, working && current);
                             out.push(Entry { id: format!("i:{id}:{k}"), html: r#"<div class="note">image</div>"#.to_string() });
                         }
                         // A thinking block has no text worth showing (its
@@ -163,7 +169,7 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
             }
         }
     }
-    flush(&mut group, &mut out);
+    flush(&mut group, &mut out, working && current);
     (out, start > 0)
 }
 
@@ -213,8 +219,10 @@ fn tool_row(tool: &Tool, working: bool) -> String {
     )
 }
 
-fn tool_group(tools: &[&Tool], working: bool) -> Entry {
-    let id = format!("g:{}", tools[0].id);
+fn tool_group(tools: &[&Tool], working: bool, at: usize) -> Entry {
+    // A call without an id (never seen, but nothing forbids it) is keyed by
+    // its place, so two of them do not share one node on the page.
+    let id = if tools[0].id.is_empty() { format!("g:@{at}") } else { format!("g:{}", tools[0].id) };
     let rows: String = tools.iter().map(|t| tool_row(t, working)).collect();
     if tools.len() <= GROUP_FOLD_OVER {
         return Entry { id, html: format!(r#"<div class="tools">{rows}</div>"#) };
@@ -363,7 +371,7 @@ body {{ display: flex; flex-direction: column; }}
   border-radius: 6px; padding: 2px 8px; cursor: pointer; }}
 #banner button:hover {{ color: var(--t1); border-color: var(--b2); }}
 @keyframes pulse {{ 0%, 100% {{ opacity: .35; }} 50% {{ opacity: 1; }} }}
-#scroll {{ flex: 1; overflow-y: auto; padding: 16px 18px 8px; }}
+#scroll {{ flex: 1; overflow-y: auto; padding: 16px 18px 8px; position: relative; }}
 #log {{ max-width: 860px; margin: 0 auto; }}
 #more {{ display: none; margin: 0 auto 12px; font: inherit; font-size: 12px; color: var(--t3); background: none;
   border: 1px solid var(--b3); border-radius: 6px; padding: 3px 10px; cursor: pointer; }}
@@ -435,7 +443,8 @@ body {{ display: flex; flex-direction: column; }}
 <textarea id="box" rows="1" placeholder="Message Claude"></textarea><div id="note"></div></div>
 <script nonce="{nonce}">
 (function () {{
-  const post = (m) => {{ try {{ window.webkit.messageHandlers.{handler}.postMessage(JSON.stringify(m)); }} catch (e) {{}} }};
+  // Each message carries this load's nonce: Kova drops one from another load.
+  const post = (m) => {{ try {{ m.load = "{nonce}"; window.webkit.messageHandlers.{handler}.postMessage(JSON.stringify(m)); }} catch (e) {{}} }};
   const $ = (id) => document.getElementById(id);
   const log = $("log"), scroll = $("scroll"), box = $("box"), cardsEl = $("cards");
   const opened = new Set();
@@ -623,6 +632,14 @@ mod tests {
         assert_eq!(ids(&entries), ["u:u1", "g:a", "t:r3:0", "g:c"]);
         assert_eq!(entries[1].html.matches(r#"class="tool""#).count(), 2, "a thinking block does not split the run");
         assert!(!entries[1].html.contains("actions"), "five calls or fewer are not folded into a group");
+    }
+
+    #[test]
+    fn only_the_current_turn_has_a_running_call() {
+        let c = conv(vec![user("u1", "go"), tool("r1", 0, "old"), user("u2", "next"), tool("r2", 0, "new")]);
+        let (e, _) = entries(&c, EXCHANGES_STEP, true);
+        assert!(e[1].html.contains(r#"class="st stop""#), "an earlier turn's call without result was stopped");
+        assert!(e[3].html.contains(r#"class="st run""#));
     }
 
     #[test]

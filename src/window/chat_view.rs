@@ -80,10 +80,16 @@ struct ChatState {
     note: Option<String>,
     restore: Option<String>,
     last_poll: Option<std::time::Instant>,
+    /// The nonce of the page loaded for this pane: a message carrying
+    /// another one was posted by an earlier load.
+    load: String,
+    /// The last lookup of a transcript not written yet (a scan of every
+    /// project folder when the cwd is unknown): once a second at most.
+    looked: Option<std::time::Instant>,
 }
 
 impl ChatState {
-    fn new(pane_id: PaneId) -> Self {
+    fn new(pane_id: PaneId, load: String) -> Self {
         ChatState {
             pane_id,
             session: None,
@@ -108,6 +114,8 @@ impl ChatState {
             note: None,
             restore: None,
             last_poll: None,
+            load,
+            looked: None,
         }
     }
 
@@ -280,10 +288,13 @@ impl KovaView {
         };
         let mtm = MainThreadMarker::from(self);
         let web = self.chat_web_view(mtm);
+        if slot.delegate.get().is_some_and(|d| d.ivars().crashed.take()) {
+            slot.state.replace(None);
+        }
         let fresh = slot.state.borrow().as_ref().is_none_or(|st| st.pane_id != target.pane_id);
         if fresh {
-            slot.state.replace(Some(ChatState::new(target.pane_id)));
             let nonce = crate::ask::new_question_id().replace('-', "");
+            slot.state.replace(Some(ChatState::new(target.pane_id, nonce.clone())));
             let title = self.with_pane(target.pane_id, |p| p.display_title("Chat")).unwrap_or_default();
             let html = page::shell(&theme(), &title, &nonce);
             unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
@@ -362,6 +373,9 @@ impl KovaView {
     fn chat_message(&self, st: &mut ChatState, pane: &Pane, raw: &str) -> Reply {
         let Ok(msg) = serde_json::from_str::<Value>(raw) else { return Reply::Nothing };
         let s = |k: &str| msg.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        if s("load") != st.load {
+            return Reply::Nothing;
+        }
         match msg.get("type").and_then(Value::as_str).unwrap_or_default() {
             "ready" => {
                 st.ready = true;
@@ -408,19 +422,27 @@ impl KovaView {
                     (Some(q), Some(c)) if cards::offers(c, &action) => crate::ask::accepts_external_answer(q, &action, &text),
                     _ => Err("this question is no longer waiting".to_string()),
                 };
-                match checked {
+                // The page disabled the card's buttons. They come back when
+                // the answer is refused, or after a handoff's step (the
+                // question waits for Fait); an answer taken leaves them off.
+                let again = match checked {
                     Ok(()) => {
+                        let step = question.is_some_and(|q| crate::handoff::detail(q).is_some());
                         let mtm = MainThreadMarker::from(self);
                         crate::app::app_delegate(mtm)
                             .ivars()
                             .queue_ask_action(super::sidebar_asks::AskAction::Answer { id: id.clone(), action, text });
+                        step
                     }
-                    Err(e) => st.note = Some(e),
+                    Err(e) => {
+                        st.note = Some(e);
+                        true
+                    }
+                };
+                if again {
+                    st.sent_cards.remove(&id);
+                    st.shown_cards = None;
                 }
-                // The page disabled the card's buttons: send it again, enabled,
-                // in case the question stays (a handoff step).
-                st.sent_cards.remove(&id);
-                st.shown_cards = None;
                 Reply::Push
             }
             "open" => {
@@ -438,11 +460,12 @@ impl KovaView {
                     (Some(prompt), Some(choice)) if cards::permission_id(prompt) == id => pane.answer_permission(prompt, choice.into()),
                     _ => false,
                 };
+                // Typed: the card stays off until the prompt leaves the screen.
                 if !typed {
                     st.note = Some("The prompt changed: look at the terminal".to_string());
+                    st.sent_cards.remove(&id);
+                    st.shown_cards = None;
                 }
-                st.sent_cards.remove(&id);
-                st.shown_cards = None;
                 Reply::Push
             }
             _ => Reply::Nothing,
@@ -504,7 +527,9 @@ fn type_into(pane: &Pane, text: &str) {
 fn gate(pane: &Pane) -> input::Verdict {
     let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
     input::gate(input::GateInput {
-        has_session: pane.claude_session_id().is_some(),
+        // The session id lags Claude's exit; a fresh probe of the foreground
+        // process does not, so a shell's own `❯` never reads as Claude's.
+        has_session: pane.claude_session_id().is_some() && pane.pty.foreground_process().is_some(),
         working: pane.is_working(),
         permission_prompt: pane.has_permission_prompt() || crate::prompt_preview::parse_permission_prompt(&visible).is_some(),
         composer: input::composer(&visible),
@@ -540,7 +565,9 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
                 st.tail = None;
             }
         }
+        (None, Some(_)) if st.looked.is_some_and(|t| t.elapsed().as_millis() < 1000) => {}
         (None, Some(id)) => {
+            st.looked = Some(std::time::Instant::now());
             let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
             let cwd = pane.cached_cwd();
             if let Some(path) = crate::chat::transcript_path(&home, pane.claude_config_dir().as_deref(), cwd.as_deref(), id) {
@@ -662,6 +689,8 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
 pub struct ChatDelegateIvars {
     /// The page's messages since the last tick.
     inbox: RefCell<Vec<String>>,
+    /// The page's process died: the next tick loads it again.
+    crashed: Cell<bool>,
 }
 
 impl ChatDelegateIvars {
@@ -705,6 +734,12 @@ define_class!(
                 WKNavigationActionPolicy::Cancel
             };
             handler.call((policy,));
+        }
+
+        #[unsafe(method(webViewWebContentProcessDidTerminate:))]
+        fn content_process_did_terminate(&self, _web_view: &WKWebView) {
+            log::warn!("chat: the page's process ended, loading it again");
+            self.ivars().crashed.set(true);
         }
     }
 

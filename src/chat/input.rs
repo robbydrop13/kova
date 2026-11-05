@@ -61,8 +61,12 @@ pub fn composer(visible: &str) -> Composer {
     if !after.is_empty() && !after.starts_with(PLACEHOLDER_PREFIX) {
         return Composer::Typed;
     }
-    let pasted = lines[i..lines.len().min(i + COMPOSER_TAIL_LINES)].iter().any(|l| l.contains(PASTED_PREFIX));
-    if pasted { Composer::Typed } else { Composer::Empty }
+    let tail = &lines[i + 1..lines.len().min(i + COMPOSER_TAIL_LINES)];
+    let pasted = tail.iter().any(|l| l.contains(PASTED_PREFIX));
+    // A draft that starts with a new line: text under the `❯`, above the
+    // composer's bottom rule.
+    let below = tail.iter().position(|l| l.trim_start().starts_with('\u{2500}')).is_some_and(|end| tail[..end].iter().any(|l| !l.trim().is_empty()));
+    if pasted || below { Composer::Typed } else { Composer::Empty }
 }
 
 /// What the pane says, for the gate.
@@ -214,6 +218,7 @@ mod tests {
         assert_eq!(composer("output\n───\n❯ \n───\n  ? for shortcuts"), Composer::Empty);
         assert_eq!(composer("❯ fix the bug\n"), Composer::Typed);
         assert_eq!(composer("❯ \n  [Pasted text #2 +11 lines]"), Composer::Typed);
+        assert_eq!(composer("───\n❯ \n  second line of a draft\n───\n  ? for shortcuts"), Composer::Typed, "a draft starting with a new line");
         assert_eq!(composer("❯ │"), Composer::Empty, "the frame's box drawing is not text");
         assert_eq!(composer("❯ \n Do you want to proceed?\n ❯ 1. Yes\n   2. No"), Composer::Unreadable, "a menu is no composer");
         assert_eq!(composer("❯ Try \"refactor <filepath>\""), Composer::Empty, "the start hint is not a draft");

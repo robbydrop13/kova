@@ -66,15 +66,20 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
 
 Every text from the transcript is escaped by Rust. Markdown shows raw HTML
 as text, keeps a link only to http(s) or mailto (it opens in the default
-browser) and never loads an image. The page's content security policy runs
+browser; a link to anything else is shown as its text) and never loads an
+image. Every message the page posts carries its load's nonce: one from an
+earlier load (another pane) is dropped. The page's content security policy runs
 only the script carrying the load's nonce.
 
 ## The input box
 
 Enter sends, Shift+Enter is a new line. The text goes to the pane's PTY as
 a paste (bracketed when Claude Code asked for it), then Enter on its own
-300 ms later, only when Claude is idle with an empty prompt
-(`chat::input::gate`):
+300 ms later, only when Claude is the pane's foreground process, idle, with
+an empty prompt (`chat::input::gate`). The Enter is written only while the
+prompt still shows the pasted text and no permission prompt came up, and
+not at all when it is more than 2 s late: the text then waits in the
+terminal's prompt, with a note.
 
 | The pane | The message |
 |---|---|
@@ -113,3 +118,7 @@ At the bottom of the thread, above the box:
   switch made while it is shown.
 - The expanded state of tool rows is lost when the page reloads (another
   pane shown as a chat in the window).
+- The outbox lives with the page: a message still queued is dropped when
+  the window shows another pane as a chat.
+- The first 4 MB are parsed on the main thread, and every change renders the
+  shown entries' markdown again.
