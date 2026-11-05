@@ -13,7 +13,7 @@ input gate, cards, page; all unit-tested), the AppKit half in
 
 | From | What |
 |---|---|
-| Cmd+Option+C (`toggle_chat`), Pane > Show as Chat, IPC `dispatch-action` `toggle-chat` | the focused pane as a chat, or its terminal again |
+| Cmd+Option+T (`toggle_chat`; not Cmd+Option+C, taken by Alfred's clipboard viewer), Pane > Show as Chat, IPC `dispatch-action` `toggle-chat` | the focused pane as a chat, or its terminal again |
 | The banner's Terminal button | the terminal again |
 
 A pane without a Claude conversation stays a terminal, with a note in the

@@ -655,7 +655,7 @@ impl Default for KeysConfig {
             toggle_sidebar: "cmd+option+s".into(),
             toggle_side_panel: "cmd+option+b".into(),
             panel_history: "cmd+option+y".into(),
-            toggle_chat: "cmd+option+c".into(),
+            toggle_chat: "cmd+option+t".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

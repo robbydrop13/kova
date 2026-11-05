@@ -1026,7 +1026,7 @@ define_class!(
             self.toggle_side_panel();
         }
 
-        /// Pane menu: `Show as Chat` (Cmd+Option+C).
+        /// Pane menu: `Show as Chat` (Cmd+Option+T; Cmd+Option+C is Alfred's clipboard hotkey).
         #[unsafe(method(toggleChatFromMenu:))]
         fn toggle_chat_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
             self.toggle_chat();
