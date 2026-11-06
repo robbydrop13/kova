@@ -875,6 +875,9 @@ pub fn pane_attention(term: &TerminalState, seen: bool) -> (bool, bool) {
 /// A blank terminal state sized `cols`×`rows`, with the configured scrollback
 /// and default colours.
 fn new_terminal(cols: u16, rows: u16, config: &Config) -> Arc<RwLock<TerminalState>> {
+    // The defaults of the active theme, not those of the config the window
+    // was created with: the theme may have switched since.
+    let config = &crate::theme::themed(config);
     Arc::new(RwLock::new(TerminalState::new(
         cols,
         rows,

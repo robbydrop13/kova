@@ -73,6 +73,7 @@ pub fn persist() {
         mode: Some(layout_mode()),
         sidebar_width: Some(width_pt()),
         panel_fraction: Some(super::side_panel::fraction()),
+        theme: Some(crate::theme::mode()),
     }
     .save();
 }

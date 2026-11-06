@@ -922,6 +922,7 @@ toggle-help  mem-report
 toggle-sidebar                     (switch the layout between the tab bar and the sidebar, see sidebar-spec.md)
 toggle-side-panel                  (show or hide the side panel at the right, see side-panel.md)
 panel-history                      (the side panel on what it opened lately, see side-panel.md)
+cycle-theme                        (the next appearance: light, dark, the system's; View menu)
 toggle-chat                        (the focused pane's Claude conversation as a chat, or its terminal again;
                                     with pane_id that pane is focused first. A pane without a Claude
                                     conversation stays a terminal. See chat-mode.md)

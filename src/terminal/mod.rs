@@ -1246,6 +1246,35 @@ impl TerminalState {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
+    /// The theme switched: every colour drawn with the old defaults or ANSI
+    /// slots takes the new one, on screen, in the scrollback and in the
+    /// alternate screen, and so does what the next printed cell will get. The
+    /// old defaults are this terminal's own; `from_ansi` is the palette that
+    /// was active.
+    pub fn recolor(&mut self, from_ansi: &[[u8; 3]; 16], to: &crate::theme::TermColors) {
+        let from = crate::theme::TermColors { fg: self.default_fg, bg: self.default_bg, ansi: *from_ansi };
+        let fg = |c: [u8; 3]| crate::theme::recolor(c, true, &from, to);
+        let bg = |c: [u8; 3]| crate::theme::recolor(c, false, &from, to);
+        let rows = self.grid.iter_mut().chain(self.scrollback.iter_mut()).chain(self.alt_grid.iter_mut().flatten());
+        for row in rows {
+            for cell in row.cells.iter_mut() {
+                cell.fg = fg(cell.fg);
+                cell.bg = bg(cell.bg);
+            }
+        }
+        self.blank.fg = fg(self.blank.fg);
+        self.blank.bg = bg(self.blank.bg);
+        self.current_fg = fg(self.current_fg);
+        self.current_bg = bg(self.current_bg);
+        if let Some(saved) = self.saved_cursor.as_mut() {
+            saved.fg = fg(saved.fg);
+            saved.bg = bg(saved.bg);
+        }
+        self.default_fg = to.fg;
+        self.default_bg = to.bg;
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
     pub fn set_sgr(&mut self, params: &[u16]) {
         let mut i = 0;
         while i < params.len() {
@@ -3263,6 +3292,29 @@ pub fn doc_path_span(chars: &[char], col: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recolor_moves_screen_scrollback_and_defaults_to_the_new_theme() {
+        use crate::theme::{TermColors, DARK_ANSI, LIGHT_ANSI};
+        let dark_fg = [255, 255, 255];
+        let dark_bg = [25, 25, 30];
+        let mut t = TerminalState::new(10, 2, 100, dark_fg, dark_bg);
+        t.set_sgr(&[31]);
+        t.put_char('r');
+        t.set_sgr(&[0]);
+        t.put_char('d');
+        t.set_sgr(&[38, 2, 10, 200, 90]);
+        t.put_char('x');
+        let light = TermColors { fg: [36, 36, 36], bg: [255, 255, 255], ansi: LIGHT_ANSI };
+        t.recolor(&DARK_ANSI, &light);
+        let row = &t.grid[0].cells;
+        assert_eq!(row[0].fg, LIGHT_ANSI[1]);
+        assert_eq!(row[1].fg, light.fg);
+        assert_eq!(row[1].bg, light.bg);
+        assert_eq!(row[2].fg, [10, 200, 90]);
+        assert_eq!(t.grid[1].cells[5].bg, light.bg);
+        assert_eq!((t.default_fg, t.default_bg), (light.fg, light.bg));
+    }
 
     #[test]
     fn scroll_crossed_page_fires_once_per_page_going_up() {

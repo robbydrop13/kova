@@ -1120,25 +1120,27 @@ impl AnsiColor {
         }
     }
 
+    /// The colour of this slot in the active theme (`theme::ansi`).
     pub fn to_rgb(&self) -> [u8; 3] {
-        match self {
-            Self::Black => [0, 0, 0],
-            Self::Red => [204, 51, 51],
-            Self::Green => [51, 204, 51],
-            Self::Yellow => [204, 204, 51],
-            Self::Blue => [77, 77, 230],
-            Self::Magenta => [204, 51, 204],
-            Self::Cyan => [51, 204, 204],
-            Self::White => [191, 191, 191],
-            Self::BrightBlack => [102, 102, 102],
-            Self::BrightRed => [255, 77, 77],
-            Self::BrightGreen => [77, 255, 77],
-            Self::BrightYellow => [255, 255, 77],
-            Self::BrightBlue => [128, 128, 255],
-            Self::BrightMagenta => [255, 77, 255],
-            Self::BrightCyan => [77, 255, 255],
-            Self::BrightWhite => [255, 255, 255],
-        }
+        let idx = match self {
+            Self::Black => 0,
+            Self::Red => 1,
+            Self::Green => 2,
+            Self::Yellow => 3,
+            Self::Blue => 4,
+            Self::Magenta => 5,
+            Self::Cyan => 6,
+            Self::White => 7,
+            Self::BrightBlack => 8,
+            Self::BrightRed => 9,
+            Self::BrightGreen => 10,
+            Self::BrightYellow => 11,
+            Self::BrightBlue => 12,
+            Self::BrightMagenta => 13,
+            Self::BrightCyan => 14,
+            Self::BrightWhite => 15,
+        };
+        crate::theme::ansi(crate::theme::is_light())[idx]
     }
 
     pub fn from_256(idx: u8) -> [u8; 3] {

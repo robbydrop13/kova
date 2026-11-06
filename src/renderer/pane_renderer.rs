@@ -64,7 +64,7 @@ impl PaneStyle {
             bg_color_u8: crate::terminal::color_to_u8(config.colors.background),
             cursor_color: config.colors.cursor,
             paste_block_color: config.colors.paste_block,
-            selection_color: [0.45, 0.42, 0.20],
+            selection_color: crate::theme::selection_color(),
             list_selected_bg: config.switcher.selected_bg,
             status_bar_enabled: config.status_bar.enabled,
             dim_opacity: config.splits.dim_opacity,

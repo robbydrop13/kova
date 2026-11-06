@@ -138,7 +138,7 @@ impl KovaView {
         let terminal_for_renderer = tabs[active_tab].first_pane().terminal.clone();
 
         let renderer = Arc::new(parking_lot::RwLock::new(
-            Renderer::new(&device, &layer, terminal_for_renderer, scale, config),
+            Renderer::new(&device, &layer, terminal_for_renderer, scale, &crate::theme::themed(config)),
         ));
 
         self.ivars().renderer.set(renderer).ok();

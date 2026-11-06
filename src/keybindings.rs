@@ -87,6 +87,8 @@ pub enum Action {
     ToggleUnread,
     /// Show the focused pane's Claude conversation as a chat, or its terminal again.
     ToggleChat,
+    /// The next appearance: light, dark, the system's, and round again.
+    CycleTheme,
 }
 
 /// Terminal-level actions dispatched from handle_key_event.
@@ -378,6 +380,7 @@ impl Keybindings {
         bind(&keys.panel_history, Action::PanelHistory);
         bind(&keys.toggle_unread, Action::ToggleUnread);
         bind(&keys.toggle_chat, Action::ToggleChat);
+        bind(&keys.cycle_theme, Action::CycleTheme);
 
         // Hard-coded debug binding (not user-configurable)
         window_map.insert(parse_key_combo("cmd+shift+i"), Action::MemReport);
@@ -485,6 +488,7 @@ pub fn action_from_ipc_name(name: &str) -> Option<Action> {
         "panel-history" => Action::PanelHistory,
         "toggle-unread" => Action::ToggleUnread,
         "toggle-chat" => Action::ToggleChat,
+        "cycle-theme" => Action::CycleTheme,
 
         _ => return None,
     };

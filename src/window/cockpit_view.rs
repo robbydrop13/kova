@@ -103,6 +103,8 @@ struct Page {
     last_poll: Option<std::time::Instant>,
     /// The items of the last render: what a click names.
     items: Vec<Item>,
+    /// The theme the page was loaded in (`theme::generation`).
+    theme: u64,
     /// A permission card's prompt as rendered, by key: a click answers it
     /// only if the screen still shows that prompt.
     prompts: HashMap<String, String>,
@@ -282,9 +284,10 @@ impl KovaView {
         let mtm = MainThreadMarker::from(self);
         let web = self.cockpit_web_view(mtm);
         let crashed = slot.delegate.get().is_some_and(|d| d.ivars().crashed.take());
-        if crashed || slot.page.borrow().load.is_empty() {
+        let theme = crate::theme::generation();
+        if crashed || slot.page.borrow().load.is_empty() || slot.page.borrow().theme != theme {
             let nonce = crate::ask::new_question_id().replace('-', "");
-            *slot.page.borrow_mut() = Page { load: nonce.clone(), ..Default::default() };
+            *slot.page.borrow_mut() = Page { load: nonce.clone(), theme, ..Default::default() };
             let html = cockpit::shell(tokens::get() == &tokens::LIGHT, &nonce);
             unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
         }

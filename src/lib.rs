@@ -43,6 +43,7 @@ mod search_history;
 mod surface;
 mod tab_colors;
 mod terminal;
+mod theme;
 mod update_check;
 mod team;
 mod attention;

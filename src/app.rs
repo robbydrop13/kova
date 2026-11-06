@@ -101,7 +101,7 @@ define_class!(
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
             window::sidebar::init(&config.layout);
             window::side_panel::init(crate::config::LayoutPrefs::load().panel_fraction);
-            window::sidebar::tokens::set_background(config.colors.background);
+            init_theme(mtm, config);
             crate::team::set_command(&config.sidebar.roster_command);
             crate::attention::set_commands(&config.attention.commands());
             crate::catchup::set_commands(&config.attention.catchup_commands());
@@ -310,6 +310,8 @@ impl AppDelegate {
                     // before the NSWindow/KovaView is deallocated.
                     ivars.pending_close.borrow_mut().clear();
 
+
+                    poll_system_theme(MainThreadMarker::new_unchecked());
 
                     // The need list scans every window's panes: build it once
                     // per tick and let each window read the same one.
@@ -1765,7 +1767,7 @@ fn handle_ipc_open_panel(windows: &RefCell<Vec<Retained<NSWindow>>>, target: &st
 fn handle_ipc_reload_config(
     windows: &RefCell<Vec<Retained<NSWindow>>>,
 ) -> crate::ipc::IpcResponse {
-    let config = Config::load();
+    let config = crate::theme::themed(&Config::load());
     // The sidebar follows the terminal background, and the roster and
     // attention commands are read here too: all are re-picked on a reload,
     // not only on a restart.
@@ -1874,6 +1876,89 @@ fn handle_ipc_merge_window(
     IpcResponse::Ok { data: None }
 }
 
+/// Whether macOS draws dark right now. Read from the app's effective
+/// appearance, which is the system's as long as the app sets none of its own
+/// (System mode clears it).
+fn system_is_dark(mtm: MainThreadMarker) -> bool {
+    use objc2_app_kit::{NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+    let app = NSApplication::sharedApplication(mtm);
+    let (aqua, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
+    let names = objc2_foundation::NSArray::from_slice(&[aqua, dark]);
+    app.effectiveAppearance().bestMatchFromAppearancesWithNames(&names).is_some_and(|n| &*n == dark)
+}
+
+/// The app's own appearance for `mode`: menus, the ask cards' fields and the
+/// pages of the side panel (`prefers-color-scheme`) follow it. None in System
+/// mode, so macOS decides and `system_is_dark` reads it.
+fn set_app_appearance(mtm: MainThreadMarker, mode: crate::theme::ThemeMode) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+    let name = match mode {
+        crate::theme::ThemeMode::Light => Some(unsafe { NSAppearanceNameAqua }),
+        crate::theme::ThemeMode::Dark => Some(unsafe { NSAppearanceNameDarkAqua }),
+        crate::theme::ThemeMode::System => None,
+    };
+    let appearance = name.and_then(NSAppearance::appearanceNamed);
+    NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
+}
+
+/// The theme `prefs.json` remembered, resolved before the first window so
+/// every terminal starts in it.
+fn init_theme(mtm: MainThreadMarker, config: &Config) {
+    let mode = crate::config::LayoutPrefs::load().theme.unwrap_or_default();
+    set_app_appearance(mtm, mode);
+    crate::theme::set(mode, system_is_dark(mtm));
+    window::sidebar::tokens::set_background(crate::theme::themed(config).colors.background);
+}
+
+/// The View menu and the shortcut: take `mode`, remember it, and redraw every
+/// surface if the app changes side.
+pub(crate) fn set_theme(mode: crate::theme::ThemeMode) {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    set_app_appearance(mtm, mode);
+    let was_light = crate::theme::is_light();
+    let changed = crate::theme::set(mode, system_is_dark(mtm));
+    window::sidebar::persist();
+    log::info!("theme: {:?} ({})", mode, if crate::theme::is_light() { "light" } else { "dark" });
+    if changed {
+        retheme(mtm, was_light);
+    }
+}
+
+/// System mode: follow macOS when it switches. Asked once a second from the
+/// app timer, which costs one appearance read; the other modes skip it.
+fn poll_system_theme(mtm: MainThreadMarker) {
+    thread_local! {
+        static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    }
+    if crate::theme::mode() != crate::theme::ThemeMode::System {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if LAST.with(Cell::get).is_some_and(|t| now.duration_since(t).as_millis() < 1000) {
+        return;
+    }
+    LAST.with(|l| l.set(Some(now)));
+    let was_light = crate::theme::is_light();
+    if crate::theme::set(crate::theme::ThemeMode::System, system_is_dark(mtm)) {
+        log::info!("theme: macOS went {}", if crate::theme::is_light() { "light" } else { "dark" });
+        retheme(mtm, was_light);
+    }
+}
+
+/// Every window, its terminals and the sidebar's palette in the theme just
+/// set. The dark side is `config.toml`, read again like a reload does.
+fn retheme(mtm: MainThreadMarker, was_light: bool) {
+    let themed = crate::theme::themed(&Config::load());
+    window::sidebar::tokens::set_background(themed.colors.background);
+    let to = crate::theme::TermColors::of(&themed, crate::theme::is_light());
+    let from_ansi = crate::theme::ansi(was_light);
+    for win in NSApplication::sharedApplication(mtm).windows().iter() {
+        if let Some(view) = kova_view(&win) {
+            view.apply_theme(&themed, from_ansi, &to);
+        }
+    }
+}
+
 /// Tags of the View menu's layout items (`setLayoutMode:` reads them).
 pub const LAYOUT_MENU_TAG_TABS: isize = 0;
 pub const LAYOUT_MENU_TAG_SIDEBAR: isize = 1;
@@ -1968,6 +2053,31 @@ fn setup_menu(mtm: MainThreadMarker, config: &Config) {
         }
         view_menu.addItem(&item);
     }
+    // The appearance: three radio items (`validateMenuItem:` keeps the mark),
+    // then the item that cycles them, which shows the shortcut.
+    view_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let theme_item = |title: &str, tag: isize, key: Option<&str>| {
+        let (key_eq, mask) = key
+            .map(menu_key_equivalent)
+            .unwrap_or((String::new(), objc2_app_kit::NSEventModifierFlags::empty()));
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &NSString::from_str(title),
+                Some(objc2::sel!(setTheme:)),
+                &NSString::from_str(&key_eq),
+            )
+        };
+        item.setTag(tag);
+        if !key_eq.is_empty() {
+            item.setKeyEquivalentModifierMask(mask);
+        }
+        item
+    };
+    for mode in [crate::theme::ThemeMode::Light, crate::theme::ThemeMode::Dark, crate::theme::ThemeMode::System] {
+        view_menu.addItem(&theme_item(mode.label(), mode.tag(), None));
+    }
+    view_menu.addItem(&theme_item("Changer d'apparence", -1, Some(&config.keys.cycle_theme)));
     view_menu_item.setSubmenu(Some(&view_menu));
     menu_bar.addItem(&view_menu_item);
 

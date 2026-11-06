@@ -645,6 +645,25 @@ impl KovaView {
         }
     }
 
+    /// The theme switched: the renderer, the sidebar and the window take
+    /// `themed`, and every terminal recolours what it holds from the palette
+    /// `from_ansi` to `to`. The web views notice on their next tick
+    /// (`theme::generation`).
+    pub fn apply_theme(&self, themed: &Config, from_ansi: &[[u8; 3]; 16], to: &crate::theme::TermColors) {
+        self.ipc_apply_config(themed);
+        for tab in self.ivars().tabs.borrow().iter() {
+            tab.for_each_pane(&mut |pane| pane.terminal.write().recolor(from_ansi, to));
+        }
+        if let Some(window) = self.window() {
+            let bg = themed.colors.background;
+            window.setBackgroundColor(Some(&objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(bg[0] as f64, bg[1] as f64, bg[2] as f64, 1.0)));
+        }
+        if let Some(panel) = self.ivars().side_panel.get() {
+            panel.setNeedsDisplay(true);
+        }
+        self.mark_dirty();
+    }
+
     /// IPC: focus a pane by ID (switch tab if needed). Returns true if found.
     pub fn ipc_focus_pane(&self, pane_id: PaneId) -> bool {
         let found = self.focus_pane_in_window(pane_id);

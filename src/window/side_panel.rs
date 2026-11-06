@@ -488,6 +488,8 @@ pub struct SidePanelIvars {
     /// it changes.
     rendered_mtime: Cell<Option<std::time::SystemTime>>,
     last_mtime_check: Cell<Option<std::time::Instant>>,
+    /// The theme the page Kova rendered was drawn in (`theme::generation`).
+    theme: Cell<u64>,
 }
 
 define_class!(
@@ -642,6 +644,7 @@ impl SidePanelView {
             drag: Cell::new(None),
             rendered_mtime: Cell::new(None),
             last_mtime_check: Cell::new(None),
+            theme: Cell::new(crate::theme::generation()),
         });
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setHidden(true);
@@ -765,6 +768,19 @@ impl SidePanelView {
                 *self.ivars().title.borrow_mut() = title;
                 self.setNeedsDisplay(true);
             }
+        }
+        // The theme switched: a page Kova rendered is drawn again in it (a
+        // site follows the app's appearance by itself).
+        let theme = crate::theme::generation();
+        if self.ivars().theme.replace(theme) != theme {
+            self.setNeedsDisplay(true);
+            let current = self.ivars().current.borrow().clone();
+            match current {
+                Some(PanelTarget::Markdown(path)) => self.render_markdown_file(web, &path),
+                Some(target @ (PanelTarget::Sheet(_) | PanelTarget::History)) => self.open_target(target),
+                _ => {}
+            }
+            return;
         }
         let path = match self.ivars().current.borrow().as_ref() {
             Some(PanelTarget::Markdown(p)) => p.clone(),

@@ -661,7 +661,7 @@ define_class!(
             if in_panel
                 && !matches!(
                     keybindings.window_map.get(&combo),
-                    Some(Action::ToggleSidePanel | Action::PanelHistory | Action::ToggleSidebar | Action::NextAttention)
+                    Some(Action::ToggleSidePanel | Action::PanelHistory | Action::ToggleSidebar | Action::NextAttention | Action::CycleTheme)
                 )
             {
                 return objc2::runtime::Bool::NO;
@@ -1021,6 +1021,14 @@ define_class!(
             self.set_layout_mode(mode);
         }
 
+        /// View menu: `Clair` / `Sombre` / `Système` (tag = `ThemeMode::tag`),
+        /// and the item that cycles them (tag -1, Cmd+Option+L).
+        #[unsafe(method(setTheme:))]
+        fn set_theme_from_menu(&self, sender: &objc2_app_kit::NSMenuItem) {
+            let mode = crate::theme::ThemeMode::from_tag(sender.tag()).unwrap_or_else(|| crate::theme::mode().next());
+            crate::app::set_theme(mode);
+        }
+
         /// Pane menu: `Rename Pane`.
         /// View menu: `Side Panel` (Cmd+Option+B).
         #[unsafe(method(toggleSidePanelFromMenu:))]
@@ -1065,6 +1073,14 @@ define_class!(
                     crate::config::LayoutMode::Sidebar => crate::app::LAYOUT_MENU_TAG_SIDEBAR,
                 };
                 let state = if item.tag() == current {
+                    objc2_app_kit::NSControlStateValueOn
+                } else {
+                    objc2_app_kit::NSControlStateValueOff
+                };
+                item.setState(state);
+            }
+            if item.action() == Some(objc2::sel!(setTheme:)) && item.tag() >= 0 {
+                let state = if item.tag() == crate::theme::mode().tag() {
                     objc2_app_kit::NSControlStateValueOn
                 } else {
                     objc2_app_kit::NSControlStateValueOff
@@ -1945,6 +1961,7 @@ impl KovaView {
             Action::NextAttention => self.do_focus_next_attention(),
             Action::ToggleUnread => self.do_toggle_unread(),
             Action::ToggleChat => self.toggle_chat(),
+            Action::CycleTheme => crate::app::set_theme(crate::theme::mode().next()),
             Action::HistoryBack => do_history_step(false),
             Action::HistoryForward => do_history_step(true),
             Action::ToggleSidebar => self.toggle_layout_mode(),
@@ -2627,7 +2644,7 @@ pub fn create_window(
     view.ivars().side_panel.set(panel).ok();
     // The window paints its own background wherever a view does not: make it
     // the terminal's, so a resize can never flash the light grey default.
-    let bg = config.colors.background;
+    let bg = crate::theme::themed(config).colors.background;
     window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(bg[0] as f64, bg[1] as f64, bg[2] as f64, 1.0)));
     window.setContentView(Some(&container));
     view.apply_layout();

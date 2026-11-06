@@ -2575,6 +2575,7 @@ impl Renderer {
                     ("Toggle Sidebar", kc.toggle_sidebar.as_str(), "tabs and panes as a side list"),
                     ("Side Panel", kc.toggle_side_panel.as_str(), "the page or .md file opened at the right"),
                     ("Panel History", kc.panel_history.as_str(), "what the side panel opened lately"),
+                    ("Appearance", kc.cycle_theme.as_str(), "light, dark, the system's"),
                     ("Merge Window", kc.merge_window.as_str(), "fold window into another"),
                     ("Swap Pane", kc.swap_up.as_str(), "trade two panes"),
                     ("Reparent Pane", kc.reparent_up.as_str(), "move across the split tree"),
