@@ -130,7 +130,7 @@ Claude Code. Only a file Kova wrote for this page's paste goes along
 (`chat::input::with_images`). Text pastes as usual.
 
 Control characters are removed (tab and newline
-kept), 8 KB at most. The empty prompt is read off the screen like KovaLink's
+kept), 32 KB at most (a 20 minute dictation). The empty prompt is read off the screen like KovaLink's
 daemon does (`composerIsEmpty`); Claude Code's start hint (`Try "…"`) counts
 as empty.
 

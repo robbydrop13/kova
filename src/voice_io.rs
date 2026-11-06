@@ -353,7 +353,7 @@ fn run(control: &AtomicU8, level: &AtomicU32, inbox: &Inbox) {
     if audio.len() < voice::MIN_AUDIO_MS * voice::BYTES_PER_MS {
         return log::info!("voice: too short, nothing sent");
     }
-    let outcome = dictate(&key, &audio, control);
+    let outcome = dictate(&key, audio, control);
     drop(key);
     if control.load(Ordering::Relaxed) == CANCEL {
         return log::info!("voice: cancelled");
@@ -367,10 +367,12 @@ fn run(control: &AtomicU8, level: &AtomicU32, inbox: &Inbox) {
 
 /// The request, retried like Claap's back does (3 attempts on 429 and
 /// gateway errors, or no connection), until the dictation is cancelled.
-fn dictate(key: &str, audio: &[u8], control: &AtomicU8) -> Result<Heard, Failure> {
+fn dictate(key: &str, audio: Vec<u8>, control: &AtomicU8) -> Result<Heard, Failure> {
     let boundary = format!("kova-{:x}", crate::surface::monotonic_ms() ^ (std::process::id() as u64) << 32);
     let rules = std::env::var_os("HOME").and_then(|h| std::fs::read_to_string(std::path::Path::new(&h).join(voice::INSTRUCTION_FILE)).ok());
-    let body = voice::multipart(&boundary, &voice::config_json(&voice::instruction(rules), &voice::vocabulary()), audio);
+    let body = voice::multipart(&boundary, &voice::config_json(&voice::instruction(rules), &voice::vocabulary()), &audio);
+    // 20 min is 38 MB: the body holds it, the audio goes.
+    drop(audio);
     let mut last = Failure::Unreachable;
     for attempt in 0..3u32 {
         if attempt > 0 {
@@ -379,7 +381,7 @@ fn dictate(key: &str, audio: &[u8], control: &AtomicU8) -> Result<Heard, Failure
                 return Err(Failure::Failed);
             }
         }
-        match post(key, &boundary, &body) {
+        match post(key, &boundary, &body, control) {
             Some((200, answer)) => return voice::parse_result(&String::from_utf8_lossy(&answer)).ok_or(Failure::Failed),
             Some((status, _)) => {
                 // Never the body: an error page may echo the request.
@@ -399,8 +401,9 @@ fn dictate(key: &str, audio: &[u8], control: &AtomicU8) -> Result<Heard, Failure
 }
 
 /// One POST through an ephemeral NSURLSession (no cache, no cookies):
-/// the status and body, or `None` without an answer.
-fn post(key: &str, boundary: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
+/// the status and body, or `None` without an answer. Esc or the wait running
+/// out cancels the upload: up to 38 MB, it is not left running.
+fn post(key: &str, boundary: &str, body: &[u8], control: &AtomicU8) -> Option<(u16, Vec<u8>)> {
     let url = NSURL::URLWithString(&NSString::from_str(voice::DICTATION_URL))?;
     let request = NSMutableURLRequest::requestWithURL(&url);
     request.setHTTPMethod(&NSString::from_str("POST"));
@@ -424,8 +427,15 @@ fn post(key: &str, boundary: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
     });
     let task = unsafe { session.dataTaskWithRequest_completionHandler(&request, &done) };
     task.resume();
-    let answer = rx.recv_timeout(Duration::from_secs(wait)).ok().flatten();
-    session.finishTasksAndInvalidate();
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    let answer = loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(answer) => break answer,
+            Err(RecvTimeoutError::Timeout) if control.load(Ordering::Relaxed) != CANCEL && std::time::Instant::now() < deadline => {}
+            Err(_) => break None,
+        }
+    };
+    session.invalidateAndCancel();
     answer
 }
 

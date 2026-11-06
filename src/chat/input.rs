@@ -13,8 +13,9 @@
 //! Enter. Enter goes on its own, a moment later: Claude Code takes a pasted
 //! newline as part of the message (the same reason `ask::deliver_late` waits).
 
-/// Longest message accepted, the cap of `answer-ask` (`ask::ANSWER_TEXT_MAX`).
-pub const TEXT_MAX: usize = 8 * 1024;
+/// Longest message accepted: a 20 min dictation (`voice::MAX_AUDIO_MS`) is
+/// 13 to 20 KB of text.
+pub const TEXT_MAX: usize = 32 * 1024;
 /// Between the pasted text and its Enter.
 pub const ENTER_DELAY_MS: u64 = 300;
 /// An Enter not written this long after it was due (the chat was out of
@@ -126,7 +127,7 @@ pub fn sanitize(raw: &str) -> Result<String, &'static str> {
         return Err("Nothing to send");
     }
     if text.len() > TEXT_MAX {
-        return Err("Too long: 8 KB at most");
+        return Err("Too long: 32 KB at most");
     }
     Ok(text)
 }
