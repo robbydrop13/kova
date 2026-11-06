@@ -1914,9 +1914,6 @@ pub struct Pane {
     /// Where that probe stands, so a screen is read once a turn settles rather
     /// than on every frame.
     prompt_probe: Cell<PromptProbe>,
-    /// The pane shows its Claude conversation as a chat over its grid
-    /// (`toggle-chat`, `window::chat_view`). Saved with the session.
-    pub chat: bool,
 }
 
 /// Where the prompt probe stands for a pane: the last `is_working` it saw and
@@ -1970,7 +1967,6 @@ impl Pane {
             prompt_preview: RefCell::new(None),
             permission: RefCell::new(None),
             prompt_probe: Cell::new(PromptProbe::default()),
-            chat: false,
         }
     }
 

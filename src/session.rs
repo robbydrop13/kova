@@ -123,9 +123,6 @@ pub struct SavedPane {
     /// The subject of its tab the pane is filed under (`Pane::subject`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
-    /// The pane showed its conversation as a chat (`Pane::chat`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub chat: bool,
 }
 
 /// The conversation a pane was holding, and which agent to hand it back to.
@@ -203,7 +200,6 @@ fn snapshot_flat_column(col: &Column) -> SavedFlatColumn {
             // `will_terminate` saves before `shutdown_all` for this.
             agent_session: session_to_save(crate::agent_session::for_shell(p.pty.pid()), p.unregistered_session()),
             subject: p.subject.clone(),
-            chat: p.chat,
         }).collect(),
         row_weights: col.row_weights.clone(),
         custom_row_weights: if col.custom_row_weights.iter().any(|&cw| cw) {
@@ -716,7 +712,6 @@ fn restore_flat_column(saved: &SavedFlatColumn, cols: u16, rows: u16, config: &C
         pane.custom_title = sp.custom_title.clone();
         pane.minimized = sp.minimized;
         pane.subject = sp.subject.clone();
-        pane.chat = sp.chat;
         panes.push(pane);
         ids.push(id);
     }
@@ -1169,7 +1164,6 @@ mod tests {
             claude_session: None,
             agent_session: None,
             subject: None,
-            chat: false,
         }
     }
 
@@ -1193,13 +1187,11 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_pane_is_saved_as_one_and_others_say_nothing() {
-        assert!(serde_json::to_value(pane("/a")).unwrap().get("chat").is_none());
-        let mut sp = pane("/a");
-        sp.chat = true;
-        let back: SavedPane = serde_json::from_str(&serde_json::to_string(&sp).unwrap()).unwrap();
-        assert!(back.chat);
-        assert!(!serde_json::from_str::<SavedPane>(r#"{"cwd":"/a"}"#).unwrap().chat);
+    fn a_pane_saved_as_a_chat_still_loads_as_a_terminal() {
+        // Panes had a chat mode once; its flag is read and dropped.
+        let saved: SavedPane = serde_json::from_str(r#"{"cwd":"/a","chat":true}"#).expect("the old chat flag must still parse");
+        assert_eq!(saved.cwd.as_deref(), Some("/a"));
+        assert!(serde_json::to_value(&saved).unwrap().get("chat").is_none());
     }
 
     #[test]

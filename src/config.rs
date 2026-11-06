@@ -653,7 +653,8 @@ pub struct KeysConfig {
     pub toggle_side_panel: String,
     /// The side panel on its history of what it opened.
     pub panel_history: String,
-    /// The focused pane as a chat, or as its terminal again.
+    /// The Cockpit's chat column hidden or shown. Not `cmd+option+c`: Alfred's
+    /// clipboard.
     pub toggle_chat: String,
     /// The next appearance (light, dark, system). Not `cmd+option+c`: Alfred's
     /// clipboard.

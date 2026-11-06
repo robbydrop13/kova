@@ -9,8 +9,9 @@
 //! read), renders the page in Rust and pushes only the parts that changed;
 //! the page keeps a draft being rewritten through a push.
 //!
-//! The `Chat` button opens a chief of staff's chat on the left third of the
-//! page: the chat mode's own web view (`chat_view.rs`), pointed at the chief's
+//! A chief of staff's chat sits on the left third of the page, open by
+//! default; the `Chat` button and `toggle-chat` (`cmd+option+t`) hide or show
+//! it. It is the chat's own web view (`chat_view.rs`), pointed at the chief's
 //! pane through `cockpit_chat_target`, with no focus or tab switch. A message
 //! is taken only from this web view's main frame on `about:blank`.
 
@@ -64,7 +65,8 @@ pub struct CockpitSlot {
     web: OnceCell<Retained<WKWebView>>,
     delegate: OnceCell<Retained<CockpitWebDelegate>>,
     open: Cell<bool>,
-    chat: Cell<bool>,
+    /// The chat column hidden by its button or `toggle-chat`: it shows by default.
+    chat_hidden: Cell<bool>,
     chief: Cell<Scope>,
     filter: Cell<Filter>,
     frame: Cell<Option<Frame>>,
@@ -173,11 +175,24 @@ impl KovaView {
         self.ivars().cockpit.chat_target.get()
     }
 
-    /// The chat's `terminal` button, from the Cockpit: the column closes.
-    pub(super) fn cockpit_close_chat(&self) {
-        self.ivars().cockpit.chat.set(false);
-        self.ivars().cockpit.focus.set(true);
-        self.ivars().cockpit.chat_target.set(None);
+    /// `toggle-chat`: the chat column hidden or shown; from elsewhere, the
+    /// Cockpit opens on its chat.
+    pub(super) fn toggle_cockpit_chat(&self) {
+        let slot = &self.ivars().cockpit;
+        if slot.open.get() {
+            self.show_cockpit_chat(slot.chat_hidden.get());
+        } else {
+            self.toggle_cockpit();
+            self.show_cockpit_chat(true);
+        }
+        self.mark_dirty();
+    }
+
+    /// The page gets the keyboard back when the chat goes; a chat shown takes it.
+    fn show_cockpit_chat(&self, show: bool) {
+        let slot = &self.ivars().cockpit;
+        slot.chat_hidden.set(!show);
+        slot.focus.set(!show);
     }
 
     /// The page's web view, once made: the chat goes above it.
@@ -327,7 +342,7 @@ impl KovaView {
 
         // The chief's chat on the left third, under the column's top bar.
         let chief = slot.chief.get();
-        let chief_pane = if slot.chat.get() { self.chief_pane(cockpit::chief_session(chief)) } else { None };
+        let chief_pane = if slot.chat_hidden.get() { None } else { self.chief_pane(cockpit::chief_session(chief)) };
         slot.chat_target.set(chief_pane.map(|id| (id, cockpit::chat_frame(frame, CHAT_TOP_H))));
 
         let due = slot.page.borrow().last_poll.is_none_or(|t| t.elapsed().as_millis() >= POLL_MS);
@@ -368,7 +383,7 @@ impl KovaView {
         let view = View {
             items: &items,
             filter: slot.filter.get(),
-            chat: slot.chat.get().then_some(ChatColumn { chief, found: chief_pane.is_some() }),
+            chat: (!slot.chat_hidden.get()).then_some(ChatColumn { chief, found: chief_pane.is_some() }),
             can_act: crate::attention::can_act(),
             can_close: crate::attention::can_close(),
             can_snooze: crate::attention::can_snooze(),
@@ -552,8 +567,7 @@ impl KovaView {
                 true
             }
             "chat" => {
-                slot.chat.set(s("what") == "toggle" && !slot.chat.get());
-                slot.focus.set(!slot.chat.get());
+                self.show_cockpit_chat(s("what") == "toggle" && slot.chat_hidden.get());
                 true
             }
             "act" => {

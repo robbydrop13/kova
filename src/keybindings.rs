@@ -85,7 +85,7 @@ pub enum Action {
     PanelHistory,
     /// Cmd+U: the focused pane's unread mark.
     ToggleUnread,
-    /// Show the focused pane's Claude conversation as a chat, or its terminal again.
+    /// Hide or show the Cockpit's chat column (the Cockpit opens on it from elsewhere).
     ToggleChat,
     /// The next appearance: light, dark, the system's, and round again.
     CycleTheme,

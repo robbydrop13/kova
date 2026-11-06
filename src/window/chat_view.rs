@@ -1,12 +1,12 @@
-//! Chat mode on the window's side: a web view laid over the pane that shows
-//! its conversation as a chat (`docs/chat-mode.md`, the pure half in
-//! `crate::chat`).
+//! The Cockpit's chat on the window's side: a web view on the page's chat
+//! column that shows the chief's conversation as a chat (`docs/chat-mode.md`,
+//! the pure half in `crate::chat`).
 //!
-//! One web view per window, created on first use and shared: it sits over
-//! the active tab's chat pane (at most one per tab), its grid and PTY going
-//! on underneath, and hides when there is none, when the pane is minimized,
-//! or while an overlay Kova draws in Metal (the switcher, the search palette,
-//! help, a rename) needs the window. The pane's status bar stays visible.
+//! One web view per window, created on first use: it sits where the Cockpit
+//! says (`cockpit_chat_target`), the chief's pane, its grid and PTY going on
+//! underneath, and hides when the column is closed or while an overlay Kova
+//! draws in Metal (the switcher, the search palette, help, a rename) needs
+//! the window.
 //!
 //! The page posts what the user does (`kovaChat` messages); the tick reads
 //! the transcript and the pane, answers through the existing paths and
@@ -51,8 +51,6 @@ pub struct ChatSlot {
     web: OnceCell<Retained<WKWebView>>,
     delegate: OnceCell<Retained<ChatWebDelegate>>,
     state: RefCell<Option<ChatState>>,
-    /// The web view had the keyboard at the last tick.
-    had_keyboard: Cell<bool>,
     /// The frame last given to the web view, in the container's coordinates.
     frame: Cell<Option<(f64, f64, f64, f64)>>,
     /// The theme the page was loaded in (`theme::generation`).
@@ -62,8 +60,6 @@ pub struct ChatSlot {
 /// The chat of one pane, from the moment it is shown.
 struct ChatState {
     pane_id: PaneId,
-    /// Shown on the Cockpit page (no Terminal button there).
-    cockpit: bool,
     session: Option<String>,
     tail: Option<Tail>,
     conv: Conversation,
@@ -127,10 +123,9 @@ struct ChatState {
 }
 
 impl ChatState {
-    fn new(pane_id: PaneId, cockpit: bool, load: String) -> Self {
+    fn new(pane_id: PaneId, load: String) -> Self {
         ChatState {
             pane_id,
-            cockpit,
             session: None,
             tail: None,
             conv: Conversation::new(),
@@ -210,62 +205,7 @@ fn theme() -> page::Theme {
     }
 }
 
-/// What the tick found about the chat pane, read under the tabs' borrow.
-struct Target {
-    pane_id: PaneId,
-    /// In the container's coordinates (points, y up).
-    frame: (f64, f64, f64, f64),
-    focused: PaneId,
-    /// The chief's chat on the Cockpit page: not this tab's chat pane.
-    cockpit: bool,
-}
-
 impl KovaView {
-    /// `toggle-chat`: the focused pane as a chat, or as its terminal again.
-    /// A pane without a Claude conversation stays a terminal, with a note.
-    /// One chat pane per tab: turning one on turns the others off.
-    pub(super) fn toggle_chat(&self) {
-        let note = {
-            let mut tabs = self.ivars().tabs.borrow_mut();
-            let Some(tab) = tabs.get_mut(self.ivars().active_tab.get()) else { return };
-            let focused = tab.focused_pane;
-            let Some(pane) = tab.pane(focused) else { return };
-            if pane.chat {
-                if let Some(p) = tab.pane_mut(focused) {
-                    p.chat = false;
-                }
-                None
-            } else if pane.last_claude_session_id().is_none() {
-                Some("No Claude conversation in this pane")
-            } else {
-                only_chat(tab, focused);
-                None
-            }
-        };
-        if let Some(note) = note {
-            self.set_transient_status(note);
-        }
-        self.mark_dirty();
-    }
-
-    /// A session chosen in the sidebar: focused, and on its chat when a
-    /// Claude conversation runs there (a shell or another agent stays a
-    /// terminal). `cmd+option+t` still shows the terminal.
-    pub(super) fn open_pane_from_sidebar(&self, pane_id: PaneId) {
-        if !self.focus_pane_in_window(pane_id) {
-            return;
-        }
-        {
-            let mut tabs = self.ivars().tabs.borrow_mut();
-            let Some(tab) = tabs.iter_mut().find(|t| t.contains(pane_id)) else { return };
-            if !tab.pane(pane_id).is_some_and(|p| p.claude_session_id().is_some()) {
-                return;
-            }
-            only_chat(tab, pane_id);
-        }
-        self.mark_dirty();
-    }
-
     /// Whether `responder` (the window's first responder) is the chat's web view.
     pub(super) fn chat_holds(&self, responder: &objc2::runtime::AnyObject) -> bool {
         let (Some(web), Some(view)) = (self.ivars().chat.web.get(), responder.downcast_ref::<NSView>()) else { return false };
@@ -287,63 +227,23 @@ impl KovaView {
             || i.show_mem_report.get()
     }
 
-    /// The active tab's chat pane, where it is on screen, and the focused pane.
-    /// While the Cockpit is open it covers the panes: the only chat is the
-    /// chief's, on the page's left third, and its pane counts as focused so
-    /// nothing moves the focus or switches tabs to it.
-    fn chat_target(&self) -> Option<Target> {
+    /// The chief's pane and where its chat goes on the Cockpit page, unless
+    /// an overlay Kova draws in Metal needs the window.
+    fn chat_target(&self) -> Option<(PaneId, (f64, f64, f64, f64))> {
         if self.metal_overlay_open() {
             return None;
         }
-        if self.cockpit_open() {
-            return self
-                .cockpit_chat_target()
-                .map(|(pane_id, frame)| Target { pane_id, frame, focused: pane_id, cockpit: true });
-        }
-        let tabs = self.ivars().tabs.borrow();
-        let tab = tabs.get(self.ivars().active_tab.get())?;
-        let mut found = None;
-        tab.for_each_pane(&mut |p| {
-            if p.chat && found.is_none() && !p.minimized {
-                found = Some(p.id);
-            }
-        });
-        let pane_id = found?;
-        let vp = tab.viewport_for_pane(pane_id, self.panes_viewport_for_tab(tab))?;
-        let scale = self.backing_scale().max(1.0) as f64;
-        let renderer = self.ivars().renderer.get()?;
-        let (bar, cell_h) = {
-            let r = renderer.read();
-            (r.status_bar_enabled(), r.cell_size().1)
-        };
-        // Points, from the view's top-left; the status bar row stays Kova's.
-        let bar_h = if bar { cell_h as f64 } else { 0.0 };
-        let view = self.frame();
-        let x0 = (vp.x as f64 / scale).max(0.0);
-        let x1 = ((vp.x + vp.width) as f64 / scale).min(view.size.width);
-        let top = vp.y as f64 / scale;
-        let h = ((vp.height as f64 - bar_h) / scale).max(0.0);
-        if x1 - x0 < 40.0 || h < 40.0 {
-            return None;
-        }
-        // The view's y axis points up; the container holds it at its origin.
-        let y = view.size.height - top - h;
-        Some(Target {
-            pane_id,
-            frame: (view.origin.x + x0, view.origin.y + y, x1 - x0, h),
-            focused: tab.focused_pane,
-            cockpit: false,
-        })
+        self.cockpit_chat_target()
     }
 
-    /// Once per frame: place the web view over the chat pane (or hide it),
-    /// keep the keyboard where the focus is, serve the page's messages and
-    /// push what changed.
+    /// Once per frame: place the web view on the Cockpit's chat column (or
+    /// hide it), give it the keyboard when it shows, serve the page's
+    /// messages and push what changed.
     pub(super) fn tick_chat(&self) {
         let Some(window) = self.window() else { return };
         let slot = &self.ivars().chat;
         let target = self.chat_target();
-        let Some(target) = target else {
+        let Some((pane_id, frame)) = target else {
             if let Some(web) = slot.web.get()
                 && !web.isHidden()
             {
@@ -352,9 +252,8 @@ impl KovaView {
                 }
                 web.setHidden(true);
             }
-            // A pane that left chat mode drops its state; one hidden by an
-            // overlay keeps it.
-            let gone = slot.state.borrow().as_ref().is_some_and(|st| !self.pane_is_chat(st.pane_id));
+            // A column closed drops its state; one hidden by an overlay keeps it.
+            let gone = !self.metal_overlay_open();
             // Out of sight, no one sees what the mic hears: it is cancelled.
             if let Some(st) = slot.state.borrow_mut().as_mut() {
                 st.voice.hide();
@@ -365,7 +264,6 @@ impl KovaView {
                     unsafe { web.loadHTMLString_baseURL(&NSString::from_str(""), None) };
                 }
             }
-            slot.had_keyboard.set(false);
             return;
         };
         let mtm = MainThreadMarker::from(self);
@@ -374,13 +272,13 @@ impl KovaView {
             slot.state.replace(None);
         }
         let generation = crate::theme::generation();
-        let fresh = slot.state.borrow().as_ref().is_none_or(|st| st.pane_id != target.pane_id || st.cockpit != target.cockpit);
+        let fresh = slot.state.borrow().as_ref().is_none_or(|st| st.pane_id != pane_id);
         if fresh {
             slot.theme.set(generation);
             let nonce = crate::ask::new_question_id().replace('-', "");
-            slot.state.replace(Some(ChatState::new(target.pane_id, target.cockpit, nonce.clone())));
-            let title = self.with_pane(target.pane_id, |p| p.display_title("Chat")).unwrap_or_default();
-            let html = page::shell(&theme(), &title, &nonce, !target.cockpit);
+            slot.state.replace(Some(ChatState::new(pane_id, nonce.clone())));
+            let title = self.with_pane(pane_id, |p| p.display_title("Chat")).unwrap_or_default();
+            let html = page::shell(&theme(), &title, &nonce);
             unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
         }
         // The theme switched: the colours change in place, the page keeps
@@ -389,47 +287,40 @@ impl KovaView {
             slot.theme.set(generation);
             unsafe { web.evaluateJavaScript_completionHandler(&NSString::from_str(&page::restyle_script(&theme())), None) };
         }
-        if slot.frame.get() != Some(target.frame) {
-            let (x, y, w, h) = target.frame;
+        if slot.frame.get() != Some(frame) {
+            let (x, y, w, h) = frame;
             web.setFrame(CGRect { origin: CGPoint { x, y }, size: CGSize { width: w, height: h } });
-            slot.frame.set(Some(target.frame));
+            slot.frame.set(Some(frame));
         }
         if web.isHidden() {
             web.setHidden(false);
         }
 
-        // The keyboard follows the focus: a click into the chat focuses its
-        // pane, the chat pane focused gets the box, another pane focused
-        // takes the keyboard back.
-        let responder = window.firstResponder();
-        let in_chat = responder.as_ref().is_some_and(|r| self.chat_holds(r));
-        let on_terminal = responder.as_ref().is_some_and(|r| std::ptr::eq(Retained::as_ptr(r).cast::<()>(), (self as *const Self).cast::<()>()));
-        if in_chat && !slot.had_keyboard.get() && target.focused != target.pane_id {
-            self.focus_pane_in_window(target.pane_id);
-        } else if target.focused == target.pane_id && (on_terminal || fresh) {
+        // The box gets the keyboard when the chat shows, and back from the
+        // terminal under the page. The chief's pane is never focused for it:
+        // nothing moves the focus or switches tabs.
+        let on_terminal = window
+            .firstResponder()
+            .is_some_and(|r| std::ptr::eq(Retained::as_ptr(&r).cast::<()>(), (self as *const Self).cast::<()>()));
+        if on_terminal || fresh {
             window.makeFirstResponder(Some(&web));
             if let Some(st) = slot.state.borrow_mut().as_mut() {
                 st.focus = true;
             }
-        } else if target.focused != target.pane_id && in_chat {
-            window.makeFirstResponder(Some(self));
         }
-        slot.had_keyboard.set(window.firstResponder().is_some_and(|r| self.chat_holds(&r)));
 
         // The page's messages, then the poll.
         let messages = slot.delegate.get().map(|d| d.ivars().take()).unwrap_or_default();
-        let mut leave = false;
         let mut update = None;
         let mut open = Vec::new();
         {
             let tabs = self.ivars().tabs.borrow();
-            let Some(pane) = tabs.iter().find_map(|t| t.pane(target.pane_id)) else { return };
+            let Some(pane) = tabs.iter().find_map(|t| t.pane(pane_id)) else { return };
             let mut state = slot.state.borrow_mut();
             let Some(st) = state.as_mut() else { return };
             let mut force = false;
             for raw in messages {
                 match self.chat_message(st, pane, &raw) {
-                    Reply::Leave => leave = true,
                     Reply::Push => force = true,
                     Reply::Open(target) => {
                         open.push(target);
@@ -456,18 +347,6 @@ impl KovaView {
         for t in open {
             self.open_in_side_panel(t);
         }
-        if leave && target.cockpit {
-            self.cockpit_close_chat();
-        } else if leave {
-            let mut tabs = self.ivars().tabs.borrow_mut();
-            if let Some(p) = tabs.iter_mut().find_map(|t| t.pane_mut(target.pane_id)) {
-                p.chat = false;
-            }
-        }
-    }
-
-    fn pane_is_chat(&self, id: PaneId) -> bool {
-        self.with_pane(id, |p| p.chat).unwrap_or(false)
     }
 
     fn with_pane<T>(&self, id: PaneId, f: impl FnOnce(&Pane) -> T) -> Option<T> {
@@ -497,7 +376,6 @@ impl KovaView {
                 st.exchanges += page::EXCHANGES_STEP;
                 Reply::Push
             }
-            "terminal" => Reply::Leave,
             "cancel" => {
                 // Taken back: its text returns to the box, to rework or drop.
                 match msg.get("id").and_then(Value::as_u64).and_then(|id| st.outbox.cancel(id)) {
@@ -802,28 +680,10 @@ impl KovaView {
     }
 }
 
-/// One chat per tab: `pane_id` shows its chat, the tab's other panes their
-/// terminal.
-fn only_chat(tab: &mut crate::pane::Tab, pane_id: PaneId) {
-    let mut ids = Vec::new();
-    tab.for_each_pane(&mut |p| ids.push(p.id));
-    for (id, chat) in chat_flags(&ids, pane_id) {
-        if let Some(p) = tab.pane_mut(id) {
-            p.chat = chat;
-        }
-    }
-}
-
-fn chat_flags(ids: &[PaneId], chosen: PaneId) -> Vec<(PaneId, bool)> {
-    ids.iter().map(|&id| (id, id == chosen)).collect()
-}
-
 enum Reply {
     Nothing,
     /// Something changed: push an update now.
     Push,
-    /// Back to the terminal.
-    Leave,
     /// Open a link in the side panel, once the tabs are no longer borrowed:
     /// opening it lays the window out again, which borrows the tabs mutably.
     Open(super::side_panel::PanelTarget),
@@ -1317,20 +1177,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_tab_shows_one_chat_the_one_chosen() {
-        assert_eq!(chat_flags(&[1, 2, 3], 2), vec![(1, false), (2, true), (3, false)]);
-        assert_eq!(chat_flags(&[1, 2], 9), vec![(1, false), (2, false)]);
-    }
-
-    #[test]
     fn the_chat_page_takes_the_light_tokens_in_light_mode() {
         let mut c = crate::config::Config::default();
         crate::theme::apply_light(&mut c);
         tokens::set_background(c.colors.background);
-        let light = page::shell(&theme(), "t", "n", true);
+        let light = page::shell(&theme(), "t", "n");
         let restyle = page::restyle_script(&theme());
         tokens::set_background(crate::config::Config::default().colors.background);
-        let dark = page::shell(&theme(), "t", "n", true);
+        let dark = page::shell(&theme(), "t", "n");
         assert!(light.contains("color-scheme: light"));
         assert!(light.contains("--bg:#fafafa;") && light.contains("--t1:#242424;"), "{light}");
         assert!(dark.contains("color-scheme: dark") && !dark.contains("--t1:#242424;"));

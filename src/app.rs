@@ -2111,7 +2111,6 @@ fn setup_menu(mtm: MainThreadMarker, config: &Config) {
     };
     pane_menu.addItem(&pane_item("Rename Pane\u{2026}", objc2::sel!(renamePaneFromMenu:), &config.keys.rename_pane));
     pane_menu.addItem(&pane_item("Mark as Unread", objc2::sel!(toggleUnreadFromMenu:), &config.keys.toggle_unread));
-    pane_menu.addItem(&pane_item("Show as Chat", objc2::sel!(toggleChatFromMenu:), &config.keys.toggle_chat));
     pane_menu_item.setSubmenu(Some(&pane_menu));
     menu_bar.addItem(&pane_menu_item);
 

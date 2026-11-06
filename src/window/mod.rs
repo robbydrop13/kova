@@ -219,7 +219,7 @@ pub struct KovaViewIvars {
     /// The side panel at the right (a web view), a sibling of this view,
     /// hidden until something is opened in it. See `side_panel`.
     side_panel: OnceCell<Retained<side_panel::SidePanelView>>,
-    /// The web view laid over the active tab's chat pane. See `chat_view`.
+    /// The web view of the Cockpit's chat column. See `chat_view`.
     chat: chat_view::ChatSlot,
     cockpit: cockpit_view::CockpitSlot,
 }
@@ -1040,12 +1040,6 @@ define_class!(
         #[unsafe(method(toggleSidePanelFromMenu:))]
         fn toggle_side_panel_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
             self.toggle_side_panel();
-        }
-
-        /// Pane menu: `Show as Chat` (Cmd+Option+T; Cmd+Option+C is Alfred's clipboard hotkey).
-        #[unsafe(method(toggleChatFromMenu:))]
-        fn toggle_chat_from_menu(&self, _sender: &objc2_app_kit::NSMenuItem) {
-            self.toggle_chat();
         }
 
         /// View menu: `Panel History` (Cmd+Option+Y).
@@ -1966,7 +1960,7 @@ impl KovaView {
             Action::RepaintPane => self.do_repaint_pane(),
             Action::NextAttention => self.do_focus_next_attention(),
             Action::ToggleUnread => self.do_toggle_unread(),
-            Action::ToggleChat => self.toggle_chat(),
+            Action::ToggleChat => self.toggle_cockpit_chat(),
             Action::CycleTheme => crate::app::set_theme(crate::theme::mode().next()),
             Action::ToggleVoice => self.toggle_voice(),
             Action::HistoryBack => do_history_step(false),
