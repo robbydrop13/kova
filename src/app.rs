@@ -226,6 +226,7 @@ define_class!(
                     view.cockpit_leave(true);
                 }
             }
+            crate::record::abort();
             crate::terminal::pty::shutdown_all();
             crate::ipc::cleanup();
             log::logger().flush();

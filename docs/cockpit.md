@@ -87,6 +87,32 @@ shows when no project moved or before the first read lands.
   was there at open plus what the 60 s refresh brings; something that moved in
   the last minute before leaving is marked read unseen.
 
+## Record
+
+`Enregistrer` (header, left of `Chat`) records for the montre-une-fois skill
+(`src/record.rs`, phases and commands tested): Kova runs macOS's own
+`/usr/sbin/screencapture -v -g -k -x <file>` (main display, default
+microphone, clicks shown, no sound) into
+`~/Movies/Kova/montre-une-fois-<YYYYMMDD-HHMM>.mov` (`-2`, `-3` for the same
+minute). Only the click starts it; the state is in memory, so a launch never
+records.
+
+- While it records the button reads `Arrêter` with the elapsed time, in red,
+  and the sidebar's Cockpit entry shows a red dot in place of its icon.
+- `Arrêter` sends SIGINT and waits for the exit (a minute at most) and for the
+  file to be non-empty with a stable size. A screencapture that ends on its own
+  is handled the same way; quitting Kova stops it.
+- Then `attn add --scope=pro --level=memo --kind=info --from=kova
+  --topic=montre-une-fois --title=… --body=<path>` (`[attention] command`'s
+  program) and `act_command <id> instruct --text=Lance le skill
+  montre-une-fois sur la vidéo <path> (…)`, the path of a card's instruction,
+  which types it into claap-agent. The note under the title reads
+  `Enregistrement remis à claap-agent` with the path (click: `open -R`, shown
+  in the Finder) and what `attn act` said.
+- No start, or a missing or empty file: `Autorise Kova dans Réglages Système >
+  Confidentialité : Enregistrement de l'écran et Microphone, puis réessaie`.
+  A hand-off that fails says so with the CLI's words; the file stays.
+
 ## Opened cards
 
 A click on any card's body (not a button, a field or the open detail) opens

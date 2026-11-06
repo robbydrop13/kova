@@ -273,6 +273,7 @@ impl KovaView {
     /// Once per frame: place the page (or hide it), serve its messages, push
     /// what changed, and say where the chief's chat goes.
     pub(super) fn tick_cockpit(&self) {
+        crate::record::poll();
         let slot = &self.ivars().cockpit;
         let frame = if slot.open.get() && !self.metal_overlay_open() { self.cockpit_frame() } else { None };
         let Some(frame) = frame else {
@@ -371,6 +372,8 @@ impl KovaView {
             limit: slot.limit.get().max(cockpit::PAGE_SIZE),
             now: now / 1000,
             band: self.cockpit_band(&items),
+            record: crate::record::button_html(&crate::record::phase(), now),
+            record_note: crate::record::note_html(&crate::record::phase()),
         };
         let parts = cockpit::parts(&view);
         page.items = items;
@@ -516,6 +519,21 @@ impl KovaView {
             }
             "band" => {
                 self.cockpit_band_click(&s("what"), &s("proj"), &s("link"));
+                true
+            }
+            "record" => {
+                match s("what").as_str() {
+                    // Only on the click: nothing else starts a recording.
+                    "start" => {
+                        let attention = self.ivars().config.get().map(|c| c.attention.clone()).unwrap_or_default();
+                        crate::record::start(attention.add_command(), attention.act_command.clone());
+                    }
+                    "stop" => crate::record::stop(),
+                    "reveal" => crate::record::reveal(),
+                    "dismiss" => crate::record::dismiss(),
+                    _ => {}
+                }
+                self.mark_dirty();
                 true
             }
             "reveal" => {

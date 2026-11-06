@@ -532,6 +532,10 @@ pub struct View<'a> {
     /// The catch-up band (`crate::catchup::band_html`), between the title
     /// and the filter; empty when nothing moved.
     pub band: String,
+    /// The `Enregistrer` button and the note under the title once a
+    /// recording stopped (`crate::record`).
+    pub record: String,
+    pub record_note: String,
 }
 
 /// The cards the list shows first, and each `Voir plus` adds.
@@ -859,10 +863,12 @@ pub fn head_html(view: &View) -> String {
     };
     format!(
         "<div class=\"phead\"><div><div class=\"ptitle\">Cockpit</div><div class=\"psub\">{}{tail}</div></div>\
-         <button type=\"button\" class=\"btn {}\" data-chat=\"toggle\">{ICON_CHAT}<span>Chat</span></button></div>\
-         {}<div class=\"bar\"><div class=\"seg\">{}{}{}</div><span class=\"sortlbl\">{ICON_SORT}Par priorité</span></div>",
+         <div class=\"hbtns\">{}<button type=\"button\" class=\"btn {}\" data-chat=\"toggle\">{ICON_CHAT}<span>Chat</span></button></div></div>\
+         {}{}<div class=\"bar\"><div class=\"seg\">{}{}{}</div><span class=\"sortlbl\">{ICON_SORT}Par priorité</span></div>",
         esc(&lead),
+        view.record,
         if view.chat.is_some() { "on" } else { "sec" },
+        view.record_note,
         view.band,
         seg(Filter::All, "all", "Tout", count(None)),
         seg(Filter::Only(Scope::Pro), "pro", scope_label(Scope::Pro), count(Some(Scope::Pro))),
@@ -1082,6 +1088,16 @@ body.chat-on .chat{display:flex}
 .chat .x{color:var(--t3);width:26px;height:26px;display:flex;align-items:center;justify-content:center;border-radius:6px}
 .chat .x:hover{background:var(--hover)}
 .cbody{flex:1;padding:20px}
+.hbtns{display:flex;gap:8px;flex:none}
+.btn.rec.on{background:color-mix(in srgb,var(--crit-dot) 22%,transparent);color:var(--crit)}
+.btn.rec.on svg{fill:currentColor}
+.btn.rec .tm{font-variant-numeric:tabular-nums;font-weight:400}
+.recn{margin-top:16px;display:flex;align-items:flex-start;gap:10px;background:var(--bg1);border:1px solid var(--b3);border-radius:8px;padding:10px 10px 10px 16px;font-size:13px;line-height:19px}
+.recn.ok{border-color:color-mix(in srgb,var(--ok-dot) 45%,transparent)}
+.recn.crit{border-color:color-mix(in srgb,var(--crit-dot) 45%,transparent)}
+.recn.crit .rt{color:var(--crit)}
+.recn .rb{flex:1;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:2px}
+.recn .rt{font-weight:500}.recn .link{font-size:12px;text-align:left;overflow-wrap:anywhere}.recn .dim{font-size:12px;color:var(--t3)}
 .cu{margin-top:16px;background:var(--bg1);border:1px solid var(--b3);border-radius:8px;padding:4px 0 6px}
 .cu-h{display:flex;align-items:center;gap:8px;padding:6px 10px 6px 16px;font-size:13px;font-weight:600}
 .cu-h svg{color:var(--info-dot)}
@@ -1231,6 +1247,7 @@ document.addEventListener('click', e => {
   if (!$('snz').hidden) snzClose();
   const b = e.target.closest('button');
   // The catch-up band: its buttons, its links, a row that opens in place.
+  if (b && b.dataset.rec) return post({ type: 'record', what: b.dataset.rec });
   if (b && b.dataset.band) return post({ type: 'band', what: b.dataset.band });
   if (b && b.dataset.goto) return post({ type: 'reveal', key: b.dataset.goto });
   const ln = e.target.closest('.cu .ln');
@@ -1455,7 +1472,7 @@ mod tests {
     fn the_list_shows_ten_cards_then_voir_plus() {
         let items: Vec<Item> =
             (0..23).map(|i| from_attention(&entry(&format!("a-{i}"), Level::Now, Some(if i < 4 { 1 } else { 2 }), i), None, false).unwrap()).collect();
-        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new() };
+        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new() };
         let html = list_html(&view(PAGE_SIZE));
         assert_eq!(html.matches("<article").count(), 10);
         assert!(html.contains("data-more=\"1\"><span>Voir plus (13)</span>"));
@@ -1547,7 +1564,7 @@ mod tests {
             from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap(),
             from_attention(&perso, None, false).unwrap(),
         ];
-        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new() };
+        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new() };
         assert!(list_html(&view(Filter::All)).contains("attention:a-1"));
         let only = list_html(&view(Filter::Only(Scope::Perso)));
         assert!(only.contains("attention:a-2") && !only.contains("attention:a-1"));
@@ -1564,13 +1581,13 @@ mod tests {
             from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap(),
             from_attention(&entry("a-1", Level::Point, None, 1), None, false).unwrap(),
         ];
-        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new() });
+        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new() });
         assert!(html.contains("Urgent <span class=\"k\">1</span>"));
         assert!(html.contains("Cette semaine <span class=\"k\">1</span>"));
         assert!(!html.contains("Aujourd'hui"));
         assert_eq!(subtitle(&items), ("2 actions pour toi".to_string(), "1 urgente".to_string()));
         assert_eq!(subtitle(&[]).0, "Aucune action pour toi");
-        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new() }).contains("Rien ne t'attend"));
+        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new() }).contains("Rien ne t'attend"));
     }
 
     #[test]
@@ -1705,11 +1722,15 @@ mod tests {
         let items: Vec<Item> = Vec::new();
         let view = |band: &str| View {
             items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
-            limit: PAGE_SIZE, now: 0, band: band.to_string(),
+            limit: PAGE_SIZE, now: 0, band: band.to_string(), record: "<button data-rec=\"start\">R</button>".into(),
+            record_note: "<div class=\"recn\">N</div>".into(),
         };
         let head = head_html(&view("<div class=\"cu\">B</div>"));
         let (title, band, bar) = (head.find("ptitle").unwrap(), head.find("class=\"cu\"").unwrap(), head.find("class=\"bar\"").unwrap());
         assert!(title < band && band < bar);
+        // The record button sits left of Chat; its note above the band.
+        assert!(head.find("data-rec=\"start\"").unwrap() < head.find("data-chat").unwrap());
+        assert!(head.find("class=\"recn\"").unwrap() < band);
         assert!(!head_html(&view("")).contains("class=\"cu\""), "no band, nothing between");
         // A reveal alone is a push.
         assert!(!Update { reveal: Some("attention:a-1".into()), ..Default::default() }.is_empty());

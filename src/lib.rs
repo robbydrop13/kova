@@ -49,6 +49,7 @@ mod team;
 mod attention;
 mod catchup;
 mod cockpit;
+mod record;
 mod window;
 
 /// `kova ask …` (see `ask::USAGE`): returns the exit code.

@@ -118,6 +118,9 @@ pub struct CockpitVm {
     pub urgent: bool,
     /// Its page is open over the panes: the entry is selected.
     pub open: bool,
+    /// Kova records the screen (`crate::record`): a red dot takes the
+    /// inbox icon's place, seen from any page.
+    pub recording: bool,
 }
 
 /// One need, as the tiles' `Answer` link and the Agents view look it up.

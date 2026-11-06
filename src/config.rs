@@ -298,6 +298,12 @@ impl AttentionConfig {
         crate::catchup::Commands { read: or_list(&self.catchup_command, &["catchup", "--json"]), seen: or_list(&self.seen_command, &["seen"]) }
     }
 
+    /// `attn add`, for the Cockpit's recording (`crate::record`): `command`'s
+    /// program with `add`.
+    pub fn add_command(&self) -> Vec<String> {
+        self.command.first().map(|bin| vec![bin.clone(), "add".to_string()]).unwrap_or_default()
+    }
+
     /// `perso_dir` with a leading `~/` expanded, `None` when unset.
     pub fn perso_root(&self) -> Option<std::path::PathBuf> {
         let dir = self.perso_dir.trim();
@@ -796,6 +802,8 @@ mod tests {
         assert_eq!(none.attention.catchup_commands(), crate::catchup::Commands::default());
         let given: Config = toml::from_str("[attention]\ncommand = [\"/a\"]\ncatchup_command = [\"/b\", \"x\"]\n").unwrap();
         assert_eq!(given.attention.catchup_commands().read, ["/b", "x"]);
+        assert_eq!(config.attention.add_command(), ["/usr/local/bin/attn", "add"]);
+        assert!(none.attention.add_command().is_empty());
         let perso: Config = toml::from_str("[attention]\nperso_dir = \"~/Perso\"\n").unwrap();
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         assert_eq!(perso.attention.perso_root(), Some(home.join("Perso")));

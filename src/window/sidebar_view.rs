@@ -2828,7 +2828,11 @@ impl SidebarListView {
         }
         let cy = frame.y + frame.h / 2.0;
         let icon = Rect::new(frame.x + COCKPIT_PAD_L, cy - COCKPIT_ICON_D / 2.0, COCKPIT_ICON_D, COCKPIT_ICON_D);
-        stroke_icon(Icon::Inbox, &icon, COCKPIT_ICON_D, ink, alpha);
+        if cockpit.recording {
+            fill_dot(icon.x + icon.w / 2.0, cy, COCKPIT_ICON_D * 0.7, t.error, alpha);
+        } else {
+            stroke_icon(Icon::Inbox, &icon, COCKPIT_ICON_D, ink, alpha);
+        }
         let mut right = frame.right() - COCKPIT_PAD_R;
         if cockpit.count > 0 {
             let m = AppKitMetrics(sh);
@@ -3556,7 +3560,7 @@ mod tests {
         assert_eq!(none.rows[0].frame.y, LIST_TOP + GROUP_PAD_V);
 
         // One 40 pt card, full width, then the groups 10 pt below.
-        m.cockpit = Some(CockpitVm { count: 7, urgent: true, open: false });
+        m.cockpit = Some(CockpitVm { count: 7, urgent: true, open: false, recording: false });
         let l = ListLayout::new(&m, W, &FakeMetrics);
         assert_eq!(l.rows[0].kind, RowKind::Cockpit);
         assert_eq!(l.rows[0].frame, Rect::new(SX, LIST_TOP, SR - SX, COCKPIT_H));

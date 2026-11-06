@@ -673,7 +673,12 @@ impl KovaView {
         model.routine_failed = routine_failed;
         model.apply_needs(&needs, now);
         if list == SidebarList::Panes {
-            model.cockpit = Some(CockpitVm { count: waits_on_you, urgent: self.cockpit_urgent(), open: self.cockpit_open() });
+            model.cockpit = Some(CockpitVm {
+                count: waits_on_you,
+                urgent: self.cockpit_urgent(),
+                open: self.cockpit_open(),
+                recording: crate::record::is_recording(),
+            });
         }
         if list == SidebarList::Scheduled {
             // The rows' own state: folding, the row being confirmed, the
