@@ -109,6 +109,10 @@ pub struct Item {
     pub draft: Option<Draft>,
     /// An attention entry whose action is a link or a file the panel shows.
     pub openable: bool,
+    /// The waiting `kova ask` an attention entry stands for (its action is
+    /// `kova-sheet:<id>` or `kova-ask:<id>`): its button opens that sheet,
+    /// and the ask's own card is left out so it shows once.
+    pub ask: Option<String>,
     pub state: State,
 }
 
@@ -144,8 +148,33 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         scope: entry.scope,
         draft: entry.draft.clone(),
         openable,
+        ask: None,
         state,
     })
+}
+
+/// The ask id an attention entry's action names: `kova-sheet:<id>` or
+/// `kova-ask:<id>`, the id possibly shortened to a prefix.
+pub fn ask_ref(action: &str) -> Option<&str> {
+    let a = action.trim();
+    let id = a.strip_prefix(crate::decision_sheet::LINK_SCHEME).or_else(|| a.strip_prefix("kova-ask:"))?.trim();
+    (id.len() >= 6 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')).then_some(id)
+}
+
+/// Point attention entries at the waiting asks they name (`ask_ref`, a
+/// unique prefix match on `asks`) and drop those asks' own items.
+pub fn link_asks(items: &mut Vec<Item>, actions: &[(String, String)], asks: &[String]) {
+    let mut linked = std::collections::HashSet::new();
+    for item in items.iter_mut().filter(|i| i.kind == Kind::Attention) {
+        let Some((_, action)) = actions.iter().find(|(key, _)| *key == item.key) else { continue };
+        let Some(r) = ask_ref(action) else { continue };
+        let hits: Vec<&String> = asks.iter().filter(|id| id.starts_with(r)).collect();
+        if let [id] = hits[..] {
+            item.ask = Some(id.clone());
+            linked.insert(format!("ask:{id}"));
+        }
+    }
+    items.retain(|i| !(matches!(i.kind, Kind::Sheet | Kind::Ask) && linked.contains(&i.key)));
 }
 
 /// A live need as an item. `sheet` says an ask is a decision sheet. An
@@ -194,6 +223,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         scope: Scope::Pro,
         draft: None,
         openable: false,
+        ask: None,
         state: State::Idle,
     })
 }
@@ -274,6 +304,8 @@ pub fn buttons(item: &Item, can_act: bool, can_close: bool) -> Vec<Button> {
                 vec![Button::Correct, Button::Validate]
             }
         }
+        // Its sheet leaves the queue once answered: no `C'est fait`.
+        Kind::Attention if item.ask.is_some() => vec![Button::OpenSheet],
         Kind::Attention => {
             let mut out = Vec::new();
             if can_close {
@@ -782,6 +814,27 @@ mod tests {
             prio,
             draft: None,
         }
+    }
+
+    #[test]
+    fn an_entry_naming_a_waiting_ask_opens_its_sheet_and_hides_the_ask_card() {
+        assert_eq!(ask_ref("kova-sheet:19e0e20f"), Some("19e0e20f"));
+        assert_eq!(ask_ref("kova-ask:19e0e20f-aaaa"), Some("19e0e20f-aaaa"));
+        assert_eq!(ask_ref("https://x"), None);
+        let mut entry_item = from_attention(&entry("a-1", Level::Now, None, 10), None, false).expect("item");
+        entry_item.openable = false;
+        let mut ask_item = from_need(&need(NeedKind::Ask, "ask:19e0e20f-1111", 5), true).expect("ask");
+        ask_item.kind = Kind::Sheet;
+        let mut items = vec![entry_item, ask_item];
+        let actions = vec![("attention:a-1".to_string(), "kova-sheet:19e0e20f".to_string())];
+        link_asks(&mut items, &actions, &["19e0e20f-1111".to_string(), "aaaa0000".to_string()]);
+        assert_eq!(items.len(), 1, "the ask's own card is left out");
+        assert_eq!(items[0].ask.as_deref(), Some("19e0e20f-1111"));
+        assert_eq!(buttons(&items[0], true, true), [Button::OpenSheet]);
+        // An ask that is not waiting any more: the entry keeps its own buttons.
+        let mut items = vec![from_attention(&entry("a-1", Level::Now, None, 10), None, false).expect("item")];
+        link_asks(&mut items, &actions, &[]);
+        assert_eq!(items[0].ask, None);
     }
 
     fn need(kind: NeedKind, key: &str, since: u64) -> NeedItem {

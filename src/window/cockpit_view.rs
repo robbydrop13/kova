@@ -161,11 +161,14 @@ impl KovaView {
     fn cockpit_items(&self, exists: &dyn Fn(&Path) -> bool) -> Vec<Item> {
         let mtm = MainThreadMarker::from(self);
         let mut sheets = std::collections::HashSet::new();
+        let mut waiting = Vec::new();
         crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|q| {
             if q.panel_link().is_some() {
                 sheets.insert(format!("ask:{}", q.id));
             }
+            waiting.push(q.id.clone());
         });
+        let mut actions = Vec::new();
         let mut items: Vec<Item> = {
             let st = self.ivars().sidebar.borrow();
             st.needs.iter().filter_map(|need| cockpit::from_need(need, sheets.contains(&need.key))).collect()
@@ -179,8 +182,12 @@ impl KovaView {
                     .as_deref()
                     .is_some_and(|a| super::sidebar_attention::open_target(a, home.as_deref(), exists).is_some());
                 items.extend(cockpit::from_attention(entry, outcomes.get(&entry.id), openable));
+                if let Some(a) = &entry.action {
+                    actions.push((format!("attention:{}", entry.id), a.clone()));
+                }
             }
         }
+        cockpit::link_asks(&mut items, &actions, &waiting);
         cockpit::sort(&mut items);
         items
     }
@@ -383,12 +390,29 @@ impl KovaView {
         }
     }
 
+    /// Open a waiting ask's sheet (or page) in the side panel, images and all.
+    fn cockpit_open_ask(&self, id: &str) {
+        let mut link = None;
+        let mtm = MainThreadMarker::from(self);
+        crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|q| {
+            if q.id == id {
+                link = q.panel_link();
+            }
+        });
+        if let Some(link) = link {
+            crate::ask_card::open_in_panel(id.to_string(), link);
+        }
+    }
+
     /// A card's button, on the item it was rendered from.
     fn cockpit_act(&self, key: &str, button: Button, text: Option<&str>) {
         let slot = &self.ivars().cockpit;
         let Some(item) = slot.page.borrow().items.iter().find(|i| i.key == key).cloned() else { return };
         let attention_id = key.strip_prefix("attention:");
         match (item.kind, button) {
+            (Kind::Attention, Button::Open | Button::OpenSheet) if item.ask.is_some() => {
+                self.cockpit_open_ask(item.ask.as_deref().unwrap_or_default());
+            }
             (Kind::Attention, Button::Open) => {
                 let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let action = crate::attention::snapshot()
@@ -412,17 +436,7 @@ impl KovaView {
                 }
             }
             (Kind::Sheet, Button::Open | Button::OpenSheet) => {
-                let id = key.strip_prefix("ask:").unwrap_or_default().to_string();
-                let mut link = None;
-                let mtm = MainThreadMarker::from(self);
-                crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|q| {
-                    if q.id == id {
-                        link = q.panel_link();
-                    }
-                });
-                if let Some(link) = link {
-                    crate::ask_card::open_in_panel(id, link);
-                }
+                self.cockpit_open_ask(key.strip_prefix("ask:").unwrap_or_default());
             }
             // A question opens on its card in the Asks list, a failed routine
             // on its row, as the `Needs you` rows did.

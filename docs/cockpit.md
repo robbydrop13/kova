@@ -58,3 +58,7 @@ peer name is `claap-agent` or `perso-agent`. It is the chat mode's own view
 the Cockpit is open, and counts it as focused, so nothing moves the focus or
 switches tab. No chief pane: the column says so in one line (no launch yet).
 The chosen chief is saved per window in the session file (`cockpit_chief`).
+
+## Une entrée de la file qui renvoie à une fiche
+
+Une entrée dont l'`action` est `kova-sheet:<id>` (ou `kova-ask:<id>`, id complet ou préfixe d'au moins 6 caractères) d'une question `kova ask` en attente porte le bouton « Ouvrir la fiche » : il ouvre la fiche dans le volet, images comprises. La carte propre de la question n'apparaît plus, pour ne la montrer qu'une fois. Pas de « C'est fait » : l'entrée part quand la fiche est répondue et l'entrée fermée.
