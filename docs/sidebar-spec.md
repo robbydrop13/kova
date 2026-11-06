@@ -759,11 +759,11 @@ that pane's card, as the block's row did.
 | Panel padding, gaps, bottom| `do_switch_tab(idx)`                                   |                    | header menu  |
 | Header chevron zone (16 pt)| toggle collapse, no tab switch                         | same               | header menu  |
 | Header colour dot (16 pt)  | colour picker (4.3), no tab switch                     |                    | header menu  |
-| Header body                | `do_switch_tab(idx)`; on the active tab: toggle collapse | `start_rename_tab` | header menu |
+| Header body                | `do_switch_tab(idx)`; on the active tab: toggle collapse (from the Cockpit: show the tab, no fold) | `start_rename_tab` | header menu |
 | Header `+`                 | add a pane (4.4)                                       |                    | header menu  |
-| Tile body                  | `focus_pane_in_window(id)` (switches tab, restores, reveals) | rename pane  | tile menu    |
+| Tile body                  | `open_pane_from_sidebar(id)`: `focus_pane_in_window` (switches tab, restores, reveals), then the chat when a live Claude conversation runs there | rename pane  | tile menu    |
 | Tile hover buttons         | the action, without focusing the pane                  |                    | tile menu    |
-| Awaiting `Open`            | same as tile body                                      |                    | tile menu    |
+| Awaiting `Open`            | `focus_pane_in_window(id)`, terminal                   |                    | tile menu    |
 | Awaiting `Stop`            | interrupt (4.4)                                        |                    | tile menu    |
 | Shell `Start Claude`       | start Claude (4.4)                                     |                    | tile menu    |
 | Restored `Resume`          | resume (4.4)                                           |                    | tile menu    |
