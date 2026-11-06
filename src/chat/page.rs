@@ -161,7 +161,7 @@ pub fn markdown(source: &str) -> String {
 /// One thing of the thread, before it is shown or kept behind the scenes.
 enum Unit<'a> {
     User { id: &'a str, text: &'a str },
-    Text { key: String, text: &'a str },
+    Text { key: String, text: &'a str, ends: bool },
     Tool(&'a Tool),
     Thinking { key: String, text: &'a str },
     Note { key: String, text: &'a str },
@@ -187,10 +187,10 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
             Item::User { id, text, .. } => units.push(Unit::User { id, text }),
             Item::Note { id, text } => units.push(Unit::Note { key: format!("n:{id}"), text }),
             Item::Behind { id, label, text } => units.push(Unit::Behind { key: format!("b:{id}"), label, text }),
-            Item::Assistant { id, blocks, .. } => {
+            Item::Assistant { id, blocks, ends_turn, .. } => {
                 for (k, block) in blocks.iter().enumerate() {
                     units.push(match &block.kind {
-                        BlockKind::Text(text) => Unit::Text { key: format!("t:{id}:{k}"), text },
+                        BlockKind::Text(text) => Unit::Text { key: format!("t:{id}:{k}"), text, ends: *ends_turn },
                         BlockKind::Tool(tool) => Unit::Tool(tool),
                         BlockKind::Image => Unit::Image { key: format!("i:{id}:{k}") },
                         BlockKind::Thinking(text) => Unit::Thinking { key: format!("k:{id}:{k}"), text },
@@ -199,7 +199,9 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
             }
         }
     }
-    // A text is final when no tool call follows it before the next user message.
+    // A text is final when no tool call follows it before the next user message,
+    // or when it ended the agent's turn: another session's message can start
+    // a new turn with calls before the user writes again (06/11).
     let mut visible = vec![false; units.len()];
     let mut tool_after = false;
     for (n, unit) in units.iter().enumerate().rev() {
@@ -209,7 +211,7 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
                 tool_after = false;
             }
             Unit::Tool(_) => tool_after = true,
-            Unit::Text { .. } => visible[n] = !tool_after,
+            Unit::Text { ends, .. } => visible[n] = !tool_after || *ends,
             _ => {}
         }
     }
@@ -235,7 +237,7 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
                 id: format!("u:{id}"),
                 html: format!(r#"<div class="user"><div class="bubble">{}</div></div>"#, linkify(text)),
             },
-            Unit::Text { key, text } => Entry { id: key.clone(), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) },
+            Unit::Text { key, text, .. } => Entry { id: key.clone(), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) },
             _ => unreachable!("only messages are visible"),
         });
     }
@@ -1088,6 +1090,23 @@ mod tests {
         assert!(e[1].html.contains(r#"<div class="fold">"#), "folded by default, unfolded on a click");
         assert!(e[3].html.contains("1 action en coulisse") && e[3].html.contains("Message de pm"));
         assert!(e[5].html.contains("Interrupted"));
+    }
+
+    #[test]
+    fn a_turn_s_final_text_stays_when_another_session_starts_a_turn_with_calls() {
+        let mut end = text("r1", 0, "Here is the full answer.");
+        end["message"]["stop_reason"] = json!("end_turn");
+        let c = conv(vec![
+            user("u1", "explain"),
+            tool("r0", 0, "a"),
+            end,
+            json!({"type": "attachment", "uuid": "q", "attachment": {"type": "queued_command", "commandMode": "prompt", "origin": {"kind": "peer"},
+                   "prompt": "<cross-session-message from-name=\"pm\">done</cross-session-message>"}}),
+            tool("r2", 0, "b"),
+            text("r3", 0, "Noted."),
+        ]);
+        let (e, _) = entries(&c, EXCHANGES_STEP, false);
+        assert_eq!(ids(&e), ["u:u1", "c:g:a", "t:r1:0", "c:b:q", "t:r3:0"]);
     }
 
     #[test]
