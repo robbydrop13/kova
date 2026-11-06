@@ -2,7 +2,7 @@
 //! is doing (idle, working, done, blocked, error) and why.
 //!
 //! Spec: <https://www.superlogical.com/rex/docs/build/program-status>. Pi
-//! reports its state this way (and Claude Code does not), so a Kova pane can say
+//! reports its state this way (Claude Code too, since 2.1.x), so a Kova pane can say
 //! "the agent behind this pane is working / waiting for you / finished" without
 //! scraping the screen.
 //!

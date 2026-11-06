@@ -67,7 +67,10 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
   result in the transcript, and the cards. A hook's `waiting` holds only
   while a dialog covers the `❯` line and the spinner is off; its `working`
   bridges the moment before the spinner shows (5 s at most, and not past a
-  spinner that went off after it: Esc runs no Stop hook);
+  spinner that went off after it: Esc runs no Stop hook); its `ready` ends the
+  turn even when Claude Code still reports `working`, as it does while
+  background agents run after its turn (`Waiting for N background agents to
+  finish`, the prompt takes a message);
 - the assistant's text full width, rendered markdown, no bubble; the user's
   message in a quiet bubble on the right;
 - only the user's messages and the assistant's final text (no tool call

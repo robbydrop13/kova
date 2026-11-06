@@ -3,7 +3,8 @@
 //! `Prêt`, `Hors ligne` (KovaLink's readability rule 1).
 //!
 //! Driven by the session's own events, never by a timer guessing:
-//! - Claude Code's title spinner, pushed through the PTY (`Pane::is_working`);
+//! - Claude Code's busy signal, pushed through the PTY (`Pane::is_working`:
+//!   its title spinner, or `working` in OSC 7501);
 //! - the session's hooks (`~/.claude/state/turns/<session id>`, written by
 //!   `claude-config/hooks/harness.py` on UserPromptSubmit and Stop, by
 //!   `notify.sh` on a permission prompt or a question), read when the file
@@ -27,6 +28,14 @@ pub struct HookTurn {
     pub turn: Turn,
     /// Epoch milliseconds of the hook.
     pub at_ms: u64,
+}
+
+/// Stop ran and no prompt since: the turn is over, whatever the pane still
+/// says. Claude Code keeps reporting `working` (OSC 7501) after its turn while
+/// background agents run (`✻ Waiting for 2 background agents to finish`), and
+/// its prompt takes a message then (measured on 2.1.319).
+pub fn turn_ended(hook: Option<HookTurn>) -> bool {
+    hook.is_some_and(|h| h.turn == Turn::Ready)
 }
 
 /// A prompt just submitted counts as working this long before the spinner
@@ -100,7 +109,7 @@ pub fn banner(input: BannerInput) -> Banner {
     if input.cards || (asked && !input.spinner && !input.prompt_line) {
         return Banner::Waiting;
     }
-    let working = input.spinner
+    let working = (input.spinner && !turn_ended(input.hook))
         || hook(Turn::Working).is_some_and(|h| {
             input.now_ms < h.at_ms + HOOK_BRIDGE_MS && input.spinner_off_at.is_none_or(|off| off < h.at_ms)
         });
@@ -197,7 +206,24 @@ mod tests {
         assert_eq!(banner(after), Banner::Done { at: None });
         // Too old to bridge anything.
         assert_eq!(banner(BannerInput { hook: hook(Turn::Working, now - HOOK_BRIDGE_MS), ..input() }), Banner::Done { at: None });
-        assert_eq!(banner(BannerInput { spinner: true, hook: hook(Turn::Ready, now), ..input() }), Banner::Working { since: None }, "the spinner wins");
+        assert_eq!(banner(BannerInput { spinner: true, hook: hook(Turn::Working, now - 60_000), ..input() }), Banner::Working { since: None }, "the spinner holds it");
+    }
+
+    #[test]
+    fn waiting_for_background_agents_is_ready() {
+        // Measured on Claude Code 2.1.319: the turn ends on `launched2`, Stop
+        // writes `ready`, then the screen says `✻ Waiting for 1 background
+        // agent to finish` and OSC 7501 says `working` until the agent is done.
+        let status = crate::terminal::program_status::parse_report(b"state=working:app=claude-code");
+        let Some(crate::terminal::program_status::ProgramReport::Record(s)) = status else { panic!("{status:?}") };
+        assert_eq!(s.state, Some(crate::terminal::program_status::ProgramState::Working));
+        let stop = parse_hook("ready 1793979027.648\n");
+        let now = 1_793_979_028_500;
+        let b = banner(BannerInput { spinner: true, hook: stop, now_ms: now, last_activity: Some(1_793_979_027), ..input() });
+        assert_eq!(b, Banner::Done { at: Some(1_793_979_027) });
+        // The agent's result starts a turn of its own: UserPromptSubmit says so.
+        let next = parse_hook("working 1793979069.330\n");
+        assert_eq!(banner(BannerInput { spinner: true, hook: next, now_ms: 1_793_979_120_000, ..input() }), Banner::Working { since: None });
     }
 
     #[test]

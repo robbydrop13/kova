@@ -693,7 +693,9 @@ fn type_into(pane: &Pane, text: &str) {
 }
 
 /// Whether the pane's prompt takes a message now (`chat::input::gate`).
-fn gate(pane: &Pane, status: banner::Banner) -> input::Verdict {
+/// `ended`: Stop ran since the last prompt (`banner::turn_ended`), so a busy
+/// pane is only waiting for its background agents.
+fn gate(pane: &Pane, status: banner::Banner, ended: bool) -> input::Verdict {
     let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
     // A permission prompt that came up since the last poll waits too.
     let prompt = pane.has_permission_prompt()
@@ -705,7 +707,7 @@ fn gate(pane: &Pane, status: banner::Banner) -> input::Verdict {
         has_session: pane.claude_session_id().is_some() && pane.pty.foreground_process().is_some(),
         status: if prompt {
             banner::Banner::Waiting
-        } else if pane.is_working() {
+        } else if pane.is_working() && !ended {
             banner::Banner::Working { since: None }
         } else {
             status
@@ -1000,7 +1002,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         st.queue_reason = "part quand le texte laissé dans le terminal est envoyé ou effacé";
     }
     // The queue: its first message once the turn is over.
-    let verdict = if st.outbox.queue().is_empty() { input::Verdict::Wait("") } else { gate(pane, b) };
+    let verdict = if st.outbox.queue().is_empty() { input::Verdict::Wait("") } else { gate(pane, b, banner::turn_ended(st.hook)) };
     if let input::Verdict::Wait(reason) = verdict
         && !reason.is_empty()
     {
