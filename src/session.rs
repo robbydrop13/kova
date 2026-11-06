@@ -23,6 +23,10 @@ pub struct WindowSession {
     /// How the sidebar orders this window's tabs.
     #[serde(default)]
     pub sidebar_sort: crate::window::sidebar::SidebarSort,
+    /// Which chief of staff the Cockpit's chat talks to (`perso`), when not
+    /// the default one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cockpit_chief: Option<String>,
 }
 
 /// Legacy single-window session format (v1) — kept for backward compat loading.
@@ -521,6 +525,7 @@ pub struct RestoredWindow {
     pub active_tab: usize,
     pub frame: Option<(f64, f64, f64, f64)>,
     pub sidebar_sort: crate::window::sidebar::SidebarSort,
+    pub cockpit_chief: Option<String>,
     /// Tabs not yet spawned (deferred for progressive loading).
     pub deferred_tabs: Vec<(usize, SavedTab)>,
 }
@@ -604,6 +609,7 @@ pub fn load(backup: Option<usize>) -> Option<Session> {
                     active_tab: v1.active_tab,
                     frame: None,
                     sidebar_sort: Default::default(),
+                    cockpit_chief: None,
                 }],
             }
         } else {
@@ -1116,6 +1122,7 @@ pub fn restore_session(session: Session, config: &Config) -> Option<Vec<Restored
                 active_tab,
                 frame: ws.frame,
                 sidebar_sort: ws.sidebar_sort,
+                cockpit_chief: ws.cockpit_chief.clone(),
                 deferred_tabs,
             });
         }
@@ -1416,6 +1423,7 @@ mod tests {
             active_tab: 0,
             frame: None,
             sidebar_sort: Default::default(),
+            cockpit_chief: None,
         }
     }
 

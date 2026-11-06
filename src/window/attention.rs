@@ -283,6 +283,8 @@ impl KovaView {
     /// the focused pane in the unread list, wrapping, across tabs and
     /// windows. Nothing unread anywhere: a status line says so.
     pub(super) fn do_focus_next_attention(&self) {
+        // The jump lands on a pane: the Cockpit, if open, gives the panes back.
+        self.close_cockpit();
         let active_tab = self.ivars().active_tab.get();
         let current = {
             let tabs = self.ivars().tabs.borrow();

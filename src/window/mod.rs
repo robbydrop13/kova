@@ -10,7 +10,7 @@ pub use ipc_handlers::{IpcMergeTabResult, IpcMoveTabResult, IpcSwapPaneResult, S
 use overlays::{FilterState, RenamePaneState, RenameTabState};
 mod recent_projects_overlay;
 use recent_projects_overlay::RecentProjectsState;
-mod needs;
+pub(crate) mod needs;
 mod resize;
 mod search_palette;
 use search_palette::{SearchPaletteState, SearchRow, is_shortcut, is_typed_char, typed_text};
@@ -26,6 +26,7 @@ pub(super) mod sidebar_sched;
 mod sidebar_view;
 pub(crate) mod side_panel;
 mod chat_view;
+mod cockpit_view;
 pub(crate) mod panel_history;
 use sidebar_ui::SidebarState;
 mod switcher;
@@ -220,6 +221,7 @@ pub struct KovaViewIvars {
     side_panel: OnceCell<Retained<side_panel::SidePanelView>>,
     /// The web view laid over the active tab's chat pane. See `chat_view`.
     chat: chat_view::ChatSlot,
+    cockpit: cockpit_view::CockpitSlot,
 }
 
 #[derive(Clone, Copy)]
@@ -1263,6 +1265,7 @@ impl KovaView {
             side_panel: OnceCell::new(),
             sidebar_shown: Cell::new(false),
             chat: Default::default(),
+            cockpit: Default::default(),
         });
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         // Accept file drags from Finder (legacy filenames type; AppKit bridges
@@ -2351,6 +2354,7 @@ impl KovaView {
             active_tab,
             frame,
             sidebar_sort: self.sidebar_sort(),
+            cockpit_chief: self.cockpit_chief(),
         });
     }
 }

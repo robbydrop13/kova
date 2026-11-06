@@ -109,7 +109,18 @@ impl RoutineVm {
     }
 }
 
-/// One row of the `Needs you` block: what waits, in need order.
+/// The Cockpit entry at the top of the Panes list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CockpitVm {
+    /// `needs::waits_on_you`: what a human has to answer.
+    pub count: u32,
+    /// At least one action is urgent (priority 1): the red dot.
+    pub urgent: bool,
+    /// Its page is open over the panes: the entry is selected.
+    pub open: bool,
+}
+
+/// One need, as the tiles' `Answer` link and the Agents view look it up.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NeedRowVm {
     pub kind: NeedKind,
@@ -138,21 +149,6 @@ pub fn need_rows(items: &[NeedItem], now: u64) -> Vec<NeedRowVm> {
             age: format_age(now.saturating_sub(item.since)),
         })
         .collect()
-}
-
-/// How many rows the block shows: every error and failed routine, then the
-/// asks and permissions filling up to four rows, two of them at least. `all`
-/// is the `Show all` state, which shows every row.
-pub fn need_rows_shown(needs: &[NeedRowVm], all: bool) -> usize {
-    if all {
-        return needs.len();
-    }
-    let head = needs
-        .iter()
-        .filter(|row| matches!(row.kind, NeedKind::Error | NeedKind::FailedRoutine))
-        .count();
-    let tail = needs.len() - head;
-    head + tail.min(4usize.saturating_sub(head).max(2))
 }
 
 /// What the Next pill shows, the same rule as `Cmd+J`: a need item with a
@@ -207,11 +203,12 @@ pub struct SidebarModel {
     pub pill: NextPill,
     /// The groups in display order.
     pub groups: Vec<GroupVm>,
-    /// The `Needs you` block's rows, in need order. `build` leaves it empty;
-    /// `apply_needs` fills it, with the tiles' `waiting` line.
+    /// The need items, in need order, for the tiles' `Answer` link. `build`
+    /// leaves it empty; `apply_needs` fills it, with the tiles' `waiting` line.
     pub needs: Vec<NeedRowVm>,
-    /// `Show all`: the block lists every row rather than the four it folds to.
-    pub needs_all: bool,
+    /// The Cockpit entry, when the list shows it. `build` leaves it out;
+    /// `sync_sidebar` sets it on the Panes list.
+    pub cockpit: Option<CockpitVm>,
     /// The Asks list's cards and transient state. Empty for every other list.
     pub asks: AsksState,
     /// Fewer than three panes in the window: show the `⌘T new tab · ⌘D split` hint.
@@ -559,7 +556,7 @@ impl SidebarModel {
             pill: next_pill(needs, unread),
             groups,
             needs: Vec::new(),
-            needs_all: false,
+            cockpit: None,
             asks: AsksState::default(),
             show_hint: total_panes < 3,
             sched: SchedState::default(),
@@ -570,12 +567,11 @@ impl SidebarModel {
         }
     }
 
-    /// Fill the `Needs you` block and, for every pane with an open ask or a
+    /// Fill the need rows and, for every pane with an open ask or a
     /// permission prompt, the age its tile's subtitle shows. `items` is the
     /// tick's `needs::need_items`: the same list the badges and Next read.
-    pub fn apply_needs(&mut self, items: &[NeedItem], now: u64, all: bool) {
+    pub fn apply_needs(&mut self, items: &[NeedItem], now: u64) {
         self.needs = need_rows(items, now);
-        self.needs_all = all;
         for group in &mut self.groups {
             for tile in &mut group.tiles {
                 tile.waiting = items

@@ -118,6 +118,7 @@ define_class!(
                         let win = window::create_window(mtm, config, rw.tabs, rw.active_tab, rw.deferred_tabs);
                         if let Some(view) = kova_view(&win) {
                             view.set_sidebar_sort(rw.sidebar_sort);
+                            view.set_cockpit_chief(rw.cockpit_chief.as_deref());
                         }
                         // Restore saved window position if available
                         if let Some((x, y, w, h)) = rw.frame {

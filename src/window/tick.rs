@@ -299,6 +299,8 @@ impl KovaView {
         if let Some(panel) = ivars.side_panel.get() {
             panel.tick();
         }
+        // The Cockpit first: it says where the chief's chat goes.
+        self.tick_cockpit();
         self.tick_chat();
         let show_tab_bar = !self.sidebar_active();
         // Output or a scroll may have slid other text under a still pointer.

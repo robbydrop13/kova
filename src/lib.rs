@@ -46,6 +46,7 @@ mod terminal;
 mod update_check;
 mod team;
 mod attention;
+mod cockpit;
 mod window;
 
 /// `kova ask …` (see `ask::USAGE`): returns the exit code.

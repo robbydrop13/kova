@@ -11,7 +11,7 @@ use super::needs::{self, AskNeed, AttentionNeed, NeedInput, NeedItem, NeedKind, 
 use super::sidebar_asks::{self, AskCardVm, AsksHit, AsksState, Highlight};
 use super::sidebar_agents;
 use super::sidebar_attention;
-use super::sidebar_model::{asks_summary, header_title, next_pill, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
+use super::sidebar_model::{asks_summary, header_title, next_pill, CockpitVm, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
 use super::sidebar_sched::{self, SchedButton, SchedHit, SchedState};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
@@ -159,9 +159,6 @@ pub(super) struct SidebarState {
     pub(super) waits_on_you: u32,
     /// A scheduled routine's last run failed, the badge on the Scheduled icon.
     pub(super) routine_failed: bool,
-    /// `Show all` on the `Needs you` block: every row rather than the four
-    /// it folds to.
-    pub(super) needs_all: bool,
     /// The Asks list's cards and transient state, read from the board while
     /// the Asks list is up.
     pub(super) asks: AsksState,
@@ -192,7 +189,6 @@ impl SidebarState {
             needs_generation: 0,
             waits_on_you: 0,
             routine_failed: false,
-            needs_all: false,
             asks: AsksState::default(),
             last_revealed_ask: None,
             routine_shown: None,
@@ -655,9 +651,9 @@ impl KovaView {
         }
         // The unread count across every window, for the Next pill.
         let unread = sidebar::unread_count(&self.collect_unread());
-        let (sort, list, waits_on_you, routine_failed, needs, needs_all) = {
+        let (sort, list, waits_on_you, routine_failed, needs) = {
             let st = self.ivars().sidebar.borrow();
-            (st.sort, st.list, st.waits_on_you, st.routine_failed, st.needs.clone(), st.needs_all)
+            (st.sort, st.list, st.waits_on_you, st.routine_failed, st.needs.clone())
         };
         let now = now_epoch_secs();
         let facts = self.sidebar_tab_facts();
@@ -675,7 +671,10 @@ impl KovaView {
         let mut model = SidebarModel::build(&facts, sort, unread, list, routines, &needs);
         model.asks_waiting = waits_on_you;
         model.routine_failed = routine_failed;
-        model.apply_needs(&needs, now, needs_all);
+        model.apply_needs(&needs, now);
+        if list == SidebarList::Panes {
+            model.cockpit = Some(CockpitVm { count: waits_on_you, urgent: self.cockpit_urgent(), open: self.cockpit_open() });
+        }
         if list == SidebarList::Scheduled {
             // The rows' own state: folding, the row being confirmed, the
             // actions in flight, and the clock the meta row reads.
@@ -949,12 +948,6 @@ impl KovaView {
     /// Escape or `Cancel` on the inline delete confirmation.
     pub(super) fn sidebar_sched_cancel_confirm(&self) {
         self.ivars().sidebar.borrow_mut().sched.close_confirm();
-    }
-
-    /// `Show all` / `Show less` on the `Needs you` block.
-    pub(super) fn sidebar_toggle_needs_all(&self) {
-        let mut st = self.ivars().sidebar.borrow_mut();
-        st.needs_all = !st.needs_all;
     }
 
     /// A stat tile of the Agents list: its section replaces the one under it.

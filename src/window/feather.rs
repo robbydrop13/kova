@@ -84,11 +84,13 @@ pub enum Icon {
     Send,
     /// `mic`: dictate an answer from the ask card.
     Mic,
+    /// `inbox`: the Cockpit entry, every action that waits on the user.
+    Inbox,
 }
 
 /// Every icon, walked by the grid test so a new variant is never forgotten.
 #[cfg(test)]
-pub const ALL: [Icon; 31] = [
+pub const ALL: [Icon; 32] = [
     Icon::ChevronDown,
     Icon::ChevronRight,
     Icon::ChevronLeft,
@@ -120,6 +122,7 @@ pub const ALL: [Icon; 31] = [
     Icon::Sort,
     Icon::Send,
     Icon::Mic,
+    Icon::Inbox,
 ];
 
 /// One stroke of an icon, in grid coordinates.
@@ -286,6 +289,17 @@ impl Icon {
             Icon::Send => vec![
                 Polyline(vec![(22.0, 2.0), (11.0, 13.0)]),
                 Polygon(vec![(22.0, 2.0), (15.0, 22.0), (11.0, 13.0), (2.0, 9.0)]),
+            ],
+            Icon::Inbox => vec![
+                Polyline(vec![(22.0, 12.0), (16.0, 12.0), (14.0, 15.0), (10.0, 15.0), (8.0, 12.0), (2.0, 12.0)]),
+                Polyline(vec![(5.45, 5.11), (2.0, 12.0), (2.0, 18.0)]),
+                svg_arc((2.0, 18.0), (4.0, 20.0), 2.0, false, false),
+                Polyline(vec![(4.0, 20.0), (20.0, 20.0)]),
+                svg_arc((20.0, 20.0), (22.0, 18.0), 2.0, false, false),
+                Polyline(vec![(22.0, 18.0), (22.0, 12.0), (18.55, 5.11)]),
+                svg_arc((18.55, 5.11), (16.76, 4.0), 2.0, false, false),
+                Polyline(vec![(16.76, 4.0), (7.24, 4.0)]),
+                svg_arc((7.24, 4.0), (5.45, 5.11), 2.0, false, false),
             ],
             Icon::Mic => vec![
                 svg_arc((12.0, 1.0), (9.0, 4.0), 3.0, false, false),
@@ -467,7 +481,7 @@ mod tests {
 
     #[test]
     fn every_icon_stays_on_the_grid() {
-        assert_eq!(ALL.len(), 31);
+        assert_eq!(ALL.len(), 32);
         for icon in ALL {
             let segments = icon.segments();
             assert!(!segments.is_empty(), "{icon:?} draws nothing");

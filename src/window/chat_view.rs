@@ -161,6 +161,8 @@ struct Target {
     /// In the container's coordinates (points, y up).
     frame: (f64, f64, f64, f64),
     focused: PaneId,
+    /// The chief's chat on the Cockpit page: not this tab's chat pane.
+    cockpit: bool,
 }
 
 impl KovaView {
@@ -204,7 +206,7 @@ impl KovaView {
     }
 
     /// An overlay Kova draws over the panes is open: the chat steps aside.
-    fn metal_overlay_open(&self) -> bool {
+    pub(super) fn metal_overlay_open(&self) -> bool {
         let i = self.ivars();
         i.search_palette.borrow().is_some()
             || i.pane_switcher.borrow().is_some()
@@ -219,9 +221,17 @@ impl KovaView {
     }
 
     /// The active tab's chat pane, where it is on screen, and the focused pane.
+    /// While the Cockpit is open it covers the panes: the only chat is the
+    /// chief's, on the page's right third, and its pane counts as focused so
+    /// nothing moves the focus or switches tabs to it.
     fn chat_target(&self) -> Option<Target> {
         if self.metal_overlay_open() {
             return None;
+        }
+        if self.cockpit_open() {
+            return self
+                .cockpit_chat_target()
+                .map(|(pane_id, frame)| Target { pane_id, frame, focused: pane_id, cockpit: true });
         }
         let tabs = self.ivars().tabs.borrow();
         let tab = tabs.get(self.ivars().active_tab.get())?;
@@ -255,6 +265,7 @@ impl KovaView {
             pane_id,
             frame: (view.origin.x + x0, view.origin.y + y, x1 - x0, h),
             focused: tab.focused_pane,
+            cockpit: false,
         })
     }
 
@@ -352,7 +363,9 @@ impl KovaView {
         if let Some(update) = update {
             unsafe { web.evaluateJavaScript_completionHandler(&NSString::from_str(&page::update_script(&update)), None) };
         }
-        if leave {
+        if leave && target.cockpit {
+            self.cockpit_close_chat();
+        } else if leave {
             let mut tabs = self.ivars().tabs.borrow_mut();
             if let Some(p) = tabs.iter_mut().find_map(|t| t.pane_mut(target.pane_id)) {
                 p.chat = false;
@@ -472,6 +485,11 @@ impl KovaView {
         }
     }
 
+    /// The chat's web view, once made: the Cockpit puts it back above its page.
+    pub(super) fn chat_web(&self) -> Option<Retained<WKWebView>> {
+        self.ivars().chat.web.get().cloned()
+    }
+
     fn chat_web_view(&self, mtm: MainThreadMarker) -> Retained<WKWebView> {
         let slot = &self.ivars().chat;
         if let Some(web) = slot.web.get() {
@@ -500,7 +518,12 @@ impl KovaView {
         }
         web.setHidden(true);
         if let Some(container) = unsafe { self.superview() } {
-            container.addSubview_positioned_relativeTo(&web, NSWindowOrderingMode::Above, Some(self));
+            // Above the Cockpit's page when there is one: the chief's chat
+            // is drawn over its right third.
+            match self.cockpit_web() {
+                Some(page) => container.addSubview_positioned_relativeTo(&web, NSWindowOrderingMode::Above, Some(&page)),
+                None => container.addSubview_positioned_relativeTo(&web, NSWindowOrderingMode::Above, Some(self)),
+            }
         }
         let _ = slot.delegate.set(delegate);
         let _ = slot.web.set(web.clone());
