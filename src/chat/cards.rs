@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::ask::{Question, OTHER};
 use crate::cockpit;
+use crate::prompt_preview::Menu;
 use crate::prompt_preview::{ParsedPrompt, PermissionChoice};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -177,6 +178,138 @@ pub fn ask_card_html(
         instruction: None,
     };
     cockpit::card_html_with(&item, &sheet, &icons, true, now)
+}
+
+/// The id of a menu's card: it changes with the menu, so a click made on one
+/// never answers the next.
+pub fn menu_id(menu: &Menu) -> String {
+    format!("menu:{:016x}", menu.fingerprint())
+}
+
+/// A menu Claude Code waits on (a permission prompt, an AskUserQuestion,
+/// the plan approval), as a Cockpit card: what the frame says, the plan the
+/// transcript holds, each option as a button, a field for text.
+pub fn menu_card_html(menu: &Menu, plan: Option<&str>, now: u64) -> String {
+    let (title, rest) = match menu.body.split_first() {
+        Some((first, rest)) => (first.clone(), rest.to_vec()),
+        None => ("Claude attend ta réponse".to_string(), Vec::new()),
+    };
+    let mut message: Vec<String> = rest;
+    if let Some(plan) = plan {
+        message.push(plan.trim().to_string());
+    }
+    for o in menu.options.iter().filter(|o| !o.free_text) {
+        if let Some(d) = o.detail.as_deref().filter(|d| *d != o.label) {
+            message.push(format!("{} : {}", o.label, d.replace('\n', " ")));
+        }
+    }
+    let item = cockpit::Item {
+        key: menu_id(menu),
+        kind: cockpit::Kind::Ask,
+        prio: 2,
+        since: now,
+        title,
+        needs: menu.question.clone(),
+        from: "Claude".to_string(),
+        scope: crate::attention::Scope::Pro,
+        draft: None,
+        openable: false,
+        ask: None,
+        detail: Some(cockpit::Detail::Ask {
+            message: message.join("\n"),
+            answers: menu.options.iter().map(|o| (o.label.clone(), o.free_text)).collect(),
+            input: true,
+        }),
+        state: cockpit::State::Idle,
+        instruction: None,
+    };
+    cockpit::card_html_with(&item, &[], &[], false, now)
+}
+
+/// The card shown when the session waits on something Kova cannot read
+/// (a dialog of another shape): it says so, never guesses options.
+pub fn unread_wait_html(now: u64) -> String {
+    let item = cockpit::Item {
+        key: "wait:unread".to_string(),
+        kind: cockpit::Kind::Ask,
+        prio: 2,
+        since: now,
+        title: "Claude attend ta réponse dans le terminal".to_string(),
+        needs: "Kova ne sait pas lire cette question : réponds dans le terminal".to_string(),
+        from: "Claude".to_string(),
+        scope: crate::attention::Scope::Pro,
+        draft: None,
+        openable: false,
+        ask: None,
+        detail: None,
+        state: cockpit::State::Idle,
+        instruction: None,
+    };
+    cockpit::card_html_with(&item, &[], &[], false, now)
+}
+
+/// An answer to a menu: the option's digit, the text its field takes, and a
+/// text that goes after as the next message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuAnswer {
+    pub number: u32,
+    pub text: Option<String>,
+    pub after: Option<String>,
+}
+
+/// A click on the option `label` with `text` in the card's field. The
+/// free-text option takes the text (one line: Enter would send it early);
+/// any other option is answered and the text, if any, follows as a message.
+pub fn menu_answer(menu: &Menu, label: &str, text: &str) -> Result<MenuAnswer, &'static str> {
+    let option = menu.option(label).ok_or("Cette option n'est plus proposée")?;
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if option.free_text {
+        if one_line.is_empty() {
+            return Err("Écris ta réponse dans le champ");
+        }
+        return Ok(MenuAnswer { number: option.number, text: Some(one_line), after: None });
+    }
+    Ok(MenuAnswer { number: option.number, text: None, after: (!text.trim().is_empty()).then(|| text.to_string()) })
+}
+
+/// What the box sends while a menu with a free-text option waits: the
+/// answer, at once, never queued.
+pub fn box_answer(menu: &Menu, text: &str) -> Option<MenuAnswer> {
+    let label = menu.free_text()?.label.clone();
+    menu_answer(menu, &label, text).ok()
+}
+
+/// Where an answer under way stands, after its digit or its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuStage {
+    Digit,
+    Text,
+}
+
+/// What to write next, given the menu on screen now (`question` is the one
+/// answered). After the digit: a menu gone means it took it; still there and
+/// on that option, the text goes, or Enter. After the text: Enter, only
+/// when the option shows it. `Err` says why nothing more goes.
+pub fn menu_next(answer: &MenuAnswer, stage: MenuStage, question: &str, now: Option<&Menu>) -> Result<Option<String>, &'static str> {
+    let Some(menu) = now.filter(|m| m.question == question) else {
+        return match stage {
+            MenuStage::Digit => Ok(None),
+            MenuStage::Text => Err("La réponse n'est pas partie : regarde le terminal"),
+        };
+    };
+    if menu.selected != Some(answer.number) {
+        return Err("Le menu a changé : regarde le terminal");
+    }
+    match (stage, &answer.text) {
+        (MenuStage::Digit, Some(text)) => Ok(Some(text.clone())),
+        (MenuStage::Digit, None) => Ok(Some("\r".to_string())),
+        (MenuStage::Text, Some(text)) => {
+            let shown = menu.options.iter().find(|o| o.number == answer.number).map(|o| o.label.as_str()).unwrap_or_default();
+            let head: String = text.chars().take(20).collect();
+            if shown.starts_with(&head) { Ok(Some("\r".to_string())) } else { Err("La réponse n'est pas partie : regarde le terminal") }
+        }
+        (MenuStage::Text, None) => Ok(None),
+    }
 }
 
 /// The longest first line the card's title shows whole, roughly.
@@ -352,6 +485,55 @@ mod tests {
         let mut long = question("l", Some(4), None);
         long.message = "x".repeat(80);
         assert!(ask_card_html(&long, None, None, true, crate::attention::Scope::Pro, 100).contains(&format!("<p class=\"msg\">{}</p>", "x".repeat(80))));
+    }
+
+    fn screen(name: &str) -> Menu {
+        let text = std::fs::read_to_string(format!("{}/tests/fixtures/prompt/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        crate::prompt_preview::parse_menu(&text).expect(name)
+    }
+
+    #[test]
+    fn an_ask_user_question_answers_by_digit_or_by_its_typed_option() {
+        let m = screen("ask-user-question.txt");
+        let html = menu_card_html(&m, None, 100);
+        assert!(html.contains(&format!("data-key=\"{}\"", menu_id(&m))));
+        assert!(html.contains("Which color do you prefer?") && html.contains("data-arg=\"Green\""));
+        assert!(html.contains("data-arg=\"Type something.\" data-text=\"1\"") && html.contains("textarea class=\"ans\""));
+        assert!(!html.contains("Red : Red"), "a description that repeats its label is left out");
+
+        // A plain option: its digit, nothing typed after.
+        let a = menu_answer(&m, "Green", "").unwrap();
+        assert_eq!(a, MenuAnswer { number: 2, text: None, after: None });
+        assert_eq!(menu_next(&a, MenuStage::Digit, &m.question, None), Ok(None), "the menu took the digit and left");
+        // The typed option: digit, then the text, then Enter once it shows.
+        let a = box_answer(&m, "Purple\nplease").unwrap();
+        assert_eq!(a, MenuAnswer { number: 4, text: Some("Purple please".into()), after: None });
+        let mut on4 = m.clone();
+        on4.selected = Some(4);
+        assert_eq!(menu_next(&a, MenuStage::Digit, &m.question, Some(&on4)), Ok(Some("Purple please".into())));
+        assert!(menu_next(&a, MenuStage::Text, &m.question, Some(&on4)).is_err(), "the option does not show the text yet");
+        on4.options[3].label = "Purple please".into();
+        assert_eq!(menu_next(&a, MenuStage::Text, &m.question, Some(&on4)), Ok(Some("\r".into())));
+        assert!(menu_next(&a, MenuStage::Digit, &m.question, Some(&m)).is_err(), "the cursor is elsewhere: nothing goes");
+        assert_eq!(menu_answer(&m, "Type something.", " "), Err("Écris ta réponse dans le champ"));
+        assert!(menu_answer(&m, "Yellow", "").is_err());
+    }
+
+    #[test]
+    fn a_plan_card_shows_the_plan_and_a_permission_answer_lets_the_text_follow() {
+        let m = screen("plan-approval.txt");
+        let html = menu_card_html(&m, Some("1. Create c.txt\n2. Check it"), 100);
+        assert!(html.contains("1. Create c.txt\n2. Check it") && html.contains("data-arg=\"Yes, manually approve edits\""));
+        assert_eq!(box_answer(&m, "Name it d.txt").map(|a| a.number), Some(3));
+
+        let m = screen("prompt-write-wrapped.txt");
+        assert!(box_answer(&m, "x").is_none(), "no typed option: the box queues as before");
+        let a = menu_answer(&m, "No", "Write it in /tmp instead").unwrap();
+        assert_eq!(a, MenuAnswer { number: 3, text: None, after: Some("Write it in /tmp instead".into()) });
+        // Still on the menu, cursor on 3 after the digit: Enter confirms.
+        let mut on3 = m.clone();
+        on3.selected = Some(3);
+        assert_eq!(menu_next(&a, MenuStage::Digit, &m.question, Some(&on3)), Ok(Some("\r".into())));
     }
 
     #[test]

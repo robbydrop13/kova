@@ -476,6 +476,8 @@ pub struct Menu {
     pub body: Vec<String>,
     pub question: String,
     pub options: Vec<MenuOption>,
+    /// The option the `❯` points at: where Enter goes. Not in the fingerprint.
+    pub selected: Option<u32>,
 }
 
 impl Menu {
@@ -569,6 +571,7 @@ pub fn parse_menu(visible: &str) -> Option<Menu> {
         q_start -= 1;
     }
     let question = normalize(&lines[q_start..q_end].join(" "));
+    let selected = options.iter().find(|o| o.2).map(|o| o.0);
     // The body: what the frame shows above the question.
     let top = lines[..q_start].iter().rposition(|l| is_frame(l)).map_or(q_start, |t| t + 1);
     let body: Vec<String> =
@@ -576,6 +579,7 @@ pub fn parse_menu(visible: &str) -> Option<Menu> {
     Some(Menu {
         body,
         question,
+        selected,
         options: options
             .into_iter()
             .map(|(number, label, _, under)| MenuOption {
@@ -783,6 +787,7 @@ mod tests {
         assert!(m.options[2].free_text);
         assert_eq!(m.options[2].detail.as_deref(), Some("shift+tab to approve with this feedback"));
         assert!(m.body.is_empty(), "the plan itself sits above the frame: the transcript has it");
+        assert_eq!(m.selected, Some(1));
     }
 
     #[test]
