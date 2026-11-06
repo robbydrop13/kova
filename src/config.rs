@@ -257,6 +257,24 @@ pub struct AttentionConfig {
     /// Closes an entry: Kova appends the id, then `--note` and its words
     /// (`["/usr/local/bin/attn", "close", "--by", "me"]`).
     pub close_command: Vec<String>,
+    /// The folder whose work is personal (`"~/Perso"`): a failed routine,
+    /// a permission or an error whose cwd sits under it is scoped Perso in
+    /// the Cockpit, anything else Pro. Empty: everything is Pro.
+    pub perso_dir: String,
+}
+
+impl AttentionConfig {
+    /// `perso_dir` with a leading `~/` expanded, `None` when unset.
+    pub fn perso_root(&self) -> Option<std::path::PathBuf> {
+        let dir = self.perso_dir.trim();
+        if dir.is_empty() {
+            return None;
+        }
+        Some(match dir.strip_prefix("~/") {
+            Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
+            None => std::path::PathBuf::from(dir),
+        })
+    }
 }
 
 /// The layout settings Kova changes at runtime (View menu, the sidebar edge
@@ -730,6 +748,12 @@ mod tests {
         assert!(config.attention.close_command.is_empty());
         let none = Config::default();
         assert!(none.attention.command.is_empty() && none.attention.act_command.is_empty());
+        assert_eq!(none.attention.perso_root(), None);
+        let perso: Config = toml::from_str("[attention]\nperso_dir = \"~/Perso\"\n").unwrap();
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        assert_eq!(perso.attention.perso_root(), Some(home.join("Perso")));
+        let abs: Config = toml::from_str("[attention]\nperso_dir = \"/srv/me\"\n").unwrap();
+        assert_eq!(abs.attention.perso_root(), Some(std::path::PathBuf::from("/srv/me")));
     }
 
     #[test]

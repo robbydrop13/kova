@@ -15,7 +15,7 @@
 //! is taken only from this web view's main frame on `about:blank`.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use objc2::rc::Retained;
@@ -31,7 +31,8 @@ use objc2_web_kit::{
 use serde_json::Value;
 
 use crate::attention::{Scope, Verb};
-use crate::cockpit::{self, Button, ChatColumn, Filter, Item, Kind, State, Update, View};
+use crate::cockpit::{self, Button, ChatColumn, Detail, Filter, Item, Kind, RoutineAct, State, Update, View};
+use crate::routines::Routine;
 use crate::surface::PaneId;
 
 use super::sidebar::tokens;
@@ -46,6 +47,10 @@ const MESSAGE_MAX: usize = 64 * 1024;
 const CHAT_TOP_H: f64 = 56.0;
 /// How long a typed permission answer keeps its card waiting.
 const PENDING_MS: u64 = 5_000;
+/// The pane lines an opened error card shows.
+const ERROR_LINES: usize = 15;
+/// The most of a routine's prompt an opened card shows.
+const PROMPT_MAX: usize = 16 * 1024;
 
 /// A frame in the container's coordinates (points, y up).
 type Frame = (f64, f64, f64, f64);
@@ -64,6 +69,9 @@ pub struct CockpitSlot {
     chat_target: Cell<Option<(PaneId, Frame)>>,
     /// Give the page the keyboard on the next tick.
     focus: Cell<bool>,
+    /// The cards opened with `Ouvrir`, by key: kept through every refresh,
+    /// dropped once the card is gone.
+    expanded: RefCell<HashSet<String>>,
     page: RefCell<Page>,
 }
 
@@ -81,7 +89,8 @@ struct Page {
     /// A permission card's prompt as rendered, by key: a click answers it
     /// only if the screen still shows that prompt.
     prompts: HashMap<String, String>,
-    /// Permission answers typed, by key, with when (ms): the card waits.
+    /// Permission and question answers given, by key, with when (ms): the
+    /// card waits.
     pending: HashMap<String, u64>,
 }
 
@@ -281,17 +290,18 @@ impl KovaView {
             return;
         }
         let mut items = self.cockpit_items(&|p: &Path| p.is_file());
+        self.cockpit_fill(&mut items);
         let mut page = slot.page.borrow_mut();
         page.last_poll = Some(std::time::Instant::now());
         let now = now_ms();
         page.pending.retain(|_, at| now.saturating_sub(*at) < PENDING_MS);
         let mut prompts = HashMap::new();
         for item in &mut items {
-            if item.kind != Kind::Permission {
-                continue;
-            }
             if page.pending.contains_key(&item.key) {
                 item.state = State::Running;
+            }
+            if item.kind != Kind::Permission {
+                continue;
             }
             let prompt = pane_of(&item.key).and_then(|id| {
                 super::sidebar_ui::with_pane(id, |p| p.permission_prompt().map(|pr| crate::chat::cards::permission_id(&pr)))
@@ -381,8 +391,21 @@ impl KovaView {
             }
             "act" => {
                 let text = msg.get("text").and_then(Value::as_str).map(str::to_string);
-                if let Some(button) = Button::parse(&s("act")) {
-                    self.cockpit_act(&s("key"), button, text.as_deref());
+                let key = s("key");
+                match s("act").as_str() {
+                    // The buttons inside an opened card.
+                    "routine" => self.cockpit_routine(&key, &s("arg")),
+                    "answer" => self.cockpit_answer(&key, &s("arg"), text.as_deref().unwrap_or_default()),
+                    "pane" => {
+                        self.close_cockpit();
+                        self.sidebar_open_need(&key);
+                        self.mark_dirty();
+                    }
+                    act => {
+                        if let Some(button) = Button::parse(act) {
+                            self.cockpit_act(&key, button, text.as_deref());
+                        }
+                    }
                 }
                 true
             }
@@ -438,13 +461,12 @@ impl KovaView {
             (Kind::Sheet, Button::Open | Button::OpenSheet) => {
                 self.cockpit_open_ask(key.strip_prefix("ask:").unwrap_or_default());
             }
-            // A question opens on its card in the Asks list, a failed routine
-            // on its row, as the `Needs you` rows did.
-            (Kind::Ask | Kind::FailedRoutine, Button::Open) => self.sidebar_open_need(key),
-            // A pane: focus it, and the page gives the panes back.
-            (Kind::Error, Button::Open) => {
-                self.close_cockpit();
-                self.sidebar_open_need(key);
+            // The card opens in place, or folds back.
+            (_, Button::Expand) => {
+                let mut expanded = slot.expanded.borrow_mut();
+                if !expanded.remove(key) {
+                    expanded.insert(key.to_string());
+                }
             }
             (Kind::Permission, Button::Allow | Button::Deny) => {
                 let Some(pane_id) = pane_of(key) else { return };
@@ -468,6 +490,166 @@ impl KovaView {
                 }
             }
             _ => {}
+        }
+        self.mark_dirty();
+    }
+
+    /// What the tick adds to the live cards: their scope from the cwd
+    /// (`[attention] perso_dir`), and the detail of the cards opened.
+    fn cockpit_fill(&self, items: &mut [Item]) {
+        let slot = &self.ivars().cockpit;
+        let perso = self.ivars().config.get().and_then(|c| c.attention.perso_root());
+        let routines = crate::routines::snapshot();
+        let routines = routines.as_deref().map(Vec::as_slice);
+        slot.expanded.borrow_mut().retain(|k| items.iter().any(|i| &i.key == k));
+        let expanded = slot.expanded.borrow();
+        for item in items.iter_mut() {
+            let routine = find_routine(routines, &item.key);
+            let cwd = match item.kind {
+                Kind::FailedRoutine => routine.map(|r| r.cwd.clone()),
+                Kind::Permission | Kind::Error => {
+                    pane_of(&item.key).and_then(|id| super::sidebar_ui::with_pane(id, |p| p.cached_cwd()).flatten())
+                }
+                _ => None,
+            };
+            if let Some(cwd) = cwd {
+                item.scope = cockpit::scope_of_cwd(&cwd, perso.as_deref());
+            }
+            // A run, a pause or a resume in flight: the card waits for it.
+            if let Some(r) = routine
+                && self.ivars().sidebar.borrow().sched.busy_action(&r.name).is_some()
+            {
+                item.state = State::Running;
+            }
+            if expanded.contains(&item.key) {
+                item.detail = self.cockpit_detail(item, routine);
+            }
+        }
+    }
+
+    /// What an opened card shows: the Scheduled tile's body for a routine,
+    /// the prompt for a permission, the pane's last lines for an error, the
+    /// question and its answers for an ask.
+    fn cockpit_detail(&self, item: &Item, routine: Option<&Routine>) -> Option<Detail> {
+        use super::sidebar_sched::{self, SchedButton};
+        match item.kind {
+            Kind::FailedRoutine => {
+                let r = routine?;
+                let vm = super::sidebar_model::RoutineVm::of(r, true);
+                let labels = ["Horaire", "Prochain", "Dernier", "Dossier"];
+                let rows = labels.iter().zip(sidebar_sched::body_rows(&vm)).map(|(l, (_, v))| (l.to_string(), v)).collect();
+                let prompt = std::fs::read_to_string(crate::routines::prompt_path(&r.name))
+                    .map(|mut text| {
+                        if text.len() > PROMPT_MAX {
+                            let mut cut = PROMPT_MAX;
+                            while !text.is_char_boundary(cut) {
+                                cut -= 1;
+                            }
+                            text.truncate(cut);
+                            text.push('\u{2026}');
+                        }
+                        text
+                    })
+                    .unwrap_or_else(|_| "Prompt introuvable".to_string());
+                let acts = sidebar_sched::buttons(&vm)
+                    .iter()
+                    .filter_map(|b| match b {
+                        SchedButton::Run => Some(RoutineAct::Run),
+                        SchedButton::Resume => Some(RoutineAct::Resume),
+                        SchedButton::Log => Some(RoutineAct::Log),
+                        SchedButton::Pause => Some(RoutineAct::Pause),
+                        SchedButton::Edit => Some(RoutineAct::Edit),
+                        _ => None,
+                    })
+                    .collect();
+                let note = self.ivars().sidebar.borrow().sched.error(&r.name).map(str::to_string);
+                let failed = matches!(vm.last_status, crate::routines::LastStatus::Failed(_));
+                Some(Detail::Routine { rows, failed, prompt, acts, note })
+            }
+            Kind::Permission => {
+                let prompt = super::sidebar_ui::with_pane(pane_of(&item.key)?, |p| p.permission_prompt()).flatten()?;
+                let mut text = prompt.lines.join("\n");
+                if !prompt.question.is_empty() {
+                    text.push_str("\n\n");
+                    text.push_str(&prompt.question);
+                }
+                Some(Detail::Permission { text })
+            }
+            Kind::Error => {
+                let visible = super::sidebar_ui::with_pane(pane_of(&item.key)?, |p| {
+                    p.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text
+                })?;
+                Some(Detail::Error { words: item.needs.clone(), lines: cockpit::last_lines(&visible, ERROR_LINES) })
+            }
+            Kind::Ask => {
+                let q = self.waiting_ask(item.key.strip_prefix("ask:")?)?;
+                let card = crate::chat::cards::question_card(&q, crate::handoff::detail(&q).map(|d| d.card_text()));
+                let message = match &card.detail {
+                    Some(d) => format!("{}\n\n{d}", card.message),
+                    None => card.message.clone(),
+                };
+                let answers = card
+                    .buttons
+                    .iter()
+                    .filter(|b| matches!(b.act, crate::chat::cards::Act::Answer { .. }))
+                    .map(|b| (b.label.clone(), b.needs_text))
+                    .collect();
+                Some(Detail::Ask { message, answers, input: card.input })
+            }
+            _ => None,
+        }
+    }
+
+    /// A waiting `kova ask`, by id.
+    fn waiting_ask(&self, id: &str) -> Option<crate::ask::Question> {
+        let mut found = None;
+        let mtm = MainThreadMarker::from(self);
+        crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|q| {
+            if q.id == id {
+                found = Some(q.clone());
+            }
+        });
+        found
+    }
+
+    /// An opened routine card's button: the Scheduled tile's own path.
+    fn cockpit_routine(&self, key: &str, word: &str) {
+        use super::sidebar_sched::{SchedButton, SchedHit};
+        let (Some(name), Some(act)) = (key.strip_prefix("routine:"), RoutineAct::parse(word)) else { return };
+        let button = match act {
+            RoutineAct::Run => SchedButton::Run,
+            RoutineAct::Resume => SchedButton::Resume,
+            RoutineAct::Log => SchedButton::Log,
+            RoutineAct::Pause => SchedButton::Pause,
+            RoutineAct::Edit => SchedButton::Edit,
+        };
+        let routines = crate::routines::snapshot();
+        let log = find_routine(routines.as_deref().map(Vec::as_slice), key).map(|r| r.log.clone()).unwrap_or_default();
+        // The index names a row of the sidebar's list; the action ignores it.
+        self.sidebar_sched_hit(SchedHit::Button(0, button), name, &log);
+        self.mark_dirty();
+    }
+
+    /// An opened question's answer, checked and queued as the chat does.
+    fn cockpit_answer(&self, key: &str, action: &str, text: &str) {
+        let Some(q) = key.strip_prefix("ask:").and_then(|id| self.waiting_ask(id)) else { return };
+        let card = crate::chat::cards::question_card(&q, None);
+        let checked = if crate::chat::cards::offers(&card, action) {
+            crate::ask::accepts_external_answer(&q, action, text)
+        } else {
+            Err("this answer is not offered".to_string())
+        };
+        match checked {
+            Ok(()) => {
+                let mtm = MainThreadMarker::from(self);
+                crate::app::app_delegate(mtm).ivars().queue_ask_action(super::sidebar_asks::AskAction::Answer {
+                    id: q.id.clone(),
+                    action: action.to_string(),
+                    text: text.to_string(),
+                });
+                self.ivars().cockpit.page.borrow_mut().pending.insert(key.to_string(), now_ms());
+            }
+            Err(why) => log::warn!("cockpit: {why}"),
         }
         self.mark_dirty();
     }
@@ -510,6 +692,12 @@ impl KovaView {
         let _ = slot.web.set(web.clone());
         web
     }
+}
+
+/// The routine a `routine:<name>` key names.
+fn find_routine<'a>(list: Option<&'a [Routine]>, key: &str) -> Option<&'a Routine> {
+    let name = key.strip_prefix("routine:")?;
+    list?.iter().find(|r| r.name == name)
 }
 
 /// The pane a `pane:<id>` key names.

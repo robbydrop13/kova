@@ -25,13 +25,14 @@ it: one `WKWebView` per window over the active tab's panes area
 - Priority: the entry's `prio` (1..3), else `now` 2 and `point` 3; permission
   prompts and errors 1; asks, sheets and failed routines 2. Sections Urgent,
   Aujourd'hui, Cette semaine; oldest first inside a section.
-- Scope: the entry's `scope` (`pro` shows as Claap, `perso` as Perso). Live
-  needs carry none and count as Claap. The filter `Tout · Claap · Perso` is
+- Scope: the entry's `scope` (`pro` shows as Claap, `perso` as Perso). A live
+  need takes it from its cwd: the routine's `cwd`, the pane's cwd for a
+  permission or an error. Under `[attention] perso_dir` (`~/` expanded) it is
+  Perso, else Claap; an ask, or no `perso_dir`, is Claap. The filter `Tout · Claap · Perso` is
   kept in the window's state.
 - Buttons: `Ouvrir` for an entry whose `action` the side panel can show
-  (`sidebar_attention::open_target`), a question (Asks list on its card), a
-  failed routine (Scheduled list) or an error (focus the pane, close the page);
-  `Ouvrir la fiche` for a decision sheet (no `C'est fait`); `C'est fait`
+  (`sidebar_attention::open_target`); `Ouvrir` on a live need opens the card in
+  place (see Opened cards); `Ouvrir la fiche` for a decision sheet (no `C'est fait`); `C'est fait`
   runs `close_command`; `Refuser` / `Autoriser` answer a permission prompt
   like the chat mode does, only if the screen still shows the prompt the card
   was rendered from.
@@ -48,6 +49,33 @@ only posts clicks, the filter and the edited text (`kovaCockpit`); messages
 from another frame, another URL or an earlier load are dropped. The tick
 gathers the items every 250 ms and pushes only the parts that changed; a draft
 being rewritten keeps its text, caret and focus through a push.
+
+## Opened cards
+
+`Ouvrir` on a failed routine, a permission, an error or a plain question opens
+its detail inside the card, with no jump to another view; the button reads
+`Masquer` while it is open. The opened keys live in the window
+(`CockpitSlot::expanded`): the 250 ms refresh rebuilds the detail and keeps it
+open, with its folded prompt, its scroll and a typed answer; a key whose card
+is gone is dropped.
+
+- Failed routine (the Scheduled tile's body): `Horaire`, `Prochain`,
+  `Dernier` (crit when it failed, with its exit code), `Dossier`; the prompt
+  file, folded and scrollable (16 KiB at most); `Lancer maintenant` (or
+  `Reprendre` when off), `Voir le log`, `Mettre en pause`, `Modifier le
+  prompt`, through the tile's own path (`sidebar_sched_hit`). No delete here.
+  An action in flight shows `En cours`; an open that failed shows its words.
+- Permission: the prompt's lines and question; `Refuser` / `Autoriser` stay
+  on the card.
+- Error: the provider's words, the pane's last 15 non-blank lines, and `Voir le
+  pane`, which closes the page and focuses the pane.
+- Question: its text and its answers as buttons (a free answer brings a
+  field), checked with `ask::accepts_external_answer` and queued like the
+  chat's (`queue_ask_action`); the card shows `En cours` for 5 s.
+
+A failed routine has no `Needs attention` section in the Scheduled list any
+more (06/11/2026): its row sits in its normal group and says it failed; the
+Scheduled icon keeps its red dot.
 
 ## Chat
 

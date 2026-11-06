@@ -26,6 +26,9 @@
 # ask_resume_tab = ""               # tab title where a conversation reopened for a late `kova ask` answer
 #                                   # goes, as a new column ("" = a new tab each time)
 
+# [attention]
+# perso_dir = "~/Perso"        # cwd under this folder = Perso in the Cockpit, else Pro
+
 # [splits]
 # min_width = 300.0            # minimum pane width before horizontal scroll kicks in
 # dim_opacity = 0.3            # how much an unfocused pane is faded (0.0 .. 1.0)
