@@ -370,7 +370,8 @@ pub fn short_home(path: &str) -> String {
 /// The meta row's left side: `N active · K failed`.
 pub fn meta_left(routines: &[RoutineVm]) -> Vec<(String, bool)> {
     let active = routines.iter().filter(|r| r.group != Group::Off).count();
-    let failed = routines.iter().filter(|r| r.group == Group::NeedsAttention).count();
+    let failed =
+        routines.iter().filter(|r| r.group != Group::Off && matches!(r.last_status, LastStatus::Failed(_))).count();
     let mut out = vec![(format!("{active} active"), false)];
     if failed > 0 {
         out.push((" \u{b7} ".to_string(), false));
@@ -618,7 +619,7 @@ fn draw_section(sh: &Shared, group: Group, count: usize, state: &SchedState, fra
     let cx = frame.x + SECTION_CHEVRON_X;
     let chevron = if state.is_folded(group) { Icon::ChevronRight } else { Icon::ChevronDown };
     stroke_icon(chevron, &Rect::new(cx, cy - CHEVRON / 2.0, CHEVRON, CHEVRON), CHEVRON, tokens::get().text_tertiary, alpha);
-    let label_fg = if group == Group::NeedsAttention { tokens::get().crit_text } else { tokens::get().text_secondary };
+    let label_fg = tokens::get().text_secondary;
     let x = frame.x + SECTION_LABEL_X;
     let w = draw_text_sh(sh, group.label(), &Rect::new(x, frame.y, frame.w, frame.h), Style::Chip, label_fg, alpha);
     let count_text = count.to_string();
@@ -865,7 +866,7 @@ mod tests {
         let routines = fixture();
         let (sched, rows) = layout(&routines, &SchedState::default(), 280.0, &FakeMetrics);
         let groups: Vec<Group> = sched.sections.iter().map(|s| s.group).collect();
-        assert_eq!(groups, [Group::NeedsAttention, Group::Today, Group::ThisWeek, Group::Later, Group::Off]);
+        assert_eq!(groups, [Group::Today, Group::ThisWeek, Group::Later, Group::Off]);
         // Next run first inside a section, a manual routine last; the off
         // routine stays hidden behind its folded header.
         let names: Vec<&str> = rows
@@ -877,10 +878,11 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["gamma-report", "beta-cleanup", "alpha-digest", "eta-week", "theta-edge", "zeta-later", "epsilon-manual"]
+            ["beta-cleanup", "gamma-report", "alpha-digest", "eta-week", "theta-edge", "zeta-later", "epsilon-manual"]
         );
         assert_eq!(sched.sections[0].header.h, SECTION_H);
-        assert_eq!(sched.sections[0].count, 1);
+        // The failed `gamma-report` sits in Today, by its next run.
+        assert_eq!(sched.sections[0].count, 3);
         assert_eq!(sched.sections[1].count, 2);
     }
 
@@ -890,22 +892,22 @@ mod tests {
         let mut state = SchedState::default();
         assert!(state.is_folded(Group::Off));
         let (folded, rows) = layout(&routines, &state, 280.0, &FakeMetrics);
-        assert_eq!(rows.iter().filter(|r| matches!(r.kind, RowKind::SchedHeader { .. })).count(), 5);
+        assert_eq!(rows.iter().filter(|r| matches!(r.kind, RowKind::SchedHeader { .. })).count(), 4);
         let delta = index_of(&routines, "delta-paused");
         assert!(rows.iter().all(|r| r.kind != RowKind::Routine { index: delta }));
 
         // Opened, the off routine joins the list and the content grows.
         state.toggle(Group::Off);
         let (open, rows) = layout(&routines, &state, 280.0, &FakeMetrics);
-        assert!(!open.sections[4].folded);
+        assert!(!open.sections[3].folded);
         assert!(open.content_h > folded.content_h);
         let row = row_of(&rows, delta);
         assert_eq!(hit(row, row.frame.x + 2.0, row.frame.y + 2.0), Some(SchedHit::Row(delta)));
 
-        // Today folded keeps its header and drops its two rows.
+        // Today folded keeps its header and drops its rows.
         state.toggle(Group::Today);
         let (today_folded, rows) = layout(&routines, &state, 280.0, &FakeMetrics);
-        assert!(today_folded.sections[1].folded);
+        assert!(today_folded.sections[0].folded);
         assert!(rows.iter().all(|r| !matches!(r.kind, RowKind::Routine { index } if routines[index].group == Group::Today)));
         // Folding is a toggle, not a latch.
         state.toggle(Group::Today);

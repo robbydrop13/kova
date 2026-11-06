@@ -630,7 +630,8 @@ mod tests {
         };
         let vm = RoutineVm::at(&failed, false, now);
         assert_eq!(vm.last_status, LastStatus::Failed(2));
-        assert_eq!(vm.group, crate::routines::Group::NeedsAttention);
+        // It stays in its schedule's group: the Cockpit is where it asks.
+        assert_ne!(vm.group, crate::routines::Group::Off);
 
         // A run still going has no end: it is running, not failed, and the
         // row counts from its start.

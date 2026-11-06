@@ -145,9 +145,6 @@ pub enum LastStatus {
 /// Where a routine belongs in the Scheduled list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
-    /// The last run failed and nothing paused it: the one group that asks
-    /// for a look.
-    NeedsAttention,
     /// Next run later today.
     Today,
     /// Next run in the coming seven days.
@@ -160,14 +157,14 @@ pub enum Group {
 }
 
 impl Group {
-    /// The sections in display order: a failure first, the switched-off last.
-    pub const ALL: [Group; 5] =
-        [Group::NeedsAttention, Group::Today, Group::ThisWeek, Group::Later, Group::Off];
+    /// The sections in display order, the switched-off last. A failure has
+    /// no section of its own since 06/11/2026: it sits in its schedule's
+    /// group, its row says it failed, and the Cockpit lists it.
+    pub const ALL: [Group; 4] = [Group::Today, Group::ThisWeek, Group::Later, Group::Off];
 
     /// The section's header.
     pub fn label(self) -> &'static str {
         match self {
-            Group::NeedsAttention => "Needs attention",
             Group::Today => "Today",
             Group::ThisWeek => "This week",
             Group::Later => "Later",
@@ -180,7 +177,7 @@ impl Group {
         match self {
             Group::Today => Some("next first"),
             Group::Off => Some("paused"),
-            Group::NeedsAttention | Group::ThisWeek | Group::Later => None,
+            Group::ThisWeek | Group::Later => None,
         }
     }
 }
@@ -240,13 +237,10 @@ impl Routine {
     }
 }
 
-/// Where a routine sits for the sidebar, given the clock. A failure wins over
-/// every schedule group, a paused routine is off whatever its last run did,
-/// and a manual routine has no next run to be today or later.
+/// Where a routine sits for the sidebar, given the clock. A paused routine
+/// is off whatever its last run did, a manual routine has no next run to be
+/// today or later, and a failed one stays in its schedule's group.
 pub fn group(r: &Routine, now: When) -> Group {
-    if !r.paused && r.last.as_ref().is_some_and(|l| l.code != 0) {
-        return Group::NeedsAttention;
-    }
     if r.paused {
         return Group::Off;
     }
@@ -914,9 +908,10 @@ mod tests {
         r.next_run = Some(at("2026-11-03T21:05"));
         assert_eq!(group(&r, now), Group::Later);
         r.manual = false;
-        // A failed run asks for a look even when the next one is today.
+        // A failed run stays in its schedule's group (the Cockpit lists it).
         r.last = Some(LastRun { start: None, end: Some(at("2026-11-03T19:00")), code: 2 });
-        assert_eq!(group(&r, now), Group::NeedsAttention);
+        r.next_run = Some(at("2026-11-03T21:05"));
+        assert_eq!(group(&r, now), Group::Today);
         // Paused wins over a failure: off is not broken.
         r.paused = true;
         assert_eq!(group(&r, now), Group::Off);
@@ -1001,7 +996,7 @@ mod tests {
                 ("delta-paused", Group::Off),
                 ("epsilon-manual", Group::Later),
                 ("eta-week", Group::ThisWeek),
-                ("gamma-report", Group::NeedsAttention),
+                ("gamma-report", Group::Today),
                 ("theta-edge", Group::ThisWeek),
                 ("zeta-later", Group::Later),
             ]

@@ -335,21 +335,24 @@ rows are grouped into sections, next run first, and each row can run, pause,
 resume, edit or delete its routine through `routinectl` (3.7.2.3).
 
 The meta row reads `N active · K failed` on the left (`failed` in `crit`,
-`K` counting `NeedsAttention`) and the clock the list is phrased against on
+`K` counting the routines whose last run failed and that are not paused) and the clock the list is phrased against on
 the right, `now 18:45`.
 
 #### Sections
 
 | Section | Holds | Note | Folded at start |
 |---|---|---|---|
-| `Needs attention` | the last run failed, and it is not paused | | no |
 | `Today` | next run later today | `next first` | no |
 | `This week` | next run within seven days | | no |
 | `Later` | further out, and manual routines | | no |
 | `Off` | `enabled: false` | `paused` | **yes** |
 
-A header is 24 pt: the chevron (12), the label (11 medium, `crit` on
-`Needs attention`), the count in tertiary, and the note right-aligned.
+A failed routine has no section of its own (the `Needs attention` group went
+on 06/11/2026): it sits in its schedule's section, its second line says
+`failed` in `crit`, the Scheduled icon keeps its red dot, and the Cockpit
+lists it as a card (`docs/cockpit.md`).
+
+A header is 24 pt: the chevron (12), the label (11 medium), the count in tertiary, and the note right-aligned.
 Clicking it folds or unfolds the section; the folded state lives in
 `SidebarState.sched` (`folded`, `Off` in it by default) and rides the model.
 An empty section is not drawn. Rows inside a section sort by next run, a
