@@ -232,23 +232,36 @@ impl TermColors {
     }
 }
 
+/// SGR 2: the foreground halved (`TerminalState::effective_colors`).
+pub fn dim(c: [u8; 3]) -> [u8; 3] {
+    c.map(|v| v / 2)
+}
+
+/// SGR 1: the foreground brightened by 30%, clamped.
+pub fn bold(c: [u8; 3]) -> [u8; 3] {
+    c.map(|v| (v as u16 * 13 / 10).min(255) as u8)
+}
+
 /// A colour of a cell in the old palette, in the new one. `fg` says which
 /// side of the cell it is: a foreground matches the old default foreground
 /// first, a background the old default background first, and each then the
 /// other default (reverse video swapped them) before the ANSI slots. Any other
 /// colour (256-colour cube, truecolor) is the program's own and stays.
-pub fn recolor(c: [u8; 3], fg: bool, from: &TermColors, to: &TermColors) -> [u8; 3] {
+/// A colour written dim, or bold on a `bold` cell, is the old colour through
+/// that transform and becomes the new one through it.
+pub fn recolor(c: [u8; 3], fg: bool, from: &TermColors, to: &TermColors, bold_cell: bool) -> [u8; 3] {
     let (first, then) = if fg { ((from.fg, to.fg), (from.bg, to.bg)) } else { ((from.bg, to.bg), (from.fg, to.fg)) };
-    if c == first.0 {
-        return first.1;
+    let pairs = || [first, then].into_iter().chain(from.ansi.iter().copied().zip(to.ansi.iter().copied()));
+    let plain = |c: [u8; 3]| c;
+    let dim_bold = |c: [u8; 3]| bold(dim(c));
+    let transforms: &[&dyn Fn([u8; 3]) -> [u8; 3]] =
+        if bold_cell { &[&plain, &bold, &dim_bold] } else { &[&plain, &dim] };
+    for t in transforms {
+        if let Some((_, new)) = pairs().find(|(old, _)| t(*old) == c) {
+            return t(new);
+        }
     }
-    if c == then.0 {
-        return then.1;
-    }
-    match from.ansi.iter().position(|a| *a == c) {
-        Some(i) => to.ansi[i],
-        None => c,
-    }
+    c
 }
 
 #[cfg(test)]
@@ -343,14 +356,17 @@ mod tests {
         let light = TermColors { fg: [36, 36, 36], bg: [255, 255, 255], ansi: LIGHT_ANSI };
         // The default foreground is also bright white: as a foreground it is
         // the default, so it becomes the dark text.
-        assert_eq!(recolor([255, 255, 255], true, &dark, &light), [36, 36, 36]);
-        assert_eq!(recolor([25, 25, 30], false, &dark, &light), [255, 255, 255]);
+        assert_eq!(recolor([255, 255, 255], true, &dark, &light, false), [36, 36, 36]);
+        assert_eq!(recolor([25, 25, 30], false, &dark, &light, false), [255, 255, 255]);
         // Reverse video: the default background as a foreground.
-        assert_eq!(recolor([25, 25, 30], true, &dark, &light), [255, 255, 255]);
-        assert_eq!(recolor(DARK_ANSI[1], true, &dark, &light), LIGHT_ANSI[1]);
-        assert_eq!(recolor([10, 200, 90], true, &dark, &light), [10, 200, 90]);
+        assert_eq!(recolor([25, 25, 30], true, &dark, &light, false), [255, 255, 255]);
+        assert_eq!(recolor(DARK_ANSI[1], true, &dark, &light, false), LIGHT_ANSI[1]);
+        assert_eq!(recolor([10, 200, 90], true, &dark, &light, false), [10, 200, 90]);
+        // Bold and dim text keep their weight in the new palette.
+        assert_eq!(recolor(bold(DARK_ANSI[3]), true, &dark, &light, true), bold(LIGHT_ANSI[3]));
+        assert_eq!(recolor(dim([255, 255, 255]), true, &dark, &light, false), dim([36, 36, 36]));
         // And back.
-        assert_eq!(recolor([36, 36, 36], true, &light, &dark), [255, 255, 255]);
-        assert_eq!(recolor(LIGHT_ANSI[4], false, &light, &dark), DARK_ANSI[4]);
+        assert_eq!(recolor([36, 36, 36], true, &light, &dark, false), [255, 255, 255]);
+        assert_eq!(recolor(LIGHT_ANSI[4], false, &light, &dark, false), DARK_ANSI[4]);
     }
 }

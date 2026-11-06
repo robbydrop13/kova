@@ -786,14 +786,10 @@ impl TerminalState {
     fn effective_colors(&self) -> ([u8; 3], [u8; 3]) {
         let mut fg = self.current_fg;
         if self.dim {
-            fg = [fg[0] / 2, fg[1] / 2, fg[2] / 2];
+            fg = crate::theme::dim(fg);
         }
         if self.bold {
-            fg = [
-                (fg[0] as u16 * 13 / 10).min(255) as u8,
-                (fg[1] as u16 * 13 / 10).min(255) as u8,
-                (fg[2] as u16 * 13 / 10).min(255) as u8,
-            ];
+            fg = crate::theme::bold(fg);
         }
         if self.reversed {
             (self.current_bg, fg)
@@ -1253,13 +1249,17 @@ impl TerminalState {
     /// was active.
     pub fn recolor(&mut self, from_ansi: &[[u8; 3]; 16], to: &crate::theme::TermColors) {
         let from = crate::theme::TermColors { fg: self.default_fg, bg: self.default_bg, ansi: *from_ansi };
-        let fg = |c: [u8; 3]| crate::theme::recolor(c, true, &from, to);
-        let bg = |c: [u8; 3]| crate::theme::recolor(c, false, &from, to);
+        let fg = |c: [u8; 3]| crate::theme::recolor(c, true, &from, to, false);
+        let bg = |c: [u8; 3]| crate::theme::recolor(c, false, &from, to, false);
         let rows = self.grid.iter_mut().chain(self.scrollback.iter_mut()).chain(self.alt_grid.iter_mut().flatten());
         for row in rows {
             for cell in row.cells.iter_mut() {
-                cell.fg = fg(cell.fg);
-                cell.bg = bg(cell.bg);
+                // A bold or dim cell holds its colour brightened or halved:
+                // matched through the same transform (either side, reverse
+                // video puts the foreground in the background).
+                let bold = cell.attrs.contains(CellAttrs::BOLD);
+                cell.fg = crate::theme::recolor(cell.fg, true, &from, to, bold);
+                cell.bg = crate::theme::recolor(cell.bg, false, &from, to, bold);
             }
         }
         self.blank.fg = fg(self.blank.fg);

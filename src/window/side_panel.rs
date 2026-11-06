@@ -677,19 +677,7 @@ impl SidePanelView {
                 let read = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
                 unsafe { web.loadFileURL_allowingReadAccessToURL(&file, &read) };
             }
-            PanelTarget::Sheet(id) => {
-                let html = match crate::app::sheet_page(mtm, id) {
-                    Some((sheet, answers, from)) => {
-                        *self.ivars().title.borrow_mut() = sheet.title.clone();
-                        let home = std::env::var_os("HOME").map(PathBuf::from);
-                        crate::decision_sheet::render(&sheet, &answers, &from, tokens::get(), home.as_deref())
-                    }
-                    None => crate::decision_sheet::render_closed("Decision", None, tokens::get()),
-                };
-                // No base URL: the page is `about:blank`, the one origin
-                // whose script may post to Kova (`did_receive_script_message`).
-                unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
-            }
+            PanelTarget::Sheet(id) => self.render_sheet(mtm, &web, id),
             PanelTarget::History => {
                 let html = super::panel_history::page();
                 unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
@@ -777,7 +765,11 @@ impl SidePanelView {
             let current = self.ivars().current.borrow().clone();
             match current {
                 Some(PanelTarget::Markdown(path)) => self.render_markdown_file(web, &path),
-                Some(target @ (PanelTarget::Sheet(_) | PanelTarget::History)) => self.open_target(target),
+                Some(PanelTarget::Sheet(id)) => self.render_sheet(MainThreadMarker::from(self), web, &id),
+                Some(PanelTarget::History) => {
+                    let html = super::panel_history::page();
+                    unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
+                }
                 _ => {}
             }
             return;
@@ -811,6 +803,20 @@ impl SidePanelView {
         {
             kova.apply_layout();
         }
+    }
+
+    fn render_sheet(&self, mtm: MainThreadMarker, web: &WKWebView, id: &str) {
+        let html = match crate::app::sheet_page(mtm, id) {
+            Some((sheet, answers, from)) => {
+                *self.ivars().title.borrow_mut() = sheet.title.clone();
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                crate::decision_sheet::render(&sheet, &answers, &from, tokens::get(), home.as_deref())
+            }
+            None => crate::decision_sheet::render_closed("Decision", None, tokens::get()),
+        };
+        // No base URL: the page is `about:blank`, the one origin
+        // whose script may post to Kova (`did_receive_script_message`).
+        unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
     }
 
     fn render_markdown_file(&self, web: &WKWebView, path: &Path) {
