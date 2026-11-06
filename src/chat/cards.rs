@@ -178,6 +178,7 @@ pub fn ask_card_html(
         detail,
         state: cockpit::State::Idle,
         instruction: None,
+        validates: false,
     };
     cockpit::card_html_with(&item, &sheet, &icons, true, now)
 }
@@ -224,6 +225,7 @@ pub fn menu_card_html(menu: &Menu, plan: Option<&str>, now: u64) -> String {
         }),
         state: cockpit::State::Idle,
         instruction: None,
+        validates: false,
     };
     cockpit::card_html_with(&item, &[], &[], false, now)
 }
@@ -260,6 +262,7 @@ pub fn unread_wait_html(now: u64) -> String {
         detail: None,
         state: cockpit::State::Idle,
         instruction: None,
+        validates: false,
     };
     cockpit::card_html_with(&item, &[], &[], false, now)
 }
@@ -501,6 +504,7 @@ mod tests {
             detail: Some(crate::cockpit::Detail::Entry { needs: String::new(), body: "Le fond".into(), detail: String::new(), src: Vec::new(), links: Vec::new(), explaining: false }),
             state: crate::cockpit::State::Idle,
             instruction: None,
+            validates: false,
         };
         let html = ask_card_html(&d, None, Some(&entry), true, crate::attention::Scope::Pro, 100);
         assert!(html.contains("data-key=\"430b8a55-1\"") && html.contains("Harnais commun") && html.contains("Le fond"), "{html}");

@@ -35,6 +35,16 @@ it: one `WKWebView` per window over the active tab's panes area
   place (see Opened cards); `Ouvrir la fiche` for a decision sheet; `Refuser` / `Autoriser` answer a permission prompt
   like the chat does, only if the screen still shows the prompt the card
   was rendered from.
+- Waiting on a go (Robin, 06/11/2026): an entry without a draft of kind
+  `would` or `review`, or a `decision` whose `action` is prepared (not a
+  `kova-sheet:` / `kova-ask:`, answered on its sheet), carries `Refuser` and
+  `Valider`, both blue, after `Ouvrir` (secondary then). `Valider` runs
+  `act_command ID Valider` (the chief of the scope receives it) and the card
+  reads `Transmis`. `Refuser` opens a small field `Pourquoi ? (facultatif)`
+  under the card: Enter runs `close_command ID --reason dismissed`, plus
+  `--note=<reason>` when one was typed (one argv element), and the card
+  leaves; Escape folds the field. No close command, no `Refuser`. A draft
+  keeps its own `Corriger` / `Valider`.
 - Icons (every attention card, top right, Feather, with a tooltip): clock
   `Plus tard`, x `Pas pertinent, retirer` (`close_command ID --reason
   dismissed`), check `C'est fait` (`close_command ID --reason done`). The clock

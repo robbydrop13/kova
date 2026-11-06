@@ -426,7 +426,8 @@ pub enum Verb {
     Correct,
     /// The Cockpit's check: `close_command <id> --reason done`.
     Resolve,
-    /// The Cockpit's x, not relevant: `close_command <id> --reason dismissed`.
+    /// The Cockpit's x, not relevant: `close_command <id> --reason dismissed`;
+    /// `Refuser` adds its reason as `--note=<text>`.
     Dismiss,
     /// Out of the list until a date: `snooze_command <id> --until=<ISO>`.
     Snooze,
@@ -559,7 +560,13 @@ fn verb_argv_with(
         Verb::Done => args.extend(["--note".to_string(), "Fait (Kova)".to_string()]),
         Verb::Ignore => args.extend(["--note".to_string(), "Ignoré (Kova)".to_string()]),
         Verb::Resolve => args.extend(["--reason".to_string(), "done".to_string()]),
-        Verb::Dismiss => args.extend(["--reason".to_string(), "dismissed".to_string()]),
+        Verb::Dismiss => {
+            args.extend(["--reason".to_string(), "dismissed".to_string()]);
+            // Refuser's reason, when one was typed: one argv element.
+            if let Some(why) = text.map(str::trim).filter(|t| !t.is_empty()) {
+                args.push(format!("--note={why}"));
+            }
+        }
         Verb::Snooze => {
             let until = text.map(str::trim).filter(|t| epoch_of(t).is_some())?;
             args.push(format!("--until={until}"));
@@ -797,6 +804,12 @@ mod tests {
             Some(vec!["--reason".to_string(), "dismissed".to_string()])
         );
         assert_eq!(verb_argv(&act, &close, "a-1", Verb::Resolve, None).map(|(_, a)| a[5].clone()), Some("done".into()));
+        // Refuser's reason rides along as one `--note=` element; blank adds nothing.
+        assert_eq!(
+            verb_argv(&act, &close, "a-1", Verb::Dismiss, Some(" --by evil\npas maintenant ")).map(|(_, a)| a[4..].to_vec()),
+            Some(vec!["--reason".to_string(), "dismissed".to_string(), "--note=--by evil\npas maintenant".to_string()])
+        );
+        assert_eq!(verb_argv(&act, &close, "a-1", Verb::Dismiss, Some("  ")).map(|(_, a)| a.len()), Some(6));
         let snooze = or_close_bin(&[], &close, "snooze");
         assert_eq!(snooze, ["/bin/attn", "snooze"]);
         assert_eq!(

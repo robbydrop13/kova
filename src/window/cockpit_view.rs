@@ -630,11 +630,16 @@ impl KovaView {
                     self.open_in_side_panel(target);
                 }
             }
-            (Kind::Attention, Button::Done | Button::Dismiss | Button::Snooze | Button::Validate | Button::Correct) => {
+            (
+                Kind::Attention,
+                Button::Done | Button::Dismiss | Button::Refuse | Button::Snooze | Button::Validate | Button::Correct,
+            ) => {
                 let Some(id) = attention_id else { return };
                 let (verb, text) = match button {
                     Button::Done => (Verb::Resolve, None),
                     Button::Dismiss => (Verb::Dismiss, None),
+                    // Closed as dismissed, with the reason typed, if any.
+                    Button::Refuse => (Verb::Dismiss, text),
                     Button::Snooze => (Verb::Snooze, text),
                     Button::Validate => (Verb::Validate, None),
                     _ => (Verb::Correct, text),

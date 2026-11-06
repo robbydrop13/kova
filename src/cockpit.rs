@@ -113,6 +113,10 @@ pub struct Item {
     /// `kova-sheet:<id>` or `kova-ask:<id>`): its button opens that sheet,
     /// and the ask's own card is left out so it shows once.
     pub ask: Option<String>,
+    /// An attention entry that waits on the user's go without a draft: a
+    /// `would`, a `review`, or a `decision` with a prepared action. Its card
+    /// carries `Refuser` and `Valider`.
+    pub validates: bool,
     /// Opened with `Ouvrir`: what the card shows under itself. Filled by the
     /// host only for the cards it keeps open.
     pub detail: Option<Detail>,
@@ -278,10 +282,19 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         draft: entry.draft.clone(),
         openable,
         ask: None,
+        validates: expects_validation(entry),
         detail: None,
         state,
         instruction: None,
     })
+}
+
+/// An entry that waits on the user's go: a `would` or a `review`, or a
+/// `decision` whose action is prepared (not a sheet, which takes its own
+/// answers). A draft has its own `Valider`.
+pub fn expects_validation(entry: &Entry) -> bool {
+    let prepared = entry.action.as_deref().is_some_and(|a| !a.trim().is_empty() && ask_ref(a).is_none());
+    entry.draft.is_none() && (matches!(entry.kind.as_str(), "would" | "review") || entry.kind == "decision" && prepared)
 }
 
 /// The ask id an attention entry's action names: `kova-sheet:<id>` or
@@ -383,6 +396,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         draft: None,
         openable: false,
         ask: None,
+        validates: false,
         detail: None,
         state: State::Idle,
         instruction: None,
@@ -412,6 +426,9 @@ pub enum Button {
     Allow,
     Correct,
     Validate,
+    /// Turn down an entry that waits on a go: closed as dismissed, with the
+    /// reason typed in the card's small field, if any.
+    Refuse,
     /// The attention card's icons: out until a date, not relevant.
     Snooze,
     Dismiss,
@@ -428,6 +445,7 @@ impl Button {
             Button::Allow => "allow",
             Button::Correct => "correct",
             Button::Validate => "validate",
+            Button::Refuse => "refuse",
             Button::Snooze => "snooze",
             Button::Dismiss => "dismiss",
         }
@@ -442,6 +460,7 @@ impl Button {
             "allow" => Some(Button::Allow),
             "correct" => Some(Button::Correct),
             "validate" => Some(Button::Validate),
+            "refuse" => Some(Button::Refuse),
             "snooze" => Some(Button::Snooze),
             "dismiss" => Some(Button::Dismiss),
             _ => None,
@@ -453,7 +472,7 @@ impl Button {
             Button::Expand | Button::Open => "Ouvrir",
             Button::OpenSheet => "Ouvrir la fiche",
             Button::Done => "C'est fait",
-            Button::Deny => "Refuser",
+            Button::Deny | Button::Refuse => "Refuser",
             Button::Allow => "Autoriser",
             Button::Correct => "Corriger",
             Button::Validate => "Valider",
@@ -463,7 +482,7 @@ impl Button {
     }
 
     fn primary(self) -> bool {
-        matches!(self, Button::Open | Button::OpenSheet | Button::Allow | Button::Validate)
+        matches!(self, Button::Open | Button::OpenSheet | Button::Allow | Button::Validate | Button::Refuse)
     }
 }
 
@@ -479,6 +498,15 @@ pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
             }
         }
         Kind::Attention if item.ask.is_some() => vec![Button::OpenSheet],
+        // Once the go went through, only the way to its material is left.
+        Kind::Attention if item.validates && can_act => {
+            let open = item.openable.then_some(Button::Open);
+            if item.state == State::Sent {
+                open.into_iter().collect()
+            } else {
+                open.into_iter().chain([Button::Refuse, Button::Validate]).collect()
+            }
+        }
         // `C'est fait` is one of the card's icons (`icons`).
         Kind::Attention if item.openable => vec![Button::Open],
         Kind::Attention => Vec::new(),
@@ -664,7 +692,9 @@ fn state_html(state: &State) -> String {
 
 /// One card.
 pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, now: u64) -> String {
-    card_html_with(item, &buttons(item, can_act), &icons(item, can_close, can_snooze), can_act, now)
+    // `Refuser` closes the entry: no close command, no `Refuser`.
+    let list: Vec<Button> = buttons(item, can_act).into_iter().filter(|&b| can_close || b != Button::Refuse).collect();
+    card_html_with(item, &list, &icons(item, can_close, can_snooze), can_act, now)
 }
 
 /// One card with the buttons and icons given: the chat's ask cards pick
@@ -679,12 +709,18 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
             // `Ouvrir` is the card's main button when it stands alone, and
             // reads `Masquer` while the detail shows.
             Button::Expand => button_html_as(b, false, i == last, if item.detail.is_some() { "Masquer" } else { "Ouvrir" }),
+            // Next to Refuser / Valider, `Ouvrir` steps back.
+            Button::Open if list.contains(&Button::Validate) => button_html_as(b, running, false, b.label()),
             _ => button_html(b, running),
         })
         .collect();
     let acts = format!("<div class=\"acts\">{acts}</div>");
     let icons = icons_html(icon_list, running);
     let mut detail = item.detail.as_ref().map(|d| detail_html(d, running)).unwrap_or_default();
+    // `Refuser` opens this field first: Enter confirms, Escape cancels.
+    if list.contains(&Button::Refuse) {
+        detail.insert_str(0, &format!("<div class=\"why\" hidden><input type=\"text\" class=\"why\" placeholder=\"{REFUSE_PLACEHOLDER}\" maxlength=\"500\"></div>"));
+    }
     // An opened attention card takes an instruction, action or not, under
     // the draft's actions when it has a draft.
     if item.kind == Kind::Attention && item.detail.is_some() && can_act {
@@ -738,6 +774,9 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
         esc(&item.key),
     )
 }
+
+/// The placeholder of the reason field `Refuser` opens.
+pub const REFUSE_PLACEHOLDER: &str = "Pourquoi ? (facultatif)";
 
 /// The placeholder of an opened card's instruction field.
 pub const INSTRUCT_PLACEHOLDER: &str = "Une consigne pour cette carte";
@@ -1077,6 +1116,9 @@ textarea.ans:focus{border-color:var(--accent);outline:0}
 textarea.ins{display:block;width:100%;margin-top:4px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;line-height:19px;padding:6px 10px;resize:vertical}
 textarea.ins:focus{border-color:var(--accent);outline:0}
 .msg.sent{margin-top:4px;font-size:12px;color:var(--t2)}
+div.why{margin-top:8px;cursor:auto}div.why[hidden]{display:none}
+input.why{display:block;width:100%;height:28px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:0 10px}
+input.why:focus{border-color:var(--accent);outline:0}
 .card{cursor:pointer}.card textarea,.card .detail{cursor:auto}
 .side{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:none}
 .icons{display:flex;gap:2px;flex:none}
@@ -1241,12 +1283,14 @@ function setList(html) {
       open: [...card.querySelectorAll('details')].map(d => d.open),
       scroll: [...card.querySelectorAll('pre.scroll')].map(p => p.scrollTop),
       ans: (card.querySelector('textarea.ans') || {}).value || '',
-      ins: (card.querySelector('textarea.ins') || {}).value || ''
+      ins: (card.querySelector('textarea.ins') || {}).value || '',
+      why: card.querySelector('div.why:not([hidden]) input.why')
     };
   });
   const ansFocus = a && a.classList && a.classList.contains('ans') ? a.closest('.card').dataset.key : null;
   const insFocus = a && a.classList && a.classList.contains('ins') ? a.closest('.card').dataset.key : null;
   const insSel = insFocus ? [a.selectionStart, a.selectionEnd] : null;
+  const whyFocus = a && a.classList && a.classList.contains('why') ? a.closest('.card').dataset.key : null;
   $('list').innerHTML = html;
   document.querySelectorAll('.card').forEach(card => {
     const t = card.querySelector('textarea.bd');
@@ -1269,6 +1313,12 @@ function setList(html) {
       ins.value = k.ins;
       if (card.dataset.key === insFocus) { ins.focus(); ins.setSelectionRange(insSel[0], insSel[1]); }
     }
+    // A reason being typed for Refuser stays open with its text.
+    const why = card.querySelector('input.why');
+    if (why && k.why) {
+      why.value = k.why.value; why.parentNode.hidden = false;
+      if (card.dataset.key === whyFocus) why.focus();
+    }
   });
   document.querySelector('.page').scrollTop = top;
 }
@@ -1277,7 +1327,7 @@ window.kova = {
     if (u.head !== undefined) $('head').innerHTML = u.head;
     if (u.list !== undefined) setList(u.list);
     if (u.chat !== undefined) { $('chat').innerHTML = u.chat; document.body.classList.toggle('chat-on', u.chat !== ''); }
-    if (u.focus && !(document.activeElement && document.activeElement.tagName === 'TEXTAREA')) window.focus();
+    if (u.focus && !(document.activeElement && /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName))) window.focus();
     if (u.reveal) {
       const c = document.querySelector('.card[data-key="' + CSS.escape(u.reveal) + '"]');
       if (c) {
@@ -1358,6 +1408,11 @@ document.addEventListener('click', e => {
     return;
   }
   if (act === 'dismiss' || act === 'done') { hide(card.dataset.key); return post(msg); }
+  if (act === 'refuse') {
+    const w = card.querySelector('div.why');
+    if (w) { w.hidden = false; w.querySelector('input').focus(); }
+    return;
+  }
   if (act === 'validate' && t && edited(t)) { msg.act = 'correct'; msg.text = t.value; }
   card.querySelectorAll('.acts button, .dacts button').forEach(x => x.disabled = true);
   post(msg);
@@ -1376,6 +1431,18 @@ document.addEventListener('keydown', e => {
     post({ type: 'act', key: t.closest('.card').dataset.key, act: 'instruct', text: t.value });
     t.value = '';
     return;
+  }
+  // Refuser's reason: Enter closes the entry with it (or none), Escape
+  // folds the field and keeps the card.
+  if (t.classList && t.classList.contains('why') && t.tagName === 'INPUT') {
+    if (e.key === 'Enter' && !e.isComposing) {
+      e.preventDefault();
+      const key = t.closest('.card').dataset.key;
+      hide(key);
+      post({ type: 'act', key, act: 'refuse', text: t.value });
+      return;
+    }
+    if (e.key === 'Escape') { e.preventDefault(); t.value = ''; t.parentNode.hidden = true; t.blur(); return; }
   }
   if (e.key !== 'Escape') return;
   e.preventDefault();
@@ -1624,9 +1691,44 @@ mod tests {
         let err = from_need(&need(NeedKind::Error, "pane:1", 1), false).unwrap();
         assert_eq!(buttons(&err, true), [Button::Expand]);
         assert!(icons(&perm, true, true).is_empty(), "a live need keeps its own buttons");
-        for b in [Button::Snooze, Button::Dismiss, Button::Expand, Button::Done, Button::Deny, Button::Allow, Button::Correct, Button::Validate, Button::Open] {
+        for b in [Button::Snooze, Button::Dismiss, Button::Expand, Button::Done, Button::Deny, Button::Allow, Button::Correct, Button::Validate, Button::Refuse, Button::Open] {
             assert_eq!(Button::parse(b.act()), Some(b));
         }
+    }
+
+    #[test]
+    fn an_entry_waiting_on_a_go_carries_refuser_and_valider() {
+        let with = |kind: &str, action: Option<&str>| Entry { kind: kind.into(), action: action.map(Into::into), ..entry("a-1", Level::Point, None, 1) };
+        assert!(expects_validation(&with("would", None)));
+        assert!(expects_validation(&with("review", Some("https://notion.so/x"))));
+        assert!(expects_validation(&with("decision", Some("/tmp/prep.md#P1"))));
+        assert!(!expects_validation(&with("decision", None)), "a decision with nothing prepared");
+        assert!(!expects_validation(&with("decision", Some("kova-sheet:430b8a55"))), "a sheet takes its own answers");
+        assert!(!expects_validation(&with("test", Some("/tmp/x.md"))));
+        let drafted = Entry { draft: Some(Draft { to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..with("would", None) };
+        assert!(!expects_validation(&drafted), "a draft keeps its own Valider");
+        let mut item = from_attention(&with("would", Some("/tmp/prep.md")), None, true).unwrap();
+        assert_eq!(buttons(&item, true), [Button::Open, Button::Refuse, Button::Validate]);
+        assert_eq!(buttons(&item, false), [Button::Open], "no act command, no go to give");
+        let html = card_html(&item, true, true, true, 10);
+        // Both blue, Ouvrir steps back, the icons stay, the reason field waits hidden.
+        assert!(html.contains("<button type=\"button\" class=\"btn sec\" data-act=\"open\"><span>Ouvrir</span></button>"), "{html}");
+        assert!(html.contains("<button type=\"button\" class=\"btn acc\" data-act=\"refuse\"><span>Refuser</span></button>"), "{html}");
+        assert!(html.contains("class=\"btn acc\" data-act=\"validate\">"), "{html}");
+        assert!(html.contains("data-act=\"snooze\"") && html.contains("data-act=\"dismiss\"") && html.contains("data-act=\"done\""));
+        assert!(html.contains("<div class=\"why\" hidden><input type=\"text\" class=\"why\" placeholder=\"Pourquoi ? (facultatif)\""), "{html}");
+        // Refuser closes the entry: without a close command it is left out.
+        let no_close = card_html(&item, true, false, true, 10);
+        assert!(!no_close.contains("data-act=\"refuse\"") && !no_close.contains("class=\"why\""), "{no_close}");
+        // The go went through: the card says so and offers it no more.
+        item.state = State::Sent;
+        assert_eq!(buttons(&item, true), [Button::Open]);
+        assert!(card_html(&item, true, true, true, 10).contains("Transmis"));
+        // An opened card keeps its instruction field under the reason field.
+        item.state = State::Idle;
+        item.detail = Some(entry_detail(&with("would", None), false));
+        let opened = card_html(&item, true, true, true, 10);
+        assert!(opened.find("class=\"why\"").unwrap() < opened.find("Consigne").unwrap(), "{opened}");
     }
 
     #[test]
