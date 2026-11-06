@@ -19,6 +19,16 @@ pub struct Config {
     pub agent: AgentConfig,
     pub sidebar: SidebarConfig,
     pub attention: AttentionConfig,
+    pub chat: ChatConfig,
+}
+
+/// The chat mode's options.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// Dictation sends the message by itself after about 2 s of silence.
+    /// Off: the dictated text waits in the box until Enter.
+    pub voice_auto_send: bool,
 }
 
 /// How Kova rebuilds an agent's command line when it puts a conversation back.
@@ -429,6 +439,7 @@ impl Default for Config {
             agent: AgentConfig::default(),
             sidebar: SidebarConfig::default(),
             attention: AttentionConfig::default(),
+            chat: ChatConfig::default(),
         }
     }
 }
@@ -644,6 +655,7 @@ pub struct KeysConfig {
     /// The next appearance (light, dark, system). Not `cmd+option+c`: Alfred's
     /// clipboard.
     pub cycle_theme: String,
+    pub toggle_voice: String,
     pub terminal: TerminalKeysConfig,
 }
 
@@ -721,6 +733,7 @@ impl Default for KeysConfig {
             panel_history: "cmd+option+y".into(),
             toggle_chat: "cmd+option+t".into(),
             cycle_theme: "cmd+option+l".into(),
+            toggle_voice: "cmd+shift+m".into(),
             terminal: TerminalKeysConfig::default(),
         }
     }

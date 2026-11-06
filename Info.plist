@@ -23,7 +23,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Kova needs microphone access so that terminal commands like ffmpeg, sox, or recording tools can capture audio.</string>
+    <string>Kova utilise le micro pour la dictée dans le chat, les enregistrements du Cockpit et les outils du terminal qui captent le son.</string>
     <key>NSCameraUsageDescription</key>
     <string>Kova needs camera access so that apps launched from the terminal (e.g. an Electron app in dev mode) can use the webcam.</string>
 </dict>

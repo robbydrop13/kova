@@ -46,6 +46,8 @@ mod terminal;
 mod theme;
 mod update_check;
 mod team;
+mod voice;
+mod voice_io;
 mod attention;
 mod catchup;
 mod cockpit;

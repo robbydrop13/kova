@@ -243,7 +243,8 @@ impl Conversation {
         if a.get("type").and_then(Value::as_str) != Some("queued_command") {
             return false;
         }
-        // A peer's message is queued as a `prompt` too: the origin decides.
+        // A peer's message is queued as a `prompt` too: the origin decides,
+        // and an origin of a kind not known here is not the user's.
         let origin = a.pointer("/origin/kind").and_then(Value::as_str);
         let human = origin == Some("human") || (origin.is_none() && a.get("commandMode").and_then(Value::as_str) == Some("prompt"));
         let text = match a.get("prompt") {
@@ -341,6 +342,7 @@ const HARNESS_TAGS: &[&str] = &[
     "system-reminder",
     "system-notification",
     "cross-session-message",
+    "teammate-message",
     "local-command-stdout",
     "local-command-stderr",
     "local-command-caveat",
@@ -388,11 +390,13 @@ fn classify_user(v: &Value, text: &str) -> UserLine {
 /// session's message, a background task's end. Everything else the harness
 /// says (reminders, caveats) is dropped.
 fn behind(text: &str) -> Option<(String, String)> {
-    if let Some(start) = text.find("<cross-session-message") {
+    for tag in ["cross-session-message", "teammate-message"] {
+        let Some(start) = text.find(&format!("<{tag}")) else { continue };
         let rest = &text[start..];
         let open_end = rest.find('>')?;
-        let name = between(&rest[..open_end], "from-name=\"", "\"").unwrap_or("une autre session");
-        let body = between(rest, ">", "</cross-session-message>").unwrap_or(&rest[open_end + 1..]);
+        let head = &rest[..open_end];
+        let name = between(head, "from-name=\"", "\"").or_else(|| between(head, "teammate_id=\"", "\"")).unwrap_or("une autre session");
+        let body = between(rest, ">", &format!("</{tag}>")).unwrap_or(&rest[open_end + 1..]);
         return Some((format!("Message de {}", one_line(name, 60)), body.trim().to_string()));
     }
     if text.trim_start().starts_with("<task-notification>") {

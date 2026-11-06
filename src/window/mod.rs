@@ -1968,6 +1968,7 @@ impl KovaView {
             Action::ToggleUnread => self.do_toggle_unread(),
             Action::ToggleChat => self.toggle_chat(),
             Action::CycleTheme => crate::app::set_theme(crate::theme::mode().next()),
+            Action::ToggleVoice => self.toggle_voice(),
             Action::HistoryBack => do_history_step(false),
             Action::HistoryForward => do_history_step(true),
             Action::ToggleSidebar => self.toggle_layout_mode(),

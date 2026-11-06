@@ -115,6 +115,29 @@ kept), 8 KB at most. The empty prompt is read off the screen like KovaLink's
 daemon does (`composerIsEmpty`); Claude Code's start hint (`Try "…"`) counts
 as empty.
 
+## Dictation
+
+The mic button at the right of the box, or Cmd+Shift+M (`toggle_voice`,
+IPC `dispatch-action` `toggle-voice`), turns dictation on; the button
+again, Esc in the box or the shortcut turn it off. While it listens the
+button is red and pulses. What is said fills the box live (the turn in
+progress replaced as it firms up, finished turns kept); the box can be
+edited meanwhile, an edit stays and what is said next is added after it.
+Enter sends as usual. With `[chat] voice_auto_send = true` in
+`config.toml` (off by default), about 2 s of silence after a finished turn
+sends the box by itself and dictation goes on.
+
+AssemblyAI streaming (Universal-Streaming v3, `universal-3-6-pro`,
+`language_codes=["fr"]`, 16 kHz mono PCM; `src/voice.rs` pure and tested,
+`src/voice_io.rs` the native half). The key is read from the Keychain at
+each start (`security find-generic-password -s assemblyai-api-key -w`),
+handed to `curl` on stdin to mint a 60 s token
+(`token.assemblyai.com/v1/token`), and dropped: the socket URL carries the
+token, never the key, and nothing writes or logs either. No key: the line
+`Clé AssemblyAI absente du Trousseau` under the box. The microphone is an
+AudioQueue input; the first use shows macOS's prompt with
+`NSMicrophoneUsageDescription` (Info.plist).
+
 ## Cards
 
 At the bottom of the thread, above the box:

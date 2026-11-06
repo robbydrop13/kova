@@ -117,6 +117,7 @@ pub fn markdown(source: &str) -> String {
             }
             if !(super::links::is_web(dest) || lower.starts_with("mailto:")) {
                 unsafe_link = true;
+                in_link += 1;
                 return Event::Text("".into());
             }
             in_link += 1;
@@ -124,6 +125,7 @@ pub fn markdown(source: &str) -> String {
         }
         Event::End(TagEnd::Link) if unsafe_link => {
             unsafe_link = false;
+            in_link = in_link.saturating_sub(1);
             Event::Text("".into())
         }
         Event::End(TagEnd::Link) if path_link => {
@@ -447,8 +449,10 @@ pub struct Update {
     pub note: Option<String>,
     /// Text to put back in the box (a message that was not sent).
     pub restore: Option<String>,
-    /// An image just pasted: its chip in the box.
-    pub attach: Option<Attach>,
+    /// Images just pasted: their chips in the box.
+    pub attach: Option<Vec<Attach>>,
+    /// Dictation, when it changed.
+    pub voice: Option<Voice>,
     /// The page was just loaded: place the view on the last exchange.
     pub first: bool,
     /// Give the box the keyboard.
@@ -460,6 +464,17 @@ pub struct Update {
 pub struct BannerWire {
     pub state: &'static str,
     pub text: String,
+}
+
+/// Dictation as the box shows it: listening, its session still open (the
+/// last words may still come), the text heard, and whether a pause sends
+/// the box now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Voice {
+    pub on: bool,
+    pub live: bool,
+    pub text: String,
+    pub send: bool,
 }
 
 /// A pasted image as the box shows it: its file, and a `data:` URL of it
@@ -599,7 +614,13 @@ body {{ display: flex; flex-direction: column; }}
 #queued {{ display: none; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12.5px; color: var(--t2); }}
 #queued.on {{ display: flex; }}
 #queued .qtext {{ flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }}
-#box {{ width: 100%; min-height: 38px; max-height: 40vh; resize: none; font: inherit; color: var(--t1); background: var(--bg2);
+#inrow {{ display: flex; align-items: flex-end; gap: 6px; }}
+#mic {{ flex: none; display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; padding: 0;
+  color: var(--t3); background: var(--bg2); border: 1px solid var(--b2); border-radius: 10px; cursor: pointer; }}
+#mic:hover {{ color: var(--t1); }}
+#mic.on {{ color: #fff; background: var(--err); border-color: var(--err); animation: pulse 1.2s ease-in-out infinite; }}
+@media (prefers-reduced-motion: reduce) {{ #mic.on {{ animation: none; }} }}
+#box {{ flex: 1; width: 100%; min-height: 38px; max-height: 40vh; resize: none; font: inherit; color: var(--t1); background: var(--bg2);
   border: 1px solid var(--b2); border-radius: 10px; padding: 8px 12px; outline: none; }}
 #box:focus {{ border-color: var(--accent); }}
 #note {{ min-height: 16px; margin-top: 4px; font-size: 12px; color: var(--t3); }}
@@ -628,7 +649,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
 <div id="scroll"><div id="log"><button id="more" data-act="more">Show earlier</button></div></div>
 <div id="cards"></div>
 <div id="foot"><div id="chips"></div><div id="queued"><span>Queued:</span><span class="qtext"></span><span class="qwhy"></span><button class="btn" data-act="cancel">Cancel</button></div>
-<textarea id="box" rows="1" placeholder="Message Claude"></textarea><div id="note"></div></div>
+<div id="inrow"><textarea id="box" rows="1" placeholder="Message Claude"></textarea><button id="mic" data-act="mic" title="Dictée (⌘⇧M)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button></div><div id="note"></div></div>
 <script nonce="{nonce}">
 (function () {{
   // Each message carries this load's nonce: Kova drops one from another load.
@@ -637,6 +658,28 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
   const log = $("log"), scroll = $("scroll"), box = $("box"), cardsEl = $("cards");
   const opened = new Set();
   let noteTimer = null;
+  // Dictation: the box's text before it (`vBase`), what of the heard text
+  // the box already took in before the user edited it (`vSkip`), and what
+  // of it the box shows (`vShown`).
+  let vBase = null, vSkip = 0, vShown = "", vLead = 0, listening = false;
+  const spaced = (t) => (t && !/\s$/.test(t) ? t + " " : t);
+  function applyVoice(v) {{
+    listening = !!v.on;
+    $("mic").classList.toggle("on", listening);
+    box.placeholder = listening ? "Parlez, le texte s'écrit ici" : "Message Claude";
+    if (vBase === null) {{
+      if (!v.live) return;
+      vBase = spaced(box.value); vSkip = 0; vShown = "";
+    }}
+    // Edited by hand: the edit stays, only what is said next is added.
+    if (box.value !== vBase + vShown) {{ vSkip += vLead + vShown.length; vBase = spaced(box.value); }}
+    const raw = v.text.slice(vSkip);
+    vShown = vBase ? raw.trimStart() : raw;
+    vLead = raw.length - vShown.length;
+    box.value = vBase + vShown; grow();
+    if (v.send) {{ send(); vBase = ""; vSkip = 0; vShown = ""; vLead = 0; }}
+    if (!v.live) vBase = null;
+  }}
   // Images pasted into the box, sent with the next message: their paths.
   let images = [];
   function chips() {{
@@ -708,7 +751,8 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     const q = $("queued");
     q.classList.toggle("on", !!m.queued);
     if (m.queued) {{ q.querySelector(".qtext").textContent = m.queued.text; q.querySelector(".qwhy").textContent = m.queued.reason; }}
-    if (m.attach) {{ images.push(m.attach); chips(); }}
+    if (m.attach) {{ images.push(...m.attach); chips(); }}
+    if (m.voice) applyVoice(m.voice);
     if (m.restore) {{ box.value = box.value ? box.value + "\n" + m.restore : m.restore; grow(); }}
     if (m.note) {{
       $("note").textContent = m.note;
@@ -728,18 +772,21 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
   }}
   function grow() {{ box.style.height = "auto"; box.style.height = Math.min(box.scrollHeight + 2, window.innerHeight * 0.4) + "px"; }}
   box.addEventListener("input", grow);
+  function send() {{
+    const text = box.value;
+    if (!text.trim() && !images.length) return;
+    const paths = images.map((im) => im.path);
+    box.value = ""; grow(); images = []; chips();
+    if (vBase !== null) {{ vBase = ""; vSkip += vLead + vShown.length; vShown = ""; vLead = 0; }}
+    post({{ type: "send", text, images: paths }});
+  }}
   box.addEventListener("keydown", (e) => {{
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {{
       e.preventDefault();
-      const text = box.value;
-      if (!text.trim() && !images.length) return;
-      const paths = images.map((im) => im.path);
-      box.value = ""; grow(); images = []; chips();
-      post({{ type: "send", text, images: paths }});
-    }} else if (e.key === "v" && e.ctrlKey && !e.metaKey) {{
-      // Claude Code's own image paste key: Kova reads the pasteboard.
+      send();
+    }} else if (e.key === "Escape" && listening) {{
       e.preventDefault();
-      post({{ type: "paste-image" }});
+      post({{ type: "voice-stop" }});
     }}
   }});
   // An image on the pasteboard (Cmd+V): Kova writes it to a file, the box
@@ -782,6 +829,9 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
       post({{ type: "permission", id: card.dataset.id, choice: b.dataset.choice }});
     }} else if (act === "open" && card) {{
       post({{ type: "open", id: card.dataset.id }});
+    }} else if (act === "mic") {{
+      post({{ type: "voice" }});
+      box.focus();
     }} else if (act === "more" || act === "cancel" || act === "terminal") {{
       post({{ type: act }});
     }}

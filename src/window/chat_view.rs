@@ -83,7 +83,12 @@ struct ChatState {
     restore: Option<String>,
     /// The images pasted into the box, by their files: only these go with a message.
     pasted: Vec<String>,
-    attach: Option<page::Attach>,
+    attach: Vec<page::Attach>,
+    /// Dictation: its thread while it runs, whether it listens, what it heard.
+    voice: Option<crate::voice_io::Session>,
+    listening: bool,
+    transcript: crate::voice::Transcript,
+    shown_voice: Option<page::Voice>,
     last_poll: Option<std::time::Instant>,
     /// The nonce of the page loaded for this pane: a message carrying
     /// another one was posted by an earlier load.
@@ -119,7 +124,11 @@ impl ChatState {
             note: None,
             restore: None,
             pasted: Vec::new(),
-            attach: None,
+            attach: Vec::new(),
+            voice: None,
+            listening: false,
+            transcript: crate::voice::Transcript::default(),
+            shown_voice: None,
             last_poll: None,
             load,
             looked: None,
@@ -134,6 +143,21 @@ impl ChatState {
         self.shown_cards = None;
         self.shown_banner = None;
         self.shown_queued = None;
+        self.shown_voice = None;
+    }
+
+    /// Dictation on, or off: off, what was said still arrives.
+    fn toggle_voice(&mut self) {
+        if self.listening {
+            self.listening = false;
+            if let Some(session) = &self.voice {
+                session.stop();
+            }
+        } else {
+            self.voice = Some(crate::voice_io::Session::start());
+            self.listening = true;
+            self.transcript = crate::voice::Transcript::default();
+        }
     }
 }
 
@@ -424,6 +448,16 @@ impl KovaView {
                 st.restore = st.outbox.cancel();
                 Reply::Push
             }
+            "voice" => {
+                st.toggle_voice();
+                Reply::Push
+            }
+            "voice-stop" => {
+                if st.listening {
+                    st.toggle_voice();
+                }
+                Reply::Push
+            }
             "paste-image" => {
                 if !attach_pasted_image(st) {
                     st.note = Some("Pas d'image dans le presse-papier".to_string());
@@ -440,6 +474,7 @@ impl KovaView {
                     let cwd = pane.cached_cwd().map(std::path::PathBuf::from);
                     match super::side_panel::target_on_disk(&href, cwd.as_deref()) {
                         Some(target) => self.open_in_side_panel(target),
+                        None if crate::chat::links::is_web(&href) => st.note = Some("Lien non pris en charge".to_string()),
                         None => st.note = Some("Fichier introuvable".to_string()),
                     }
                 }
@@ -451,10 +486,11 @@ impl KovaView {
                     .and_then(Value::as_array)
                     .map(|list| list.iter().filter_map(Value::as_str).filter(|p| st.pasted.iter().any(|q| q == p)).map(str::to_string).collect())
                     .unwrap_or_default();
-                match input::sanitize(&input::with_images(&s("text"), &images)) {
+                let text = input::with_images(&s("text"), &images);
+                match input::sanitize(&text) {
                     Err(reason) => {
                         st.note = Some(reason.to_string());
-                        st.restore = Some(s("text"));
+                        st.restore = Some(text);
                     }
                     Ok(text) => match st.outbox.submit(text, gate(pane), crate::surface::monotonic_ms()) {
                         input::Step::Type(text) => type_into(pane, &text),
@@ -523,6 +559,21 @@ impl KovaView {
                 Reply::Push
             }
             _ => Reply::Nothing,
+        }
+    }
+
+    /// `toggle-voice`: dictation in the chat shown, on or off.
+    pub(super) fn toggle_voice(&self) {
+        let toggled = match self.ivars().chat.state.borrow_mut().as_mut() {
+            Some(st) if st.ready => {
+                st.toggle_voice();
+                st.last_poll = None;
+                true
+            }
+            _ => false,
+        };
+        if !toggled {
+            self.set_transient_status("La dictée marche dans le chat");
         }
     }
 
@@ -618,14 +669,14 @@ fn gate(pane: &Pane) -> input::Verdict {
 /// message. False without an image.
 fn attach_pasted_image(st: &mut ChatState) -> bool {
     let Some(path) = crate::appkit_input::pasted_image_path(&objc2_app_kit::NSPasteboard::generalPasteboard()) else { return false };
-    st.attach = Some(page::Attach { src: thumbnail(&path), path: path.clone() });
+    st.attach.push(page::Attach { src: thumbnail(&path), path: path.clone() });
     st.pasted.push(path);
     true
 }
 
 /// A pasted image as a `data:` URL for its chip, when small enough to send to the page.
 fn thumbnail(path: &str) -> Option<String> {
-    const MAX: u64 = 6 * 1024 * 1024;
+    const MAX: u64 = 3 * 1024 * 1024;
     if std::fs::metadata(path).ok()?.len() > MAX {
         return None;
     }
@@ -741,6 +792,28 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
         input::Step::Queued(_) | input::Step::Nothing => {}
     }
 
+    // Dictation: what was heard, a failure, the end of its thread.
+    let mut voice_send = false;
+    if let Some(session) = &st.voice {
+        let ms = crate::surface::monotonic_ms();
+        for note in session.take() {
+            match note {
+                crate::voice_io::Note::Event(e) => {
+                    st.transcript.apply(&e, ms);
+                }
+                crate::voice_io::Note::Failed(line) => st.note = Some(line),
+                crate::voice_io::Note::Closed => {
+                    st.voice = None;
+                    st.listening = false;
+                    break;
+                }
+            }
+        }
+        if st.listening && crate::voice::auto_send() && st.transcript.auto_send_due(ms, crate::voice::AUTO_SEND_PAUSE_MS) {
+            voice_send = true;
+        }
+    }
+
     if !st.ready {
         return None;
     }
@@ -776,7 +849,16 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
     update.queued = queued;
     update.note = st.note.take();
     update.restore = st.restore.take();
-    update.attach = st.attach.take();
+    update.attach = (!st.attach.is_empty()).then(|| std::mem::take(&mut st.attach));
+    let voice = page::Voice { on: st.listening, live: st.voice.is_some(), text: st.transcript.text(), send: voice_send };
+    if voice_send {
+        st.transcript.clear();
+    }
+    if st.shown_voice.as_ref() != Some(&voice) {
+        st.shown_voice = Some(voice.clone());
+        update.voice = Some(voice);
+        changed = true;
+    }
     update.first = std::mem::take(&mut st.first);
     update.focus = std::mem::take(&mut st.focus);
     changed |= update.note.is_some() || update.restore.is_some() || update.attach.is_some() || update.first || update.focus;
@@ -807,9 +889,10 @@ define_class!(
     unsafe impl NSObjectProtocol for ChatWebDelegate {}
 
     unsafe impl WKNavigationDelegate for ChatWebDelegate {
-        /// The page Kova loads, and nothing else: a link the user clicks
-        /// opens in the default browser (http(s) and mailto only), every
-        /// other navigation is cancelled.
+        /// The page Kova loads, and nothing else. The page's script takes
+        /// every link click (side panel, `link` message); should a click get
+        /// through anyway, http(s) and mailto open in the default browser and
+        /// every other navigation is cancelled.
         #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
         fn decide_policy(
             &self,

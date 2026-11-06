@@ -32,7 +32,7 @@ pub fn is_panel_path(raw: &str) -> bool {
     (raw.starts_with('/') || raw.starts_with("~/")) && (raw.ends_with(".md") || raw.ends_with(".html"))
 }
 
-/// Whether `raw` is a link worth keeping in markdown: http(s), or a panel path.
+/// Whether `raw` is an http(s) URL.
 pub fn is_web(raw: &str) -> bool {
     let lower = raw.trim().to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
@@ -100,6 +100,7 @@ fn paths(text: &str, urls: &[Link], exists: &dyn Fn(&str) -> bool) -> Vec<Link> 
             }
             let line_start = text[..end].rfind('\n').map_or(0, |i| i + 1);
             let low = line_start.max(end.saturating_sub(SPACED_PATH_MAX));
+            let low = (low..end).find(|&i| text.is_char_boundary(i)).unwrap_or(end);
             // The nearest start of a path on the line; one with spaces only
             // when the file is there.
             let starts = text[low..end]
@@ -126,6 +127,9 @@ pub fn linkify_with(text: &str, exists: &dyn Fn(&str) -> bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     for link in find(text, exists) {
+        if link.start < at {
+            continue;
+        }
         out.push_str(&escape(&text[at..link.start]));
         let target = &text[link.start..link.end];
         out.push_str(&anchor(target, link.kind));
@@ -201,6 +205,8 @@ mod tests {
         assert_eq!(targets(text, &exists), [("~/AI directory/Claap/context/now.md".to_string(), Kind::Path)]);
         assert!(targets(text, &none).is_empty());
         assert!(targets("I edited /a/b and c/d.md", &none).is_empty(), "not a path made of a sentence");
+        let long = format!("{} /tmp/x.md", "é".repeat(200));
+        assert_eq!(targets(&long, &none), [("/tmp/x.md".to_string(), Kind::Path)], "a long accented line: no cut inside a char");
     }
 
     #[test]
