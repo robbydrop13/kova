@@ -369,8 +369,9 @@ const ICON_X: &str = r#"<svg class="i" width="16" height="16" viewBox="0 0 24 24
 
 fn button_html(button: Button, disabled: bool) -> String {
     let icon = if button == Button::Validate { ICON_CHECK } else { "" };
+    let tip = if button == Button::Done { " title=\"Retire de ta file\"" } else { "" };
     format!(
-        "<button type=\"button\" class=\"btn {}\" data-act=\"{}\"{}>{}<span>{}</span></button>",
+        "<button type=\"button\" class=\"btn {}\" data-act=\"{}\"{tip}{}>{}<span>{}</span></button>",
         if button.primary() { "acc" } else { "sec" },
         button.act(),
         if disabled { " disabled" } else { "" },
@@ -713,7 +714,8 @@ function setList(html) {
     const t = card.querySelector('textarea.bd');
     if (!t) return;
     const k = keep[card.dataset.key];
-    if (k && k.orig === t.dataset.orig && !t.readOnly) t.value = k.value;
+    // A correction already sent keeps showing the text that went.
+    if (k && k.orig === t.dataset.orig) t.value = k.value;
     grow(t); sync(card);
     if (card.dataset.key === focusKey && !t.readOnly) { t.focus(); t.setSelectionRange(sel[0], sel[1]); }
   });
@@ -846,6 +848,7 @@ mod tests {
         assert_eq!(buttons(&perm, true, true), [Button::Deny, Button::Allow]);
         let err = from_need(&need(NeedKind::Error, "pane:1", 1), false).unwrap();
         assert_eq!(buttons(&err, true, true), [Button::Open]);
+        assert!(button_html(Button::Done, false).contains("title=\"Retire de ta file\""));
         for b in [Button::Done, Button::Deny, Button::Allow, Button::Correct, Button::Validate, Button::Open] {
             assert_eq!(Button::parse(b.act()), Some(b));
         }

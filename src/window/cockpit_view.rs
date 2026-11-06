@@ -131,6 +131,7 @@ impl KovaView {
     /// The chat's `terminal` button, from the Cockpit: the column closes.
     pub(super) fn cockpit_close_chat(&self) {
         self.ivars().cockpit.chat.set(false);
+        self.ivars().cockpit.focus.set(true);
         self.ivars().cockpit.chat_target.set(None);
     }
 
@@ -241,7 +242,12 @@ impl KovaView {
         if web.isHidden() {
             web.setHidden(false);
         }
-        if slot.focus.take() {
+        // The panes are covered: the keyboard never stays on the terminal
+        // under the page (the chief's chat keeps it when it has it).
+        let on_terminal = window
+            .firstResponder()
+            .is_some_and(|r| std::ptr::eq(Retained::as_ptr(&r).cast::<()>(), (self as *const Self).cast::<()>()));
+        if slot.focus.take() || on_terminal {
             window.makeFirstResponder(Some(&web));
         }
 
@@ -298,7 +304,6 @@ impl KovaView {
             now: now / 1000,
         };
         let parts = cockpit::parts(&view);
-        drop(view);
         page.items = items;
         if !page.ready {
             return;
@@ -364,6 +369,7 @@ impl KovaView {
             }
             "chat" => {
                 slot.chat.set(s("what") == "toggle" && !slot.chat.get());
+                slot.focus.set(!slot.chat.get());
                 true
             }
             "act" => {
