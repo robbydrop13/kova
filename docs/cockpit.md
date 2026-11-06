@@ -152,7 +152,7 @@ Scheduled icon keeps its red dot.
 
 ## Chat
 
-`Chat` (top right) opens a chief of staff's chat on the right third: the
+`Chat` (top right) opens a chief of staff's chat on the left third (the side panel keeps the right): the
 segmented `Claap | Perso` picks the pane of this window whose agent session or
 peer name is `claap-agent` or `perso-agent`. It is the chat mode's own view
 (`chat_view.rs`): `chat_target` returns that pane and the column's frame while

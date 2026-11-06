@@ -9,7 +9,7 @@
 //! read), renders the page in Rust and pushes only the parts that changed;
 //! the page keeps a draft being rewritten through a push.
 //!
-//! The `Chat` button opens a chief of staff's chat on the right third of the
+//! The `Chat` button opens a chief of staff's chat on the left third of the
 //! page: the chat mode's own web view (`chat_view.rs`), pointed at the chief's
 //! pane through `cockpit_chat_target`, with no focus or tab switch. A message
 //! is taken only from this web view's main frame on `about:blank`.
@@ -325,14 +325,10 @@ impl KovaView {
             return;
         }
 
-        // The chief's chat on the right third, under the column's top bar.
+        // The chief's chat on the left third, under the column's top bar.
         let chief = slot.chief.get();
         let chief_pane = if slot.chat.get() { self.chief_pane(cockpit::chief_session(chief)) } else { None };
-        slot.chat_target.set(chief_pane.map(|id| {
-            let (x, y, w, h) = frame;
-            let col = (w / 3.0).round();
-            (id, (x + w - col + 1.0, y, col - 1.0, (h - CHAT_TOP_H).max(0.0)))
-        }));
+        slot.chat_target.set(chief_pane.map(|id| (id, cockpit::chat_frame(frame, CHAT_TOP_H))));
 
         let due = slot.page.borrow().last_poll.is_none_or(|t| t.elapsed().as_millis() >= POLL_MS);
         if !(due || force) {
@@ -912,7 +908,7 @@ impl KovaView {
         if let Some(container) = unsafe { self.superview() } {
             container.addSubview_positioned_relativeTo(&web, NSWindowOrderingMode::Above, Some(self));
             // The chat's web view, if it was made first, goes back above the
-            // page: the chief's chat is drawn over its right third.
+            // page: the chief's chat is drawn over its left third.
             if let Some(chat) = self.chat_web() {
                 container.addSubview_positioned_relativeTo(&chat, NSWindowOrderingMode::Above, Some(&web));
             }

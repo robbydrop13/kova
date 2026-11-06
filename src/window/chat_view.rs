@@ -253,7 +253,7 @@ impl KovaView {
 
     /// The active tab's chat pane, where it is on screen, and the focused pane.
     /// While the Cockpit is open it covers the panes: the only chat is the
-    /// chief's, on the page's right third, and its pane counts as focused so
+    /// chief's, on the page's left third, and its pane counts as focused so
     /// nothing moves the focus or switches tabs to it.
     fn chat_target(&self) -> Option<Target> {
         if self.metal_overlay_open() {
@@ -624,7 +624,7 @@ impl KovaView {
         web.setHidden(true);
         if let Some(container) = unsafe { self.superview() } {
             // Above the Cockpit's page when there is one: the chief's chat
-            // is drawn over its right third.
+            // is drawn over its left third.
             match self.cockpit_web() {
                 Some(page) => container.addSubview_positioned_relativeTo(&web, NSWindowOrderingMode::Above, Some(&page)),
                 None => container.addSubview_positioned_relativeTo(&web, NSWindowOrderingMode::Above, Some(self)),

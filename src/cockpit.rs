@@ -985,6 +985,15 @@ pub fn restyle_script(light: bool) -> String {
 }
 
 /// The page, loaded once per open; `update_script` fills it.
+/// The chat column in the page's frame (x, y up, width, height, in points):
+/// the left third, under its `top` bar, its right border left to the page.
+/// The side panel keeps the window's right.
+pub fn chat_frame(page: (f64, f64, f64, f64), top: f64) -> (f64, f64, f64, f64) {
+    let (x, y, w, h) = page;
+    let col = (w / 3.0).round();
+    (x, y, (col - 1.0).max(0.0), (h - top).max(0.0))
+}
+
 pub fn shell(light: bool, nonce: &str) -> String {
     PAGE.replace("{scheme}", if light { "light" } else { "dark" })
         .replace("{vars}", &vars(light))
@@ -1084,7 +1093,7 @@ textarea.ins:focus{border-color:var(--accent);outline:0}
 .snz button:hover{background:var(--hover)}
 .snz .pick{display:flex;gap:6px;padding:4px}
 .snz input{flex:1;min-width:0;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:12px;padding:3px 6px}
-.chat{width:33.333%;flex:none;border-left:1px solid var(--b3);background:var(--bg1);display:none;flex-direction:column}
+.chat{width:33.333%;flex:none;border-right:1px solid var(--b3);background:var(--bg1);display:none;flex-direction:column}
 body.chat-on .chat{display:flex}
 .chat .top{height:56px;flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 14px 0 16px;border-bottom:1px solid var(--b3)}
 .chat .who{font-size:11px;color:var(--t3);display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden}
@@ -1129,8 +1138,8 @@ body.chat-on .chat{display:flex}
 .card.flash{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 35%,transparent);transition:box-shadow .3s}
 .none{font-size:13px;color:var(--t3)}
 </style></head><body>
-<section class="page"><div class="inner"><div id="head"></div><div id="list"></div></div></section>
 <section class="chat" id="chat"></section>
+<section class="page"><div class="inner"><div id="head"></div><div id="list"></div></div></section>
 <div class="snz" id="snz" hidden><button type="button" data-when="hour">Dans 1 h</button><button type="button" data-when="evening">Ce soir</button><button type="button" data-when="morning">Demain matin</button><button type="button" data-when="monday">Lundi prochain</button><button type="button" data-when="pick">Choisir…</button><div class="pick" id="snzPick" hidden><input type="datetime-local" id="snzAt"><button type="button" class="btn acc" data-when="at"><span>OK</span></button></div></div>
 <script nonce="{nonce}">
 const $ = id => document.getElementById(id);
@@ -1716,6 +1725,15 @@ mod tests {
         assert!(page.contains("<script nonce=\"abc123\">"));
         assert!(page.contains("messageHandlers.kovaCockpit"));
         assert!(shell(true, "n").contains("color-scheme:light"));
+    }
+
+    #[test]
+    fn the_chat_column_sits_left_of_the_action_list() {
+        let page = shell(false, "n");
+        let (chat, list) = (page.find(r#"<section class="chat""#).unwrap(), page.find(r#"<section class="page""#).unwrap());
+        assert!(chat < list, "the chat comes first in the flex row");
+        assert!(page.contains(".chat{width:33.333%;flex:none;border-right:"));
+        assert_eq!(chat_frame((200.0, 10.0, 900.0, 600.0), 56.0), (200.0, 10.0, 299.0, 544.0), "the left third, under its bar");
         assert!(!PAGE.contains('\u{2014}'), "no em dash in the UI");
         let u = Update { list: Some("<p>x</p>".into()), ..Default::default() };
         assert_eq!(update_script(&u), "window.kova && window.kova.update({\"list\":\"<p>x</p>\"})");
