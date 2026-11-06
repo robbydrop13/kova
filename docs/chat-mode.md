@@ -201,7 +201,19 @@ At the bottom of the thread, above the box:
   card, the entry gets the same verb (`attn snooze`, `attn close --reason
   dismissed|done`) and the card has the instruction field (`attn act ID
   instruct --text=...`, Enter sends, Shift+Enter is a new line);
-- the permission prompt read on the pane's screen: Yes, the option that
+- the menu Claude Code waits on, read off the pane's screen
+  (`prompt_preview::parse_menu`, one grammar for a permission prompt, an
+  AskUserQuestion and the plan approval, fixtures in `tests/fixtures/prompt/`;
+  a label wrapped in a narrow pane and a named session's bottom rule
+  included): each option a button, a field, the plan from the transcript
+  (`ExitPlanMode`'s `plan`). A click types the option's digit only while that
+  menu is still on screen; the option that takes text (`Type something.`,
+  `Tell Claude what to change`) gets the digit, the text, then Enter, 250 ms
+  apart (written together, Claude Code reads them as one key), Enter only
+  once the option shows the text. Text with another option follows as the
+  next message. While such a menu waits, the box answers it at once. A wait
+  Kova cannot read shows a card saying so, never guessed options;
+- the permission prompt read on the pane's screen, when no menu was read: Yes, the option that
   always allows, No; the digit is typed only while the screen still shows
   that prompt (`Pane::answer_permission`).
 
