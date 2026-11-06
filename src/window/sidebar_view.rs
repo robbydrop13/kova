@@ -2435,7 +2435,7 @@ impl SidebarListView {
             ListHit::Tile(pane_id) => {
                 // A pane chosen in the list: the Cockpit gives the panes back.
                 kova.close_cockpit();
-                kova.focus_pane_in_window(pane_id);
+                kova.open_pane_from_sidebar(pane_id);
             }
             ListHit::TileButton(pane_id, button) => {
                 let action = match button {
@@ -2453,7 +2453,7 @@ impl SidebarListView {
             ListHit::Agent(hit) => match hit {
                 AgentsHit::Filter(section) => kova.sidebar_agents_filter(section),
                 AgentsHit::Pane(pane_id) => {
-                    kova.focus_pane_in_window(pane_id);
+                    kova.open_pane_from_sidebar(pane_id);
                 }
                 AgentsHit::Need(index) => {
                     let key = self.ivars().shared.borrow().model.agents.panes.get(index).and_then(|p| p.key.clone());

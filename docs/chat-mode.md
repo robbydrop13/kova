@@ -14,7 +14,8 @@ input gate, cards, page; all unit-tested), the AppKit half in
 | From | What |
 |---|---|
 | Cmd+Option+T (`toggle_chat`; not Cmd+Option+C, taken by Alfred's clipboard viewer), Pane > Show as Chat, IPC `dispatch-action` `toggle-chat` | the focused pane as a chat, or its terminal again |
-| The banner's Terminal button | the terminal again |
+| A click on a session in the sidebar (pane list or agents view) | the pane as a chat when a Claude conversation runs in it; a shell or another agent stays a terminal |
+| The banner's Terminal button (not on the Cockpit's chat, which has no terminal) | the terminal again |
 
 A pane without a Claude conversation stays a terminal, with a note in the
 status bar. One chat pane per tab: turning one on turns the others of its

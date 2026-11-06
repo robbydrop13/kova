@@ -232,18 +232,30 @@ impl KovaView {
             } else if pane.last_claude_session_id().is_none() {
                 Some("No Claude conversation in this pane")
             } else {
-                let mut ids = Vec::new();
-                tab.for_each_pane(&mut |p| ids.push(p.id));
-                for id in ids {
-                    if let Some(p) = tab.pane_mut(id) {
-                        p.chat = id == focused;
-                    }
-                }
+                only_chat(tab, focused);
                 None
             }
         };
         if let Some(note) = note {
             self.set_transient_status(note);
+        }
+        self.mark_dirty();
+    }
+
+    /// A session chosen in the sidebar: focused, and on its chat when a
+    /// Claude conversation runs there (a shell or another agent stays a
+    /// terminal). `cmd+option+t` still shows the terminal.
+    pub(super) fn open_pane_from_sidebar(&self, pane_id: PaneId) {
+        if !self.focus_pane_in_window(pane_id) {
+            return;
+        }
+        {
+            let mut tabs = self.ivars().tabs.borrow_mut();
+            let Some(tab) = tabs.iter_mut().find(|t| t.contains(pane_id)) else { return };
+            if !tab.pane(pane_id).is_some_and(|p| p.claude_session_id().is_some()) {
+                return;
+            }
+            only_chat(tab, pane_id);
         }
         self.mark_dirty();
     }
@@ -760,6 +772,22 @@ impl KovaView {
     }
 }
 
+/// One chat per tab: `pane_id` shows its chat, the tab's other panes their
+/// terminal.
+fn only_chat(tab: &mut crate::pane::Tab, pane_id: PaneId) {
+    let mut ids = Vec::new();
+    tab.for_each_pane(&mut |p| ids.push(p.id));
+    for (id, chat) in chat_flags(&ids, pane_id) {
+        if let Some(p) = tab.pane_mut(id) {
+            p.chat = chat;
+        }
+    }
+}
+
+fn chat_flags(ids: &[PaneId], chosen: PaneId) -> Vec<(PaneId, bool)> {
+    ids.iter().map(|&id| (id, id == chosen)).collect()
+}
+
 enum Reply {
     Nothing,
     /// Something changed: push an update now.
@@ -1167,6 +1195,12 @@ define_class!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tab_shows_one_chat_the_one_chosen() {
+        assert_eq!(chat_flags(&[1, 2, 3], 2), vec![(1, false), (2, true), (3, false)]);
+        assert_eq!(chat_flags(&[1, 2], 9), vec![(1, false), (2, false)]);
+    }
 
     #[test]
     fn the_chat_page_takes_the_light_tokens_in_light_mode() {
