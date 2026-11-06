@@ -192,7 +192,7 @@ At the bottom of the thread, above the box:
   conversation, not snoozed): their buttons, a field when they take text;
   the answer goes through the board's queue like a Cockpit card's, checked
   against the question's buttons (`ask::accepts_external_answer`);
-- a decision sheet: Ouvrir la fiche, which shows it in the side panel (the
+- a decision sheet: Décider, which shows it in the side panel (the
   floating card's path);
 - a handoff: its step (Ouvrir, Lancer) and Fait, the step performed by the
   board without answering;

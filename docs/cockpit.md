@@ -30,23 +30,41 @@ it: one `WKWebView` per window over the active tab's panes area
   permission or an error. Under `[attention] perso_dir` (`~/` expanded) it is
   Perso, else Claap; an ask, or no `perso_dir`, is Claap. The filter `Tout · Claap · Perso` is
   kept in the window's state.
-- Buttons: `Ouvrir` for an entry whose `action` the side panel can show
-  (`side_panel::open_target`); `Ouvrir` on a live need opens the card in
-  place (see Opened cards); `Ouvrir la fiche` for a decision sheet; `Refuser` / `Autoriser` answer a permission prompt
-  like the chat does, only if the screen still shows the prompt the card
-  was rendered from.
-- Waiting on a go (Robin, 06/11/2026): an entry without a draft of kind
-  `would` or `review`, or a `decision` whose `action` is prepared (not a
-  `kova-sheet:` / `kova-ask:`), carries `Refuser` and `Valider`, both blue,
-  after `Ouvrir` (secondary then). An entry naming a waiting ask shows
-  `Ouvrir la fiche` only. `Valider` runs
+- Buttons (Robin, 06/11/2026), one rule for every card, in the Cockpit and
+  in the chat's cards (`cockpit::primary`, `cockpit::buttons`): the icons
+  top right; at most one blue button, named by what the user does, never
+  `Ouvrir`; every other action a plain text link left of it.
+
+  | Card | Blue button | What it does | Links |
+  |---|---|---|---|
+  | `would`, `review`, `decision` with a prepared action | `Valider` | `act_command ID Valider` | `Voir`, `Refuser` |
+  | Draft | `Valider` (`Valider la correction` once rewritten) | `act_command ID Valider` / `Corriger --text=` | `Corriger` (`Annuler`) |
+  | Entry naming a waiting ask, decision sheet | `Décider` | opens the sheet in the side panel | |
+  | `decision` with nothing prepared | `Décider` | opens the card on its `Consigne` | `Voir` |
+  | `test` | `Tester` | opens the card (the plan) on its `Consigne` | `Voir` |
+  | `blocked`, `ask` (and a future `brief`) | `Brief` | opens the card on its `Consigne` | `Voir` |
+  | `info`, `auto`, any other kind | none | the check icon is the action | `Voir` |
+  | Permission | `Autoriser` | answers the prompt | `Refuser` |
+  | Question | `Répondre` | opens the card on its answer | |
+  | Turn error | `Voir le pane` | closes the page, focuses the pane | |
+  | Failed routine | `Voir le log` | the Scheduled tile's log | in the opened card: `Lancer maintenant`, `Mettre en pause`, `Modifier le prompt` |
+
+  `Voir` shows the entry's `action` in the side panel
+  (`side_panel::open_target`). No kind means "a brief from Robin" in the
+  queue: `blocked` (an agent stuck on him) and `ask` (he has something to
+  give) are the two that wait on his words. A decision sheet
+  reads `Décider` rather than `Ouvrir la fiche`: the verb is what he does, the
+  field is where. Gone a go (`Transmis`), the card keeps its links only. A
+  question opened in the chat shows its answers as its buttons. `Refuser` /
+  `Autoriser` answer a permission prompt like the chat does, only if the
+  screen still shows the prompt the card was rendered from.
+- Waiting on a go (Robin, 06/11/2026): `Refuser` opens a small field
+  `Pourquoi ? (facultatif)` under the card: Enter runs `close_command ID
+  --reason dismissed`, plus `--note=<reason>` when one was typed (one argv
+  element), and the card leaves; Escape folds the field (and only it). No
+  close command, no `Refuser`; no act command, no `Valider`. `Valider` runs
   `act_command ID Valider` (the chief of the scope receives it) and the card
-  reads `Transmis`. `Refuser` opens a small field `Pourquoi ? (facultatif)`
-  under the card: Enter runs `close_command ID --reason dismissed`, plus
-  `--note=<reason>` when one was typed (one argv element), and the card
-  leaves; Escape folds the field (and only it). No close command, no
-  `Refuser`; no act command, no `Valider`. A draft
-  keeps its own `Corriger` / `Valider`.
+  reads `Transmis`.
 - Icons (every attention card, top right, Feather, with a tooltip): clock
   `Plus tard`, x `Pas pertinent, retirer` (`close_command ID --reason
   dismissed`), check `C'est fait` (`close_command ID --reason done`). The clock
@@ -67,6 +85,12 @@ it: one `WKWebView` per window over the active tab's panes area
   (`attention::clean_text`: no control character but tab and newline, 16 KiB
   at most). `Corriger` focuses the field, `Annuler` puts the draft back. Kova
   never sends anything: the chief who receives the click does.
+- Selecting and copying (Robin, 06/11/2026): every text of the page selects
+  and copies, the Cockpit's web view gets Cmd+A/C/V/X/Z like the chat's
+  (`performKeyEquivalent`, Kova has no Edit menu; before, Cmd+C copied the
+  terminal's selection and Cmd+V typed into the pane). A push that would
+  replace a part holding a selection waits until the selection goes. A click
+  that ends a drag-select neither opens nor folds the card.
 
 Every text is escaped into the HTML in Rust. The page's script (CSP nonce)
 only posts clicks, the filter and the edited text (`kovaCockpit`); messages
@@ -128,9 +152,9 @@ records.
 ## Opened cards
 
 A click on any card's body (not a button, a field or the open detail) opens
-its detail inside the card, or folds it; `Ouvrir` on a failed routine, a
-permission, an error or a plain question does the same and reads `Masquer`
-while it is open. Buttons work without opening. The opened keys live in the window
+its detail inside the card, or folds it; `Brief`, `Décider`, `Tester` and
+`Répondre` open it too and give the keyboard to its `Consigne` or its answer
+(never fold it). Buttons work without opening. The opened keys live in the window
 (`CockpitSlot::expanded`): the 250 ms refresh rebuilds the detail and keeps it
 open, with its folded prompt, its scroll and a typed answer; a key whose card
 is gone is dropped.
@@ -138,22 +162,22 @@ is gone is dropped.
 - Failed routine (the Scheduled tile's body): `Horaire`, `Prochain`,
   `Dernier` (crit when it failed, with its exit code), `Dossier`; the prompt
   file, folded and scrollable (16 KiB at most); `Lancer maintenant` (or
-  `Reprendre` when off), `Voir le log`, `Mettre en pause`, `Modifier le
-  prompt`, through the tile's own path (`sidebar_sched_hit`). No delete here.
+  `Reprendre` when off), `Mettre en pause`, `Modifier le prompt` as links
+  (`Voir le log` is the card's blue button), through the tile's own path (`sidebar_sched_hit`). No delete here.
   An action in flight shows `En cours`; an open that failed shows its words.
 - Permission: the prompt's lines and question; `Refuser` / `Autoriser` stay
   on the card.
-- Error: the provider's words, the pane's last 15 non-blank lines, and `Voir le
-  pane`, which closes the page and focuses the pane.
+- Error: the provider's words and the pane's last 15 non-blank lines; the
+  card's `Voir le pane` closes the page and focuses the pane.
 - Attention entry: `needs`, `body` (line breaks kept), `detail`, the `src`
   list, and its links: the `action` (not a `kova-sheet:`) plus every http(s)
   link in the body, detail and sources, opening in the side panel like
-  `Ouvrir`. An entry with no `needs`, `body` or `detail` says `Je regarde de
+  `Voir`. An entry with no `needs`, `body` or `detail` says `Je regarde de
   quoi il s'agit…` and Kova runs `explain_command ID` (default: the attn
   program with `explain`, about 40 s) in the background, never twice at once
   for one id; the next read brings the `detail` it saved.
 - Every opened attention card, button or not, ends with a `Consigne` field (`Une consigne pour cette carte`): Enter runs `act_command ID instruct --text=<text>` (one argv element, `attention::clean_text`), which hands it to the chief of the card's scope; Shift+Enter is a new line, nothing typed sends nothing. The field clears and the card shows `Consigne envoyée` with the text sent; on a draft it sits under the draft's actions, apart from the correction, and never marks the draft sent. A typed instruction survives the refresh.
-- Decision sheet: its card's text (the decisions); `Ouvrir la fiche` opens it.
+- Decision sheet: its card's text (the decisions); `Décider` opens it.
 - Question: its text and its answers as buttons (a free answer brings a
   field), checked with `ask::accepts_external_answer` and queued like the
   chat's (`queue_ask_action`); the card shows `En cours` for 5 s.
@@ -177,4 +201,4 @@ The chosen chief is saved per window in the session file (`cockpit_chief`).
 
 ## Une entrée de la file qui renvoie à une fiche
 
-Une entrée dont l'`action` est `kova-sheet:<id>` (ou `kova-ask:<id>`, id complet ou préfixe d'au moins 6 caractères) d'une question `kova ask` en attente porte le bouton « Ouvrir la fiche » : il ouvre la fiche dans le volet, images comprises. La carte propre de la question n'apparaît plus, pour ne la montrer qu'une fois. Pas de « C'est fait » : l'entrée part quand la fiche est répondue et l'entrée fermée.
+Une entrée dont l'`action` est `kova-sheet:<id>` (ou `kova-ask:<id>`, id complet ou préfixe d'au moins 6 caractères) d'une question `kova ask` en attente porte le bouton « Décider » : il ouvre la fiche dans le volet, images comprises. La carte propre de la question n'apparaît plus, pour ne la montrer qu'une fois. Pas de « C'est fait » : l'entrée part quand la fiche est répondue et l'entrée fermée.
