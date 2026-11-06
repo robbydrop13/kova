@@ -89,7 +89,9 @@ it: one `WKWebView` per window over the active tab's panes area
   and copies, the Cockpit's web view gets Cmd+A/C/V/X/Z like the chat's
   (`performKeyEquivalent`, Kova has no Edit menu; before, Cmd+C copied the
   terminal's selection and Cmd+V typed into the pane). A push that would
-  replace a part holding a selection waits until the selection goes. A click
+  replace a part (list, head, chat column) holding a selection waits until the
+  selection goes or the page loses the keyboard; a `Voir la carte` lets the
+  list in first. A click
   that ends a drag-select neither opens nor folds the card.
 
 Every text is escaped into the HTML in Rust. The page's script (CSP nonce)

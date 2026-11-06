@@ -1376,23 +1376,31 @@ function focusIn(card, what) {
 const held = {};
 function selectedIn(id) {
   const sel = window.getSelection();
-  return sel && !sel.isCollapsed && String(sel).trim() !== '' && $(id).contains(sel.anchorNode);
+  return document.hasFocus() && sel && !sel.isCollapsed && String(sel).trim() !== '' && $(id).contains(sel.anchorNode);
+}
+function flush(force) {
+  for (const id of Object.keys(held)) if (force || !selectedIn(id)) { const h = held[id]; delete held[id]; put(id, h); }
+}
+function put(id, html) {
+  if (id === 'list') setList(html); else $(id).innerHTML = html;
 }
 function apply(id, html) {
   if (selectedIn(id)) { held[id] = html; return; }
   delete held[id];
-  if (id === 'list') setList(html); else $(id).innerHTML = html;
+  put(id, html);
 }
-document.addEventListener('selectionchange', () => {
-  for (const id of Object.keys(held)) if (!selectedIn(id)) apply(id, held[id]);
-});
+document.addEventListener('selectionchange', () => flush(false));
+// The page losing the keyboard (hidden, another view) lets every push in.
+window.addEventListener('blur', () => flush(true));
 window.kova = {
   update(u) {
     if (u.head !== undefined) apply('head', u.head);
     if (u.list !== undefined) apply('list', u.list);
-    if (u.chat !== undefined) { $('chat').innerHTML = u.chat; document.body.classList.toggle('chat-on', u.chat !== ''); }
+    if (u.chat !== undefined) { apply('chat', u.chat); document.body.classList.toggle('chat-on', u.chat !== ''); }
     if (u.focus && !(document.activeElement && /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName))) window.focus();
     if (u.reveal) {
+      // The card to light must be in the list, held or not.
+      if (held.list !== undefined) flush(true);
       const c = document.querySelector('.card[data-key="' + CSS.escape(u.reveal) + '"]');
       if (c) {
         c.scrollIntoView({ block: 'center', behavior: 'smooth' });
