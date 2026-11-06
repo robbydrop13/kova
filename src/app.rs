@@ -1578,7 +1578,9 @@ fn wake_restored_agents(ivars: &AppDelegateIvars) {
         view.launch_wake_panes(&mut panes);
     }
     let Some((pane_id, session)) = waker.pick(&panes) else {
-        if !views.iter().any(|view| view.has_deferred_tabs()) {
+        if views.iter().any(|view| view.has_deferred_tabs()) {
+            waker.idle(now);
+        } else {
             log::info!("Launch wake: every restored agent is awake");
             *slot = None;
         }

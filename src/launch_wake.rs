@@ -9,7 +9,7 @@
 //! switch. This file is the pure half (who comes next, and when); the app
 //! timer gathers the panes and does the waking.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// One pane of one window, as the waker sees it.
@@ -18,9 +18,11 @@ pub struct PaneInfo {
     pub pane_id: u32,
     /// The conversation asleep in the pane (`Surface::dormant_session_id`).
     pub dormant: Option<String>,
-    /// The conversation an agent runs in the pane (`Surface::agent_session_id`).
+    /// The conversation an agent runs in the pane (`Surface::agent_session_id`),
+    /// or the one just woken there whose agent has not registered yet.
     pub live: Option<String>,
     /// 0 for the chief of its window's Cockpit, 1 for the other chief, 2 else.
+    /// Only read while the pane sleeps.
     pub rank: u8,
 }
 
@@ -62,15 +64,23 @@ pub struct LaunchWaker {
     next_at: Instant,
     woken_panes: HashSet<u32>,
     woken_sessions: HashSet<String>,
+    /// Each pane's rank the first time it was seen asleep: the title it is
+    /// read from is the restored one only until the shell sets its own.
+    ranks: HashMap<u32, u8>,
 }
+
+/// How long an empty pick waits before looking again, while restored tabs
+/// are still spawning.
+const IDLE: Duration = Duration::from_millis(500);
 
 impl LaunchWaker {
     pub fn new(stagger_s: f64, now: Instant) -> Self {
         Self {
-            stagger: Duration::from_secs_f64(stagger_s.max(0.0)),
+            stagger: Duration::from_secs_f64(if stagger_s.is_finite() { stagger_s.clamp(0.0, 3600.0) } else { 3.0 }),
             next_at: now,
             woken_panes: HashSet::new(),
             woken_sessions: HashSet::new(),
+            ranks: HashMap::new(),
         }
     }
 
@@ -79,9 +89,22 @@ impl LaunchWaker {
         now >= self.next_at
     }
 
-    /// The pane to wake now, `None` when nothing waits.
-    pub fn pick(&self, panes: &[PaneInfo]) -> Option<(u32, String)> {
-        next_to_wake(panes, &self.woken_panes, &self.woken_sessions)
+    /// The pane to wake now, `None` when nothing waits. Ranks are the ones
+    /// first seen.
+    pub fn pick(&mut self, panes: &[PaneInfo]) -> Option<(u32, String)> {
+        let panes: Vec<PaneInfo> = panes
+            .iter()
+            .map(|p| match p.dormant {
+                Some(_) => PaneInfo { rank: *self.ranks.entry(p.pane_id).or_insert(p.rank), ..p.clone() },
+                None => p.clone(),
+            })
+            .collect();
+        next_to_wake(&panes, &self.woken_panes, &self.woken_sessions)
+    }
+
+    /// Nothing to wake yet: look again shortly, not on every frame.
+    pub fn idle(&mut self, now: Instant) {
+        self.next_at = now + IDLE;
     }
 
     /// `pane_id` was handled (woken, or found awake): never again, and the
@@ -130,6 +153,13 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_woken_elsewhere_but_not_registered_is_not_woken_twice() {
+        // Pane 2 was shown and resumes "a"; its agent has not registered yet.
+        let panes = [asleep(1, "a", 2), running(2, "a"), asleep(3, "b", 2)];
+        assert_eq!(order(&panes), vec![3]);
+    }
+
+    #[test]
     fn a_pane_that_woke_by_itself_is_left_alone() {
         let mut waker = LaunchWaker::new(3.0, Instant::now());
         let mut panes = vec![asleep(1, "a", 2), asleep(2, "b", 2)];
@@ -138,6 +168,36 @@ mod tests {
         assert_eq!(waker.pick(&panes), Some((2, "b".into())));
         waker.record(2, "b".into(), Instant::now());
         assert_eq!(waker.pick(&panes), None);
+    }
+
+    #[test]
+    fn a_rank_is_the_one_first_seen_once_the_shell_retitles_the_pane() {
+        let mut waker = LaunchWaker::new(3.0, Instant::now());
+        let mut panes = vec![asleep(1, "a", 2), asleep(2, "pro", 0), asleep(3, "perso", 1)];
+        assert_eq!(waker.pick(&panes), Some((2, "pro".into())));
+        waker.record(2, "pro".into(), Instant::now());
+        // The shell set its own title: the chief no longer reads as one.
+        panes[2].rank = 2;
+        assert_eq!(waker.pick(&panes), Some((3, "perso".into())));
+    }
+
+    #[test]
+    fn an_absurd_stagger_falls_back_instead_of_panicking() {
+        let start = Instant::now();
+        for s in [f64::INFINITY, f64::NAN, 1e300, -1.0] {
+            let mut waker = LaunchWaker::new(s, start);
+            waker.record(1, "a".into(), start);
+            assert!(waker.due(start + Duration::from_secs(3601)));
+        }
+    }
+
+    #[test]
+    fn an_empty_pick_looks_again_half_a_second_later() {
+        let start = Instant::now();
+        let mut waker = LaunchWaker::new(3.0, start);
+        waker.idle(start);
+        assert!(!waker.due(start + Duration::from_millis(499)));
+        assert!(waker.due(start + IDLE));
     }
 
     #[test]

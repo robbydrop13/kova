@@ -718,13 +718,20 @@ impl KovaView {
         let cockpit_chief = crate::cockpit::chief_session(scope);
         for tab in self.ivars().tabs.borrow().iter() {
             tab.for_each_pane(&mut |pane| {
-                let osc = pane.terminal.read().title.clone();
-                out.push(crate::launch_wake::PaneInfo {
-                    pane_id: pane.id,
-                    dormant: pane.dormant_session_id(),
-                    live: pane.agent_session_id(),
-                    rank: crate::launch_wake::rank(&[osc.as_deref(), pane.custom_title.as_deref()], cockpit_chief, &chiefs),
-                });
+                let dormant = pane.dormant_session_id();
+                // Woken but not registered yet still holds its conversation.
+                let live = pane.agent_session_id().or_else(|| dormant.is_none().then(|| pane.unregistered_session().map(|s| s.id)).flatten());
+                if dormant.is_none() && live.is_none() {
+                    return;
+                }
+                let rank = match dormant {
+                    Some(_) => {
+                        let osc = pane.terminal.read().title.clone();
+                        crate::launch_wake::rank(&[osc.as_deref(), pane.custom_title.as_deref()], cockpit_chief, &chiefs)
+                    }
+                    None => 2,
+                };
+                out.push(crate::launch_wake::PaneInfo { pane_id: pane.id, dormant, live, rank });
             });
         }
     }
