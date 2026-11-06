@@ -210,6 +210,13 @@ impl KovaView {
         self.ivars().cockpit.web.get().cloned()
     }
 
+    /// Whether the page has the keyboard (`responder` is its web view or
+    /// inside it): Cmd+C and the other Edit commands go to it.
+    pub(super) fn cockpit_holds(&self, responder: &objc2::runtime::AnyObject) -> bool {
+        let (Some(web), Some(view)) = (self.ivars().cockpit.web.get(), responder.downcast_ref::<NSView>()) else { return false };
+        view.isDescendantOf(web)
+    }
+
     /// The chief this window's chat talks to, for the session file.
     pub fn cockpit_chief(&self) -> Option<String> {
         (self.ivars().cockpit.chief.get() == Scope::Perso).then(|| "perso".to_string())

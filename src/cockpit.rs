@@ -117,7 +117,10 @@ pub struct Item {
     /// `would`, a `review`, or a `decision` with a prepared action. Its card
     /// carries `Refuser` and `Valider`.
     pub validates: bool,
-    /// Opened with `Ouvrir`: what the card shows under itself. Filled by the
+    /// An attention entry's kind (`decision`, `test`, `blocked`…), which
+    /// names its main button (`primary`); empty for a live need.
+    pub entry_kind: String,
+    /// Opened in place: what the card shows under itself. Filled by the
     /// host only for the cards it keeps open.
     pub detail: Option<Detail>,
     pub state: State,
@@ -283,6 +286,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         openable,
         ask: None,
         validates: expects_validation(entry),
+        entry_kind: entry.kind.clone(),
         detail: None,
         state,
         instruction: None,
@@ -397,6 +401,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         openable: false,
         ask: None,
         validates: false,
+        entry_kind: String::new(),
         detail: None,
         state: State::Idle,
         instruction: None,
@@ -414,13 +419,28 @@ pub fn any_urgent(items: &[Item]) -> bool {
     items.iter().any(|item| item.prio == 1)
 }
 
-/// A card's button.
+/// A card's button. One rule for every kind (`docs/cockpit.md`, Buttons):
+/// one blue button named by what the user does (`primary`), the rest plain
+/// links, the attention icons top right. Nothing reads `Ouvrir`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
-    /// Open or fold the card's detail in place (`Ouvrir` / `Masquer`).
+    /// Open or fold the card's detail in place: a click on the card's body.
     Expand,
+    /// The entry's `action` in the side panel: a link, `Voir`.
     Open,
+    /// A decision sheet in the side panel: `Décider`.
     OpenSheet,
+    /// Open the card in place and give the keyboard to where the user
+    /// answers: its `Consigne` (`Brief`, `Décider`, `Tester`) or the
+    /// question's answer (`Répondre`).
+    Brief,
+    Decide,
+    Test,
+    Reply,
+    /// A failed routine's log, the Scheduled tile's own path.
+    Log,
+    /// A turn's error: the pane, the page closed.
+    Pane,
     Done,
     Deny,
     Allow,
@@ -438,7 +458,9 @@ impl Button {
     /// The word the page posts.
     pub fn act(self) -> &'static str {
         match self {
-            Button::Expand => "expand",
+            Button::Expand | Button::Brief | Button::Decide | Button::Test | Button::Reply => "expand",
+            Button::Log => "routine",
+            Button::Pane => "pane",
             Button::Open | Button::OpenSheet => "open",
             Button::Done => "done",
             Button::Deny => "deny",
@@ -469,8 +491,14 @@ impl Button {
 
     fn label(self) -> &'static str {
         match self {
-            Button::Expand | Button::Open => "Ouvrir",
-            Button::OpenSheet => "Ouvrir la fiche",
+            Button::Expand => "Détails",
+            Button::Open => "Voir",
+            Button::OpenSheet | Button::Decide => "Décider",
+            Button::Brief => "Brief",
+            Button::Test => "Tester",
+            Button::Reply => "Répondre",
+            Button::Log => "Voir le log",
+            Button::Pane => "Voir le pane",
             Button::Done => "C'est fait",
             Button::Deny | Button::Refuse => "Refuser",
             Button::Allow => "Autoriser",
@@ -481,41 +509,56 @@ impl Button {
         }
     }
 
-    fn primary(self) -> bool {
-        matches!(self, Button::Open | Button::OpenSheet | Button::Allow | Button::Validate | Button::Refuse)
+    /// Where an opening button puts the keyboard once the card is open.
+    fn focus(self) -> Option<&'static str> {
+        match self {
+            Button::Brief | Button::Decide | Button::Test => Some("ins"),
+            Button::Reply => Some("ans"),
+            _ => None,
+        }
     }
 }
 
-/// A card's buttons, left to right. A draft's verbs need `act_command`; a
-/// sent draft has none left.
-pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
+/// A card's one blue button: what the user does on it (`docs/cockpit.md`,
+/// Buttons). `None` for a card that only informs (its check icon is the
+/// action) and once a go went through.
+pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
+    let sent = item.state == State::Sent;
     match item.kind {
-        Kind::Attention if item.draft.is_some() && can_act => {
-            if item.state == State::Sent {
-                Vec::new()
-            } else {
-                vec![Button::Correct, Button::Validate]
-            }
-        }
-        Kind::Attention if item.ask.is_some() => vec![Button::OpenSheet],
-        // Once the go went through, only the way to its material is left.
-        // `Refuser` needs the close command (`card_html`), `Valider` the act one.
-        Kind::Attention if item.validates => {
-            let open = item.openable.then_some(Button::Open);
-            if item.state == State::Sent {
-                open.into_iter().collect()
-            } else {
-                open.into_iter().chain([Some(Button::Refuse), can_act.then_some(Button::Validate)].into_iter().flatten()).collect()
-            }
-        }
-        // `C'est fait` is one of the card's icons (`icons`).
-        Kind::Attention if item.openable => vec![Button::Open],
-        Kind::Attention => Vec::new(),
-        Kind::Sheet => vec![Button::OpenSheet],
-        // The live kinds open in place: nothing jumps to another view.
-        Kind::Permission => vec![Button::Expand, Button::Deny, Button::Allow],
-        Kind::Ask | Kind::Error | Kind::FailedRoutine => vec![Button::Expand],
+        Kind::Attention if item.draft.is_some() && can_act => (!sent).then_some(Button::Validate),
+        Kind::Attention if item.ask.is_some() => Some(Button::OpenSheet),
+        Kind::Attention if item.validates => (!sent && can_act).then_some(Button::Validate),
+        Kind::Attention => match item.entry_kind.as_str() {
+            "test" => Some(Button::Test),
+            "blocked" | "ask" | "brief" => Some(Button::Brief),
+            "decision" => Some(Button::Decide),
+            _ => None,
+        },
+        Kind::Sheet => Some(Button::OpenSheet),
+        Kind::Permission => Some(Button::Allow),
+        Kind::Ask => Some(Button::Reply),
+        Kind::Error => Some(Button::Pane),
+        Kind::FailedRoutine => Some(Button::Log),
     }
+}
+
+/// A card's actions, left to right: the links, then the blue button last
+/// (`primary`). A draft's verbs need `act_command`; a sent draft has none
+/// left. `Refuser` needs the close command (`card_html`).
+pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
+    let sent = item.state == State::Sent;
+    let links: Vec<Button> = match item.kind {
+        Kind::Attention if item.draft.is_some() && can_act => if sent { Vec::new() } else { vec![Button::Correct] },
+        Kind::Attention if item.ask.is_some() => Vec::new(),
+        Kind::Attention => {
+            let open = item.openable.then_some(Button::Open);
+            let refuse = (item.validates && !sent).then_some(Button::Refuse);
+            open.into_iter().chain(refuse).collect()
+        }
+        Kind::Permission => vec![Button::Deny],
+        Kind::Sheet | Kind::Ask | Kind::Error | Kind::FailedRoutine => Vec::new(),
+    };
+    links.into_iter().chain(primary(item, can_act)).collect()
 }
 
 /// An attention card's icons, top right: snooze, remove, done. A verb whose
@@ -652,21 +695,21 @@ fn icons_html(list: &[Button], disabled: bool) -> String {
     format!("<div class=\"icons\">{one}</div>")
 }
 
-fn button_html(button: Button, disabled: bool) -> String {
-    button_html_as(button, disabled, button.primary(), button.label())
-}
-
-fn button_html_as(button: Button, disabled: bool, primary: bool, label: &str) -> String {
+/// The blue button, or a plain link for the rest.
+fn button_html(button: Button, disabled: bool, primary: bool) -> String {
+    let dis = if disabled { " disabled" } else { "" };
+    let mut data = format!("data-act=\"{}\"", button.act());
+    if button == Button::Log {
+        data.push_str(&format!(" data-arg=\"{}\"", RoutineAct::Log.word()));
+    }
+    if let Some(focus) = button.focus() {
+        data.push_str(&format!(" data-focus=\"{focus}\""));
+    }
+    if !primary {
+        return format!("<button type=\"button\" class=\"link\" {data}{dis}>{}</button>", button.label());
+    }
     let icon = if button == Button::Validate { ICON_CHECK } else { "" };
-    let tip = "";
-    format!(
-        "<button type=\"button\" class=\"btn {}\" data-act=\"{}\"{tip}{}>{}<span>{}</span></button>",
-        if primary { "acc" } else { "sec" },
-        button.act(),
-        if disabled { " disabled" } else { "" },
-        icon,
-        label,
-    )
+    format!("<button type=\"button\" class=\"btn acc\" {data}{dis}>{icon}<span>{}</span></button>", button.label())
 }
 
 fn tag_html(scope: Scope) -> String {
@@ -702,19 +745,9 @@ pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, 
 /// their own (`chat::cards::ask_card_html`) on the Cockpit's markup.
 pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_act: bool, now: u64) -> String {
     let running = item.state == State::Running;
-    let last = list.len().saturating_sub(1);
-    let acts: String = list
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| match b {
-            // `Ouvrir` is the card's main button when it stands alone, and
-            // reads `Masquer` while the detail shows.
-            Button::Expand => button_html_as(b, false, i == last, if item.detail.is_some() { "Masquer" } else { "Ouvrir" }),
-            // Next to Refuser / Valider, `Ouvrir` steps back.
-            Button::Open if list.contains(&Button::Refuse) || list.contains(&Button::Validate) => button_html_as(b, running, false, b.label()),
-            _ => button_html(b, running),
-        })
-        .collect();
+    // The blue one is the card's `primary`, whoever picked the list.
+    let main = primary(item, can_act);
+    let acts: String = list.iter().map(|&b| button_html(b, running, Some(b) == main)).collect();
     let acts = format!("<div class=\"acts\">{acts}</div>");
     let icons = icons_html(icon_list, running);
     let mut detail = item.detail.as_ref().map(|d| detail_html(d, running)).unwrap_or_default();
@@ -825,9 +858,11 @@ pub fn detail_html(detail: &Detail, running: bool) -> String {
             } else {
                 format!("<details class=\"fold\"><summary>Voir le prompt</summary><pre class=\"scroll\">{}</pre></details>", esc(prompt))
             };
+            // `Voir le log` is the card's blue button already.
             let buttons: String = acts
                 .iter()
-                .map(|a| format!("<button type=\"button\" class=\"btn sec\" data-act=\"routine\" data-arg=\"{}\"{dis}><span>{}</span></button>", a.word(), a.label()))
+                .filter(|a| **a != RoutineAct::Log)
+                .map(|a| format!("<button type=\"button\" class=\"link\" data-act=\"routine\" data-arg=\"{}\"{dis}>{}</button>", a.word(), a.label()))
                 .collect();
             let note = note.as_deref().map(|n| format!("<div class=\"state\">{}</div>", esc(n))).unwrap_or_default();
             format!("<dl class=\"kv\">{kv}</dl>{prompt}<div class=\"dacts\">{buttons}</div>{note}")
@@ -836,7 +871,8 @@ pub fn detail_html(detail: &Detail, running: bool) -> String {
         Detail::Error { words, lines } => {
             let words = if words.trim().is_empty() { String::new() } else { format!("<p class=\"words\">{}</p>", esc(words)) };
             let lines = if lines.trim().is_empty() { String::new() } else { format!("<pre class=\"scroll\">{}</pre>", esc(lines)) };
-            format!("{words}{lines}<div class=\"dacts\"><button type=\"button\" class=\"link\" data-act=\"pane\">Voir le pane</button></div>")
+            // `Voir le pane` is the card's blue button.
+            format!("{words}{lines}")
         }
         Detail::Ask { message, answers, input } => {
             let field = if *input || answers.iter().any(|(_, t)| *t) {
@@ -1100,13 +1136,13 @@ button:disabled{opacity:.5;cursor:default}
 .tag{height:18px;border-radius:4px;padding:0 6px;font-size:11px;font-weight:500;display:inline-flex;align-items:center;gap:5px;background:var(--bg-elev);color:var(--t2);flex:none}
 .tag i{width:6px;height:6px;border-radius:50%;display:block;background:var(--tag-blue)}
 .tag i.perso{background:var(--tag-green)}
-.acts{display:flex;gap:6px;flex:none}
+.acts{display:flex;align-items:center;gap:14px;flex:none}
 .state{font-size:12px;color:var(--t3);margin-top:6px}
 .detail{margin-top:10px;border-top:1px solid var(--b3);padding-top:10px;font-size:13px;line-height:19px}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}
 .kv dt{color:var(--t3)}.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}.kv dd.crit{color:var(--crit)}
 pre.scroll{margin-top:8px;max-height:240px;overflow:auto;background:var(--bg-input);border:1px solid var(--b3);border-radius:6px;padding:8px 12px;font:12px/17px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
-.dacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.dacts{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin-top:10px}
 .link{color:var(--accent);font-size:13px;font-weight:500;padding:0}
 .link:hover{text-decoration:underline}
 .words{color:var(--crit)}.msg{white-space:pre-wrap;overflow-wrap:anywhere}
@@ -1261,7 +1297,7 @@ function sync(card) {
   const t = card.querySelector('textarea.bd');
   if (!t) return;
   const v = card.querySelector('[data-act=validate] span');
-  const c = card.querySelector('[data-act=correct] span');
+  const c = card.querySelector('[data-act=correct]');
   const changed = edited(t);
   if (v) v.textContent = changed ? 'Valider la correction' : 'Valider';
   if (c) c.textContent = changed ? 'Annuler' : 'Corriger';
@@ -1322,11 +1358,38 @@ function setList(html) {
     }
   });
   document.querySelector('.page').scrollTop = top;
+  if (wantFocus) {
+    const c = document.querySelector('.card.open[data-key="' + CSS.escape(wantFocus.key) + '"]');
+    if (c) { focusIn(c, wantFocus.what); wantFocus = null; }
+  }
 }
+// `Brief`, `Décider`, `Tester`, `Répondre` open the card, then give the
+// keyboard to where the user answers, once the opened card is in.
+let wantFocus = null;
+function focusIn(card, what) {
+  const el = card.querySelector(what === 'ans' ? 'textarea.ans, .dacts button' : 'textarea.ins');
+  if (el) { el.focus(); el.scrollIntoView({ block: 'nearest' }); }
+}
+// A push replaces its part whole, which would drop a selection being made
+// or about to be copied: while text is selected in a part, its push waits
+// until the selection goes.
+const held = {};
+function selectedIn(id) {
+  const sel = window.getSelection();
+  return sel && !sel.isCollapsed && String(sel).trim() !== '' && $(id).contains(sel.anchorNode);
+}
+function apply(id, html) {
+  if (selectedIn(id)) { held[id] = html; return; }
+  delete held[id];
+  if (id === 'list') setList(html); else $(id).innerHTML = html;
+}
+document.addEventListener('selectionchange', () => {
+  for (const id of Object.keys(held)) if (!selectedIn(id)) apply(id, held[id]);
+});
 window.kova = {
   update(u) {
-    if (u.head !== undefined) $('head').innerHTML = u.head;
-    if (u.list !== undefined) setList(u.list);
+    if (u.head !== undefined) apply('head', u.head);
+    if (u.list !== undefined) apply('list', u.list);
     if (u.chat !== undefined) { $('chat').innerHTML = u.chat; document.body.classList.toggle('chat-on', u.chat !== ''); }
     if (u.focus && !(document.activeElement && /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName))) window.focus();
     if (u.reveal) {
@@ -1396,6 +1459,11 @@ document.addEventListener('click', e => {
     const ans = card.querySelector('textarea.ans');
     msg.text = ans ? ans.value : '';
     if (!msg.text.trim()) { if (ans) ans.focus(); return; }
+  }
+  if (act === 'expand' && b.dataset.focus) {
+    if (card.classList.contains('open')) return focusIn(card, b.dataset.focus);
+    wantFocus = { key: card.dataset.key, what: b.dataset.focus };
+    return post(msg);
   }
   if (act === 'expand' || act === 'pane' || act === 'link') return post(msg);
   if (act === 'snooze') {
@@ -1515,12 +1583,11 @@ mod tests {
     }
 
     #[test]
-    fn a_live_card_opens_in_place_and_says_masquer_while_open() {
+    fn a_failed_routine_shows_its_log_and_opens_in_place() {
         let mut item = from_need(&need(NeedKind::FailedRoutine, "routine:nightly", 5), false).expect("item");
         let closed = card_html(&item, true, true, true, 10);
-        assert!(closed.contains("data-act=\"expand\"") && closed.contains("Ouvrir") && !closed.contains("class=\"detail\""));
-        // Alone, `Ouvrir` is the card's main button.
-        assert!(closed.contains("btn acc\" data-act=\"expand\""));
+        assert!(!closed.contains("class=\"detail\""));
+        assert!(closed.contains("class=\"btn acc\" data-act=\"routine\" data-arg=\"log\"><span>Voir le log</span>"), "{closed}");
         item.detail = Some(Detail::Routine {
             rows: vec![
                 ("Horaire".into(), "daily 21:00".into()),
@@ -1533,22 +1600,23 @@ mod tests {
             note: Some("Running now…".into()),
         });
         let open = card_html(&item, true, true, true, 10);
-        assert!(open.contains("Masquer"));
         assert!(open.contains("<dd class=\"crit\">Failed · exit 2</dd>"));
         assert!(open.contains("Do &lt;this&gt;") && open.contains("<details class=\"fold\">"));
+        // The other actions are plain links; the log is the blue button only.
+        for word in ["run", "pause", "edit"] {
+            assert!(open.contains(&format!("class=\"link\" data-act=\"routine\" data-arg=\"{word}\"")), "{word}");
+        }
+        assert_eq!(open.matches("data-arg=\"log\"").count(), 1, "{open}");
         for word in ["run", "log", "pause", "edit"] {
-            assert!(open.contains(&format!("data-act=\"routine\" data-arg=\"{word}\"")), "{word}");
             assert_eq!(RoutineAct::parse(word).map(|a| a.word()), Some(word));
         }
-        // Next to Refuser / Autoriser, `Ouvrir` is a secondary button.
-        let perm = from_need(&need(NeedKind::Permission, "pane:1", 5), false).expect("item");
-        assert!(card_html(&perm, true, true, true, 10).contains("btn sec\" data-act=\"expand\""));
     }
 
     #[test]
     fn error_permission_and_question_details_are_escaped_and_answerable() {
         let error = detail_html(&Detail::Error { words: "<limit>".into(), lines: "a\n<b>".into() }, false);
-        assert!(error.contains("&lt;limit&gt;") && error.contains("a\n&lt;b&gt;") && error.contains("data-act=\"pane\""));
+        assert!(error.contains("&lt;limit&gt;") && error.contains("a\n&lt;b&gt;"));
+        assert!(!error.contains("data-act=\"pane\""), "the card's blue button goes to the pane");
         let perm = detail_html(&Detail::Permission { text: "Bash command\nrm -rf <x>".into() }, false);
         assert!(perm.contains("rm -rf &lt;x&gt;"));
         let ask = detail_html(
@@ -1673,9 +1741,95 @@ mod tests {
         assert!(!any_urgent(&items[1..]));
     }
 
+    /// The one blue button of a card, as rendered, and how many there are.
+    fn blue(html: &str) -> (usize, String) {
+        let n = html.matches("class=\"btn acc\"").count();
+        let label = html
+            .split("class=\"btn acc\"")
+            .nth(1)
+            .and_then(|rest| rest.split("<span>").nth(1))
+            .and_then(|rest| rest.split("</span>").next())
+            .unwrap_or_default()
+            .to_string();
+        (n, label)
+    }
+
+    #[test]
+    fn every_kind_has_one_blue_button_named_by_its_action_and_never_ouvrir() {
+        let with = |kind: &str, action: Option<&str>, openable: bool| {
+            let e = Entry { kind: kind.into(), action: action.map(Into::into), ..entry("a-1", Level::Now, None, 1) };
+            from_attention(&e, None, openable).unwrap()
+        };
+        let draft = {
+            let e = Entry { kind: "would".into(), draft: Some(Draft { to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
+            from_attention(&e, None, false).unwrap()
+        };
+        let mut sheet_entry = with("decision", Some("kova-sheet:430b8a55"), false);
+        sheet_entry.ask = Some("430b8a55-1".into());
+        let live = |kind: NeedKind, key: &str, sheet: bool| from_need(&need(kind, key, 1), sheet).unwrap();
+        let cases: Vec<(&str, Item, Option<&str>)> = vec![
+            ("would", with("would", Some("/tmp/prep.md"), true), Some("Valider")),
+            ("review", with("review", Some("https://x.test/pr"), true), Some("Valider")),
+            ("decision prepared", with("decision", Some("/tmp/prep.md"), true), Some("Valider")),
+            ("draft", draft, Some("Valider")),
+            ("decision sheet entry", sheet_entry, Some("Décider")),
+            ("decision", with("decision", None, false), Some("Décider")),
+            ("test", with("test", Some("/tmp/plan.md"), true), Some("Tester")),
+            ("blocked", with("blocked", None, false), Some("Brief")),
+            ("ask", with("ask", None, false), Some("Brief")),
+            ("info", with("info", Some("https://x.test"), true), None),
+            ("auto", with("auto", None, false), None),
+            ("permission", live(NeedKind::Permission, "pane:1", false), Some("Autoriser")),
+            ("question", live(NeedKind::Ask, "ask:q1", false), Some("Répondre")),
+            ("sheet", live(NeedKind::Ask, "ask:q2", true), Some("Décider")),
+            ("error", live(NeedKind::Error, "pane:2", false), Some("Voir le pane")),
+            ("routine", live(NeedKind::FailedRoutine, "routine:nightly", false), Some("Voir le log")),
+        ];
+        for (name, item, want) in cases {
+            let html = card_html(&item, true, true, true, 10);
+            let (n, label) = blue(&html);
+            match want {
+                Some(want) => assert_eq!((n, label.as_str()), (1, want), "{name}: {html}"),
+                None => assert_eq!(n, 0, "{name}: {html}"),
+            }
+            assert!(!html.contains(">Ouvrir<") && !html.contains("Ouvrir la fiche"), "{name}: {html}");
+            // Everything else is a plain link, never a grey button.
+            assert!(!html.contains("btn sec"), "{name}: {html}");
+            // The attention cards keep their three icons top right.
+            if item.kind == Kind::Attention {
+                assert_eq!(html.matches("class=\"ico\"").count(), 3, "{name}");
+            }
+        }
+        // The material of an entry is a secondary link, `Voir`.
+        let html = card_html(&with("test", Some("/tmp/plan.md"), true), true, true, true, 10);
+        assert!(html.contains("<button type=\"button\" class=\"link\" data-act=\"open\">Voir</button>"), "{html}");
+        // Brief, Décider, Tester open the card on its Consigne; Répondre on the answer.
+        assert!(html.contains("data-act=\"expand\" data-focus=\"ins\""), "{html}");
+        let q = card_html(&live(NeedKind::Ask, "ask:q1", false), true, true, true, 10);
+        assert!(q.contains("data-act=\"expand\" data-focus=\"ans\""), "{q}");
+        // A draft's Corriger is a link next to its blue Valider.
+        let e = Entry { kind: "would".into(), draft: Some(Draft { to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
+        let d = card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10);
+        assert!(d.contains("<button type=\"button\" class=\"link\" data-act=\"correct\">Corriger</button>"), "{d}");
+    }
+
+    #[test]
+    fn the_page_keeps_a_selection_and_routes_the_opening_buttons() {
+        let page = shell(false, "n0");
+        // Nothing in the page turns selection off.
+        assert!(!page.contains("user-select:none") && !page.contains("user-select: none"));
+        // A push waits while text is selected in its part.
+        assert!(page.contains("if (selectedIn(id)) { held[id] = html; return; }"));
+        assert!(page.contains("document.addEventListener('selectionchange'"));
+        // A click that ends a drag-select does not fold or open the card.
+        assert!(page.contains("if (String(window.getSelection()).trim()) return;\n    return post({ type: 'act', key: card.dataset.key, act: 'expand' });"));
+        assert!(page.contains("if (card.classList.contains('open')) return focusIn(card, b.dataset.focus);"));
+    }
+
     #[test]
     fn buttons_follow_the_kind() {
-        let mut item = from_attention(&entry("a-1", Level::Now, None, 1), None, true).unwrap();
+        let info = Entry { kind: "info".into(), ..entry("a-1", Level::Now, None, 1) };
+        let mut item = from_attention(&info, None, true).unwrap();
         assert_eq!(buttons(&item, true), [Button::Open]);
         // `C'est fait` is an icon now, with snooze and remove.
         assert_eq!(icons(&item, true, true), [Button::Snooze, Button::Dismiss, Button::Done]);
@@ -1691,9 +1845,9 @@ mod tests {
         // A pending sheet is answered on the sheet, never marked done here.
         assert_eq!(buttons(&sheet, true), [Button::OpenSheet]);
         let perm = from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap();
-        assert_eq!(buttons(&perm, true), [Button::Expand, Button::Deny, Button::Allow]);
+        assert_eq!(buttons(&perm, true), [Button::Deny, Button::Allow]);
         let err = from_need(&need(NeedKind::Error, "pane:1", 1), false).unwrap();
-        assert_eq!(buttons(&err, true), [Button::Expand]);
+        assert_eq!(buttons(&err, true), [Button::Pane]);
         assert!(icons(&perm, true, true).is_empty(), "a live need keeps its own buttons");
         for b in [Button::Snooze, Button::Dismiss, Button::Expand, Button::Done, Button::Deny, Button::Allow, Button::Correct, Button::Validate, Button::Refuse, Button::Open] {
             assert_eq!(Button::parse(b.act()), Some(b));
@@ -1715,9 +1869,10 @@ mod tests {
         assert_eq!(buttons(&item, true), [Button::Open, Button::Refuse, Button::Validate]);
         assert_eq!(buttons(&item, false), [Button::Open, Button::Refuse], "no act command, no go to give");
         let html = card_html(&item, true, true, true, 10);
-        // Both blue, Ouvrir steps back, the icons stay, the reason field waits hidden.
-        assert!(html.contains("<button type=\"button\" class=\"btn sec\" data-act=\"open\"><span>Ouvrir</span></button>"), "{html}");
-        assert!(html.contains("<button type=\"button\" class=\"btn acc\" data-act=\"refuse\"><span>Refuser</span></button>"), "{html}");
+        // Valider is the one blue button, Voir and Refuser are links, the
+        // icons stay, the reason field waits hidden.
+        assert!(html.contains("<button type=\"button\" class=\"link\" data-act=\"open\">Voir</button>"), "{html}");
+        assert!(html.contains("<button type=\"button\" class=\"link\" data-act=\"refuse\">Refuser</button>"), "{html}");
         assert!(html.contains("class=\"btn acc\" data-act=\"validate\">"), "{html}");
         assert!(html.contains("data-act=\"snooze\"") && html.contains("data-act=\"dismiss\"") && html.contains("data-act=\"done\""));
         assert!(html.contains("<div class=\"why\" hidden><input type=\"text\" class=\"why\" placeholder=\"Pourquoi ? (facultatif)\""), "{html}");
@@ -1810,7 +1965,7 @@ mod tests {
     #[test]
     fn an_opened_attention_card_takes_an_instruction_even_without_a_button() {
         // A card with no action, no draft, no button: once opened, a field.
-        let bare = Entry { needs: None, ..entry("a-1", Level::Point, None, 1) };
+        let bare = Entry { needs: None, kind: "info".into(), ..entry("a-1", Level::Point, None, 1) };
         let mut item = from_attention(&bare, None, false).unwrap();
         assert!(buttons(&item, true).is_empty());
         let field = format!("<textarea class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{INSTRUCT_PLACEHOLDER}\">");

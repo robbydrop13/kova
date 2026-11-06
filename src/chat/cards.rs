@@ -179,6 +179,7 @@ pub fn ask_card_html(
         state: cockpit::State::Idle,
         instruction: None,
         validates: false,
+        entry_kind: String::new(),
     };
     cockpit::card_html_with(&item, &sheet, &icons, true, now)
 }
@@ -226,6 +227,7 @@ pub fn menu_card_html(menu: &Menu, plan: Option<&str>, now: u64) -> String {
         state: cockpit::State::Idle,
         instruction: None,
         validates: false,
+        entry_kind: String::new(),
     };
     cockpit::card_html_with(&item, &[], &[], false, now)
 }
@@ -263,6 +265,7 @@ pub fn unread_wait_html(now: u64) -> String {
         state: cockpit::State::Idle,
         instruction: None,
         validates: false,
+        entry_kind: String::new(),
     };
     cockpit::card_html_with(&item, &[], &[], false, now)
 }
@@ -478,7 +481,7 @@ mod tests {
         assert!(html.contains("<div class=\"t\">Plan : 2 décisions</div>"));
         assert!(html.contains("Répondre à la fiche") && html.contains("kova \u{b7} il y a 1 min"), "{html}");
         assert!(html.contains("data-act=\"snooze\"") && html.contains("data-act=\"dismiss\"") && html.contains("data-act=\"done\""));
-        assert!(html.contains("data-act=\"open\"") && html.contains("Ouvrir la fiche"));
+        assert!(html.contains("class=\"btn acc\" data-act=\"open\"><span>Décider</span>") && !html.contains("Ouvrir"), "{html}");
         assert!(html.contains("&lt;Qui&gt;") && !html.contains("<Qui>"), "escaped");
         assert!(!html.contains("cfrom") && !html.contains("class=\"ins\""), "no asker label, no instruction without an entry");
 
@@ -505,10 +508,11 @@ mod tests {
             state: crate::cockpit::State::Idle,
             instruction: None,
             validates: false,
+            entry_kind: String::new(),
         };
         let html = ask_card_html(&d, None, Some(&entry), true, crate::attention::Scope::Pro, 100);
         assert!(html.contains("data-key=\"430b8a55-1\"") && html.contains("Harnais commun") && html.contains("Le fond"), "{html}");
-        assert!(html.contains("<div class=\"lbl\">Consigne</div>") && html.contains("Ouvrir la fiche") && html.contains("data-act=\"dismiss\""));
+        assert!(html.contains("<div class=\"lbl\">Consigne</div>") && html.contains("<span>Décider</span>") && html.contains("data-act=\"dismiss\""));
         assert!(!ask_card_html(&d, None, Some(&entry), false, crate::attention::Scope::Pro, 100).contains("Consigne"), "no act command, no field");
         let mut long = question("l", Some(4), None);
         long.message = "x".repeat(80);

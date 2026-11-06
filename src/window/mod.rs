@@ -549,8 +549,12 @@ define_class!(
             let in_panel = responder.as_ref().is_some_and(|r| {
                 self.ivars().side_panel.get().is_some_and(|panel| panel.holds(r))
             });
-            // The chat's box edits text the same way; every other shortcut stays Kova's there.
+            // The chat's box and the Cockpit's page edit text the same way
+            // (Cmd+C on a selection, Cmd+V in a field); every other shortcut
+            // stays Kova's there. Without this the Cockpit's Cmd+C copied the
+            // terminal's selection and Cmd+V typed into the pane.
             let in_chat = responder.as_ref().is_some_and(|r| self.chat_holds(r));
+            let in_cockpit = responder.as_ref().is_some_and(|r| self.cockpit_holds(r));
             // An image pasted in the box goes in as an image (Cmd+V, or
             // Ctrl+V as Claude Code takes it); text pastes as usual.
             let paste_key = matches!(combo.key, crate::keybindings::Key::Char('v')) && !combo.option && !combo.shift && (combo.cmd != combo.ctrl);
@@ -559,7 +563,7 @@ define_class!(
             }
             if responder
                 .as_ref()
-                .is_some_and(|responder| in_panel || in_chat || responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())
+                .is_some_and(|responder| in_panel || in_chat || in_cockpit || responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())
                 && let Some(edit) = text_edit(&combo)
             {
                 let mtm = unsafe { MainThreadMarker::new_unchecked() };
