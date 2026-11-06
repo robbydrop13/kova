@@ -647,13 +647,14 @@ impl KovaView {
                 log::warn!("chat: {why}");
             }
         };
+        let mut refused = None;
         match act {
             "snooze" => match crate::attention::epoch_of(text) {
                 Some(until) if until > crate::ask::now_epoch() => {
                     queue(AskAction::Snooze { id: id.to_string(), until });
                     attn(crate::attention::Verb::Snooze, Some(text));
                 }
-                _ => st.note = Some("Date de rappel invalide".to_string()),
+                _ => refused = Some("Date de rappel invalide"),
             },
             "dismiss" | "done" => {
                 let (reason, verb) =
@@ -668,13 +669,17 @@ impl KovaView {
                         crate::attention::instruction_refused(e, text, "Kova n'a pas pu la transmettre");
                     }
                 }
-                None => st.note = Some("Pas de consigne sur cette question".to_string()),
+                None => refused = Some("Pas de consigne sur cette question"),
             },
-            _ => return,
+            _ => {}
         }
-        // The card comes back if the click did not take it off.
-        st.sent_cards.remove(id);
-        st.shown_cards = None;
+        // A refusal says so and the card the page hid comes back; a click
+        // taken leaves it hidden until the next read drops it.
+        if let Some(why) = refused {
+            st.note = Some(why.to_string());
+            st.sent_cards.remove(id);
+            st.shown_cards = None;
+        }
     }
 
     /// `toggle-voice`: the shortcut went down in the chat shown (held,

@@ -606,7 +606,7 @@ body {{ display: flex; flex-direction: column; }}
 {card_css}
 }}
 #cards {{ max-width: 860px; width: 100%; margin: 0 auto; padding: 0 18px; }}
-#cards > .card {{ margin: 8px 0; }}
+#cards > .card {{ margin: 8px 0; cursor: auto; }}
 .pcard {{ margin: 8px 0; padding: 10px 12px; border: 1px solid var(--b2); border-radius: 10px; background: var(--bg2); }}
 .cfrom {{ font-size: 11.5px; color: var(--t3); text-transform: uppercase; letter-spacing: .04em; }}
 .cmsg {{ margin: 2px 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }}
