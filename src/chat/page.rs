@@ -535,8 +535,10 @@ pub fn restyle_script(t: &Theme) -> String {
     )
 }
 
-pub fn shell(theme: &Theme, title: &str, nonce: &str) -> String {
+pub fn shell(theme: &Theme, title: &str, nonce: &str, terminal: bool) -> String {
     let t = theme;
+    // The Cockpit's chat has no terminal to go back to.
+    let terminal = if terminal { r#"<button data-act="terminal">Terminal</button>"# } else { "" };
     format!(
         r##"<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'nonce-{nonce}'">
@@ -684,7 +686,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
 </style></head><body>
 <div id="scroll"><div id="log"><button id="more" data-act="more">Show earlier</button></div><div id="pending"></div></div>
 <div id="asks"><div id="cards"></div>{snooze_html}</div>
-<div id="foot"><div id="chips"></div><div id="banner"><span class="dot"></span><span id="state">…</span><span class="grow"></span><button data-act="terminal">Terminal</button></div>
+<div id="foot"><div id="chips"></div><div id="banner"><span class="dot"></span><span id="state">…</span><span class="grow"></span>{terminal}</div>
 <div id="pill"><span class="bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span><span id="pline"></span><button class="pbtn" data-act="vcancel" title="Annuler">✕</button><button class="pbtn ok" data-act="vfinish" title="Terminer">✓</button></div>
 <div id="vhist"></div>
 <div id="inrow"><textarea id="box" rows="1" placeholder="Message à Claude"></textarea><button id="hist" class="mic" data-act="vhist" title="Dictées récentes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button><button id="mic" class="mic" title="Dictée : maintenir ⌘⇧M pour parler, toucher pour continuer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button></div><div id="note"></div></div>
@@ -997,6 +999,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
 }})();
 </script></body></html>"##,
         nonce = nonce,
+        terminal = terminal,
         handler = HANDLER,
         ask_vars = crate::cockpit::vars(!t.dark),
         card_css = crate::cockpit::scoped_card_css("#asks"),
@@ -1198,12 +1201,15 @@ mod tests {
             error: "#f33".into(),
             ok: "#3c6".into(),
         };
-        let page = shell(&theme, "<x>", "abc123");
+        let page = shell(&theme, "<x>", "abc123", true);
         assert!(page.contains("script-src 'nonce-abc123'"));
         assert_eq!(page.matches("<script").count(), 1);
         assert!(page.contains(r#"<script nonce="abc123">"#));
         assert!(!page.contains("onclick"), "no inline handler: the policy would refuse it anyway");
         assert!(page.contains("<title>&lt;x&gt;</title>"));
+        // The pane's chat goes back to its terminal; the Cockpit's has none.
+        assert!(page.contains(r#"data-act="terminal""#));
+        assert!(!shell(&theme, "<x>", "abc123", false).contains(r#"data-act="terminal""#));
         // The ask cards: the Cockpit's look on the design system's dark
         // tokens, its snooze menu, never the old orange bar.
         let dark = crate::cockpit::vars(false);

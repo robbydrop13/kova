@@ -62,6 +62,8 @@ pub struct ChatSlot {
 /// The chat of one pane, from the moment it is shown.
 struct ChatState {
     pane_id: PaneId,
+    /// Shown on the Cockpit page (no Terminal button there).
+    cockpit: bool,
     session: Option<String>,
     tail: Option<Tail>,
     conv: Conversation,
@@ -121,9 +123,10 @@ struct ChatState {
 }
 
 impl ChatState {
-    fn new(pane_id: PaneId, load: String) -> Self {
+    fn new(pane_id: PaneId, cockpit: bool, load: String) -> Self {
         ChatState {
             pane_id,
+            cockpit,
             session: None,
             tail: None,
             conv: Conversation::new(),
@@ -353,13 +356,13 @@ impl KovaView {
             slot.state.replace(None);
         }
         let generation = crate::theme::generation();
-        let fresh = slot.state.borrow().as_ref().is_none_or(|st| st.pane_id != target.pane_id);
+        let fresh = slot.state.borrow().as_ref().is_none_or(|st| st.pane_id != target.pane_id || st.cockpit != target.cockpit);
         if fresh {
             slot.theme.set(generation);
             let nonce = crate::ask::new_question_id().replace('-', "");
-            slot.state.replace(Some(ChatState::new(target.pane_id, nonce.clone())));
+            slot.state.replace(Some(ChatState::new(target.pane_id, target.cockpit, nonce.clone())));
             let title = self.with_pane(target.pane_id, |p| p.display_title("Chat")).unwrap_or_default();
-            let html = page::shell(&theme(), &title, &nonce);
+            let html = page::shell(&theme(), &title, &nonce, !target.cockpit);
             unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
         }
         // The theme switched: the colours change in place, the page keeps
@@ -1170,10 +1173,10 @@ mod tests {
         let mut c = crate::config::Config::default();
         crate::theme::apply_light(&mut c);
         tokens::set_background(c.colors.background);
-        let light = page::shell(&theme(), "t", "n");
+        let light = page::shell(&theme(), "t", "n", true);
         let restyle = page::restyle_script(&theme());
         tokens::set_background(crate::config::Config::default().colors.background);
-        let dark = page::shell(&theme(), "t", "n");
+        let dark = page::shell(&theme(), "t", "n", true);
         assert!(light.contains("color-scheme: light"));
         assert!(light.contains("--bg:#fafafa;") && light.contains("--t1:#242424;"), "{light}");
         assert!(dark.contains("color-scheme: dark") && !dark.contains("--t1:#242424;"));
