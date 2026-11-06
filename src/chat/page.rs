@@ -18,6 +18,7 @@
 use serde::Serialize;
 
 use super::conversation::{BlockKind, Conversation, Item, Tool};
+use super::links::linkify;
 
 /// How many exchanges (a user message and what follows it) the page opens
 /// on; `Show earlier` adds as many again.
@@ -83,27 +84,56 @@ fn fnv(s: &str) -> u64 {
     h
 }
 
-/// Markdown as an HTML fragment: raw HTML as text, a link only to http(s)
-/// or mailto, no image source.
+/// Markdown as an HTML fragment: raw HTML as text, a link only to http(s),
+/// mailto or a local `.md` / `.html` file, no image source. A URL or such a
+/// path in the text is a link too, but not inside code.
 pub fn markdown(source: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
+    use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd, TextMergeStream};
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     // Inside a link to another scheme: its text stays, the link goes.
     let mut unsafe_link = false;
-    let parser = Parser::new_ext(source, options).map(|event| match event {
+    // Inside a link to a file: closed by hand, as it was opened.
+    let mut path_link = false;
+    let mut in_link = 0usize;
+    let mut in_code = false;
+    let parser = TextMergeStream::new(Parser::new_ext(source, options)).map(|event| match event {
         Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        Event::Text(text) if in_link == 0 && !in_code => Event::InlineHtml(CowStr::from(linkify(&text))),
+        Event::Start(Tag::CodeBlock(kind)) => {
+            in_code = true;
+            Event::Start(Tag::CodeBlock(kind))
+        }
+        Event::End(TagEnd::CodeBlock) => {
+            in_code = false;
+            Event::End(TagEnd::CodeBlock)
+        }
         Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
-            let lower = dest_url.trim().to_ascii_lowercase();
-            let safe = lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:");
-            if !safe {
+            let dest = dest_url.trim();
+            let lower = dest.to_ascii_lowercase();
+            if super::links::is_panel_path(dest) {
+                path_link = true;
+                in_link += 1;
+                return Event::InlineHtml(CowStr::from(super::links::anchor(dest, super::links::Kind::Path)));
+            }
+            if !(super::links::is_web(dest) || lower.starts_with("mailto:")) {
                 unsafe_link = true;
                 return Event::Text("".into());
             }
+            in_link += 1;
             Event::Start(Tag::Link { link_type, dest_url, title, id })
         }
         Event::End(TagEnd::Link) if unsafe_link => {
             unsafe_link = false;
             Event::Text("".into())
+        }
+        Event::End(TagEnd::Link) if path_link => {
+            path_link = false;
+            in_link = in_link.saturating_sub(1);
+            Event::InlineHtml("</a>".into())
+        }
+        Event::End(TagEnd::Link) => {
+            in_link = in_link.saturating_sub(1);
+            Event::End(TagEnd::Link)
         }
         Event::Start(Tag::Image { link_type, title, id, .. }) => {
             Event::Start(Tag::Image { link_type, dest_url: "".into(), title, id })
@@ -115,62 +145,180 @@ pub fn markdown(source: &str) -> String {
     out
 }
 
+/// One thing of the thread, before it is shown or kept behind the scenes.
+enum Unit<'a> {
+    User { id: &'a str, text: &'a str },
+    Text { key: String, text: &'a str },
+    Tool(&'a Tool),
+    Thinking { key: String, text: &'a str },
+    Note { key: String, text: &'a str },
+    Image { key: String },
+    Behind { key: String, label: &'a str, text: &'a str },
+}
+
 /// The entries of the last `exchanges` exchanges, and whether earlier ones
 /// exist. `working` says whether a tool call without its result is running
 /// (or was stopped).
+///
+/// Only the user's messages and the assistant's final text (no tool call
+/// after it in its turn) are shown. Everything between two of them (tool
+/// calls, the text that goes with them, notes, other sessions' messages,
+/// finished tasks) folds into one `N actions en coulisse` line. While the
+/// agent works with no call running, a `Réflexion` line ends the thread.
 pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Entry>, bool) {
     let users: Vec<usize> = conv.items.iter().enumerate().filter(|(_, i)| matches!(i, Item::User { .. })).map(|(n, _)| n).collect();
     let start = if users.len() > exchanges { users[users.len() - exchanges] } else { 0 };
-    let mut out = Vec::new();
-    let mut group: Vec<&Tool> = Vec::new();
-    // Only the current turn's calls can be running: one from an earlier turn
-    // that never got its result was stopped.
-    let last_user = users.last().copied();
-    let mut current = last_user.is_none();
-    let flush = |group: &mut Vec<&Tool>, out: &mut Vec<Entry>, live: bool| {
-        if !group.is_empty() {
-            let entry = tool_group(group, live, out.len());
-            out.push(entry);
-            group.clear();
-        }
-    };
-    for (n, item) in conv.items.iter().enumerate().skip(start) {
+    let mut units: Vec<Unit> = Vec::new();
+    for item in conv.items.iter().skip(start) {
         match item {
-            Item::User { id, text, .. } => {
-                flush(&mut group, &mut out, false);
-                current = Some(n) == last_user;
-                out.push(Entry {
-                    id: format!("u:{id}"),
-                    html: format!(r#"<div class="user"><div class="bubble">{}</div></div>"#, escape(text)),
-                });
-            }
-            Item::Note { id, text } => {
-                flush(&mut group, &mut out, working && current);
-                out.push(Entry { id: format!("n:{id}"), html: format!(r#"<div class="note">{}</div>"#, escape(text)) });
-            }
+            Item::User { id, text, .. } => units.push(Unit::User { id, text }),
+            Item::Note { id, text } => units.push(Unit::Note { key: format!("n:{id}"), text }),
+            Item::Behind { id, label, text } => units.push(Unit::Behind { key: format!("b:{id}"), label, text }),
             Item::Assistant { id, blocks, .. } => {
                 for (k, block) in blocks.iter().enumerate() {
-                    match &block.kind {
-                        BlockKind::Text(text) => {
-                            flush(&mut group, &mut out, working && current);
-                            out.push(Entry { id: format!("t:{id}:{k}"), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) });
-                        }
-                        BlockKind::Tool(tool) => group.push(tool),
-                        BlockKind::Image => {
-                            flush(&mut group, &mut out, working && current);
-                            out.push(Entry { id: format!("i:{id}:{k}"), html: r#"<div class="note">image</div>"#.to_string() });
-                        }
-                        // A thinking block has no text worth showing (its
-                        // content is empty in the transcript), and it must
-                        // not split a run of tool calls.
-                        BlockKind::Thinking => {}
-                    }
+                    units.push(match &block.kind {
+                        BlockKind::Text(text) => Unit::Text { key: format!("t:{id}:{k}"), text },
+                        BlockKind::Tool(tool) => Unit::Tool(tool),
+                        BlockKind::Image => Unit::Image { key: format!("i:{id}:{k}") },
+                        BlockKind::Thinking(text) => Unit::Thinking { key: format!("k:{id}:{k}"), text },
+                    });
                 }
             }
         }
     }
-    flush(&mut group, &mut out, working && current);
+    // A text is final when no tool call follows it before the next user message.
+    let mut visible = vec![false; units.len()];
+    let mut tool_after = false;
+    for (n, unit) in units.iter().enumerate().rev() {
+        match unit {
+            Unit::User { .. } => {
+                visible[n] = true;
+                tool_after = false;
+            }
+            Unit::Tool(_) => tool_after = true,
+            Unit::Text { .. } => visible[n] = !tool_after,
+            _ => {}
+        }
+    }
+    // Only the current turn's calls can be running: one from an earlier turn
+    // that never got its result was stopped.
+    let last_user = units.iter().rposition(|u| matches!(u, Unit::User { .. }));
+    let mut out = Vec::new();
+    let mut run: Vec<&Unit> = Vec::new();
+    for (n, unit) in units.iter().enumerate() {
+        if !visible[n] {
+            // A thinking block without its text is nothing to show.
+            if !matches!(unit, Unit::Thinking { text, .. } if text.is_empty()) {
+                run.push(unit);
+            }
+            continue;
+        }
+        if !run.is_empty() {
+            out.push(behind_entry(&run, working && last_user.is_none_or(|u| n > u)));
+            run.clear();
+        }
+        out.push(match unit {
+            Unit::User { id, text } => Entry {
+                id: format!("u:{id}"),
+                html: format!(r#"<div class="user"><div class="bubble">{}</div></div>"#, linkify(text)),
+            },
+            Unit::Text { key, text } => Entry { id: key.clone(), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) },
+            _ => unreachable!("only messages are visible"),
+        });
+    }
+    let running = working && run.iter().any(|u| matches!(u, Unit::Tool(t) if t.result.is_none()));
+    // The reasoning going on, when the transcript has its text and nothing
+    // came after it: shown on the Réflexion line, not behind the scenes.
+    let mut thought = "";
+    if working && !running && let Some(Unit::Thinking { text, .. }) = run.last() {
+        thought = text;
+        run.pop();
+    }
+    if !run.is_empty() {
+        out.push(behind_entry(&run, working));
+    }
+    if working && !running {
+        out.push(thinking_entry(thought));
+    }
     (out, start > 0)
+}
+
+/// `N actions en coulisse`: the hidden things between two messages, folded,
+/// compact once unfolded.
+fn behind_entry(run: &[&Unit], working: bool) -> Entry {
+    let key = |u: &Unit| match u {
+        Unit::Tool(t) if !t.id.is_empty() => format!("g:{}", t.id),
+        Unit::Tool(_) => "g:@".to_string(),
+        Unit::Text { key, .. } | Unit::Thinking { key, .. } | Unit::Note { key, .. } | Unit::Image { key } | Unit::Behind { key, .. } => key.clone(),
+        Unit::User { id, .. } => format!("u:{id}"),
+    };
+    let id = format!("c:{}", key(run[0]));
+    let mut inner = String::new();
+    let mut tools: Vec<&Tool> = Vec::new();
+    let flush = |tools: &mut Vec<&Tool>, inner: &mut String| {
+        if !tools.is_empty() {
+            inner.push_str(&tool_group(tools, working, inner.len()).html);
+            tools.clear();
+        }
+    };
+    let mut states = Vec::new();
+    for unit in run {
+        if let Unit::Tool(t) = unit {
+            states.push(state_of(t, working));
+            tools.push(t);
+            continue;
+        }
+        flush(&mut tools, &mut inner);
+        match unit {
+            Unit::Text { text, .. } => inner.push_str(&format!(r#"<div class="asst bt">{}</div>"#, markdown(text))),
+            Unit::Note { text, .. } => inner.push_str(&format!(r#"<div class="note">{}</div>"#, escape(text))),
+            Unit::Image { .. } => inner.push_str(r#"<div class="note">image</div>"#),
+            Unit::Thinking { key, text } => inner.push_str(&fold_row(key, "Réflexion", text)),
+            Unit::Behind { key, label, text } => inner.push_str(&fold_row(key, label, text)),
+            Unit::Tool(_) | Unit::User { .. } => {}
+        }
+    }
+    flush(&mut tools, &mut inner);
+    let st = if states.contains(&State::Running) {
+        r#"<span class="st run"></span>"#
+    } else if states.contains(&State::Error) {
+        r#"<span class="st err"></span>"#
+    } else {
+        ""
+    };
+    let n = run.len();
+    let label = if n == 1 { "1 action en coulisse".to_string() } else { format!("{n} actions en coulisse") };
+    Entry {
+        html: format!(
+            r#"<div class="behind" data-id="{eid}"><button class="trow bhead" data-act="fold"><span class="verb">{label}</span>{st}</button><div class="fold">{inner}</div></div>"#,
+            eid = escape(&id),
+        ),
+        id,
+    }
+}
+
+/// A folded row: its label, its text unfolded.
+fn fold_row(key: &str, label: &str, text: &str) -> String {
+    let body = if text.is_empty() { String::new() } else { format!(r#"<pre class="tres">{}</pre>"#, linkify(text)) };
+    format!(
+        r#"<div class="tool" data-id="{key}"><button class="trow" data-act="fold"><span class="verb">{label}</span></button><div class="fold">{body}</div></div>"#,
+        key = escape(key),
+        label = escape(label),
+    )
+}
+
+/// `Réflexion` while the model thinks, a light sweeping across it; its text
+/// unfolds on a click when the transcript has it.
+fn thinking_entry(text: &str) -> Entry {
+    let html = if text.is_empty() {
+        r#"<div class="think"><span class="shimmer">Réflexion</span></div>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="think" data-id="r:live"><button class="trow thead" data-act="fold"><span class="shimmer">Réflexion</span></button><div class="fold"><pre class="tres">{}</pre></div></div>"#,
+            escape(text)
+        )
+    };
+    Entry { id: "r:live".to_string(), html }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -299,6 +447,8 @@ pub struct Update {
     pub note: Option<String>,
     /// Text to put back in the box (a message that was not sent).
     pub restore: Option<String>,
+    /// An image just pasted: its chip in the box.
+    pub attach: Option<Attach>,
     /// The page was just loaded: place the view on the last exchange.
     pub first: bool,
     /// Give the box the keyboard.
@@ -310,6 +460,14 @@ pub struct Update {
 pub struct BannerWire {
     pub state: &'static str,
     pub text: String,
+}
+
+/// A pasted image as the box shows it: its file, and a `data:` URL of it
+/// when it is small enough to show.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Attach {
+    pub path: String,
+    pub src: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -445,11 +603,31 @@ body {{ display: flex; flex-direction: column; }}
   border: 1px solid var(--b2); border-radius: 10px; padding: 8px 12px; outline: none; }}
 #box:focus {{ border-color: var(--accent); }}
 #note {{ min-height: 16px; margin-top: 4px; font-size: 12px; color: var(--t3); }}
+.behind {{ margin: 2px 0; }}
+.bhead {{ height: 24px; font-size: 12.5px; }} .bhead .verb {{ color: var(--t3); font-weight: 400; }}
+.behind > .fold {{ padding-left: 10px; border-left: 1px solid var(--b3); margin: 0 0 6px 9px; font-size: 13px; }}
+.asst.bt {{ margin: 4px 6px; font-size: 13px; color: var(--t2); }}
+.behind .note {{ text-align: left; margin: 4px 6px; }}
+.think {{ margin: 6px 0; font-size: 13px; }} .think > .shimmer {{ padding: 0 6px; }}
+.shimmer {{ color: var(--t3); background: linear-gradient(90deg, var(--t3) 35%, var(--t1) 50%, var(--t3) 65%);
+  background-size: 250% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  animation: shimmer 2.2s linear infinite; }}
+@keyframes shimmer {{ from {{ background-position: 100% 0; }} to {{ background-position: 0 0; }} }}
+@media (prefers-reduced-motion: reduce) {{ .shimmer {{ animation: none; -webkit-text-fill-color: var(--t3); }} }}
+a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble a:hover, .tres a:hover {{ text-decoration: underline; }}
+.bubble a, .tres a {{ color: var(--accent); text-decoration: none; }}
+#chips {{ display: none; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }}
+#chips.on {{ display: flex; }}
+.chip {{ position: relative; display: flex; align-items: center; justify-content: center; width: 56px; height: 56px;
+  border: 1px solid var(--b2); border-radius: 8px; background: var(--bg2); font-size: 11px; color: var(--t3); overflow: hidden; }}
+.chip img {{ width: 100%; height: 100%; object-fit: cover; }}
+.chip button {{ position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; padding: 0; border: 0; border-radius: 50%;
+  font-size: 11px; line-height: 16px; color: #fff; background: rgba(0,0,0,.6); cursor: pointer; }}
 </style></head><body>
 <div id="banner"><span class="dot"></span><span id="state">…</span><span class="grow"></span><button data-act="terminal">Terminal</button></div>
 <div id="scroll"><div id="log"><button id="more" data-act="more">Show earlier</button></div></div>
 <div id="cards"></div>
-<div id="foot"><div id="queued"><span>Queued:</span><span class="qtext"></span><span class="qwhy"></span><button class="btn" data-act="cancel">Cancel</button></div>
+<div id="foot"><div id="chips"></div><div id="queued"><span>Queued:</span><span class="qtext"></span><span class="qwhy"></span><button class="btn" data-act="cancel">Cancel</button></div>
 <textarea id="box" rows="1" placeholder="Message Claude"></textarea><div id="note"></div></div>
 <script nonce="{nonce}">
 (function () {{
@@ -459,6 +637,22 @@ body {{ display: flex; flex-direction: column; }}
   const log = $("log"), scroll = $("scroll"), box = $("box"), cardsEl = $("cards");
   const opened = new Set();
   let noteTimer = null;
+  // Images pasted into the box, sent with the next message: their paths.
+  let images = [];
+  function chips() {{
+    const el = $("chips");
+    el.replaceChildren();
+    images.forEach((im, i) => {{
+      const c = document.createElement("span");
+      c.className = "chip"; c.title = im.path;
+      if (im.src) {{ const img = document.createElement("img"); img.src = im.src; c.appendChild(img); }}
+      else c.appendChild(document.createTextNode("image"));
+      const x = document.createElement("button");
+      x.textContent = "×"; x.dataset.act = "unchip"; x.dataset.i = String(i);
+      c.appendChild(x); el.appendChild(c);
+    }});
+    el.classList.toggle("on", images.length > 0);
+  }}
   function nodeFrom(html) {{
     const t = document.createElement("template");
     t.innerHTML = html;
@@ -514,6 +708,7 @@ body {{ display: flex; flex-direction: column; }}
     const q = $("queued");
     q.classList.toggle("on", !!m.queued);
     if (m.queued) {{ q.querySelector(".qtext").textContent = m.queued.text; q.querySelector(".qwhy").textContent = m.queued.reason; }}
+    if (m.attach) {{ images.push(m.attach); chips(); }}
     if (m.restore) {{ box.value = box.value ? box.value + "\n" + m.restore : m.restore; grow(); }}
     if (m.note) {{
       $("note").textContent = m.note;
@@ -537,15 +732,38 @@ body {{ display: flex; flex-direction: column; }}
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {{
       e.preventDefault();
       const text = box.value;
-      if (!text.trim()) return;
-      box.value = ""; grow();
-      post({{ type: "send", text }});
+      if (!text.trim() && !images.length) return;
+      const paths = images.map((im) => im.path);
+      box.value = ""; grow(); images = []; chips();
+      post({{ type: "send", text, images: paths }});
+    }} else if (e.key === "v" && e.ctrlKey && !e.metaKey) {{
+      // Claude Code's own image paste key: Kova reads the pasteboard.
+      e.preventDefault();
+      post({{ type: "paste-image" }});
+    }}
+  }});
+  // An image on the pasteboard (Cmd+V): Kova writes it to a file, the box
+  // shows it, its path goes with the message.
+  box.addEventListener("paste", (e) => {{
+    const items = e.clipboardData ? Array.from(e.clipboardData.items) : [];
+    if (items.some((i) => i.kind === "file" && i.type.startsWith("image/"))) {{
+      e.preventDefault();
+      post({{ type: "paste-image" }});
     }}
   }});
   document.addEventListener("click", (e) => {{
+    const a = e.target.closest("a");
+    if (a) {{
+      // Every link opens in Kova's side panel, never in this page.
+      e.preventDefault();
+      const href = a.dataset.path || a.getAttribute("href");
+      if (href && href !== "#") post({{ type: "link", href }});
+      return;
+    }}
     const b = e.target.closest("[data-act]");
     if (!b) return;
     const act = b.dataset.act;
+    if (act === "unchip") {{ images.splice(Number(b.dataset.i), 1); chips(); return; }}
     if (act === "fold") {{
       const holder = b.parentElement;
       holder.classList.toggle("open");
@@ -628,20 +846,66 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_tool_calls_group_across_requests_until_text() {
+    fn only_the_user_s_messages_and_the_final_text_show_the_rest_folds() {
         let c = conv(vec![
             user("u1", "go"),
+            text("r0", 0, "Let me look."),
             tool("r1", 0, "a"),
             json!({"type": "assistant", "requestId": "r2", "uuid": "r2t", "message": {"content": [{"type": "thinking", "thinking": ""}]}}),
             tool("r2", 1, "b"),
             text("r3", 0, "Done."),
-            tool("r4", 0, "c"),
+            json!({"type": "attachment", "uuid": "q", "attachment": {"type": "queued_command", "commandMode": "prompt", "origin": {"kind": "peer"},
+                   "prompt": "<cross-session-message from-name=\"pm\">hi</cross-session-message>"}}),
+            user("u2", "<system-reminder>x</system-reminder>"),
+            user("u3", "and now?"),
+            json!({"type": "user", "uuid": "n", "message": {"content": "[Request interrupted by user]"}}),
         ]);
-        let (entries, more) = entries(&c, EXCHANGES_STEP, false);
+        let (e, more) = entries(&c, EXCHANGES_STEP, false);
         assert!(!more);
-        assert_eq!(ids(&entries), ["u:u1", "g:a", "t:r3:0", "g:c"]);
-        assert_eq!(entries[1].html.matches(r#"class="tool""#).count(), 2, "a thinking block does not split the run");
-        assert!(!entries[1].html.contains("actions"), "five calls or fewer are not folded into a group");
+        assert_eq!(ids(&e), ["u:u1", "c:t:r0:0", "t:r3:0", "c:b:q", "u:u3", "c:n:n"]);
+        assert!(e[1].html.contains("3 actions en coulisse"), "a text before a call, two calls; an empty thinking is nothing: {}", e[1].html);
+        assert_eq!(e[1].html.matches(r#"class="tool""#).count(), 2);
+        assert!(e[1].html.contains(r#"<div class="fold">"#), "folded by default, unfolded on a click");
+        assert!(e[3].html.contains("1 action en coulisse") && e[3].html.contains("Message de pm"));
+        assert!(e[5].html.contains("Interrupted"));
+    }
+
+    #[test]
+    fn the_last_text_shows_while_the_turn_goes_on_and_folds_once_a_call_follows() {
+        let mut lines = vec![user("u1", "go"), text("r1", 0, "Looking.")];
+        let (e, _) = entries(&conv(lines.clone()), EXCHANGES_STEP, true);
+        assert_eq!(ids(&e), ["u:u1", "t:r1:0", "r:live"], "the model thinks: the Réflexion line ends the thread");
+        lines.push(tool("r2", 0, "a"));
+        let (e, _) = entries(&conv(lines), EXCHANGES_STEP, true);
+        assert_eq!(ids(&e), ["u:u1", "c:t:r1:0"], "a call runs: no Réflexion line");
+        assert!(e[1].html.contains(r#"class="st run""#), "the running call shows on the folded line");
+    }
+
+    #[test]
+    fn reflexion_unfolds_its_text_only_when_the_transcript_has_it() {
+        let think = |t: &str| json!({"type": "assistant", "requestId": "k", "uuid": format!("k{t}"), "message": {"content": [{"type": "thinking", "thinking": t}]}});
+        let (e, _) = entries(&conv(vec![user("u1", "go"), think("")]), EXCHANGES_STEP, true);
+        let last = e.last().unwrap();
+        assert!(last.html.contains("shimmer") && !last.html.contains("data-act"), "nothing to unfold");
+        let (e, _) = entries(&conv(vec![user("u1", "go"), think("weigh <both>")]), EXCHANGES_STEP, true);
+        let last = e.last().unwrap();
+        assert!(last.html.contains(r#"data-act="fold""#) && last.html.contains("weigh &lt;both&gt;"));
+        assert_eq!(ids(&e), ["u:u1", "r:live"], "the reasoning going on is not also behind the scenes");
+        let (e, _) = entries(&conv(vec![user("u1", "go"), think("x")]), EXCHANGES_STEP, false);
+        assert!(!e.iter().any(|x| x.id == "r:live"), "idle: no Réflexion");
+    }
+
+    #[test]
+    fn links_open_in_the_panel_but_not_inside_code() {
+        let html = markdown("See https://github.com/a/b/pull/1 and /tmp/r.md, `/tmp/c.md` and `https://x.io`\n\n```\nhttps://y.io\n```\n[plan](~/p/plan.md) [s](/etc/hosts)");
+        assert!(html.contains(r#"<a href="https://github.com/a/b/pull/1">"#));
+        assert!(html.contains(r#"data-path="/tmp/r.md""#));
+        assert!(html.contains(r#"<code>/tmp/c.md</code>"#) && html.contains(r#"<code>https://x.io</code>"#), "{html}");
+        assert!(!html.contains(r#"href="https://y.io""#), "a code block stays text");
+        assert!(html.contains(r#"data-path="~/p/plan.md">plan</a>"#));
+        assert!(!html.contains("/etc/hosts"), "a link to another file keeps its text only");
+        let c = conv(vec![user("u1", "open https://linear.app/x/issue/CLA-1")]);
+        assert!(entries(&c, EXCHANGES_STEP, false).0[0].html.contains(r#"<a href="https://linear.app/x/issue/CLA-1">"#));
     }
 
     #[test]

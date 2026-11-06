@@ -125,6 +125,25 @@ pub fn sanitize(raw: &str) -> Result<String, &'static str> {
     Ok(text)
 }
 
+/// Whether `path` is a file Kova wrote for a pasted image
+/// (`appkit_input::pasted_image_path`): `/tmp/kova-paste-<ms>.png`.
+pub fn is_pasted_image(path: &str) -> bool {
+    path.strip_prefix("/tmp/kova-paste-")
+        .and_then(|rest| rest.strip_suffix(".png"))
+        .is_some_and(|ms| !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The message with the images pasted in the box: their paths first, as a
+/// paste in the terminal hands them to Claude Code, then the text. Only
+/// files Kova wrote for a paste go along.
+pub fn with_images(text: &str, images: &[String]) -> String {
+    let mut parts: Vec<&str> = images.iter().map(String::as_str).filter(|p| is_pasted_image(p)).collect();
+    if !text.trim().is_empty() {
+        parts.push(text);
+    }
+    parts.join(" ")
+}
+
 /// The text to paste: as is inside a bracketed paste; on one line when the
 /// app did not ask for one, since each newline would be an Enter.
 pub fn typed(text: &str, bracketed: bool) -> String {
@@ -208,6 +227,16 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_images_go_before_the_text_as_their_paths() {
+        let images = vec!["/tmp/kova-paste-1793963274831.png".to_string(), "/etc/passwd".to_string(), "/tmp/kova-paste-x.png".to_string()];
+        assert_eq!(with_images("look at this", &images), "/tmp/kova-paste-1793963274831.png look at this", "only a file Kova wrote");
+        assert_eq!(with_images("  ", &images[..1]), "/tmp/kova-paste-1793963274831.png", "an image alone is a message");
+        assert_eq!(with_images("hi", &[]), "hi");
+        assert!(!is_pasted_image("/tmp/kova-paste-1.png\n"));
+        assert_eq!(sanitize(&with_images("x", &images[..1])).as_deref(), Ok("/tmp/kova-paste-1793963274831.png x"));
+    }
 
     fn idle() -> GateInput {
         GateInput { has_session: true, working: false, permission_prompt: false, composer: Composer::Empty }

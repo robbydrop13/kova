@@ -39,6 +39,10 @@ pub enum Item {
     /// A short line from the harness worth seeing: a slash command, an
     /// interruption, a compaction.
     Note { id: String, text: String },
+    /// What reached the agent from elsewhere than the user: another
+    /// session's message, a finished background task. Never shown as the
+    /// user's, kept behind the scenes.
+    Behind { id: String, label: String, text: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,7 +55,8 @@ pub struct Block {
 #[derive(Clone, Debug, PartialEq)]
 pub enum BlockKind {
     Text(String),
-    Thinking,
+    /// The model's reasoning: empty when the transcript only keeps its signature.
+    Thinking(String),
     Image,
     Tool(Tool),
 }
@@ -84,6 +89,9 @@ pub struct Conversation {
     /// Results that came before their call (never seen, but cheap to allow).
     early_results: HashMap<String, ToolResult>,
     seen: HashSet<String>,
+    /// The behind-the-scenes texts already kept: one message can reach the
+    /// transcript twice (queued mid-turn, then as a line).
+    behind_seen: HashSet<String>,
     /// Epoch seconds of the last line that carried a timestamp.
     pub last_ts: Option<u64>,
     /// Bumped on every change, so the view knows when to render again.
@@ -220,7 +228,10 @@ impl Conversation {
                 self.items.push(Item::User { id, text, ts });
             }
             UserLine::Note(note) => self.items.push(Item::Note { id, text: note }),
-            UserLine::Harness => return changed,
+            UserLine::Harness => match behind(&text) {
+                Some((label, body)) => return self.push_behind(id, label, body) || changed,
+                None => return changed,
+            },
         }
         true
     }
@@ -232,11 +243,9 @@ impl Conversation {
         if a.get("type").and_then(Value::as_str) != Some("queued_command") {
             return false;
         }
-        let human = a.pointer("/origin/kind").and_then(Value::as_str) == Some("human")
-            || a.get("commandMode").and_then(Value::as_str) == Some("prompt");
-        if !human {
-            return false;
-        }
+        // A peer's message is queued as a `prompt` too: the origin decides.
+        let origin = a.pointer("/origin/kind").and_then(Value::as_str);
+        let human = origin == Some("human") || (origin.is_none() && a.get("commandMode").and_then(Value::as_str) == Some("prompt"));
         let text = match a.get("prompt") {
             Some(Value::String(s)) => s.clone(),
             Some(p @ Value::Array(_)) => content_blocks(p)
@@ -250,7 +259,21 @@ impl Conversation {
             return false;
         }
         let id = v.get("uuid").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("q{}", line.offset));
+        if !human {
+            return match behind(&text) {
+                Some((label, body)) => self.push_behind(id, label, body),
+                None => false,
+            };
+        }
         self.items.push(Item::User { id, text: text.trim().to_string(), ts });
+        true
+    }
+
+    fn push_behind(&mut self, id: String, label: String, text: String) -> bool {
+        if !self.behind_seen.insert(format!("{label}\n{text}")) {
+            return false;
+        }
+        self.items.push(Item::Behind { id, label, text });
         true
     }
 
@@ -290,7 +313,8 @@ fn assistant_block(raw: &Value) -> Option<BlockKind> {
             let text = raw.get("text").and_then(Value::as_str).unwrap_or_default();
             (!text.trim().is_empty()).then(|| BlockKind::Text(text.to_string()))
         }
-        "thinking" | "redacted_thinking" => Some(BlockKind::Thinking),
+        "thinking" => Some(BlockKind::Thinking(raw.get("thinking").and_then(Value::as_str).unwrap_or_default().trim().to_string())),
+        "redacted_thinking" => Some(BlockKind::Thinking(String::new())),
         "image" => Some(BlockKind::Image),
         "tool_use" | "server_tool_use" => {
             let name = raw.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
@@ -358,6 +382,25 @@ fn classify_user(v: &Value, text: &str) -> UserLine {
         return UserLine::Harness;
     }
     UserLine::Human
+}
+
+/// A harness line worth keeping behind the scenes, as (label, text): another
+/// session's message, a background task's end. Everything else the harness
+/// says (reminders, caveats) is dropped.
+fn behind(text: &str) -> Option<(String, String)> {
+    if let Some(start) = text.find("<cross-session-message") {
+        let rest = &text[start..];
+        let open_end = rest.find('>')?;
+        let name = between(&rest[..open_end], "from-name=\"", "\"").unwrap_or("une autre session");
+        let body = between(rest, ">", "</cross-session-message>").unwrap_or(&rest[open_end + 1..]);
+        return Some((format!("Message de {}", one_line(name, 60)), body.trim().to_string()));
+    }
+    if text.trim_start().starts_with("<task-notification>") {
+        let summary = between(text, "<summary>", "</summary>").unwrap_or("Tâche terminée");
+        let result = between(text, "<result>", "</result>").unwrap_or_default();
+        return Some((one_line(summary, TARGET_MAX), result.trim().to_string()));
+    }
+    None
 }
 
 fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -515,7 +558,7 @@ mod tests {
             .iter()
             .map(|b| match &b.kind {
                 BlockKind::Text(t) => t.clone(),
-                BlockKind::Thinking => "thinking".into(),
+                BlockKind::Thinking(_) => "thinking".into(),
                 BlockKind::Image => "image".into(),
                 BlockKind::Tool(t) => format!("{} {}", t.verb, t.target),
             })
@@ -572,6 +615,27 @@ mod tests {
         ]);
         assert_eq!(c.items.len(), 1);
         assert!(matches!(&c.items[0], Item::User { text, .. } if text == "also run the tests"));
+    }
+
+    #[test]
+    fn a_peer_s_message_and_a_task_s_end_stay_behind_the_scenes() {
+        let peer = "<cross-session-message from=\"uds:/tmp/x.sock\" from-name=\"perso-agent\">\nPDF done\n</cross-session-message>";
+        let c = conv(vec![
+            // Queued mid-turn as a `prompt`, the origin says it is a peer's.
+            json!({"type": "attachment", "uuid": "q", "attachment": {"type": "queued_command", "prompt": peer, "commandMode": "prompt", "origin": {"kind": "peer", "name": "perso-agent"}}}),
+            // The same message again as a line: kept once.
+            json!({"type": "user", "uuid": "p", "isMeta": true, "origin": {"kind": "peer"}, "message": {"content": format!("Another Claude session sent a message:\n{peer}\n\nThis came from another Claude session")}}),
+            json!({"type": "user", "uuid": "t", "origin": {"kind": "task-notification"}, "message": {"content": "<task-notification>\n<summary>Agent \"Sync\" finished</summary>\n<result>Ticked 3 loops.</result>\n</task-notification>"}}),
+            json!({"type": "user", "uuid": "r", "isMeta": true, "message": {"content": "<system-reminder>x</system-reminder>"}}),
+        ]);
+        assert_eq!(
+            c.items,
+            [
+                Item::Behind { id: "q".into(), label: "Message de perso-agent".into(), text: "PDF done".into() },
+                Item::Behind { id: "t".into(), label: "Agent \"Sync\" finished".into(), text: "Ticked 3 loops.".into() },
+            ],
+            "a system reminder is dropped, never kept"
+        );
     }
 
     #[test]

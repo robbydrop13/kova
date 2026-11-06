@@ -81,6 +81,9 @@ struct ChatState {
     queued_reason: &'static str,
     note: Option<String>,
     restore: Option<String>,
+    /// The images pasted into the box, by their files: only these go with a message.
+    pasted: Vec<String>,
+    attach: Option<page::Attach>,
     last_poll: Option<std::time::Instant>,
     /// The nonce of the page loaded for this pane: a message carrying
     /// another one was posted by an earlier load.
@@ -115,6 +118,8 @@ impl ChatState {
             queued_reason: "",
             note: None,
             restore: None,
+            pasted: Vec::new(),
+            attach: None,
             last_poll: None,
             load,
             looked: None,
@@ -419,8 +424,34 @@ impl KovaView {
                 st.restore = st.outbox.cancel();
                 Reply::Push
             }
+            "paste-image" => {
+                if !attach_pasted_image(st) {
+                    st.note = Some("Pas d'image dans le presse-papier".to_string());
+                }
+                Reply::Push
+            }
+            "link" => {
+                let href = s("href");
+                if href.to_ascii_lowercase().starts_with("mailto:") {
+                    if let Some(url) = objc2_foundation::NSURL::URLWithString(&NSString::from_str(&href)) {
+                        NSWorkspace::sharedWorkspace().openURL(&url);
+                    }
+                } else {
+                    let cwd = pane.cached_cwd().map(std::path::PathBuf::from);
+                    match super::side_panel::target_on_disk(&href, cwd.as_deref()) {
+                        Some(target) => self.open_in_side_panel(target),
+                        None => st.note = Some("Fichier introuvable".to_string()),
+                    }
+                }
+                Reply::Push
+            }
             "send" => {
-                match input::sanitize(&s("text")) {
+                let images: Vec<String> = msg
+                    .get("images")
+                    .and_then(Value::as_array)
+                    .map(|list| list.iter().filter_map(Value::as_str).filter(|p| st.pasted.iter().any(|q| q == p)).map(str::to_string).collect())
+                    .unwrap_or_default();
+                match input::sanitize(&input::with_images(&s("text"), &images)) {
                     Err(reason) => {
                         st.note = Some(reason.to_string());
                         st.restore = Some(s("text"));
@@ -495,6 +526,19 @@ impl KovaView {
         }
     }
 
+    /// Cmd+V or Ctrl+V in the chat's box with an image on the pasteboard:
+    /// the image goes into the box, as in the terminal. False without one,
+    /// so the box pastes text as usual.
+    pub(super) fn chat_paste_image(&self) -> bool {
+        let mut state = self.ivars().chat.state.borrow_mut();
+        let Some(st) = state.as_mut() else { return false };
+        let done = attach_pasted_image(st);
+        if done {
+            st.last_poll = None;
+        }
+        done
+    }
+
     /// The chat's web view, once made: the Cockpit puts it back above its page.
     pub(super) fn chat_web(&self) -> Option<Retained<WKWebView>> {
         self.ivars().chat.web.get().cloned()
@@ -567,6 +611,26 @@ fn gate(pane: &Pane) -> input::Verdict {
         permission_prompt: pane.has_permission_prompt() || crate::prompt_preview::parse_permission_prompt(&visible).is_some(),
         composer: input::composer(&visible),
     })
+}
+
+/// The pasteboard's image written where a terminal paste writes it
+/// (`appkit_input::pasted_image_path`), shown in the box, sent with the next
+/// message. False without an image.
+fn attach_pasted_image(st: &mut ChatState) -> bool {
+    let Some(path) = crate::appkit_input::pasted_image_path(&objc2_app_kit::NSPasteboard::generalPasteboard()) else { return false };
+    st.attach = Some(page::Attach { src: thumbnail(&path), path: path.clone() });
+    st.pasted.push(path);
+    true
+}
+
+/// A pasted image as a `data:` URL for its chip, when small enough to send to the page.
+fn thumbnail(path: &str) -> Option<String> {
+    const MAX: u64 = 6 * 1024 * 1024;
+    if std::fs::metadata(path).ok()?.len() > MAX {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("data:image/png;base64,{}", crate::decision_sheet::base64(&bytes)))
 }
 
 /// The note when the Enter after a paste was not written.
@@ -712,9 +776,10 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
     update.queued = queued;
     update.note = st.note.take();
     update.restore = st.restore.take();
+    update.attach = st.attach.take();
     update.first = std::mem::take(&mut st.first);
     update.focus = std::mem::take(&mut st.focus);
-    changed |= update.note.is_some() || update.restore.is_some() || update.first || update.focus;
+    changed |= update.note.is_some() || update.restore.is_some() || update.attach.is_some() || update.first || update.focus;
     changed.then_some(update)
 }
 

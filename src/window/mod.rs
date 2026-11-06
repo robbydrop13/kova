@@ -552,6 +552,12 @@ define_class!(
             });
             // The chat's box edits text the same way; every other shortcut stays Kova's there.
             let in_chat = responder.as_ref().is_some_and(|r| self.chat_holds(r));
+            // An image pasted in the box goes in as an image (Cmd+V, or
+            // Ctrl+V as Claude Code takes it); text pastes as usual.
+            let paste_key = matches!(combo.key, crate::keybindings::Key::Char('v')) && !combo.option && !combo.shift && (combo.cmd != combo.ctrl);
+            if in_chat && paste_key && self.chat_paste_image() {
+                return objc2::runtime::Bool::YES;
+            }
             if responder
                 .as_ref()
                 .is_some_and(|responder| in_panel || in_chat || responder.downcast_ref::<objc2_app_kit::NSTextView>().is_some())

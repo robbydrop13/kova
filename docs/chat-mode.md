@@ -56,18 +56,31 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
   (a card waits), `Done 3 min ago`, `Offline` (no Claude in the pane);
 - the assistant's text full width, rendered markdown, no bubble; the user's
   message in a quiet bubble on the right;
-- tool calls as one-line rows (`Read  …/src/boot.ts`, `Run  npm test`,
-  `Edit  pair.tsx  +12 -3`), state at the right (running, ✓, ✕), a click
-  unfolds the result; consecutive calls form one run, folded into
-  `N actions` only past five; what was unfolded stays unfolded while the
-  page lives;
+- only the user's messages and the assistant's final text (no tool call
+  after it in its turn) show. Everything between two of them folds into
+  one `N actions en coulisse` line, a click unfolds it, compact: tool calls
+  as one-line rows (`Read  …/src/boot.ts`, `Run  npm test`), state at the
+  right (running, ✓, ✕), a click unfolds the result, a run past five folded
+  again into `N actions`; the text that went with the calls; notes
+  (`Interrupted`, a slash command); another session's message
+  (`Message de <name>`) and a finished background task, never shown as the
+  user's (a peer's message is queued as a `prompt` too: its origin decides).
+  System reminders are dropped. What was unfolded stays unfolded while the
+  page lives. The cards (questions, permission prompt) are never folded;
+- while Claude works with no call running, a `Réflexion` line ends the
+  thread, a light sweeping across it (still under `prefers-reduced-motion`);
+  a click unfolds the reasoning when the transcript holds it (it often keeps
+  only its signature);
 - the last 20 exchanges at open, `Show earlier` above for more; the view
   opens on the last user message; nothing folds by itself.
 
 Every text from the transcript is escaped by Rust. Markdown shows raw HTML
-as text, keeps a link only to http(s) or mailto (it opens in the default
-browser; a link to anything else is shown as its text) and never loads an
-image. Every message the page posts carries its load's nonce: one from an
+as text, keeps a link only to http(s), mailto or a local `.md` / `.html`
+file (a link to anything else is shown as its text) and never loads an
+image. A bare http(s) URL, or an absolute or `~/` path to a `.md` / `.html`
+file, is a link too (`src/chat/links.rs`), but not inside code; a path with
+spaces only when the file exists. A click opens it in the side panel
+(`side_panel::target_on_disk`, as `open-panel`), mailto in the mail app. Every message the page posts carries its load's nonce: one from an
 earlier load (another pane) is dropped. The page's content security policy runs
 only the script carrying the load's nonce.
 
@@ -89,6 +102,13 @@ terminal's prompt, with a note.
 | no `❯` line in the first column (a menu, a dialog) | queued |
 | the `❯` line holds text (the user's draft in the terminal) | refused, back in the box |
 | no Claude | refused, back in the box |
+
+Cmd+V or Ctrl+V with an image on the pasteboard writes it where a terminal
+paste does (`/tmp/kova-paste-<ms>.png`, `appkit_input::pasted_image_path`)
+and shows it as a thumbnail above the box (× removes it); its path goes
+before the text of the next message, as the terminal hands an image to
+Claude Code. Only a file Kova wrote for this page's paste goes along
+(`chat::input::with_images`). Text pastes as usual.
 
 One message at a time. Control characters are removed (tab and newline
 kept), 8 KB at most. The empty prompt is read off the screen like KovaLink's

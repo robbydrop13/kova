@@ -367,7 +367,7 @@ pub fn image_path(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
     raw.starts_with('/').then(|| PathBuf::from(raw))
 }
 
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
