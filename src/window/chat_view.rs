@@ -925,9 +925,15 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
     // there is one, opened (its detail, its instruction field).
     let entries = crate::attention::snapshot();
     let (outcomes, instructions) = (crate::attention::outcomes(), crate::attention::instructions());
+    let mut waiting_ids = Vec::new();
+    {
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|q| waiting_ids.push(q.id.clone()));
+    }
+    let waiting: Vec<&str> = waiting_ids.iter().map(String::as_str).collect();
     for q in &questions {
         let handoff = crate::handoff::detail(q).map(|d| d.card_text());
-        let linked = entries.as_deref().and_then(|e| crate::cockpit::entry_for_ask(e, &q.id)).and_then(|e| {
+        let linked = entries.as_deref().and_then(|e| crate::cockpit::entry_for_ask(e, &q.id, &waiting)).and_then(|e| {
             let mut item = crate::cockpit::from_attention(e, outcomes.get(&e.id), false)?;
             item.instruction = instructions.get(&e.id).cloned();
             item.detail = Some(crate::cockpit::entry_detail(e, crate::attention::explaining(&e.id)));
@@ -935,7 +941,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
             Some(item)
         });
         let scope = q.from.cwd.as_deref().map_or(crate::attention::Scope::Pro, |cwd| crate::cockpit::scope_of_cwd(cwd, st.perso.as_deref()));
-        html.push(cards::ask_card_html(q, handoff.as_deref(), linked.as_ref(), scope, now));
+        html.push(cards::ask_card_html(q, handoff.as_deref(), linked.as_ref(), crate::attention::can_act(), scope, now));
         list.push(cards::question_card(q, handoff));
     }
     st.permission = pane.permission_prompt();

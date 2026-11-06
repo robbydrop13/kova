@@ -310,9 +310,30 @@ pub fn link_asks(items: &mut Vec<Item>, actions: &[(String, String)], asks: &[St
 
 /// The attention entry that stands for the waiting ask `ask_id` (its action
 /// names it, `ask_ref`, possibly by a prefix): the card the Cockpit shows
-/// for that ask, which the chat shows too.
-pub fn entry_for_ask<'a>(entries: &'a [Entry], ask_id: &str) -> Option<&'a Entry> {
-    entries.iter().find(|e| e.action.as_deref().and_then(ask_ref).is_some_and(|r| ask_id.starts_with(r)))
+/// for that ask, which the chat shows too. Like `link_asks`, only a ref that
+/// names one waiting ask (`waiting`) links.
+pub fn entry_for_ask<'a>(entries: &'a [Entry], ask_id: &str, waiting: &[&str]) -> Option<&'a Entry> {
+    entries.iter().find(|e| {
+        e.action.as_deref().and_then(ask_ref).is_some_and(|r| ask_id.starts_with(r) && waiting.iter().filter(|id| id.starts_with(r)).count() == 1)
+    })
+}
+
+/// `CARD_CSS` with every selector under `scope` (`#asks`): the chat page
+/// takes the cards' look without it reaching its own buttons, and without
+/// CSS nesting, which the oldest WebKit Kova runs on lacks.
+pub fn scoped_card_css(scope: &str) -> String {
+    let mut out = String::with_capacity(CARD_CSS.len() * 2);
+    let mut rest = CARD_CSS;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else { break };
+        let selectors: Vec<String> =
+            rest[..open].split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| format!("{scope} {s}")).collect();
+        out.push_str(&selectors.join(","));
+        out.push_str(&rest[open..open + close + 1]);
+        out.push('\n');
+        rest = &rest[open + close + 1..];
+    }
+    out
 }
 
 /// A live need as an item. `sheet` says an ask is a decision sheet. An
@@ -1413,8 +1434,13 @@ mod tests {
         let mut e = entry("a-1", Level::Now, None, 10);
         e.action = Some("kova-sheet:19e0e20f".into());
         let entries = [entry("a-0", Level::Now, None, 10), e];
-        assert_eq!(entry_for_ask(&entries, "19e0e20f-1111").map(|e| e.id.as_str()), Some("a-1"));
-        assert!(entry_for_ask(&entries, "aaaa0000").is_none());
+        assert_eq!(entry_for_ask(&entries, "19e0e20f-1111", &["19e0e20f-1111", "aaaa0000"]).map(|e| e.id.as_str()), Some("a-1"));
+        assert!(entry_for_ask(&entries, "aaaa0000", &["19e0e20f-1111", "aaaa0000"]).is_none());
+        assert!(entry_for_ask(&entries, "19e0e20f-1111", &["19e0e20f-1111", "19e0e20f-2222"]).is_none(), "a ref naming two asks links none");
+        // The chat's copy of the card CSS stays under its scope.
+        let css = scoped_card_css("#asks");
+        assert!(css.contains("#asks button{") && css.contains("#asks .card textarea,#asks .card .detail{cursor:auto}"), "{css}");
+        assert!(css.lines().all(|l| l.starts_with("#asks ")));
     }
 
     #[test]

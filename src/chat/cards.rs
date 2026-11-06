@@ -126,15 +126,23 @@ pub fn question_card(q: &Question, handoff_detail: Option<String>) -> Card {
 /// for a decision sheet, as the Cockpit's opened card (detail and last
 /// instruction filled by the caller): the chat shows that card, with its
 /// instruction field, keyed by the ask.
-pub fn ask_card_html(q: &Question, handoff_detail: Option<&str>, linked: Option<&cockpit::Item>, scope: crate::attention::Scope, now: u64) -> String {
+pub fn ask_card_html(
+    q: &Question,
+    handoff_detail: Option<&str>,
+    linked: Option<&cockpit::Item>,
+    can_act: bool,
+    scope: crate::attention::Scope,
+    now: u64,
+) -> String {
     let icons = [cockpit::Button::Snooze, cockpit::Button::Dismiss, cockpit::Button::Done];
     let sheet = if q.panel_link().is_some() { vec![cockpit::Button::OpenSheet] } else { Vec::new() };
     if let Some(entry) = linked.filter(|_| q.is_decision()) {
         let item = cockpit::Item { key: q.id.clone(), ask: Some(q.id.clone()), ..entry.clone() };
-        return cockpit::card_html_with(&item, &sheet, &icons, true, now);
+        return cockpit::card_html_with(&item, &sheet, &icons, can_act, now);
     }
     let (title, rest) = q.message.trim().split_once('\n').unwrap_or((q.message.trim(), ""));
-    let mut message = rest.trim().to_string();
+    // The title is cut to one line: a long first line is said again in full.
+    let mut message = if title.chars().count() > TITLE_MAX { q.message.trim() } else { rest.trim() }.to_string();
     if let Some(d) = handoff_detail.filter(|d| !d.trim().is_empty()) {
         message = if message.is_empty() { d.to_string() } else { format!("{message}\n{d}") };
     }
@@ -170,6 +178,9 @@ pub fn ask_card_html(q: &Question, handoff_detail: Option<&str>, linked: Option<
     };
     cockpit::card_html_with(&item, &sheet, &icons, true, now)
 }
+
+/// The longest first line the card's title shows whole, roughly.
+const TITLE_MAX: usize = 60;
 
 /// The id of a prompt's card: it changes with the prompt, so a click made
 /// on one prompt never answers the next.
@@ -302,7 +313,7 @@ mod tests {
         d.url = Some("https://claude.ai/artifact/x".into());
         d.message = "Plan : 2 décisions\n\u{2022} Quand ?\n\u{2022} <Qui> ?".into();
         d.asked_at = 40;
-        let html = ask_card_html(&d, None, None, crate::attention::Scope::Pro, 100);
+        let html = ask_card_html(&d, None, None, true, crate::attention::Scope::Pro, 100);
         assert!(html.starts_with("<article class=\"card open\" data-key=\"430b8a55-1\">"), "{html}");
         assert!(html.contains("<div class=\"t\">Plan : 2 décisions</div>"));
         assert!(html.contains("Répondre à la fiche") && html.contains("kova \u{b7} il y a 1 min"), "{html}");
@@ -312,7 +323,7 @@ mod tests {
         assert!(!html.contains("cfrom") && !html.contains("class=\"ins\""), "no asker label, no instruction without an entry");
 
         // A plain question: its answers and its field, opened.
-        let html = ask_card_html(&question("a", Some(4), None), None, None, crate::attention::Scope::Pro, 100);
+        let html = ask_card_html(&question("a", Some(4), None), None, None, true, crate::attention::Scope::Pro, 100);
         assert!(html.contains("data-act=\"answer\" data-arg=\"No\"") && html.contains("data-arg=\"Other\" data-text=\"1\""));
         assert!(html.contains("textarea class=\"ans\"") && html.contains("Répondre à la question"));
 
@@ -334,9 +345,13 @@ mod tests {
             state: crate::cockpit::State::Idle,
             instruction: None,
         };
-        let html = ask_card_html(&d, None, Some(&entry), crate::attention::Scope::Pro, 100);
+        let html = ask_card_html(&d, None, Some(&entry), true, crate::attention::Scope::Pro, 100);
         assert!(html.contains("data-key=\"430b8a55-1\"") && html.contains("Harnais commun") && html.contains("Le fond"), "{html}");
         assert!(html.contains("<div class=\"lbl\">Consigne</div>") && html.contains("Ouvrir la fiche") && html.contains("data-act=\"dismiss\""));
+        assert!(!ask_card_html(&d, None, Some(&entry), false, crate::attention::Scope::Pro, 100).contains("Consigne"), "no act command, no field");
+        let mut long = question("l", Some(4), None);
+        long.message = "x".repeat(80);
+        assert!(ask_card_html(&long, None, None, true, crate::attention::Scope::Pro, 100).contains(&format!("<p class=\"msg\">{}</p>", "x".repeat(80))));
     }
 
     #[test]

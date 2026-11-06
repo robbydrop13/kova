@@ -311,7 +311,7 @@ action, or `action: text` when the user typed something.
   the answer is `Done` once the user has filled it in (then read the answers where the page stores
   them). Only http(s) URLs are accepted.
 - **A decision sheet Kova shows itself**, no page to publish:
-  `kova ask --decisions decisions.json` (the message defaults to `<title>: <N> decisions`). The
+  `kova ask --decisions decisions.json` (the message defaults to `<title> : <N> décisions`). The
   file: `{"title", "intro", "links": [{"label","url"}], "decisions": [{"id","title","group",
   "context","options": [{"id","label","detail","reco"}]}]}`. Open shows the sheet in the side
   panel, answers are kept as they are given, and Done returns them, one line per decision:

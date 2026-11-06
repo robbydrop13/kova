@@ -602,12 +602,11 @@ body {{ display: flex; flex-direction: column; }}
   border-radius: 6px; padding: 8px 10px; font: 12px/1.45 "SF Mono", Menlo, monospace; color: var(--t2); white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cut {{ margin: 0 0 6px 10px; font-size: 11.5px; color: var(--t3); }}
 #asks {{ flex: none; {ask_vars} line-height: normal; font-family: Inter, "SF Pro Text", -apple-system, system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased;
+  -webkit-font-smoothing: antialiased; }}
 {card_css}
-}}
 #cards {{ max-width: 860px; width: 100%; margin: 0 auto; padding: 0 18px; }}
 #cards > .card {{ margin: 8px 0; cursor: auto; }}
-.pcard {{ margin: 8px 0; padding: 10px 12px; border: 1px solid var(--b2); border-radius: 10px; background: var(--bg2); }}
+#cards .pcard {{ line-height: 1.6; margin: 8px 0; padding: 10px 12px; border: 1px solid var(--b2); border-radius: 10px; background: var(--bg2); }}
 .cfrom {{ font-size: 11.5px; color: var(--t3); text-transform: uppercase; letter-spacing: .04em; }}
 .cmsg {{ margin: 2px 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cdet {{ margin: 4px 0 8px; padding: 6px 8px; background: var(--bg); border: 1px solid var(--b3); border-radius: 6px;
@@ -615,10 +614,10 @@ body {{ display: flex; flex-direction: column; }}
 .cfield {{ width: 100%; margin: 2px 0 8px; resize: none; font: inherit; color: var(--t1); background: var(--bg);
   border: 1px solid var(--b3); border-radius: 6px; padding: 5px 8px; }}
 .cbtns {{ display: flex; flex-wrap: wrap; gap: 6px; }}
-.cbtn {{ font: inherit; font-size: 13px; color: var(--t1); background: var(--bg); border: 1px solid var(--b2);
+#cards .cbtn {{ font: inherit; font-size: 13px; color: var(--t1); background: var(--bg); border: 1px solid var(--b2);
   border-radius: 6px; padding: 3px 12px; cursor: pointer; }}
-.cbtn.primary {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
-.cbtn:disabled {{ opacity: .5; cursor: default; }}
+#cards .cbtn.primary {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
+#cards .cbtn:disabled {{ opacity: .5; cursor: default; }}
 .chint {{ margin-top: 6px; font-size: 12px; color: var(--t3); }}
 #foot {{ flex: none; max-width: 860px; width: 100%; margin: 0 auto; padding: 6px 18px 12px; }}
 #pending {{ max-width: 860px; margin: 0 auto; }}
@@ -1000,7 +999,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
         nonce = nonce,
         handler = HANDLER,
         ask_vars = crate::cockpit::vars(!t.dark),
-        card_css = crate::cockpit::CARD_CSS,
+        card_css = crate::cockpit::scoped_card_css("#asks"),
         snooze_html = crate::cockpit::SNOOZE_HTML,
         snooze_js = crate::cockpit::SNOOZE_JS,
         title = escape(title),
@@ -1209,7 +1208,7 @@ mod tests {
         // tokens, its snooze menu, never the old orange bar.
         let dark = crate::cockpit::vars(false);
         assert!(page.contains(&format!("#asks {{ flex: none; {dark}")), "the tokens are scoped to the cards");
-        assert!(page.contains(".card .t{font-size:15px") && page.contains(r#"<div class="snz" id="snz" hidden>"#));
+        assert!(page.contains("#asks .card .t{font-size:15px") && page.contains(r#"<div class="snz" id="snz" hidden>"#));
         assert!(page.contains("function iso(d)") && !page.contains("border-left: 3px solid var(--awaiting)"));
         assert!(restyle_script(&Theme { dark: false, ..theme }).contains(&crate::cockpit::vars(true)[..20]));
     }
