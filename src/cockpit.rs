@@ -499,12 +499,13 @@ pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
         }
         Kind::Attention if item.ask.is_some() => vec![Button::OpenSheet],
         // Once the go went through, only the way to its material is left.
-        Kind::Attention if item.validates && can_act => {
+        // `Refuser` needs the close command (`card_html`), `Valider` the act one.
+        Kind::Attention if item.validates => {
             let open = item.openable.then_some(Button::Open);
             if item.state == State::Sent {
                 open.into_iter().collect()
             } else {
-                open.into_iter().chain([Button::Refuse, Button::Validate]).collect()
+                open.into_iter().chain([Some(Button::Refuse), can_act.then_some(Button::Validate)].into_iter().flatten()).collect()
             }
         }
         // `C'est fait` is one of the card's icons (`icons`).
@@ -710,7 +711,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
             // reads `Masquer` while the detail shows.
             Button::Expand => button_html_as(b, false, i == last, if item.detail.is_some() { "Masquer" } else { "Ouvrir" }),
             // Next to Refuser / Valider, `Ouvrir` steps back.
-            Button::Open if list.contains(&Button::Validate) => button_html_as(b, running, false, b.label()),
+            Button::Open if list.contains(&Button::Refuse) || list.contains(&Button::Validate) => button_html_as(b, running, false, b.label()),
             _ => button_html(b, running),
         })
         .collect();
@@ -1371,7 +1372,7 @@ document.addEventListener('click', e => {
   // A click on a card's body, not on a button or a field: it opens or folds.
   if (!b) {
     const card = e.target.closest('.card');
-    if (!card || e.target.closest('textarea, input, a, .detail, .instr')) return;
+    if (!card || e.target.closest('textarea, input, a, .detail, .instr, .why')) return;
     if (String(window.getSelection()).trim()) return;
     return post({ type: 'act', key: card.dataset.key, act: 'expand' });
   }
@@ -1447,6 +1448,9 @@ document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   e.preventDefault();
   if (!$('snz').hidden) return snzClose();
+  // An open reason field folds before the page closes.
+  const why = document.querySelector('.card div.why:not([hidden])');
+  if (why) { why.querySelector('input').value = ''; why.hidden = true; return; }
   if (document.activeElement && document.activeElement.tagName === 'TEXTAREA') document.activeElement.blur();
   else post({ type: 'close' });
 });
@@ -1709,7 +1713,7 @@ mod tests {
         assert!(!expects_validation(&drafted), "a draft keeps its own Valider");
         let mut item = from_attention(&with("would", Some("/tmp/prep.md")), None, true).unwrap();
         assert_eq!(buttons(&item, true), [Button::Open, Button::Refuse, Button::Validate]);
-        assert_eq!(buttons(&item, false), [Button::Open], "no act command, no go to give");
+        assert_eq!(buttons(&item, false), [Button::Open, Button::Refuse], "no act command, no go to give");
         let html = card_html(&item, true, true, true, 10);
         // Both blue, Ouvrir steps back, the icons stay, the reason field waits hidden.
         assert!(html.contains("<button type=\"button\" class=\"btn sec\" data-act=\"open\"><span>Ouvrir</span></button>"), "{html}");
