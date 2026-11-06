@@ -84,11 +84,9 @@ struct ChatState {
     /// The images pasted into the box, by their files: only these go with a message.
     pasted: Vec<String>,
     attach: Vec<page::Attach>,
-    /// Dictation: its thread while it runs, whether it listens, what it heard.
-    voice: Option<crate::voice_io::Session>,
-    listening: bool,
-    transcript: crate::voice::Transcript,
-    shown_voice: Option<page::Voice>,
+    /// Voice typing, and its pill as the page last got it.
+    voice: crate::voice_io::Dictation,
+    shown_voice: Option<crate::voice::Pill>,
     last_poll: Option<std::time::Instant>,
     /// The nonce of the page loaded for this pane: a message carrying
     /// another one was posted by an earlier load.
@@ -125,9 +123,7 @@ impl ChatState {
             restore: None,
             pasted: Vec::new(),
             attach: Vec::new(),
-            voice: None,
-            listening: false,
-            transcript: crate::voice::Transcript::default(),
+            voice: crate::voice_io::Dictation::default(),
             shown_voice: None,
             last_poll: None,
             load,
@@ -144,20 +140,6 @@ impl ChatState {
         self.shown_banner = None;
         self.shown_queued = None;
         self.shown_voice = None;
-    }
-
-    /// Dictation on, or off: off, what was said still arrives.
-    fn toggle_voice(&mut self) {
-        if self.listening {
-            self.listening = false;
-            if let Some(session) = &self.voice {
-                session.stop();
-            }
-        } else {
-            self.voice = Some(crate::voice_io::Session::start());
-            self.listening = true;
-            self.transcript = crate::voice::Transcript::default();
-        }
     }
 }
 
@@ -319,11 +301,11 @@ impl KovaView {
             // A pane that left chat mode drops its state; one hidden by an
             // overlay keeps it.
             let gone = slot.state.borrow().as_ref().is_some_and(|st| !self.pane_is_chat(st.pane_id));
-            // Out of sight, no one sees what the mic hears: it stops.
+            // Out of sight, no one sees what the mic hears: it is cancelled.
             if let Some(st) = slot.state.borrow_mut().as_mut()
-                && st.listening
+                && st.voice.listening()
             {
-                st.toggle_voice();
+                st.voice.cancel();
             }
             if gone {
                 slot.state.replace(None);
@@ -454,14 +436,20 @@ impl KovaView {
                 st.restore = st.outbox.cancel();
                 Reply::Push
             }
-            "voice" => {
-                st.toggle_voice();
+            "voice-press" => {
+                st.voice.press(crate::surface::monotonic_ms(), None);
                 Reply::Push
             }
-            "voice-stop" => {
-                if st.listening {
-                    st.toggle_voice();
-                }
+            "voice-release" => {
+                st.voice.release(crate::surface::monotonic_ms());
+                Reply::Push
+            }
+            "voice-finish" => {
+                st.voice.finish();
+                Reply::Push
+            }
+            "voice-cancel" => {
+                st.voice.cancel();
                 Reply::Push
             }
             "paste-image" => {
@@ -492,10 +480,6 @@ impl KovaView {
                     .and_then(Value::as_array)
                     .map(|list| list.iter().filter_map(Value::as_str).filter(|p| st.pasted.iter().any(|q| q == p)).map(str::to_string).collect())
                     .unwrap_or_default();
-                // What was dictated went with it: dictation goes on from here.
-                if st.listening {
-                    st.transcript.clear();
-                }
                 let text = input::with_images(&s("text"), &images);
                 match input::sanitize(&text) {
                     Err(reason) => {
@@ -572,11 +556,12 @@ impl KovaView {
         }
     }
 
-    /// `toggle-voice`: dictation in the chat shown, on or off.
+    /// `toggle-voice`: the shortcut went down in the chat shown (held,
+    /// push-to-talk; tapped, hands-free until the next press).
     pub(super) fn toggle_voice(&self) {
         let toggled = match self.ivars().chat.state.borrow_mut().as_mut() {
             Some(st) if st.ready => {
-                st.toggle_voice();
+                st.voice.shortcut();
                 st.last_poll = None;
                 true
             }
@@ -802,27 +787,8 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
         input::Step::Queued(_) | input::Step::Nothing => {}
     }
 
-    // Dictation: what was heard, a failure, the end of its thread.
-    let mut voice_send = false;
-    if let Some(session) = &st.voice {
-        let ms = crate::surface::monotonic_ms();
-        for note in session.take() {
-            match note {
-                crate::voice_io::Note::Event(e) => {
-                    st.transcript.apply(&e, ms);
-                }
-                crate::voice_io::Note::Failed(line) => st.note = Some(line),
-                crate::voice_io::Note::Closed => {
-                    st.voice = None;
-                    st.listening = false;
-                    break;
-                }
-            }
-        }
-        if st.listening && crate::voice::auto_send() && st.transcript.auto_send_due(ms, crate::voice::AUTO_SEND_PAUSE_MS) {
-            voice_send = true;
-        }
-    }
+    // Voice typing: its pill, and the text of a dictation that just ended.
+    let polled = st.voice.poll();
 
     if !st.ready {
         return None;
@@ -860,18 +826,15 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
     update.note = st.note.take();
     update.restore = st.restore.take();
     update.attach = (!st.attach.is_empty()).then(|| std::mem::take(&mut st.attach));
-    let voice = page::Voice { on: st.listening, live: st.voice.is_some(), text: st.transcript.text(), send: voice_send };
-    if voice_send {
-        st.transcript.clear();
-    }
-    if st.shown_voice.as_ref() != Some(&voice) {
-        st.shown_voice = Some(voice.clone());
-        update.voice = Some(voice);
+    if st.shown_voice.as_ref() != Some(&polled.pill) {
+        st.shown_voice = Some(polled.pill.clone());
+        update.voice = Some(polled.pill);
         changed = true;
     }
+    update.dictated = polled.text.map(|text| page::Dictated { text, send: crate::voice::auto_send() });
     update.first = std::mem::take(&mut st.first);
     update.focus = std::mem::take(&mut st.focus);
-    changed |= update.note.is_some() || update.restore.is_some() || update.attach.is_some() || update.first || update.focus;
+    changed |= update.note.is_some() || update.restore.is_some() || update.attach.is_some() || update.dictated.is_some() || update.first || update.focus;
     changed.then_some(update)
 }
 

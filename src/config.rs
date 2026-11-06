@@ -26,9 +26,12 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ChatConfig {
-    /// Dictation sends the message by itself after about 2 s of silence.
-    /// Off: the dictated text waits in the box until Enter.
+    /// A dictation's text sends the message as soon as it is in the box.
+    /// Off: it waits in the box until Enter.
     pub voice_auto_send: bool,
+    /// Words voice typing should spell right (names, jargon), sent as the
+    /// provider's vocabulary; Claap's back takes them from the workspace.
+    pub voice_vocabulary: Vec<String>,
 }
 
 /// How Kova rebuilds an agent's command line when it puts a conversation back.

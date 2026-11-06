@@ -1,35 +1,238 @@
-//! The native half of `voice`: the key from the Keychain, a temporary token
-//! minted with it, the microphone through an AudioQueue (16 kHz mono PCM,
-//! Core Audio converts), the socket through NSURLSession. Not tested: the
-//! pure half (`voice`) is.
+//! The native half of `voice`: the dictation a chat drives (`Dictation`),
+//! its thread (`Session`: the key from the Keychain, the microphone through
+//! an AudioQueue at 16 kHz mono, then one request through NSURLSession), the
+//! keyboard watch that tells a hold from a tap and catches Escape, and the
+//! sounds. Not tested: the pure half (`voice`) is.
 //!
-//! One thread per dictation. The key lives in that thread's memory only: it
-//! goes to `curl` on stdin (never on a command line other processes can
-//! read), and the socket only ever sees the token.
+//! The key lives in the dictation thread's memory only, from the Keychain to
+//! the request's `Authorization` header; nothing writes or logs it. The audio
+//! stays in memory and is dropped with the thread.
 
-use std::io::Write as _;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use objc2::rc::Retained;
-use objc2::AnyThread;
+use objc2::runtime::AnyObject;
+use objc2_app_kit::{NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSSound};
 use objc2_foundation::{
-    NSData, NSError, NSString, NSURLSession, NSURLSessionWebSocketCloseCode, NSURLSessionWebSocketMessage,
-    NSURLSessionWebSocketMessageType, NSURLSessionWebSocketTask, NSURL,
+    MainThreadMarker, NSData, NSError, NSHTTPURLResponse, NSMutableURLRequest, NSString, NSURLResponse, NSURLSession,
+    NSURLSessionConfiguration, NSURL,
 };
 
-use crate::voice;
+use crate::voice::{self, Command as Cmd, Failure, Flash, Heard, History, Keys, Pill};
 
-/// What the dictation thread reports to the chat.
+static HISTORY: Mutex<History> = Mutex::new(History::new());
+/// What the keyboard watch saw, with when: drained by the chat's poll.
+static KEYS: Mutex<Vec<KeyInput>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Copy, Debug)]
+enum KeyInput {
+    Release(u64),
+    Escape,
+}
+
+fn history() -> Vec<String> {
+    HISTORY.lock().map(|h| h.items()).unwrap_or_default()
+}
+
+/// One chat's voice typing: the shortcut or the mic button in, the pill and
+/// the text to insert out.
+#[derive(Default)]
+pub struct Dictation {
+    keys: Keys,
+    session: Option<Session>,
+    watch: Option<KeyWatch>,
+    flash: Option<Flash>,
+}
+
+/// What a poll hands the chat.
+pub struct Polled {
+    pub pill: Pill,
+    /// Clean text to insert at the cursor.
+    pub text: Option<String>,
+}
+
+impl Dictation {
+    /// The shortcut went down. From the keyboard, its key is watched for the
+    /// release (hold or tap); from IPC there is no key: a tap.
+    pub fn shortcut(&mut self) {
+        let now = crate::surface::monotonic_ms();
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let key = NSApplication::sharedApplication(mtm)
+            .currentEvent()
+            .filter(|e| e.r#type() == NSEventType::KeyDown)
+            .map(|e| (e.keyCode(), e.isARepeat()));
+        match key {
+            Some((_, true)) => {}
+            Some((code, false)) => self.press(now, Some(code)),
+            None => {
+                self.press(now, None);
+                self.release(now);
+            }
+        }
+    }
+
+    /// A press: the shortcut (with its key code) or the mic button.
+    pub fn press(&mut self, now: u64, key: Option<u16>) {
+        let cmd = self.keys.press(now);
+        self.run(cmd, now);
+        if cmd == Cmd::Start {
+            self.watch = KeyWatch::install(key);
+        }
+    }
+
+    pub fn release(&mut self, now: u64) {
+        let cmd = self.keys.release(now);
+        self.run(cmd, now);
+    }
+
+    pub fn finish(&mut self) {
+        let cmd = self.keys.finish();
+        self.run(cmd, crate::surface::monotonic_ms());
+    }
+
+    pub fn cancel(&mut self) {
+        let cmd = self.keys.cancel();
+        self.run(cmd, crate::surface::monotonic_ms());
+    }
+
+    /// The microphone is on (not once the audio went).
+    pub fn listening(&self) -> bool {
+        matches!(self.keys.phase, voice::Phase::Listening { .. })
+    }
+
+    fn run(&mut self, cmd: Cmd, now: u64) {
+        match cmd {
+            Cmd::Start => {
+                self.flash = None;
+                if let Ok(mut keys) = KEYS.lock() {
+                    keys.clear();
+                }
+                play("Tink");
+                self.session = Some(Session::start());
+            }
+            Cmd::Finish => {
+                play("Pop");
+                if let Some(session) = &self.session {
+                    session.finish();
+                }
+            }
+            Cmd::Cancel => {
+                if let Some(session) = self.session.take() {
+                    session.cancel();
+                }
+                self.watch = None;
+                self.flash = Some(Flash::cancelled(now));
+            }
+            Cmd::Nothing => {}
+        }
+    }
+
+    pub fn poll(&mut self) -> Polled {
+        let now = crate::surface::monotonic_ms();
+        let inputs = KEYS.lock().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default();
+        for input in inputs {
+            match input {
+                KeyInput::Release(at) => self.release(at),
+                KeyInput::Escape => self.cancel(),
+            }
+        }
+        let mut text = None;
+        let notes = self.session.as_ref().map(Session::take).unwrap_or_default();
+        for note in notes {
+            match note {
+                Note::Full => self.finish(),
+                Note::Heard(heard) => {
+                    if heard.cleanup_failed {
+                        log::info!("voice: cleanup failed, the verbatim text goes in");
+                    }
+                    if let Ok(mut h) = HISTORY.lock() {
+                        h.push(&heard.text);
+                    }
+                    text = Some(heard.text);
+                }
+                Note::Failed(f) => {
+                    if !f.quiet() {
+                        play("Basso");
+                    }
+                    self.flash = Some(Flash::failure(f, now));
+                }
+                Note::Closed => {
+                    self.session = None;
+                    self.keys.done();
+                }
+            }
+        }
+        if !self.keys.active() {
+            self.watch = None;
+        }
+        let level = self.session.as_ref().map(Session::level).unwrap_or(0.0);
+        Polled { pill: voice::pill(self.keys.phase, self.flash.as_ref(), now, level, history()), text }
+    }
+}
+
+fn play(name: &str) {
+    if let Some(sound) = NSSound::soundNamed(&NSString::from_str(name)) {
+        sound.play();
+    }
+}
+
+/// A local event monitor while a dictation runs: the release of the
+/// shortcut's key (or of Cmd: a Cmd combo's key-up may never reach the
+/// app), and Escape, which goes no further.
+struct KeyWatch {
+    monitor: Retained<AnyObject>,
+}
+
+impl KeyWatch {
+    fn install(key: Option<u16>) -> Option<KeyWatch> {
+        let released = std::cell::Cell::new(key.is_none());
+        let handler = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+            let e = unsafe { event.as_ref() };
+            let push = |input| {
+                if let Ok(mut keys) = KEYS.lock() {
+                    keys.push(input);
+                }
+            };
+            match e.r#type() {
+                NSEventType::KeyDown if e.keyCode() == 53 => {
+                    push(KeyInput::Escape);
+                    return std::ptr::null_mut();
+                }
+                NSEventType::KeyUp if !released.get() && Some(e.keyCode()) == key => {
+                    released.set(true);
+                    push(KeyInput::Release(crate::surface::monotonic_ms()));
+                }
+                NSEventType::FlagsChanged if !released.get() && !e.modifierFlags().contains(NSEventModifierFlags::Command) => {
+                    released.set(true);
+                    push(KeyInput::Release(crate::surface::monotonic_ms()));
+                }
+                _ => {}
+            }
+            event.as_ptr()
+        });
+        let mask = NSEventMask::KeyDown | NSEventMask::KeyUp | NSEventMask::FlagsChanged;
+        let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &handler) }?;
+        Some(KeyWatch { monitor })
+    }
+}
+
+impl Drop for KeyWatch {
+    fn drop(&mut self) {
+        unsafe { NSEvent::removeMonitor(&self.monitor) };
+    }
+}
+
+/// What the dictation thread reports.
 #[derive(Debug)]
-pub enum Note {
-    Event(voice::Event),
-    /// A line for the user: no key, no microphone, the server refused.
-    Failed(String),
-    /// The thread is done.
+enum Note {
+    /// 120 s reached: listening stopped, the audio is on its way.
+    Full,
+    Heard(Heard),
+    Failed(Failure),
     Closed,
 }
 
@@ -41,41 +244,55 @@ fn push(inbox: &Inbox, note: Note) {
     }
 }
 
-/// One dictation: listening from `start` until `stop` (or a failure).
-pub struct Session {
-    stop: Arc<AtomicBool>,
+const RUN: u8 = 0;
+const FINISH: u8 = 1;
+const CANCEL: u8 = 2;
+
+/// One dictation's thread: listening until `finish` (then the request) or
+/// `cancel` (then nothing).
+struct Session {
+    control: Arc<AtomicU8>,
+    level: Arc<AtomicU32>,
     inbox: Inbox,
 }
 
 impl Session {
-    pub fn start() -> Session {
-        let stop = Arc::new(AtomicBool::new(false));
+    fn start() -> Session {
+        let control = Arc::new(AtomicU8::new(RUN));
+        let level = Arc::new(AtomicU32::new(0));
         let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
-        let (s, i) = (stop.clone(), inbox.clone());
+        let (c, l, i) = (control.clone(), level.clone(), inbox.clone());
         let spawned = std::thread::Builder::new().name("kova-voice".into()).spawn(move || {
-            run(&s, &i);
+            run(&c, &l, &i);
             push(&i, Note::Closed);
         });
         if spawned.is_err() {
-            push(&inbox, Note::Failed("Dictée indisponible".into()));
+            push(&inbox, Note::Failed(Failure::Failed));
             push(&inbox, Note::Closed);
         }
-        Session { stop, inbox }
+        Session { control, level, inbox }
     }
 
-    /// Stop listening; what was said still arrives, then `Closed`.
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+    fn finish(&self) {
+        let _ = self.control.compare_exchange(RUN, FINISH, Ordering::Relaxed, Ordering::Relaxed);
     }
 
-    pub fn take(&self) -> Vec<Note> {
+    fn cancel(&self) {
+        self.control.store(CANCEL, Ordering::Relaxed);
+    }
+
+    fn level(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
+    }
+
+    fn take(&self) -> Vec<Note> {
         self.inbox.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default()
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.stop();
+        self.cancel();
     }
 }
 
@@ -89,139 +306,123 @@ fn keychain_key() -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// A temporary streaming token, the key passed to curl as a header file on stdin.
-fn mint_token(key: &str) -> Option<String> {
-    let mut child = Command::new("/usr/bin/curl")
-        .args(["-sS", "-m", "10", "-X", "POST", voice::TOKEN_URL, "-H", "@-", "-H", "Content-Type: application/json", "-d", voice::TOKEN_BODY])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(format!("Authorization: {key}\n").as_bytes());
-    }
-    let out = child.wait_with_output().ok()?;
-    voice::token_from(&String::from_utf8_lossy(&out.stdout))
-}
-
-fn run(stop: &AtomicBool, inbox: &Inbox) {
-    let key = match voice::api_key(keychain_key) {
-        Ok(key) => key,
-        Err(line) => return push(inbox, Note::Failed(line.into())),
-    };
-    let token = mint_token(&key);
-    drop(key);
-    let Some(token) = token else {
-        return push(inbox, Note::Failed("AssemblyAI a refusé la clé".into()));
-    };
-    let closed = Arc::new(AtomicBool::new(false));
-    let Some(socket) = Socket::open(&voice::ws_url(&token), inbox.clone(), closed.clone()) else {
-        return push(inbox, Note::Failed("Connexion AssemblyAI impossible".into()));
-    };
+fn run(control: &AtomicU8, level: &AtomicU32, inbox: &Inbox) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // The microphone first: the first words are not lost to the Keychain read.
     let mic = match Mic::start(tx) {
         Ok(mic) => mic,
         Err(status) => {
             log::warn!("voice: no microphone (AudioQueue status {status})");
-            socket.close();
-            return push(inbox, Note::Failed("Micro indisponible".into()));
+            return push(inbox, Note::Failed(Failure::NoMic));
         }
     };
+    let key = match voice::api_key(keychain_key) {
+        Ok(key) => key,
+        Err(_) => return push(inbox, Note::Failed(Failure::NoKey)),
+    };
     log::info!("voice: listening");
-    while !stop.load(Ordering::Relaxed) && !closed.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => socket.send_binary(&chunk),
+    let max = voice::MAX_AUDIO_MS * voice::BYTES_PER_MS;
+    let mut audio: Vec<u8> = Vec::with_capacity(voice::SAMPLE_RATE as usize * 2 * 10);
+    while control.load(Ordering::Relaxed) == RUN {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => {
+                level.store(voice::level(&chunk).to_bits(), Ordering::Relaxed);
+                audio.extend_from_slice(&chunk);
+                if audio.len() >= max {
+                    audio.truncate(max);
+                    push(inbox, Note::Full);
+                    break;
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     drop(mic);
-    // The open turn is finalised on Terminate: wait for it, a moment at most.
-    if !closed.load(Ordering::Relaxed) {
-        socket.send_text(r#"{"type":"Terminate"}"#);
-        let until = Instant::now() + Duration::from_secs(3);
-        while !closed.load(Ordering::Relaxed) && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    level.store(0, Ordering::Relaxed);
+    if control.load(Ordering::Relaxed) == CANCEL {
+        return log::info!("voice: cancelled");
     }
-    socket.close();
-    log::info!("voice: stopped");
-}
-
-/// The socket: messages read in a loop on NSURLSession's queue, each pushed
-/// to the inbox as a `voice::Event`; `closed` once the server ends it.
-struct Socket {
-    task: Retained<NSURLSessionWebSocketTask>,
-    closed: Arc<AtomicBool>,
-}
-
-impl Socket {
-    fn open(url: &str, inbox: Inbox, closed: Arc<AtomicBool>) -> Option<Socket> {
-        let url = NSURL::URLWithString(&NSString::from_str(url))?;
-        let task = NSURLSession::sharedSession().webSocketTaskWithURL(&url);
-        task.resume();
-        receive(task.clone(), inbox, closed.clone());
-        Some(Socket { task, closed })
+    while let Ok(chunk) = rx.try_recv() {
+        audio.extend_from_slice(&chunk);
     }
-
-    fn send(&self, message: &NSURLSessionWebSocketMessage) {
-        let closed = self.closed.clone();
-        let done = block2::RcBlock::new(move |error: *mut NSError| {
-            if !error.is_null() {
-                closed.store(true, Ordering::Relaxed);
-            }
-        });
-        unsafe { self.task.sendMessage_completionHandler(message, &done) };
+    audio.truncate(max);
+    if audio.len() < voice::MIN_AUDIO_MS * voice::BYTES_PER_MS {
+        return log::info!("voice: too short, nothing sent");
     }
-
-    fn send_binary(&self, bytes: &[u8]) {
-        let data = NSData::with_bytes(bytes);
-        self.send(&NSURLSessionWebSocketMessage::initWithData(NSURLSessionWebSocketMessage::alloc(), &data));
+    let outcome = dictate(&key, &audio, control);
+    drop(key);
+    if control.load(Ordering::Relaxed) == CANCEL {
+        return log::info!("voice: cancelled");
     }
-
-    fn send_text(&self, text: &str) {
-        self.send(&NSURLSessionWebSocketMessage::initWithString(NSURLSessionWebSocketMessage::alloc(), &NSString::from_str(text)));
-    }
-
-    fn close(&self) {
-        self.task.cancelWithCloseCode_reason(NSURLSessionWebSocketCloseCode::NormalClosure, None);
+    match outcome {
+        Ok(heard) if heard.text.is_empty() => push(inbox, Note::Failed(Failure::NothingHeard)),
+        Ok(heard) => push(inbox, Note::Heard(heard)),
+        Err(f) => push(inbox, Note::Failed(f)),
     }
 }
 
-/// Read one message, then arm the next read: NSURLSession reads one at a time.
-fn receive(task: Retained<NSURLSessionWebSocketTask>, inbox: Inbox, closed: Arc<AtomicBool>) {
-    let next = task.clone();
-    let handler = block2::RcBlock::new(move |message: *mut NSURLSessionWebSocketMessage, error: *mut NSError| {
-        if !error.is_null() || message.is_null() {
-            // Not after the server's own end: the socket was lost. The
-            // error's text may hold the URL, and so the token: its code only.
-            if !closed.swap(true, Ordering::Relaxed) {
-                let code = if error.is_null() { 0 } else { unsafe { &*error }.code() };
-                log::info!("voice: socket lost (code {code})");
-                push(&inbox, Note::Failed("Connexion AssemblyAI perdue".into()));
-            }
-            return;
-        }
-        let message = unsafe { &*message };
-        if message.r#type() == NSURLSessionWebSocketMessageType::String
-            && let Some(text) = message.string()
-        {
-            let event = voice::parse(&text.to_string());
-            let end = event == voice::Event::Termination;
-            if let voice::Event::Error(e) = &event {
-                log::warn!("voice: server error: {e}");
-                push(&inbox, Note::Failed("Erreur AssemblyAI".into()));
-            }
-            push(&inbox, Note::Event(event));
-            if end {
-                closed.store(true, Ordering::Relaxed);
-                return;
+/// The request, retried like Claap's back does (3 attempts on 429 and
+/// gateway errors, or no connection), until the dictation is cancelled.
+fn dictate(key: &str, audio: &[u8], control: &AtomicU8) -> Result<Heard, Failure> {
+    let boundary = format!("kova-{:x}", crate::surface::monotonic_ms() ^ (std::process::id() as u64) << 32);
+    let rules = std::env::var_os("HOME").and_then(|h| std::fs::read_to_string(std::path::Path::new(&h).join(voice::INSTRUCTION_FILE)).ok());
+    let body = voice::multipart(&boundary, &voice::config_json(&voice::instruction(rules), &voice::vocabulary()), audio);
+    let mut last = Failure::Unreachable;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(400 << attempt));
+            if control.load(Ordering::Relaxed) == CANCEL {
+                return Err(Failure::Failed);
             }
         }
-        receive(next.clone(), inbox.clone(), closed.clone());
+        match post(key, &boundary, &body) {
+            Some((200, answer)) => return voice::parse_result(&String::from_utf8_lossy(&answer)).ok_or(Failure::Failed),
+            Some((status, _)) => {
+                // Never the body: an error page may echo the request.
+                log::warn!("voice: AssemblyAI answered {status}");
+                last = Failure::from_status(status);
+                if !voice::retriable(status) {
+                    return Err(last);
+                }
+            }
+            None => {
+                log::warn!("voice: AssemblyAI unreachable");
+                last = Failure::Unreachable;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// One POST through an ephemeral NSURLSession (no cache, no cookies):
+/// the status and body, or `None` without an answer.
+fn post(key: &str, boundary: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let url = NSURL::URLWithString(&NSString::from_str(voice::DICTATION_URL))?;
+    let request = NSMutableURLRequest::requestWithURL(&url);
+    request.setHTTPMethod(&NSString::from_str("POST"));
+    request.setValue_forHTTPHeaderField(Some(&NSString::from_str(key)), &NSString::from_str("Authorization"));
+    let kind = format!("multipart/form-data; boundary={boundary}");
+    request.setValue_forHTTPHeaderField(Some(&NSString::from_str(&kind)), &NSString::from_str("Content-Type"));
+    request.setHTTPBody(Some(&NSData::with_bytes(body)));
+    request.setTimeoutInterval(25.0);
+    let session = NSURLSession::sessionWithConfiguration(&NSURLSessionConfiguration::ephemeralSessionConfiguration());
+    let (tx, rx) = mpsc::channel::<Option<(u16, Vec<u8>)>>();
+    let done = block2::RcBlock::new(move |data: *mut NSData, response: *mut NSURLResponse, error: *mut NSError| {
+        let answer = if !error.is_null() || response.is_null() {
+            None
+        } else {
+            let status = unsafe { &*response }.downcast_ref::<NSHTTPURLResponse>().map(|r| r.statusCode() as u16);
+            let bytes = if data.is_null() { Vec::new() } else { unsafe { &*data }.to_vec() };
+            status.map(|s| (s, bytes))
+        };
+        let _ = tx.send(answer);
     });
-    unsafe { task.receiveMessageWithCompletionHandler(&handler) };
+    let task = unsafe { session.dataTaskWithRequest_completionHandler(&request, &done) };
+    task.resume();
+    let answer = rx.recv_timeout(Duration::from_secs(30)).ok().flatten();
+    session.finishTasksAndInvalidate();
+    answer
 }
 
 // ---------------------------------------------------------------

@@ -103,7 +103,7 @@ define_class!(
             window::side_panel::init(crate::config::LayoutPrefs::load().panel_fraction);
             init_theme(mtm, config);
             crate::team::set_command(&config.sidebar.roster_command);
-            crate::voice::set_auto_send(config.chat.voice_auto_send);
+            crate::voice::configure(config.chat.voice_auto_send, &config.chat.voice_vocabulary);
             crate::attention::set_commands(&config.attention.commands());
             crate::catchup::set_commands(&config.attention.catchup_commands());
             setup_menu(mtm, config);
@@ -1775,7 +1775,7 @@ fn handle_ipc_reload_config(
     // not only on a restart.
     window::sidebar::tokens::set_background(config.colors.background);
     crate::team::set_command(&config.sidebar.roster_command);
-    crate::voice::set_auto_send(config.chat.voice_auto_send);
+    crate::voice::configure(config.chat.voice_auto_send, &config.chat.voice_vocabulary);
     crate::attention::set_commands(&config.attention.commands());
     crate::catchup::set_commands(&config.attention.catchup_commands());
     let mut applied = 0usize;

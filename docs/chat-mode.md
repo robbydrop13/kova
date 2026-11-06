@@ -117,26 +117,43 @@ as empty.
 
 ## Dictation
 
-The mic button at the right of the box, or Cmd+Shift+M (`toggle_voice`,
-IPC `dispatch-action` `toggle-voice`), turns dictation on; the button
-again, Esc in the box or the shortcut turn it off. While it listens the
-button is red and pulses. What is said fills the box live (the turn in
-progress replaced as it firms up, finished turns kept); the box can be
-edited meanwhile, an edit stays and what is said next is added after it.
-Enter sends as usual. With `[chat] voice_auto_send = true` in
-`config.toml` (off by default), about 2 s of silence after a finished turn
-sends the box by itself and dictation goes on.
+Voice typing as Claap's desktop app does it (`src/voice.rs` pure and
+tested, `src/voice_io.rs` the native half; how Claap does it:
+`docs/voice-typing.md`). Hold Cmd+Shift+M (`toggle_voice`, IPC
+`dispatch-action` `toggle-voice`) or the mic button and talk, release to
+insert (push-to-talk); a tap under 300 ms keeps listening hands-free until
+the next press or the pill's check. Esc anywhere in Kova cancels, while
+listening or while the text is on its way; a press meanwhile is ignored.
+Listening stops by itself at 120 s and sends.
 
-AssemblyAI streaming (Universal-Streaming v3, `universal-3-6-pro`,
-`language_codes=["fr"]`, 16 kHz mono PCM; `src/voice.rs` pure and tested,
-`src/voice_io.rs` the native half). The key is read from the Keychain at
-each start (`security find-generic-password -s assemblyai-api-key -w`),
-handed to `curl` on stdin to mint a 60 s token
-(`token.assemblyai.com/v1/token`), and dropped: the socket URL carries the
-token, never the key, and nothing writes or logs either. No key: the line
-`Clé AssemblyAI absente du Trousseau` under the box. The microphone is an
-AudioQueue input; the first use shows macOS's prompt with
-`NSMicrophoneUsageDescription` (Info.plist).
+A pill above the box shows the state: green bars following the voice
+(hold), the same with cancel and finish buttons (hands-free), a moving wave
+(transcribing), then a short line on a miss or a fault (`Rien entendu`,
+`Annulé`, `La dictée a échoué`, `Limite de dictée atteinte`,
+`Impossible de joindre AssemblyAI`, `AssemblyAI a refusé la clé`,
+`Micro indisponible`, `Clé AssemblyAI absente du Trousseau`). Sounds:
+Tink at the start, Pop at the end, Basso on a fault (macOS system sounds).
+The clean text goes in at the cursor, spaced from what is around it. The
+clock button lists the last 10 dictations (memory only, for the app's
+life); a click puts one back at the cursor. With `[chat] voice_auto_send =
+true` the box sends as soon as the text is in.
+
+The audio stays in memory and goes in one request to AssemblyAI's dictation
+endpoint (`dictation.eu.assemblyai.com/v1/transcribe/live`, multipart:
+Claap's config, then the raw 16 kHz mono PCM), with the cleanup rules as
+`llm_instruction` (`~/.config/kova/voice-instruction.txt` when it exists,
+where Claap's own rules live on this Mac only since this repo is public,
+else a short generic set in `voice.rs`), `rewrite_mode` `fast`,
+`language_codes` `["fr","en"]` and `[chat] voice_vocabulary` (optional
+list of names and jargon, default empty) as `keyterms_prompt`. The answer's
+`llm_response` goes in, or its verbatim `text` when the cleanup failed.
+429 and gateway errors are retried twice, like Claap's back. The key is
+read from the Keychain at each dictation (`security find-generic-password
+-s assemblyai-api-key -w`) and only ever reaches the request's
+`Authorization` header; nothing writes or logs it. Less than 300 ms of
+audio sends nothing. The microphone is an AudioQueue input; the first use
+shows macOS's prompt with `NSMicrophoneUsageDescription` (Info.plist).
+The chat going out of sight cancels a dictation.
 
 ## Cards
 

@@ -451,8 +451,10 @@ pub struct Update {
     pub restore: Option<String>,
     /// Images just pasted: their chips in the box.
     pub attach: Option<Vec<Attach>>,
-    /// Dictation, when it changed.
-    pub voice: Option<Voice>,
+    /// The voice typing pill, when it changed.
+    pub voice: Option<crate::voice::Pill>,
+    /// Dictated text to insert at the cursor.
+    pub dictated: Option<Dictated>,
     /// The page was just loaded: place the view on the last exchange.
     pub first: bool,
     /// Give the box the keyboard.
@@ -466,13 +468,10 @@ pub struct BannerWire {
     pub text: String,
 }
 
-/// Dictation as the box shows it: listening, its session still open (the
-/// last words may still come), the text heard, and whether a pause sends
-/// the box now.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub struct Voice {
-    pub on: bool,
-    pub live: bool,
+/// A dictation's clean text, and whether the box sends right after
+/// (`[chat] voice_auto_send`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Dictated {
     pub text: String,
     pub send: bool,
 }
@@ -615,11 +614,34 @@ body {{ display: flex; flex-direction: column; }}
 #queued.on {{ display: flex; }}
 #queued .qtext {{ flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }}
 #inrow {{ display: flex; align-items: flex-end; gap: 6px; }}
-#mic {{ flex: none; display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; padding: 0;
+.mic {{ flex: none; display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; padding: 0;
   color: var(--t3); background: var(--bg2); border: 1px solid var(--b2); border-radius: 10px; cursor: pointer; }}
-#mic:hover {{ color: var(--t1); }}
-#mic.on {{ color: #fff; background: var(--err); border-color: var(--err); animation: pulse 1.2s ease-in-out infinite; }}
-@media (prefers-reduced-motion: reduce) {{ #mic.on {{ animation: none; }} }}
+.mic:hover {{ color: var(--t1); }}
+#mic.on {{ color: #fff; background: var(--err); border-color: var(--err); }}
+#hist {{ display: none; }} #hist.on {{ display: flex; }}
+#foot {{ position: relative; }}
+#pill {{ display: none; position: absolute; left: 50%; bottom: calc(100% + 6px); transform: translateX(-50%); z-index: 5;
+  height: 28px; align-items: center; gap: 8px; padding: 0 12px; border-radius: 14px; font-size: 12.5px; white-space: nowrap;
+  color: #fff; background: rgba(24, 24, 27, .94); box-shadow: 0 4px 14px rgba(0, 0, 0, .25); }}
+#pill.hold, #pill.free, #pill.working, #pill.error, #pill.info {{ display: flex; }}
+#pill.error {{ background: var(--err); }}
+#pill .bars {{ display: none; align-items: center; gap: 2px; height: 16px; }}
+#pill.hold .bars, #pill.free .bars, #pill.working .bars {{ display: flex; }}
+#pill .bar {{ width: 3px; height: 16px; border-radius: 2px; background: var(--ok); transform: scaleY(.15); transition: transform .18s ease-out; }}
+#pill.working .bar {{ animation: wave 1s ease-in-out infinite; }}
+@keyframes wave {{ 0%, 100% {{ transform: scaleY(.2); }} 50% {{ transform: scaleY(.8); }} }}
+@media (prefers-reduced-motion: reduce) {{ #pill.working .bar {{ animation: none; transform: scaleY(.5); }} }}
+#pill .pbtn {{ display: none; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 10px; cursor: pointer;
+  color: #fff; background: rgba(255, 255, 255, .16); font-size: 12px; line-height: 20px; }}
+#pill.free .pbtn {{ display: block; }} #pill .pbtn.ok {{ background: var(--ok); }}
+#vhist {{ display: none; position: absolute; right: 18px; bottom: calc(100% + 6px); z-index: 6; width: min(420px, 90%);
+  max-height: 50vh; overflow: auto; padding: 4px; background: var(--bg2); border: 1px solid var(--b2); border-radius: 10px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .2); }}
+#vhist.on {{ display: block; }}
+#vhist .vtitle {{ padding: 4px 8px; font-size: 11.5px; color: var(--t3); }}
+#vhist button {{ display: block; width: 100%; text-align: left; font: inherit; font-size: 13px; color: var(--t1); background: none;
+  border: 0; border-radius: 6px; padding: 5px 8px; cursor: pointer; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }}
+#vhist button:hover {{ background: var(--bg); }}
 #box {{ flex: 1; width: 100%; min-height: 38px; max-height: 40vh; resize: none; font: inherit; color: var(--t1); background: var(--bg2);
   border: 1px solid var(--b2); border-radius: 10px; padding: 8px 12px; outline: none; }}
 #box:focus {{ border-color: var(--accent); }}
@@ -649,7 +671,9 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
 <div id="scroll"><div id="log"><button id="more" data-act="more">Show earlier</button></div></div>
 <div id="cards"></div>
 <div id="foot"><div id="chips"></div><div id="queued"><span>Queued:</span><span class="qtext"></span><span class="qwhy"></span><button class="btn" data-act="cancel">Cancel</button></div>
-<div id="inrow"><textarea id="box" rows="1" placeholder="Message Claude"></textarea><button id="mic" data-act="mic" title="Dictée (⌘⇧M)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button></div><div id="note"></div></div>
+<div id="pill"><span class="bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span><span id="pline"></span><button class="pbtn" data-act="vcancel" title="Annuler">✕</button><button class="pbtn ok" data-act="vfinish" title="Terminer">✓</button></div>
+<div id="vhist"></div>
+<div id="inrow"><textarea id="box" rows="1" placeholder="Message Claude"></textarea><button id="hist" class="mic" data-act="vhist" title="Dictées récentes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button><button id="mic" class="mic" title="Dictée : maintenir ⌘⇧M pour parler, toucher pour continuer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button></div><div id="note"></div></div>
 <script nonce="{nonce}">
 (function () {{
   // Each message carries this load's nonce: Kova drops one from another load.
@@ -658,28 +682,45 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
   const log = $("log"), scroll = $("scroll"), box = $("box"), cardsEl = $("cards");
   const opened = new Set();
   let noteTimer = null;
-  // Dictation: the box's text before it (`vBase`), what of the heard text
-  // the box already took in before the user edited it (`vSkip`), and what
-  // of it the box shows (`vShown`).
-  let vBase = null, vSkip = 0, vShown = "", vLead = 0, listening = false;
-  const spaced = (t) => (t && !/\s$/.test(t) ? t + " " : t);
+  // Voice typing: the pill Kova drives, the clean text inserted at the
+  // cursor, the last dictations to put back.
+  const pill = $("pill"), bars = Array.from(pill.querySelectorAll(".bar"));
+  const shape = [.45, .7, .9, 1, .8, 1, .9, .7, .45];
+  let vHist = [];
   function applyVoice(v) {{
-    listening = !!v.on;
-    $("mic").classList.toggle("on", listening);
-    box.placeholder = listening ? "Parlez, le texte s'écrit ici" : "Message Claude";
-    if (vBase === null) {{
-      if (!v.live) return;
-      vBase = spaced(box.value); vSkip = 0; vShown = "";
-    }}
-    // Edited by hand: the edit stays, only what is said next is added.
-    if (box.value !== vBase + vShown) {{ vSkip += vLead + vShown.length; vBase = spaced(box.value); }}
-    const raw = v.text.slice(vSkip);
-    vShown = vBase ? raw.trimStart() : raw;
-    vLead = raw.length - vShown.length;
-    box.value = vBase + vShown; grow();
-    if (v.send) {{ send(); vBase = ""; vSkip = 0; vShown = ""; vLead = 0; }}
-    if (!v.live) vBase = null;
+    pill.className = v.state;
+    const on = v.state === "hold" || v.state === "free";
+    $("mic").classList.toggle("on", on);
+    $("pline").textContent = v.line;
+    bars.forEach((b, i) => {{ b.style.transform = on ? "scaleY(" + Math.max(.15, shape[i] * v.level / 10) + ")" : ""; }});
+    vHist = v.history;
+    $("hist").classList.toggle("on", vHist.length > 0);
+    if ($("vhist").classList.contains("on")) histList();
   }}
+  function insertAt(text) {{
+    const s = box.selectionStart, e = box.selectionEnd;
+    const before = box.value.slice(0, s), after = box.value.slice(e);
+    const lead = before && !/\s$/.test(before) ? " " : "";
+    const tail = after && !/^\s/.test(after) ? " " : "";
+    box.setRangeText(lead + text + tail, s, e, "end");
+    box.focus(); grow();
+  }}
+  function histList() {{
+    const el = $("vhist");
+    el.textContent = "";
+    const title = document.createElement("div");
+    title.className = "vtitle"; title.textContent = "Dictées récentes";
+    el.appendChild(title);
+    vHist.forEach((t) => {{
+      const b = document.createElement("button");
+      b.textContent = t; b.title = t;
+      b.addEventListener("click", () => {{ el.classList.remove("on"); insertAt(t); }});
+      el.appendChild(b);
+    }});
+  }}
+  // Hold the button to talk, tap it to keep listening: Kova tells them apart.
+  $("mic").addEventListener("pointerdown", (e) => {{ e.preventDefault(); post({{ type: "voice-press" }}); }});
+  $("mic").addEventListener("pointerup", () => post({{ type: "voice-release" }}));
   // Images pasted into the box, sent with the next message: their paths.
   let images = [];
   function chips() {{
@@ -753,6 +794,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     if (m.queued) {{ q.querySelector(".qtext").textContent = m.queued.text; q.querySelector(".qwhy").textContent = m.queued.reason; }}
     if (m.attach) {{ images.push(...m.attach); chips(); }}
     if (m.voice) applyVoice(m.voice);
+    if (m.dictated) {{ insertAt(m.dictated.text); if (m.dictated.send) send(); }}
     if (m.restore) {{ box.value = box.value ? box.value + "\n" + m.restore : m.restore; grow(); }}
     if (m.note) {{
       $("note").textContent = m.note;
@@ -777,17 +819,14 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     if (!text.trim() && !images.length) return;
     const paths = images.map((im) => im.path);
     box.value = ""; grow(); images = []; chips();
-    // Kova starts the heard text again from here.
-    if (vBase !== null) {{ vBase = ""; vSkip = 0; vShown = ""; vLead = 0; }}
     post({{ type: "send", text, images: paths }});
   }}
   box.addEventListener("keydown", (e) => {{
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {{
       e.preventDefault();
       send();
-    }} else if (e.key === "Escape" && listening) {{
-      e.preventDefault();
-      post({{ type: "voice-stop" }});
+    }} else if (e.key === "Escape" && $("vhist").classList.contains("on")) {{
+      $("vhist").classList.remove("on");
     }}
   }});
   // An image on the pasteboard (Cmd+V): Kova writes it to a file, the box
@@ -800,6 +839,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     }}
   }});
   document.addEventListener("click", (e) => {{
+    if (!e.target.closest("#vhist, #hist")) $("vhist").classList.remove("on");
     const a = e.target.closest("a");
     if (a) {{
       // Every link opens in Kova's side panel, never in this page.
@@ -830,9 +870,10 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
       post({{ type: "permission", id: card.dataset.id, choice: b.dataset.choice }});
     }} else if (act === "open" && card) {{
       post({{ type: "open", id: card.dataset.id }});
-    }} else if (act === "mic") {{
-      post({{ type: "voice" }});
-      box.focus();
+    }} else if (act === "vcancel" || act === "vfinish") {{
+      post({{ type: act === "vcancel" ? "voice-cancel" : "voice-finish" }});
+    }} else if (act === "vhist") {{
+      if ($("vhist").classList.toggle("on")) histList();
     }} else if (act === "more" || act === "cancel" || act === "terminal") {{
       post({{ type: act }});
     }}
