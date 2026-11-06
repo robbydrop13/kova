@@ -448,7 +448,8 @@ impl Verb {
 pub enum Outcome {
     /// The command runs: the buttons wait.
     Running,
-    /// `Send` went through: the row says so instead of offering it again.
+    /// `Valider` or a correction went through: the card says so instead of
+    /// offering it again.
     Sent,
     /// The entry was closed: hidden until the next read drops it.
     Closed,

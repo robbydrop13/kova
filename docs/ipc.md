@@ -563,7 +563,7 @@ Errors:
   client), or never asked here;
 - `"action" must be one of: OK, KO`: `action` is not one of that question's
   `buttons` (case matters). Exception: `"Other"` with a non-empty `text` is
-  accepted on any question (the Brief: a free instruction);
+  accepted on any question (a free instruction);
 - `"Other"` without text is refused. `text` is accepted on any button, whatever
   `input`, up to 8 KiB.
 

@@ -144,11 +144,14 @@ impl KovaView {
         self.mark_dirty();
     }
 
-    /// Open the page, or leave it open.
+    /// Open the page on a need, or leave it open: back to `Tout`, so a
+    /// Claap or Perso filter cannot hide the card the click was for.
     pub(super) fn open_cockpit(&self) {
         if !self.ivars().cockpit.open.get() {
             self.toggle_cockpit();
         }
+        self.ivars().cockpit.filter.set(Filter::All);
+        self.mark_dirty();
     }
 
     pub(super) fn close_cockpit(&self) {

@@ -769,8 +769,8 @@ Before that order, `Cmd+J` walks what waits on the user
 then permission prompts and open questions merged by age, with a pane's own
 prompt and open question collapsed into one item. The app timer builds that
 list once per tick (`KovaView::refresh_needs_shared`) and every window reads
-the same one, as do the Cockpit entry's count (`waits_on_you`: permissions and asks
-only, never errors or failed runs) and the Scheduled badge. A failed routine
+the same one, as do the Cockpit entry's count (`waits_on_you`: permissions, asks and
+`now` attention entries, never errors or failed runs) and the Scheduled badge. A failed routine
 has no pane to land on, so it switches the sidebar to Scheduled once, and
 the next press falls through to the unread order above. `needs::NeedWalk`,
 shared by the windows, lands on each need pane once per walk and then hands
