@@ -71,6 +71,8 @@ pub struct Tool {
     /// `+12 -3` for an edit.
     pub detail: Option<String>,
     pub result: Option<ToolResult>,
+    /// The plan an `ExitPlanMode` call asks the user to approve.
+    pub plan: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -297,6 +299,17 @@ impl Conversation {
         })
     }
 
+    /// The plan of an `ExitPlanMode` call still waiting for its approval:
+    /// the menu on screen does not show it.
+    pub fn pending_plan(&self) -> Option<&str> {
+        let last = self.items.iter().rev().find(|i| matches!(i, Item::User { .. } | Item::Assistant { .. }));
+        let Some(Item::Assistant { blocks, .. }) = last else { return None };
+        match &blocks.iter().max_by_key(|b| b.key)?.kind {
+            BlockKind::Tool(t) if t.result.is_none() => t.plan.as_deref().filter(|p| !p.is_empty()),
+            _ => None,
+        }
+    }
+
     /// When the user last wrote, epoch seconds.
     pub fn last_user_ts(&self) -> Option<u64> {
         self.items.iter().rev().find_map(|i| match i {
@@ -331,6 +344,7 @@ fn assistant_block(raw: &Value) -> Option<BlockKind> {
             let name = raw.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
             let input = raw.get("input").unwrap_or(&Value::Null);
             let (verb, target, detail) = describe_tool(&name, input);
+            let plan = (name == "ExitPlanMode").then(|| input.get("plan").and_then(Value::as_str).unwrap_or_default().trim().to_string());
             Some(BlockKind::Tool(Tool {
                 id: raw.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
                 name,
@@ -338,6 +352,7 @@ fn assistant_block(raw: &Value) -> Option<BlockKind> {
                 target,
                 detail,
                 result: None,
+                plan,
             }))
         }
         // An unknown block type is ignored, never an error.
@@ -577,6 +592,15 @@ mod tests {
                 BlockKind::Tool(t) => format!("{} {}", t.verb, t.target),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_plan_waiting_for_approval_keeps_its_text() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/transcripts/plan_pending.jsonl");
+        let c = conv(FIXTURE.lines().map(|l| serde_json::from_str(l).unwrap()).collect());
+        assert!(c.question_pending());
+        let plan = c.pending_plan().expect("the plan");
+        assert!(plan.starts_with("1. Create /private/tmp/kova-fixture/") && plan.ends_with("content \"ok\"."), "{plan}");
     }
 
     /// Real transcript lines (Claude Code 2.1.319, texts made generic) fed
