@@ -550,6 +550,7 @@ impl KovaView {
         }
         if let Err(why) = crate::attention::perform_with(id, Verb::Instruct, Some(text)) {
             log::warn!("cockpit: {why}");
+            crate::attention::instruction_refused(id, text, "Kova n'a pas pu la transmettre");
         }
         self.mark_dirty();
     }

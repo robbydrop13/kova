@@ -291,6 +291,7 @@ pub fn set_commands(config: &Commands) {
     // still running under it is stale once `CHANGED` moved.
     *CACHE.write() = None;
     *OUTCOMES.lock() = None;
+    *INSTRUCTIONS.lock() = None;
     CHANGED.fetch_add(1, Ordering::Relaxed);
     FILLED_AT.store(0, Ordering::Relaxed);
 }
@@ -496,6 +497,16 @@ pub fn instructions() -> HashMap<String, Instructed> {
     INSTRUCTIONS.lock().get_or_insert_with(HashMap::new).clone()
 }
 
+/// An instruction refused before it ran (an entry gone, no command): the
+/// card says so with its text, since the page already cleared the field. One
+/// still running is left alone.
+pub fn instruction_refused(id: &str, text: &str, words: &str) {
+    if instructions().get(id).is_some_and(|i| i.outcome == Outcome::Running) {
+        return;
+    }
+    set_instructed(id, &clean_text(text), Outcome::Failed { words: words.to_string(), until_ms: 0 });
+}
+
 fn set_instructed(id: &str, text: &str, outcome: Outcome) {
     INSTRUCTIONS
         .lock()
@@ -594,6 +605,8 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
                 Ok(()) => Outcome::Sent,
                 Err(words) => {
                     log::warn!("attention instruct {id}: {words}");
+                    // Kept until the next instruction, not timed out: the
+                    // field was cleared, the card keeps what did not go.
                     Outcome::Failed { words, until_ms: 0 }
                 }
             };
