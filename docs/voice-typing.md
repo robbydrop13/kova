@@ -49,9 +49,13 @@ CLA-10118, PRs #13752, #13753, #13770 merged, not in prod), and
 
 ## Kova
 
-Same provider, endpoint, config and limits, called directly
+Same provider and config, called directly
 with the user's own AssemblyAI key (Keychain `assemblyai-api-key`); no Claap
-account, no ceiling, no gating. Vocabulary from `[chat] voice_vocabulary`,
+account, no ceiling, no gating. The recorded-audio endpoint
+`https://dictation.eu.assemblyai.com/v1/transcribe` instead of `/live`: same
+request and answer, 20 minutes of audio instead of 120 s, as fast on a short
+clip (0.8 to 1 s for 8 s of audio on both, 3.4 s for 2.5 min, 7.2 s for
+5.8 min, measured 06/11/2026), so listening stops at 20 minutes. Vocabulary from `[chat] voice_vocabulary`,
 no glossary misspelling pass. Claap's cleanup rules are read from
 `~/.config/kova/voice-instruction.txt`, kept out of this public repo; without
 the file a short generic set applies. Languages fixed to French and English.

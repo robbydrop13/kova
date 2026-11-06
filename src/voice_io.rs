@@ -226,7 +226,7 @@ impl Drop for KeyWatch {
 /// What the dictation thread reports.
 #[derive(Debug)]
 enum Note {
-    /// 120 s reached: listening stopped, the audio is on its way.
+    /// 20 min reached: listening stopped, the audio is on its way.
     Full,
     Heard(Heard),
     Failed(Failure),
@@ -408,7 +408,8 @@ fn post(key: &str, boundary: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
     let kind = format!("multipart/form-data; boundary={boundary}");
     request.setValue_forHTTPHeaderField(Some(&NSString::from_str(&kind)), &NSString::from_str("Content-Type"));
     request.setHTTPBody(Some(&NSData::with_bytes(body)));
-    request.setTimeoutInterval(25.0);
+    let wait = voice::request_timeout_secs(body.len());
+    request.setTimeoutInterval(wait as f64 - 5.0);
     let session = NSURLSession::sessionWithConfiguration(&NSURLSessionConfiguration::ephemeralSessionConfiguration());
     let (tx, rx) = mpsc::channel::<Option<(u16, Vec<u8>)>>();
     let done = block2::RcBlock::new(move |data: *mut NSData, response: *mut NSURLResponse, error: *mut NSError| {
@@ -423,7 +424,7 @@ fn post(key: &str, boundary: &str, body: &[u8]) -> Option<(u16, Vec<u8>)> {
     });
     let task = unsafe { session.dataTaskWithRequest_completionHandler(&request, &done) };
     task.resume();
-    let answer = rx.recv_timeout(Duration::from_secs(30)).ok().flatten();
+    let answer = rx.recv_timeout(Duration::from_secs(wait)).ok().flatten();
     session.finishTasksAndInvalidate();
     answer
 }

@@ -143,7 +143,7 @@ tested, `src/voice_io.rs` the native half; how Claap does it:
 insert (push-to-talk); a tap under 300 ms keeps listening hands-free until
 the next press or the pill's check. Esc anywhere in Kova cancels, while
 listening or while the text is on its way; a press meanwhile is ignored.
-Listening stops by itself at 120 s and sends.
+Listening stops by itself at 20 minutes and sends.
 
 A pill above the box shows the state: green bars following the voice
 (hold), the same with cancel and finish buttons (hands-free), a moving wave
@@ -158,7 +158,7 @@ life); a click puts one back at the cursor. With `[chat] voice_auto_send =
 true` the box sends as soon as the text is in.
 
 The audio stays in memory and goes in one request to AssemblyAI's dictation
-endpoint (`dictation.eu.assemblyai.com/v1/transcribe/live`, multipart:
+endpoint (`dictation.eu.assemblyai.com/v1/transcribe`, the recorded-audio endpoint, 20 minutes at most, multipart:
 Claap's config, then the raw 16 kHz mono PCM), with the cleanup rules as
 `llm_instruction` (`~/.config/kova/voice-instruction.txt` when it exists,
 where Claap's own rules live on this Mac only since this repo is public,
@@ -166,7 +166,8 @@ else a short generic set in `voice.rs`), `rewrite_mode` `fast`,
 `language_codes` `["fr","en"]` and `[chat] voice_vocabulary` (optional
 list of names and jargon, default empty) as `keyterms_prompt`. The answer's
 `llm_response` goes in, or its verbatim `text` when the cleanup failed.
-429 and gateway errors are retried twice, like Claap's back. The key is
+429 and gateway errors are retried twice, like Claap's back. The wait for
+the answer grows with the audio: 30 s, plus 10 s per minute. The key is
 read from the Keychain at each dictation (`security find-generic-password
 -s assemblyai-api-key -w`) and only ever reaches the request's
 `Authorization` header; nothing writes or logs it. Less than 300 ms of

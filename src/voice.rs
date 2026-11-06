@@ -21,9 +21,11 @@ use serde_json::{json, Value};
 pub const KEYCHAIN_SERVICE: &str = "assemblyai-api-key";
 /// The line the chat shows when there is none.
 pub const MISSING_KEY: &str = "Clé AssemblyAI absente du Trousseau";
-/// Claap's provider and host (packages/back, `assemblyAiDictation.ts`): one
-/// buffered request per dictation, EU data residency.
-pub const DICTATION_URL: &str = "https://dictation.eu.assemblyai.com/v1/transcribe/live";
+/// Claap's provider and host (packages/back, `assemblyAiDictation.ts`), EU
+/// data residency, one buffered request per dictation. The recorded-audio
+/// endpoint, not Claap's `/live` one: same request and answer, 20 min instead
+/// of 120 s, as fast on short clips (measured 06/11/2026).
+pub const DICTATION_URL: &str = "https://dictation.eu.assemblyai.com/v1/transcribe";
 /// Claap's choice: the faster of the provider's two cleanup modes.
 const REWRITE_MODE: &str = "fast";
 /// The languages steered to. Claap's desktop sends the account's (up to 3).
@@ -31,8 +33,8 @@ pub const LANGUAGES: &[&str] = &["fr", "en"];
 pub const SAMPLE_RATE: u32 = 16_000;
 /// 16 kHz mono int16: 32 bytes per millisecond.
 pub const BYTES_PER_MS: usize = 32;
-/// The provider takes 120 s at most: listening stops there and sends.
-pub const MAX_AUDIO_MS: usize = 120_000;
+/// The provider takes 20 min at most: listening stops there and sends.
+pub const MAX_AUDIO_MS: usize = 1_200_000;
 /// Less audio than this is a slip, not a dictation: nothing is sent.
 pub const MIN_AUDIO_MS: usize = 300;
 /// A press held this long is push-to-talk; shorter, a tap, it keeps listening.
@@ -171,6 +173,13 @@ pub fn parse_result(body: &str) -> Option<Heard> {
     Some(Heard { text: cleaned.unwrap_or_else(|| raw.clone()), raw, cleanup_failed })
 }
 
+/// How long to wait for the answer: the upload (32 KB a second of audio)
+/// and the provider's work (measured about 2 s a minute) grow with the audio.
+/// 30 s, plus 10 s per minute of audio.
+pub fn request_timeout_secs(audio_len: usize) -> u64 {
+    30 + (audio_len / BYTES_PER_MS / 6_000) as u64
+}
+
 /// Statuses worth another try, as Claap's back retries them.
 pub fn retriable(status: u16) -> bool {
     matches!(status, 429 | 502 | 503 | 504)
@@ -286,7 +295,7 @@ impl Keys {
         }
     }
 
-    /// Stop listening and send (the pill's check, the 120 s cap).
+    /// Stop listening and send (the pill's check, the 20 min cap).
     pub fn finish(&mut self) -> Command {
         match self.phase {
             Phase::Listening { .. } => {
@@ -458,6 +467,13 @@ mod tests {
     }
 
     #[test]
+    fn the_wait_grows_with_the_audio() {
+        assert_eq!(request_timeout_secs(0), 30);
+        assert_eq!(request_timeout_secs(60_000 * BYTES_PER_MS), 40);
+        assert_eq!(request_timeout_secs(MAX_AUDIO_MS * BYTES_PER_MS), 230);
+    }
+
+    #[test]
     fn statuses_map_to_the_pills_lines() {
         assert_eq!(Failure::from_status(401).line(), "AssemblyAI a refusé la clé");
         assert_eq!(Failure::from_status(429), Failure::Limit);
@@ -520,7 +536,7 @@ mod tests {
         assert_eq!(k.phase, Phase::Working);
         assert_eq!(k.cancel(), Command::Cancel);
         assert_eq!(k.release(600), Command::Nothing);
-        // The pill's check, or the 120 s cap, sends hands-free listening.
+        // The pill's check, or the 20 min cap, sends hands-free listening.
         k.press(1_000);
         k.release(1_050);
         assert_eq!(k.finish(), Command::Finish);
