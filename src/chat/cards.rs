@@ -7,6 +7,7 @@
 use serde::Serialize;
 
 use crate::ask::{Question, OTHER};
+use crate::cockpit;
 use crate::prompt_preview::{ParsedPrompt, PermissionChoice};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -116,6 +117,58 @@ pub fn question_card(q: &Question, handoff_detail: Option<String>) -> Card {
         hint: None,
         buttons,
     }
+}
+
+/// An ask's card on the Cockpit's markup (`cockpit::card_html_with`): its
+/// first line as the title, what it wants, who asked and when, the rest of
+/// the message and its answers opened under it, and the Cockpit's three
+/// icons (snooze, remove, done). `linked` is the attention entry standing
+/// for a decision sheet, as the Cockpit's opened card (detail and last
+/// instruction filled by the caller): the chat shows that card, with its
+/// instruction field, keyed by the ask.
+pub fn ask_card_html(q: &Question, handoff_detail: Option<&str>, linked: Option<&cockpit::Item>, scope: crate::attention::Scope, now: u64) -> String {
+    let icons = [cockpit::Button::Snooze, cockpit::Button::Dismiss, cockpit::Button::Done];
+    let sheet = if q.panel_link().is_some() { vec![cockpit::Button::OpenSheet] } else { Vec::new() };
+    if let Some(entry) = linked.filter(|_| q.is_decision()) {
+        let item = cockpit::Item { key: q.id.clone(), ask: Some(q.id.clone()), ..entry.clone() };
+        return cockpit::card_html_with(&item, &sheet, &icons, true, now);
+    }
+    let (title, rest) = q.message.trim().split_once('\n').unwrap_or((q.message.trim(), ""));
+    let mut message = rest.trim().to_string();
+    if let Some(d) = handoff_detail.filter(|d| !d.trim().is_empty()) {
+        message = if message.is_empty() { d.to_string() } else { format!("{message}\n{d}") };
+    }
+    let card = question_card(q, None);
+    let (kind, needs) = match card.kind {
+        CardKind::Decision => (cockpit::Kind::Sheet, "Répondre à la fiche"),
+        CardKind::Handoff => (cockpit::Kind::Ask, "Une étape à faire de ton côté"),
+        _ => (cockpit::Kind::Ask, "Répondre à la question"),
+    };
+    let answers: Vec<(String, bool)> = card
+        .buttons
+        .iter()
+        .filter(|b| matches!(b.act, Act::Answer { .. }))
+        .map(|b| (b.label.clone(), b.needs_text))
+        .collect();
+    let detail = (!message.is_empty() || !answers.is_empty() || card.input)
+        .then(|| cockpit::Detail::Ask { message, answers, input: card.input });
+    let item = cockpit::Item {
+        key: q.id.clone(),
+        kind,
+        prio: 2,
+        since: q.asked_at,
+        title: title.to_string(),
+        needs: needs.to_string(),
+        from: q.from.name.clone(),
+        scope,
+        draft: None,
+        openable: false,
+        ask: None,
+        detail,
+        state: cockpit::State::Idle,
+        instruction: None,
+    };
+    cockpit::card_html_with(&item, &sheet, &icons, true, now)
 }
 
 /// The id of a prompt's card: it changes with the prompt, so a click made
@@ -240,6 +293,50 @@ mod tests {
         assert_eq!(card.buttons.iter().map(|b| b.label.as_str()).collect::<Vec<_>>(), ["Ouvrir", "Fait"]);
         assert!(!card.input);
         assert_eq!(card.detail.as_deref(), Some("https://example.com/login"));
+    }
+
+    #[test]
+    fn an_ask_is_a_cockpit_card_with_its_icons_in_french() {
+        let mut d = question("430b8a55-1", Some(4), None);
+        d.kind = Some(crate::ask::KIND_DECISION.into());
+        d.url = Some("https://claude.ai/artifact/x".into());
+        d.message = "Plan : 2 décisions\n\u{2022} Quand ?\n\u{2022} <Qui> ?".into();
+        d.asked_at = 40;
+        let html = ask_card_html(&d, None, None, crate::attention::Scope::Pro, 100);
+        assert!(html.starts_with("<article class=\"card open\" data-key=\"430b8a55-1\">"), "{html}");
+        assert!(html.contains("<div class=\"t\">Plan : 2 décisions</div>"));
+        assert!(html.contains("Répondre à la fiche") && html.contains("kova \u{b7} il y a 1 min"), "{html}");
+        assert!(html.contains("data-act=\"snooze\"") && html.contains("data-act=\"dismiss\"") && html.contains("data-act=\"done\""));
+        assert!(html.contains("data-act=\"open\"") && html.contains("Ouvrir la fiche"));
+        assert!(html.contains("&lt;Qui&gt;") && !html.contains("<Qui>"), "escaped");
+        assert!(!html.contains("cfrom") && !html.contains("class=\"ins\""), "no asker label, no instruction without an entry");
+
+        // A plain question: its answers and its field, opened.
+        let html = ask_card_html(&question("a", Some(4), None), None, None, crate::attention::Scope::Pro, 100);
+        assert!(html.contains("data-act=\"answer\" data-arg=\"No\"") && html.contains("data-arg=\"Other\" data-text=\"1\""));
+        assert!(html.contains("textarea class=\"ans\"") && html.contains("Répondre à la question"));
+
+        // A sheet an attention entry stands for: the Cockpit's opened card, with
+        // its instruction field, keyed by the ask.
+        let entry = crate::cockpit::Item {
+            key: "attention:a-1".into(),
+            kind: crate::cockpit::Kind::Attention,
+            prio: 2,
+            since: 40,
+            title: "Harnais commun".into(),
+            needs: "Trancher".into(),
+            from: "claap-agent".into(),
+            scope: crate::attention::Scope::Pro,
+            draft: None,
+            openable: false,
+            ask: None,
+            detail: Some(crate::cockpit::Detail::Entry { needs: String::new(), body: "Le fond".into(), detail: String::new(), src: Vec::new(), links: Vec::new(), explaining: false }),
+            state: crate::cockpit::State::Idle,
+            instruction: None,
+        };
+        let html = ask_card_html(&d, None, Some(&entry), crate::attention::Scope::Pro, 100);
+        assert!(html.contains("data-key=\"430b8a55-1\"") && html.contains("Harnais commun") && html.contains("Le fond"), "{html}");
+        assert!(html.contains("<div class=\"lbl\">Consigne</div>") && html.contains("Ouvrir la fiche") && html.contains("data-act=\"dismiss\""));
     }
 
     #[test]

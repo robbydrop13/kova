@@ -308,6 +308,13 @@ pub fn link_asks(items: &mut Vec<Item>, actions: &[(String, String)], asks: &[St
     items.retain(|i| !(matches!(i.kind, Kind::Sheet | Kind::Ask) && linked.contains(&i.key)));
 }
 
+/// The attention entry that stands for the waiting ask `ask_id` (its action
+/// names it, `ask_ref`, possibly by a prefix): the card the Cockpit shows
+/// for that ask, which the chat shows too.
+pub fn entry_for_ask<'a>(entries: &'a [Entry], ask_id: &str) -> Option<&'a Entry> {
+    entries.iter().find(|e| e.action.as_deref().and_then(ask_ref).is_some_and(|r| ask_id.starts_with(r)))
+}
+
 /// A live need as an item. `sheet` says an ask is a decision sheet. An
 /// attention need is left out: the queue's own entry stands for it. Live
 /// needs carry no scope: they count as work.
@@ -636,8 +643,13 @@ fn state_html(state: &State) -> String {
 
 /// One card.
 pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, now: u64) -> String {
+    card_html_with(item, &buttons(item, can_act), &icons(item, can_close, can_snooze), can_act, now)
+}
+
+/// One card with the buttons and icons given: the chat's ask cards pick
+/// their own (`chat::cards::ask_card_html`) on the Cockpit's markup.
+pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_act: bool, now: u64) -> String {
     let running = item.state == State::Running;
-    let list = buttons(item, can_act);
     let last = list.len().saturating_sub(1);
     let acts: String = list
         .iter()
@@ -650,7 +662,7 @@ pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, 
         })
         .collect();
     let acts = format!("<div class=\"acts\">{acts}</div>");
-    let icons = icons_html(&icons(item, can_close, can_snooze), running);
+    let icons = icons_html(icon_list, running);
     let mut detail = item.detail.as_ref().map(|d| detail_html(d, running)).unwrap_or_default();
     // An opened attention card takes an instruction, action or not, under
     // the draft's actions when it has a draft.
@@ -942,7 +954,7 @@ fn hex(c: [f32; 4]) -> String {
 }
 
 /// The design system's colours as CSS variables, light or dark.
-fn vars(light: bool) -> String {
+pub fn vars(light: bool) -> String {
     use crate::window::ds_tokens as ds;
     macro_rules! set {
         ($m:ident, $t:ident) => {
@@ -996,47 +1008,24 @@ pub fn chat_frame(page: (f64, f64, f64, f64), top: f64) -> (f64, f64, f64, f64) 
 
 pub fn shell(light: bool, nonce: &str) -> String {
     PAGE.replace("{scheme}", if light { "light" } else { "dark" })
+        .replace("{card_css}", CARD_CSS)
+        .replace("{snooze_html}", SNOOZE_HTML)
+        .replace("{snooze_js}", SNOOZE_JS)
         .replace("{vars}", &vars(light))
         .replace("{nonce}", nonce)
         .replace("{handler}", HANDLER)
 }
 
-const PAGE: &str = r#"<!doctype html><html lang="fr"><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'">
-<title>Cockpit</title>
-<style>
-:root{color-scheme:{scheme};{vars}}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:var(--bg0)}
-body{font-family:Inter,"SF Pro Text",-apple-system,system-ui,sans-serif;color:var(--t1);-webkit-font-smoothing:antialiased;display:flex;overflow:hidden}
-svg.i{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+/// The card's look, shared by the Cockpit and the chat's ask cards: the
+/// design system's variables (`vars`) must be in scope where it applies.
+pub const CARD_CSS: &str = r#"svg.i{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
 button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 button:disabled{opacity:.5;cursor:default}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.page{flex:1;min-width:0;overflow-y:auto}
-.inner{max-width:880px;margin:0 auto;padding:26px 24px 40px}
-body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
-.phead{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
-.ptitle{font-size:28px;line-height:34px;font-weight:600;letter-spacing:-.2px}
-.psub{font-size:13px;color:var(--t3);margin-top:4px}
-.psub b{color:var(--crit);font-weight:500}
 .btn{height:28px;border-radius:6px;padding:0 12px;font-size:13px;font-weight:500;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;color:var(--t1)}
 .btn.acc{background:var(--accent);color:#fff}
 .btn.acc:hover:not(:disabled){background:var(--accent-hover)}
 .btn.sec{background:var(--btn2)}
 .btn.sec:hover:not(:disabled){background:var(--btn2-hover)}
-.btn.on{background:var(--sel-bg);color:var(--sel-text)}
-.bar{display:flex;align-items:center;justify-content:space-between;margin:16px 0 4px}
-.seg{display:inline-flex;background:var(--bg2);border-radius:8px;padding:2px;gap:2px}
-.seg button{height:26px;padding:0 14px;border-radius:6px;font-size:12px;font-weight:500;color:var(--t3);display:flex;align-items:center;gap:6px}
-.seg button.on{background:var(--hover);color:var(--t1)}
-.seg .c{font-size:11px;color:var(--t3);font-weight:400}
-.sortlbl{font-size:12px;color:var(--t3);display:flex;align-items:center;gap:5px}
-.sec-h{display:flex;align-items:center;gap:8px;height:24px;margin:12px 0 6px;font-size:12px;font-weight:600;color:var(--t2)}
-.sec-h .d{width:8px;height:8px;border-radius:50%}
-.d.crit{background:var(--crit-dot)}.d.warn{background:var(--warn-dot)}.d.gray{background:var(--tag-gray)}
-.sec-h .k{color:var(--t3);font-weight:400}
-.empty{color:var(--t3);font-size:13px;margin-top:24px}
 .card{background:var(--bg1);border:1px solid var(--b3);border-radius:8px;padding:10px 14px 10px 16px;margin-bottom:6px}
 .card.urgent{border-color:color-mix(in srgb,var(--crit-dot) 45%,transparent)}
 .card .row{display:flex;align-items:center;gap:16px}
@@ -1051,20 +1040,11 @@ body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
 .tag i{width:6px;height:6px;border-radius:50%;display:block;background:var(--tag-blue)}
 .tag i.perso{background:var(--tag-green)}
 .acts{display:flex;gap:6px;flex:none}
-.draft{margin-top:10px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px}
-.draft:focus-within{border-color:var(--accent)}
-.draft .hd{display:flex;align-items:center;gap:14px;padding:8px 12px;border-bottom:1px solid var(--b3);font-size:12px;color:var(--t3);flex-wrap:wrap}
-.draft .hd b{font-weight:500;color:var(--t1)}
-.draft .hd .edit{margin-left:auto;display:flex;align-items:center;gap:5px}
-textarea.bd{display:block;width:100%;resize:none;border:0;outline:0;background:transparent;color:var(--t1);font:inherit;font-size:13px;line-height:19px;padding:8px 12px;overflow:hidden;min-height:35px}
-.draft-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}
-.draft-foot .src{margin:0}
 .state{font-size:12px;color:var(--t3);margin-top:6px}
 .detail{margin-top:10px;border-top:1px solid var(--b3);padding-top:10px;font-size:13px;line-height:19px}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}
 .kv dt{color:var(--t3)}.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}.kv dd.crit{color:var(--crit)}
 pre.scroll{margin-top:8px;max-height:240px;overflow:auto;background:var(--bg-input);border:1px solid var(--b3);border-radius:6px;padding:8px 12px;font:12px/17px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
-.fold{margin-top:8px}.fold summary{cursor:pointer;color:var(--t2);font-size:12px}
 .dacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .link{color:var(--accent);font-size:13px;font-weight:500;padding:0}
 .link:hover{text-decoration:underline}
@@ -1086,13 +1066,75 @@ textarea.ins:focus{border-color:var(--accent);outline:0}
 .srcs{margin:4px 0 0 18px;font-size:12px;color:var(--t2);overflow-wrap:anywhere}
 .links{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:10px}
 .links .link{text-align:left;overflow-wrap:anywhere}
-.more{margin:8px 0 0}
 .snz{position:fixed;z-index:10;background:var(--bg-elev);border:1px solid var(--b2);border-radius:8px;padding:4px;min-width:180px;box-shadow:0 8px 24px rgba(0,0,0,.25);display:flex;flex-direction:column}
 .snz[hidden]{display:none}
 .snz button{height:28px;padding:0 10px;border-radius:6px;text-align:left;font-size:13px}
 .snz button:hover{background:var(--hover)}
 .snz .pick{display:flex;gap:6px;padding:4px}
-.snz input{flex:1;min-width:0;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:12px;padding:3px 6px}
+.snz input{flex:1;min-width:0;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:12px;padding:3px 6px}"#;
+
+/// The snooze menu of a card's clock icon, shared with the chat: fixed, so
+/// it sits outside the list and a push never closes it.
+pub const SNOOZE_HTML: &str = r#"<div class="snz" id="snz" hidden><button type="button" data-when="hour">Dans 1 h</button><button type="button" data-when="evening">Ce soir</button><button type="button" data-when="morning">Demain matin</button><button type="button" data-when="monday">Lundi prochain</button><button type="button" data-when="pick">Choisir…</button><div class="pick" id="snzPick" hidden><input type="datetime-local" id="snzAt"><button type="button" class="btn acc" data-when="at"><span>OK</span></button></div></div>"#;
+
+/// The menu's dates: `when(word)` and `iso(date)`, the text a snooze posts
+/// (`--until=<ISO 8601>`). Needs `$` (getElementById) in scope.
+pub const SNOOZE_JS: &str = r#"function pad(n) { return String(n).padStart(2, '0'); }
+function iso(d) {
+  const off = -d.getTimezoneOffset(), a = Math.abs(off);
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' +
+    pad(d.getMinutes()) + ':00' + (off < 0 ? '-' : '+') + pad(Math.floor(a / 60)) + ':' + pad(a % 60);
+}
+function when(word) {
+  const d = new Date();
+  if (word === 'hour') return new Date(d.getTime() + 3600e3);
+  const at = (days, h) => { const x = new Date(d); x.setDate(x.getDate() + days); x.setHours(h, 0, 0, 0); return x; };
+  if (word === 'evening') return d.getHours() < 19 ? at(0, 19) : at(1, 19);
+  if (word === 'morning') return at(1, 9);
+  if (word === 'monday') return at(((8 - d.getDay()) % 7) || 7, 9);
+  if (word === 'at') { const v = $('snzAt').value; return v ? new Date(v) : null; }
+  return null;
+}"#;
+
+const PAGE: &str = r#"<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'">
+<title>Cockpit</title>
+<style>
+:root{color-scheme:{scheme};{vars}}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg0)}
+body{font-family:Inter,"SF Pro Text",-apple-system,system-ui,sans-serif;color:var(--t1);-webkit-font-smoothing:antialiased;display:flex;overflow:hidden}
+{card_css}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.page{flex:1;min-width:0;overflow-y:auto}
+.inner{max-width:880px;margin:0 auto;padding:26px 24px 40px}
+body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
+.phead{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.ptitle{font-size:28px;line-height:34px;font-weight:600;letter-spacing:-.2px}
+.psub{font-size:13px;color:var(--t3);margin-top:4px}
+.psub b{color:var(--crit);font-weight:500}
+.btn.on{background:var(--sel-bg);color:var(--sel-text)}
+.bar{display:flex;align-items:center;justify-content:space-between;margin:16px 0 4px}
+.seg{display:inline-flex;background:var(--bg2);border-radius:8px;padding:2px;gap:2px}
+.seg button{height:26px;padding:0 14px;border-radius:6px;font-size:12px;font-weight:500;color:var(--t3);display:flex;align-items:center;gap:6px}
+.seg button.on{background:var(--hover);color:var(--t1)}
+.seg .c{font-size:11px;color:var(--t3);font-weight:400}
+.sortlbl{font-size:12px;color:var(--t3);display:flex;align-items:center;gap:5px}
+.sec-h{display:flex;align-items:center;gap:8px;height:24px;margin:12px 0 6px;font-size:12px;font-weight:600;color:var(--t2)}
+.sec-h .d{width:8px;height:8px;border-radius:50%}
+.d.crit{background:var(--crit-dot)}.d.warn{background:var(--warn-dot)}.d.gray{background:var(--tag-gray)}
+.sec-h .k{color:var(--t3);font-weight:400}
+.empty{color:var(--t3);font-size:13px;margin-top:24px}
+.draft{margin-top:10px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px}
+.draft:focus-within{border-color:var(--accent)}
+.draft .hd{display:flex;align-items:center;gap:14px;padding:8px 12px;border-bottom:1px solid var(--b3);font-size:12px;color:var(--t3);flex-wrap:wrap}
+.draft .hd b{font-weight:500;color:var(--t1)}
+.draft .hd .edit{margin-left:auto;display:flex;align-items:center;gap:5px}
+textarea.bd{display:block;width:100%;resize:none;border:0;outline:0;background:transparent;color:var(--t1);font:inherit;font-size:13px;line-height:19px;padding:8px 12px;overflow:hidden;min-height:35px}
+.draft-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}
+.draft-foot .src{margin:0}
+.fold{margin-top:8px}.fold summary{cursor:pointer;color:var(--t2);font-size:12px}
+.more{margin:8px 0 0}
 .chat{width:33.333%;flex:none;border-right:1px solid var(--b3);background:var(--bg1);display:none;flex-direction:column}
 body.chat-on .chat{display:flex}
 .chat .top{height:56px;flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 14px 0 16px;border-bottom:1px solid var(--b3)}
@@ -1140,7 +1182,7 @@ body.chat-on .chat{display:flex}
 </style></head><body>
 <section class="chat" id="chat"></section>
 <section class="page"><div class="inner"><div id="head"></div><div id="list"></div></div></section>
-<div class="snz" id="snz" hidden><button type="button" data-when="hour">Dans 1 h</button><button type="button" data-when="evening">Ce soir</button><button type="button" data-when="morning">Demain matin</button><button type="button" data-when="monday">Lundi prochain</button><button type="button" data-when="pick">Choisir…</button><div class="pick" id="snzPick" hidden><input type="datetime-local" id="snzAt"><button type="button" class="btn acc" data-when="at"><span>OK</span></button></div></div>
+{snooze_html}
 <script nonce="{nonce}">
 const $ = id => document.getElementById(id);
 const load = '{nonce}';
@@ -1227,22 +1269,7 @@ window.kova = {
 };
 // The snooze menu lives outside the list, so a push never closes it.
 let snzKey = null;
-function pad(n) { return String(n).padStart(2, '0'); }
-function iso(d) {
-  const off = -d.getTimezoneOffset(), a = Math.abs(off);
-  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' +
-    pad(d.getMinutes()) + ':00' + (off < 0 ? '-' : '+') + pad(Math.floor(a / 60)) + ':' + pad(a % 60);
-}
-function when(word) {
-  const d = new Date();
-  if (word === 'hour') return new Date(d.getTime() + 3600e3);
-  const at = (days, h) => { const x = new Date(d); x.setDate(x.getDate() + days); x.setHours(h, 0, 0, 0); return x; };
-  if (word === 'evening') return d.getHours() < 19 ? at(0, 19) : at(1, 19);
-  if (word === 'morning') return at(1, 9);
-  if (word === 'monday') return at(((8 - d.getDay()) % 7) || 7, 9);
-  if (word === 'at') { const v = $('snzAt').value; return v ? new Date(v) : null; }
-  return null;
-}
+{snooze_js}
 function snzClose() { $('snz').hidden = true; $('snzPick').hidden = true; snzKey = null; }
 function hide(key) { const c = document.querySelector('.card[data-key="' + CSS.escape(key) + '"]'); if (c) c.style.display = 'none'; }
 document.addEventListener('click', e => {
@@ -1382,6 +1409,12 @@ mod tests {
         let mut items = vec![from_attention(&entry("a-1", Level::Now, None, 10), None, false).expect("item")];
         link_asks(&mut items, &actions, &[]);
         assert_eq!(items[0].ask, None);
+        // The chat finds the same entry from the ask.
+        let mut e = entry("a-1", Level::Now, None, 10);
+        e.action = Some("kova-sheet:19e0e20f".into());
+        let entries = [entry("a-0", Level::Now, None, 10), e];
+        assert_eq!(entry_for_ask(&entries, "19e0e20f-1111").map(|e| e.id.as_str()), Some("a-1"));
+        assert!(entry_for_ask(&entries, "aaaa0000").is_none());
     }
 
     #[test]
