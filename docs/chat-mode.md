@@ -59,7 +59,8 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
 - the turn's state on the line above the box (`src/chat/banner.rs`): `Travaille · 1 min 12 s` (pulsing),
   `Attend ta réponse`, `Prêt · fini il y a 3 min`, `Hors ligne`, and the
   queue (`2 en attente, part à la fin du tour`). Driven by the session's
-  events, never guessed: Claude Code's title spinner (through the PTY), its
+  events, never guessed: Claude Code's busy signal (title spinner or OSC
+  7501 `working`, through the PTY), its
   hooks (`~/.claude/state/turns/<session id>`: `working` on
   UserPromptSubmit and `ready` on Stop from `claude-config/hooks/harness.py`,
   `waiting` on a permission prompt or a question from `notify.sh`; the folder
@@ -68,7 +69,8 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
   while a dialog covers the `❯` line and the spinner is off; its `working`
   bridges the moment before the spinner shows (5 s at most, and not past a
   spinner that went off after it: Esc runs no Stop hook); its `ready` ends the
-  turn even when Claude Code still reports `working`, as it does while
+  turn even when Claude Code still reports `working` (unless it turned busy
+  after the Stop), as it does while
   background agents run after its turn (`Waiting for N background agents to
   finish`, the prompt takes a message);
 - the assistant's text full width, rendered markdown, no bubble; the user's

@@ -30,12 +30,14 @@ pub struct HookTurn {
     pub at_ms: u64,
 }
 
-/// Stop ran and no prompt since: the turn is over, whatever the pane still
-/// says. Claude Code keeps reporting `working` (OSC 7501) after its turn while
-/// background agents run (`✻ Waiting for 2 background agents to finish`), and
-/// its prompt takes a message then (measured on 2.1.319).
-pub fn turn_ended(hook: Option<HookTurn>) -> bool {
-    hook.is_some_and(|h| h.turn == Turn::Ready)
+/// Stop ran and the pane did not turn busy since: the turn is over, whatever
+/// the pane still says. Claude Code keeps reporting `working` (OSC 7501) after
+/// its turn while background agents run (`✻ Waiting for 2 background agents
+/// to finish`), and its prompt takes a message then (measured on 2.1.319). A
+/// busy pane that came on after the Stop is a new turn, its prompt hook not
+/// read yet.
+pub fn turn_ended(hook: Option<HookTurn>, spinner_on_at: Option<u64>) -> bool {
+    hook.is_some_and(|h| h.turn == Turn::Ready && spinner_on_at.is_none_or(|on| on <= h.at_ms))
 }
 
 /// A prompt just submitted counts as working this long before the spinner
@@ -67,8 +69,11 @@ pub fn parse_hook(text: &str) -> Option<HookTurn> {
 pub struct BannerInput {
     /// A Claude session runs in the pane.
     pub has_session: bool,
-    /// Claude Code's title spinner is on.
+    /// Claude Code says it is busy: its title spinner, or `working` in OSC
+    /// 7501 (`Pane::is_working`).
     pub spinner: bool,
+    /// When the chat saw it turn busy, epoch ms (`None` when it already was).
+    pub spinner_on_at: Option<u64>,
     /// When the spinner last went off, epoch ms.
     pub spinner_off_at: Option<u64>,
     /// A card waits: a permission prompt on screen, a `kova ask` of the pane.
@@ -109,7 +114,7 @@ pub fn banner(input: BannerInput) -> Banner {
     if input.cards || (asked && !input.spinner && !input.prompt_line) {
         return Banner::Waiting;
     }
-    let working = (input.spinner && !turn_ended(input.hook))
+    let working = (input.spinner && !turn_ended(input.hook, input.spinner_on_at))
         || hook(Turn::Working).is_some_and(|h| {
             input.now_ms < h.at_ms + HOOK_BRIDGE_MS && input.spinner_off_at.is_none_or(|off| off < h.at_ms)
         });
@@ -214,16 +219,16 @@ mod tests {
         // Measured on Claude Code 2.1.319: the turn ends on `launched2`, Stop
         // writes `ready`, then the screen says `✻ Waiting for 1 background
         // agent to finish` and OSC 7501 says `working` until the agent is done.
-        let status = crate::terminal::program_status::parse_report(b"state=working:app=claude-code");
-        let Some(crate::terminal::program_status::ProgramReport::Record(s)) = status else { panic!("{status:?}") };
-        assert_eq!(s.state, Some(crate::terminal::program_status::ProgramState::Working));
         let stop = parse_hook("ready 1793979027.648\n");
-        let now = 1_793_979_028_500;
-        let b = banner(BannerInput { spinner: true, hook: stop, now_ms: now, last_activity: Some(1_793_979_027), ..input() });
-        assert_eq!(b, Banner::Done { at: Some(1_793_979_027) });
+        let busy = BannerInput { spinner: true, spinner_on_at: Some(1_793_979_002_000), hook: stop, now_ms: 1_793_979_028_500, ..input() };
+        assert_eq!(banner(BannerInput { last_activity: Some(1_793_979_027), ..busy }), Banner::Done { at: Some(1_793_979_027) });
+        assert_eq!(banner(BannerInput { spinner_on_at: None, ..busy }), Banner::Done { at: None }, "busy since before the chat looked");
+        // Busy again after the Stop: a new turn, its prompt hook not read yet.
+        assert_eq!(banner(BannerInput { spinner_on_at: Some(1_793_979_030_000), ..busy }), Banner::Working { since: None });
         // The agent's result starts a turn of its own: UserPromptSubmit says so.
-        let next = parse_hook("working 1793979069.330\n");
-        assert_eq!(banner(BannerInput { spinner: true, hook: next, now_ms: 1_793_979_120_000, ..input() }), Banner::Working { since: None });
+        let next = BannerInput { hook: parse_hook("working 1793979069.330\n"), now_ms: 1_793_979_070_000, ..busy };
+        assert_eq!(banner(next), Banner::Working { since: None });
+        assert_eq!(banner(BannerInput { spinner: false, ..next }), Banner::Working { since: None }, "the hook alone, within the bridge");
     }
 
     #[test]

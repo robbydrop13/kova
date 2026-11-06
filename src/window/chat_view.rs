@@ -93,8 +93,10 @@ struct ChatState {
     files_read: Option<std::time::Instant>,
     /// What the session's hooks said last (`banner::parse_hook`).
     hook: Option<banner::HookTurn>,
-    /// The title spinner as last seen, and when it last went off (epoch ms).
-    spinner: bool,
+    /// Claude Code's busy signal as last seen (`None` before the first
+    /// look), and when it last came on and went off (epoch ms).
+    spinner: Option<bool>,
+    spinner_on_at: Option<u64>,
     spinner_off_at: Option<u64>,
     /// The turns folder was watched: it did not exist when the watch was made.
     watching_turns: bool,
@@ -148,7 +150,8 @@ impl ChatState {
             watch: None,
             files_read: None,
             hook: None,
-            spinner: false,
+            spinner: None,
+            spinner_on_at: None,
             spinner_off_at: None,
             watching_turns: false,
             ready: false,
@@ -328,7 +331,7 @@ impl KovaView {
             // The session moved (a file written, the spinner flipped) or a
             // message is on its way: now, not at the next poll.
             let files = st.watch.as_ref().is_some_and(Watch::fired);
-            let moved = files || pane.is_working() != st.spinner || st.outbox.enter_pending();
+            let moved = files || Some(pane.is_working()) != st.spinner || st.outbox.enter_pending();
             let due = st.last_poll.is_none_or(|t| t.elapsed().as_millis() >= POLL_MS);
             if due || force || moved {
                 st.last_poll = Some(std::time::Instant::now());
@@ -880,10 +883,12 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
     }
 
     let spinner = pane.is_working();
-    if st.spinner && !spinner {
-        st.spinner_off_at = Some(now_ms);
+    match (st.spinner, spinner) {
+        (Some(true), false) => st.spinner_off_at = Some(now_ms),
+        (Some(false), true) => st.spinner_on_at = Some(now_ms),
+        _ => {}
     }
-    st.spinner = spinner;
+    st.spinner = Some(spinner);
 
     // The cards: this pane's questions, then its permission prompt.
     let mut questions = Vec::new();
@@ -956,6 +961,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
     let status_input = banner::BannerInput {
         has_session: pane.claude_session_id().is_some(),
         spinner,
+        spinner_on_at: st.spinner_on_at,
         spinner_off_at: st.spinner_off_at,
         cards: !st.cards.is_empty(),
         question,
@@ -1002,7 +1008,9 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         st.queue_reason = "part quand le texte laissé dans le terminal est envoyé ou effacé";
     }
     // The queue: its first message once the turn is over.
-    let verdict = if st.outbox.queue().is_empty() { input::Verdict::Wait("") } else { gate(pane, b, banner::turn_ended(st.hook)) };
+    // Busy since the last poll is a new turn, not a background wait.
+    let ended = banner::turn_ended(st.hook, st.spinner_on_at) && st.spinner == Some(true);
+    let verdict = if st.outbox.queue().is_empty() { input::Verdict::Wait("") } else { gate(pane, b, ended) };
     if let input::Verdict::Wait(reason) = verdict
         && !reason.is_empty()
     {
