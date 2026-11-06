@@ -190,7 +190,7 @@ At the bottom of the thread, above the box:
 
 - the pane's questions on the board (`kova ask` from this pane and this
   conversation, not snoozed): their buttons, a field when they take text;
-  the answer goes through the board's queue like an Asks card's, checked
+  the answer goes through the board's queue like a Cockpit card's, checked
   against the question's buttons (`ask::accepts_external_answer`);
 - a decision sheet: Ouvrir la fiche, which shows it in the side panel (the
   floating card's path);
@@ -201,7 +201,7 @@ At the bottom of the thread, above the box:
   `#asks`): its first line as the title, what it wants, who asked and when,
   the rest of the message and its answers under it. Its three icons are the
   Cockpit's: the clock opens the same snooze menu (the question comes back
-  at that date, `Board::snooze`), X and the check take it off the Asks
+  at that date, `Board::snooze`), X and the check take it off the Cockpit
   (`Board::close`, logged with reason `dismissed` or `done`; its `kova ask`
   exits 3 as on a withdrawal). When an attention entry stands for a sheet
   (its action `kova-sheet:<id>`), the card is that entry's opened Cockpit

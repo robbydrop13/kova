@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn every_icon_stays_on_the_grid() {
-        assert_eq!(ALL.len(), 32);
+        assert_eq!(ALL.len(), 31);
         for icon in ALL {
             let segments = icon.segments();
             assert!(!segments.is_empty(), "{icon:?} draws nothing");

@@ -31,7 +31,7 @@ it: one `WKWebView` per window over the active tab's panes area
   Perso, else Claap; an ask, or no `perso_dir`, is Claap. The filter `Tout · Claap · Perso` is
   kept in the window's state.
 - Buttons: `Ouvrir` for an entry whose `action` the side panel can show
-  (`sidebar_attention::open_target`); `Ouvrir` on a live need opens the card in
+  (`side_panel::open_target`); `Ouvrir` on a live need opens the card in
   place (see Opened cards); `Ouvrir la fiche` for a decision sheet; `Refuser` / `Autoriser` answer a permission prompt
   like the chat does, only if the screen still shows the prompt the card
   was rendered from.

@@ -15,7 +15,7 @@ in `src/window/sidebar_ui.rs`.
 |---|---|
 | Cmd+click in a pane | an http(s) link, or a `.md` / `.markdown` / `.html` / `.htm` path (relative to the pane's directory, then to its parents up to `$HOME`, the nearest existing file first; `~/`, absolute, `file://`, a `:line[:col]` suffix ignored; a path the printing program broke over rows, the next row indented, counts as one, `hard_wrapped_doc_path`). Cmd+hover underlines both. Cmd+Shift+click keeps the old way: the default browser. A link of another scheme still goes to the system |
 | The ask card | Open on a `New decision` card (`kova ask --decision <url>`, or `--decisions <file.json>` for a native sheet) |
-| The Asks view | Open on a card tagged `Decision` |
+| The Cockpit | `Ouvrir la fiche` on a decision sheet |
 | IPC | `open-panel` with `target` (`docs/ipc.md`) |
 | View > Side Panel, Cmd+Option+B (`toggle_side_panel`, `toggle-side-panel`) | hides it, or brings back the last page |
 | View > Panel History, Cmd+Option+Y (`panel_history`, `panel-history`), or the header's clock button | the list of what the panel opened lately, opening the panel if closed |
@@ -114,13 +114,13 @@ loses nothing. Done answers the question with the summary and the panel shows
 what was sent. A link in the sheet opens in the default browser: the sheet
 stays the panel's page.
 
-Open (on the floating card or in the Asks view) takes the decision off the
+Open (on the floating card or in the Cockpit) takes the decision off the
 floating card, which moves on to the next question: it is answered on the
-sheet, and stays in the sidebar's Asks until then. Not kept across a restart:
+sheet, and stays in the Cockpit until then. Not kept across a restart:
 a relaunch puts it back on the card.
 
 Done with decisions still unanswered (on the sheet, or on the card): the
-asker gets what was answered, and the rest stays in the sidebar's Asks as a
+asker gets what was answered, and the rest stays in the Cockpit as a
 sheet of its own (`<title> : N décisions restantes`, `follow_up`), off the floating
 card and not withdrawn by a message in the conversation. Its answer reaches
 the same conversation later, as a message. The answer names it, so the asker

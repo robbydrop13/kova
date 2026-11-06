@@ -27,9 +27,8 @@ Code:
   area, summary row, Next pill, resize edge, and an `NSScrollView`)
   and `SidebarListView` (its document: groups and tiles, hover, press, drags,
   right click, tooltips).
-- `src/window/sidebar_asks.rs`: pure layout, drawing and hit test of the Asks
-  list (cards, answers, snooze, the folded snoozed section), plus `AskQueue`,
-  the queue the app delegate drains into `ask::Board`. Unit tests.
+- `src/window/ask_actions.rs`: `AskQueue`, the Cockpit's and the chat's
+  clicks on a question, which the app delegate drains into `ask::Board`.
 - `src/window/sidebar_ui.rs`: the window's side. `apply_layout` (the split
   between the sidebar and the Metal view), the mode switch, `sync_sidebar`
   (once per tick: tabs -> `SidebarModel` -> view), the actions the view calls
@@ -288,7 +287,7 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
   label, `Tab order` in the default order and `Activity` when the list is
   sorted by urgency. Tertiary, `ACCENT` while sorted by activity, primary
   under the mouse, on a 10 % white ground (radius 4). The Panes list only:
-  Asks, Agents and Scheduled draw no ghost and have no sort hit target.
+  Agents and Scheduled draw no ghost and have no sort hit target.
 - Next pill (`NextPill`, `sidebar.rs`), one state pair (section 5.2):
 
 | State   | Fill             | Text                                   | Badge |
@@ -311,9 +310,9 @@ column, `Stop` after a filled `square` (interrupt colour, primary on hover) at t
 
 ### 3.7.1 View switcher
 
-Four buttons on the top row, right-aligned 10 from the inner edge, on the
+Three buttons on the top row, right-aligned 10 from the inner edge, on the
 traffic lights' own row: 26 pt each, 2 apart, radius 6 (`SWITCH_LISTS`).
-`sidebar` shows the panes, `message` the asks, `users` the agents,
+`sidebar` shows the panes, `users` the agents,
 `clock` the scheduled routines. The icons are 15 pt strokes: the selected
 one sits on `SEL_BG` in `SEL_TEXT`, the others are `TEXT_TERTIARY` and take
 a 10 % white ground under the mouse (16 % while pressed). A press on a
@@ -323,8 +322,8 @@ Clicking the selected icon does nothing, like a segmented control.
 Two badges, both hung on the icon's top right corner (4 pt in from its
 right edge, 5 pt above its top) with a 2 pt ring of the sidebar ground:
 
-- Asks: the count of waiting questions in `ACCENT`, white 10 bold digits,
-  15 pt at least and wider for two digits. Shown when `asks_waiting > 0`.
+- Agents: the count of working panes in `ACCENT`, white 10 bold digits,
+  15 pt at least and wider for two digits. Shown when `agents_working > 0`.
 - Scheduled: an 8 pt `ERROR` dot when `routine_failed`.
 
 ### 3.7.2 Scheduled list (`SidebarList::Scheduled`)
@@ -444,190 +443,32 @@ pure functions with the clock passed in, tested against
 `tests/fixtures/routines/list.json` at the fixed clock the section tests
 share (`2026-11-03T20:30`).
 
-### 3.7.3 Asks list (`SidebarList::Asks`)
+### 3.7.3 Attention queue (`[attention]`)
 
-`src/window/sidebar_asks.rs` owns this list: the view model, the pure layout,
-the drawing and the hit test. Two kinds of card share it. The
-board (`ask::Board`) holds the questions, and `sidebar_ui::ask_cards` turns
-them into `AskCardVm`s once per tick while this list is up, resolving each
-`pane_id` to its tab across every window and checking
-`claude_session::live_session_ids` for a conversation that outlived its pane.
-The same read walks every pane and turns a `PromptPreview::Permission` into
-a permission card, read from `Pane::permission_prompt`. The meta line reads
-`N need you · newest first` while N > 0 and stays empty at 0; the open cards
-are newest first, questions and permissions together.
+No list of its own: the Asks list (questions, permission cards, the queue)
+was removed on 06/11/2026 (Robin: the Cockpit is enough). Open `kova ask`
+questions, decision sheets, permission prompts and the queue's `now` and
+`point` entries are all in the Cockpit (`docs/cockpit.md`).
 
-A card (radius 8, `bg1` `TILE`, 1 pt `b3` `BORDER_SUBTLE`, 10 v / 12 h
-padding, 8 pt apart):
+`crate::attention` reads the queue from `[attention] command`, an argv
+printing a JSON array of open entries (`id`, `ts` ISO with its offset,
+`from`, `level` `now` / `point` / `memo`, `kind`, `title`, optional `needs`,
+`action`, `topic`; other fields ignored, an entry that does not read is
+skipped alone). The read is cached and redone on a background thread every
+10 s (`MAX_AGE_SECS`) and right after a click, never on the tick. Absent
+`command`: nothing runs and the Cockpit shows the live needs only.
 
-| Part | Content | Style |
-|---|---|---|
-| Header (18 pt) | 8 pt `awaiting` dot, then `from` (the asker's name), the tab name, and the age at the right (`4m`, `2h`) | `Title` primary, tab `Summary` tertiary, age `Number`; `warn.text` from 2 h |
-| Message | the question, wrapped, six lines then an ellipsis | `Secondary` (12) primary |
-| Actions (28 pt) | OK 32 x 28 (check, `ok` colour), KO (cross, `crit`), Brief (pencil, primary), then at the right the ghost Open (only when the ask has a pane) and Moon, 26 wide | button ground `bg.hover` / `bg.pressed`; ghost icons tertiary, primary under the mouse |
-| Note (14 pt) | a small green check and the first option, then a small red cross and the second 6 pt after the first label, so the pair sits together; right-aligned `Session ended` with an info icon when the ask has no pane and no live conversation | `Hint` (11) tertiary |
+The `now` entries are need items (`NeedKind::Attention`): they count on the
+Cockpit entry, but not in the Next pill nor the Agents `Need you` tile, which
+count the panes they lead to (an entry has none). An entry sent or closed
+from the Cockpit stops counting at once. Every command is the configured argv
+plus the id and fixed words, never a shell line, and only for an id the last
+read returned (letters, digits, `-`, `_`, no leading dash).
+`tests/fixtures/attention/list.json` is the made-up queue the tests read.
 
-OK answers with the question's first action, KO with its second (or `No`
-when it declared only one). The Board's answer path is the floating card's:
-`AskQueue` on the app delegate is drained by the timer tick in `app.rs`, which
-calls `Board::answer`, `Board::snooze` or `Board::unsnooze`. A click is
-queued once: the card flips to `Sending to <from>...` (send icon) at once and
-ignores further clicks; when the board drops the question the card reads
-`Sent to <from>` (check-circle, `ok` colour) for 1.5 s before it disappears.
-A sending click that the board never takes gives up after 3 s, so the card
-is clickable again.
-
-A decision card (`kova ask --decision <url>`, `AskCardVm::decision_url`)
-carries a `Decision` tag in its header (the permission tag's chip), and its
-action row reads Open (a text button on the `ACCENT` fill, `AsksHit::OpenDoc`),
-OK and Brief: no KO. Open shows the sheet in the window's side panel
-(`docs/side-panel.md`) and answers nothing; OK sends the first action, `Done`
-by default. The note line says `Done once the sheet is filled in`.
-
-The Moon opens a row of three small buttons under the actions: `1 h`,
-`Tonight 20:00`, `Tomorrow 9:00`. Tonight is the next local 20:00 (tomorrow
-when that one has passed), Tomorrow is the next local 09:00, and all three
-keep the board's 24 h bound (`ask::SNOOZE_MAX_SECS`). The row grows the card
-by 28 pt; on a narrow sidebar the three share the width equally and the
-labels truncate.
-
-The snoozed section is a folded 28 pt header at the bottom, `Snoozed N` with
-a chevron (`AsksState::folded`, true by default, remembered per window). Open
-it and each snoozed question is a dimmed card (alpha 0.55) on the same
-geometry, without the action rows: `back at 20:00` on the left and a
-`Show now` ghost button on the right, which cancels the snooze.
-
-#### Permission cards
-
-A pane whose screen asks permission is a card in the same list, newest first,
-with no `kova ask` behind it. `sidebar_ui::ask_cards` builds it from the
-pane's `PromptPreview::Permission` and the prompt it was read from
-(`Pane::permission_prompt`), keyed `perm:<pane id>:<fingerprint>`:
-`AskCardVm::from_permission`. It has the same frame, ground and padding, and:
-
-| Part | Content | Style |
-|---|---|---|
-| Header (18 pt) | the dot, `from` (the pane's agent session name, else its title), a `Permission` tag, the tab, the age | `Title` primary, tag and tab `Hint`/`Summary` tertiary in a 1 pt `b3` chip, age `Number` |
-| Message | the prompt's question (`Do you want to proceed?`), six lines then an ellipsis | `Secondary` primary |
-| Code block | the command or file under a `bg0` ground, radius 4, 6 pt padding, Menlo 11, hard-wrapped at the font's advance, four lines then an ellipsis | 11 Menlo secondary |
-| Actions (28 pt) | a green check (Approve), a red cross (Reject), a small `Always` chip when the prompt offers that option, and the ghost Open at the right | button ground `bg.hover` / `bg.pressed`; `Always` in `Chip` |
-
-No Brief and no Moon: a permission has no instruction to add and nothing to
-snooze. The buttons come from the option labels (`ParsedPrompt::choices`):
-Approve is the first label starting with `Yes` that does not promise
-`always`/`don't ask again`, Always the one that does, Reject the one starting
-with `No`. A prompt whose options do not number from 1 (scrolled so option 1
-is off screen) keeps its card, with only Open.
-
-A click re-reads the pane's screen right then (`Pane::answer_permission`)
-and compares `prompt_preview::permission_answer`'s fingerprint with the one
-the card was built from. The hash covers the whole body block, every line of
-a wrapped command or a diff (spacing normalized), not only its first line.
-Equal: the option's digit alone goes to the pane's
-PTY, the way Claude Code takes a numbered choice, and the card goes to
-`Sending` like an asked answer. Different or gone: nothing is typed, the card
-says `Prompt changed, open the pane` in `crit.text` for 5 s
-(`AsksState::flash`, `FLASH_MS`), and the pane keeps the preview it just read,
-so the list shows the new screen (or drops the card) on the next tick.
-
-The list's `waiting` set (`sync_sidebar_asks_state`) holds the board's
-questions and the permission cards of the last read, so a card leaves with
-its prompt: Sending, then `Sent to <from>` for 1.5 s.
-
-#### Brief overlay (the pencil)
-
-`AsksHit::Brief` opens the Brief overlay on any question, including the ones
-with no text field: an instruction typed on top of the ask. It is one card
-over a 40 % black scrim covering the visible list; a click outside the card
-cancels it. The card (`BriefLayout`) sits 12 pt from the top of the list and
-12 pt from each side, 12 pt of padding, `bg1` ground, 1 pt `b3` border,
-radius 8, top to bottom: the header (a warn dot, `Brief for <asker>` in
-`Title`, the age in `Number` at the right), the question (`Secondary`),
-the agent's options as chips, the instruction field, Cancel and Send, and a
-two-line hint in `Hint` tertiary.
-
-Chips are 22 pt tall, full radius, 1 pt `b3` border, `Chip` (11 Medium);
-they wrap a row at a time. One is picked at most: a picked chip takes
-`ACCENT` and white text (`TEXT_ON_FILL`), and a second click unpicks it.
-The instruction rides on the answer whether or not a chip is picked.
-
-The instruction field is native (`SidebarView` in `sidebar_view.rs`): one
-`NSTextField` at most, owned by the view, keyed by the ask id, created and
-focused when the overlay opens, moved only when its rect changes, removed
-when the overlay closes or the question leaves the board. What was typed is
-kept in `AsksState.drafts`, so reopening Brief on the same ask restores it.
-Three lines (60 pt) at least, six (120 pt) at most, then the field scrolls;
-placeholder `Your instruction`, Inter 12. Enter starts a new line, Cmd+Enter
-sends (the view's `performKeyEquivalent`: AppKit routes the key equivalent
-before the field editor, logged `sidebar: brief send (cmd+enter)`), Escape
-cancels.
-`KovaView::perform_key_equivalent` (`src/window/mod.rs`) answers NO while the
-window's first responder is an `NSTextView`: the terminal's key map must not
-take them first. Opening and closing the field is logged
-(`sidebar: brief field open|close <id>`).
-
-Send is disabled while no chip is picked and the field is empty. It queues
-`AskAction::Answer`: the picked option with the text, or `ask::OTHER` with
-the text alone. The text is trimmed, then capped at `ask::ANSWER_TEXT_MAX`
-(8 KiB) on a character boundary. The card then goes to `Sending` like OK and
-KO. `ask::accepts_external_answer` follows the same rule: text is allowed on
-any button whatever the question's `input`, and `Other` is accepted with
-text on any question.
-
-A need row that lands on an ask (`ListHit::Need`, `Cmd+J`) switches to this
-list, sets `AsksState::highlight` to the ask id and scrolls its card into
-view once; the card's border takes `sel.rail` for two seconds
-(`HIGHLIGHT_MS`, cleared on the tick). A permission row cannot name its card
-before the list is read again (the id carries the screen's fingerprint), so
-it sets `AsksState::highlight_pane` and `sync_sidebar` lights the card of
-that pane on the same tick. With no card at all the list draws its own empty
-state, not the hint line: a check-circle, `No open questions` and `Agents
-ask here when they need you`, both tertiary and centred.
-
-#### Attention queue (`[attention]`)
-
-`src/window/sidebar_attention.rs` lays out, around the cards, the queue that
-`crate::attention` reads from `[attention] command`, an argv printing a JSON
-array of open entries (`id`, `ts` ISO with its offset, `from`, `level` `now` /
-`point` / `memo`, `kind`, `title`, optional `needs`, `action`, `topic`; other
-fields ignored, an entry that does not read is skipped alone). The read is
-cached and redone on a background thread every 10 s (`MAX_AGE_SECS`) and
-right after a click, never on the tick. Absent `command`: nothing runs and
-the Asks list is exactly as described above.
-
-- `À toi maintenant (N)` heads the list: the queue's `now` rows, oldest
-  first, then the question cards. N counts both, so it is the number of rows
-  under the header. The same `now` entries are need items
-  (`NeedKind::Attention`): they count in the Asks badge and the Cockpit
-  entry, but not in the Next pill nor the Agents `Need you` tile, which count
-  the panes they lead to (an entry has none). A row sent or closed from here
-  stops counting at once.
-- `Au prochain point (N)` sits under the cards and the snoozed section,
-  folded, and opens on its rows grouped by `topic` (the topic with the oldest
-  entry first, `Divers` last for entries that name none).
-- `Pour mémoire (N)` is a count line; open, its rows are the titles only.
-- An empty queue draws nothing, not even a header, and with the queue on the
-  `No open questions` empty state is gone too: a healthy queue takes no space.
-
-A row is a tighter card: the title (13 medium) and its age at the right,
-`needs` under it (12, up to three lines), then a bottom line with `from` on
-the left and the buttons on the right. `Ouvrir` (accent ground) shows in the
-side panel an http(s) `action`, or a local `.md` / `.html` file that exists
-(the `#anchor` stripped, `~/` read as home). By `kind`: `would` gets
-`Envoyer` (`act_command <id> Envoyer`) and `Ignorer`; `decision`, `review`
-and `test` get `Fait`; `Fait` and `Ignorer` run `close_command <id> --note
-"Fait (Kova)"` or `"Ignoré (Kova)"`. A verb whose command is not configured
-is left out. A click in flight shows `…` instead of the buttons, a sent row
-says `Envoyé` and cannot send twice, a closed row leaves at once, a failure
-shows the CLI's first stderr line in `crit` for 8 s with the buttons back.
-Every command is the configured argv plus the id and fixed words, never a
-shell line, and only for an id the last read returned (letters, digits, `-`,
-`_`, no leading dash). `tests/fixtures/attention/list.json` is the made-up
-queue the tests read.
-
-The Cockpit (`docs/cockpit.md`) also reads `body`, `detail` and `src` (a list
-or one word), and uses three more keys of `[attention]`: `snooze_command`
-(`<id> --until=<ISO 8601>`) and `explain_command` (`<id>`), each defaulting to
+The Cockpit also reads `body`, `detail` and `src` (a list or one word), and
+uses three more keys of `[attention]`: `snooze_command` (`<id>
+--until=<ISO 8601>`) and `explain_command` (`<id>`), each defaulting to
 `close_command`'s program followed by `snooze` / `explain`, and `perso_dir`,
 the folder whose live needs are scoped Perso.
 
@@ -673,7 +514,7 @@ pane row is 40 pt, radius 6, `bg.hover` under the mouse: the state dot in a
 16 pt box, the title (13 medium, primary), line 2 `<tab> · <detail>` (12,
 tertiary), and the right meta, an age in `info` for working, the wait's age
 in `warn` for need you, an age in tertiary for idle, `error` in `crit`. A
-pane row focuses its pane; a need row opens the Asks list on its card
+pane row focuses its pane; a need row opens the Cockpit
 (`sidebar_open_need`).
 
 A `By tab` row is 26 pt: the tab's 3 x 10 colour bar, its name, then four
@@ -737,8 +578,7 @@ sidebar's rows (frozen by
 
 A pane holding an open ask or a permission prompt drops its meta column and
 says `waiting 4m · Answer` on the subtitle instead: the age in `warn.text`,
-`Answer` an accent link (`ListHit::NeedAnswer`) that opens the Asks list on
-that pane's card, as the block's row did.
+`Answer` an accent link (`ListHit::NeedAnswer`) that opens the Cockpit.
 
 ### 3.8 List extras
 
@@ -776,7 +616,7 @@ that pane's card, as the block's row did.
 | Inline confirmation        | filled `Delete`: `routinectl delete`; `Cancel`: close it |          |              |
 | Escape over the list       | close the inline confirmation, like a lifted tile       |                    |              |
 | Cockpit entry              | open or close the Cockpit page                         |                    |              |
-| Tile `Answer`              | Asks list on that pane's card                          |                    | tile menu    |
+| Tile `Answer`              | open the Cockpit                                       |                    | tile menu    |
 | Top area                   | window drag                                            | zoom               |              |
 | Separator +-4 pt           | drag resizes the sidebar                               |                    |              |
 
@@ -929,7 +769,7 @@ Before that order, `Cmd+J` walks what waits on the user
 then permission prompts and open questions merged by age, with a pane's own
 prompt and open question collapsed into one item. The app timer builds that
 list once per tick (`KovaView::refresh_needs_shared`) and every window reads
-the same one, as do the Asks badge (`waits_on_you`: permissions and asks
+the same one, as do the Cockpit entry's count (`waits_on_you`: permissions and asks
 only, never errors or failed runs) and the Scheduled badge. A failed routine
 has no pane to land on, so it switches the sidebar to Scheduled once, and
 the next press falls through to the unread order above. `needs::NeedWalk`,
@@ -1039,9 +879,9 @@ sidebar_collapsed_default = false   # new tabs start folded when true
 roster_command = ["/usr/local/bin/team", "list", "--json"]
 
 [attention]
-# The attention queue of the Asks view (3.7.3), three argv. Absent `command`:
-# off, nothing spawned. Kova appends `<id> Envoyer` to act_command and
-# `<id> --note <words>` to close_command; an absent one leaves its buttons out.
+# The attention queue the Cockpit lists (3.7.3), three argv. Absent `command`:
+# off, nothing spawned. Kova appends the id and the button's words
+# (docs/cockpit.md); an absent command leaves its buttons out.
 command = ["/usr/local/bin/attn", "list", "--open", "--json"]
 act_command = ["/usr/local/bin/attn", "act"]
 close_command = ["/usr/local/bin/attn", "close", "--by", "me"]

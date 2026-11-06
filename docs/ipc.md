@@ -349,10 +349,10 @@ dropped), and answers `Done` with their summary as `text`, one line per decision
 sheet of one decision with up to three short options also takes its options as
 buttons on the card. `kova ask --decisions <file.json>` builds it.
 
-Done with decisions left unanswered keeps them in the Asks as a new sheet
+Done with decisions left unanswered keeps them in the Cockpit as a new sheet
 question (`follow_up: true`, Kova's field, off the floating card, not taken back
 by `withdraw-asks`), answered late; the summary ends with
-`Still open in the user's Kova Asks: D3 (question <id>) …`.
+`Still open in the user's Kova Cockpit: D3 (question <id>) …`.
 `drop-ask` with `id` takes a question off unanswered (`kova ask --drop <id>`); a
 `kova ask` still waiting on it exits 3.
 
@@ -464,11 +464,9 @@ is over as if it were new (sound, Dock badge), and keeps its snooze across a
 restart. The asker is never told: it keeps waiting and times out as it would
 have anyway, so a snooze costs nothing but the late path.
 
-**Brief** (in the Asks view) puts an instruction on a question: the answer
-carries it as `text`, so `kova ask` prints
-`"<button>: text"` when a button was picked and `"Other: text"` when none was.
-That works on a buttons-only question too (`--no-input`): the instruction rides
-on the button the user picks, and `question.input` only decides whether the
+An answer may carry `text` on any question, a buttons-only one (`--no-input`)
+included: `kova ask` then prints `"<button>: text"` when a button was picked
+and `"Other: text"` when none was. `question.input` only decides whether the
 card shows a text field of its own.
 
 ---
@@ -671,7 +669,7 @@ Reads `~/.config/kova/config.toml` again and pushes its appearance half into
 every open window: `[colors]`, `[status_bar]`, `[global_status_bar]`, `[tab_bar]`,
 `[bookmarks]`, and the fade / focus outline of `[splits]`. The sidebar re-picks
 its light or dark palette from the new `[colors] background`, and the Agents
-roster follows the new `[sidebar] roster_command`, and the Asks list the new
+roster follows the new `[sidebar] roster_command`, and the Cockpit the new
 `[attention]` commands. The next frame draws
 with the new values, around 16 ms later: no restart, no session reload.
 

@@ -320,7 +320,7 @@ action, or `action: text` when the user typed something.
   panel, answers are kept as they are given, and Done returns them, one line per decision:
   `D1: A (label)`, `D2: B (label). Note: …`, `D3: other: …`, `D4: open`, then `Note: …`. One
   decision of up to three short options is answerable from the card's buttons too. Decisions left
-  unanswered at Done stay in the user's Asks; the answer ends with `Still open … (question <id>)`,
+  unanswered at Done stay in the user's Cockpit; the answer ends with `Still open … (question <id>)`,
   their answer comes later as a message, and `kova ask --drop <id>` takes them off once they no
   longer matter.
 - **A step only the user can do, so you can go on** (a browser login, a macOS setting): one card,
