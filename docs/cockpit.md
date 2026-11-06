@@ -32,10 +32,22 @@ it: one `WKWebView` per window over the active tab's panes area
   kept in the window's state.
 - Buttons: `Ouvrir` for an entry whose `action` the side panel can show
   (`sidebar_attention::open_target`); `Ouvrir` on a live need opens the card in
-  place (see Opened cards); `Ouvrir la fiche` for a decision sheet (no `C'est fait`); `C'est fait`
-  runs `close_command`; `Refuser` / `Autoriser` answer a permission prompt
+  place (see Opened cards); `Ouvrir la fiche` for a decision sheet; `Refuser` / `Autoriser` answer a permission prompt
   like the chat mode does, only if the screen still shows the prompt the card
   was rendered from.
+- Icons (every attention card, top right, Feather, with a tooltip): clock
+  `Plus tard`, x `Pas pertinent, retirer` (`close_command ID --reason
+  dismissed`), check `C'est fait` (`close_command ID --reason done`). The clock
+  opens a small menu in the page: `Dans 1 h`, `Ce soir` (19:00, or tomorrow
+  19:00 once past), `Demain matin` (09:00), `Lundi prochain` (09:00),
+  `Choisir…` (a date and time field); it runs `snooze_command ID
+  --until=<ISO 8601 with offset>` (default: `close_command`'s program with
+  `snooze`). The card leaves the page at once and stays hidden until the queue
+  drops it (60 s at most); a failed command brings it back with its words.
+  Live needs keep their own buttons, no icons.
+- `Voir plus`: the list shows the first 10 cards in the priority order, then
+  `Voir plus (N)` (N left) adds 10 more. Section and filter counts cover the
+  whole list. Opening the page or changing the filter starts again at 10.
 - Drafts: an entry with a `draft` shows it in an editable field under
   `À <to>  <channel>  Objet <subject>`. `Valider` runs `act_command ID
   Valider`; once the text is rewritten it reads `Valider la correction` and
@@ -52,9 +64,10 @@ being rewritten keeps its text, caret and focus through a push.
 
 ## Opened cards
 
-`Ouvrir` on a failed routine, a permission, an error or a plain question opens
-its detail inside the card, with no jump to another view; the button reads
-`Masquer` while it is open. The opened keys live in the window
+A click on any card's body (not a button, a field or the open detail) opens
+its detail inside the card, or folds it; `Ouvrir` on a failed routine, a
+permission, an error or a plain question does the same and reads `Masquer`
+while it is open. Buttons work without opening. The opened keys live in the window
 (`CockpitSlot::expanded`): the 250 ms refresh rebuilds the detail and keeps it
 open, with its folded prompt, its scroll and a typed answer; a key whose card
 is gone is dropped.
@@ -69,6 +82,14 @@ is gone is dropped.
   on the card.
 - Error: the provider's words, the pane's last 15 non-blank lines, and `Voir le
   pane`, which closes the page and focuses the pane.
+- Attention entry: `needs`, `body` (line breaks kept), `detail`, the `src`
+  list, and its links: the `action` (not a `kova-sheet:`) plus every http(s)
+  link in the body, detail and sources, opening in the side panel like
+  `Ouvrir`. An entry with no `needs`, `body` or `detail` says `Je regarde de
+  quoi il s'agit…` and Kova runs `explain_command ID` (default: the attn
+  program with `explain`, about 40 s) in the background, never twice at once
+  for one id; the next read brings the `detail` it saved.
+- Decision sheet: its card's text (the decisions); `Ouvrir la fiche` opens it.
 - Question: its text and its answers as buttons (a free answer brings a
   field), checked with `ask::accepts_external_answer` and queued like the
   chat's (`queue_ask_action`); the card shows `En cours` for 5 s.

@@ -51,6 +51,9 @@ const PENDING_MS: u64 = 5_000;
 const ERROR_LINES: usize = 15;
 /// The most of a routine's prompt an opened card shows.
 const PROMPT_MAX: usize = 16 * 1024;
+/// How long a removed, done or snoozed card stays hidden waiting for the
+/// queue to drop it.
+const HIDDEN_MS: u64 = 60_000;
 
 /// A frame in the container's coordinates (points, y up).
 type Frame = (f64, f64, f64, f64);
@@ -72,6 +75,11 @@ pub struct CockpitSlot {
     /// The cards opened with `Ouvrir`, by key: kept through every refresh,
     /// dropped once the card is gone.
     expanded: RefCell<HashSet<String>>,
+    /// How many cards the list shows (`Voir plus` adds a page); 0 is one page.
+    limit: Cell<usize>,
+    /// Entries removed, done or snoozed from here, by key, with when (ms):
+    /// hidden until the queue drops them, back if the command failed.
+    hidden: RefCell<HashMap<String, u64>>,
     page: RefCell<Page>,
 }
 
@@ -113,6 +121,7 @@ impl KovaView {
         } else {
             slot.open.set(true);
             slot.focus.set(true);
+            slot.limit.set(cockpit::PAGE_SIZE);
             crate::attention::refresh();
         }
         self.mark_dirty();
@@ -290,6 +299,14 @@ impl KovaView {
             return;
         }
         let mut items = self.cockpit_items(&|p: &Path| p.is_file());
+        {
+            let now = now_ms();
+            let mut hidden = slot.hidden.borrow_mut();
+            hidden.retain(|k, at| now.saturating_sub(*at) < HIDDEN_MS && items.iter().any(|i| &i.key == k));
+            // A command that failed brings its card back, with its words.
+            hidden.retain(|k, _| !items.iter().any(|i| &i.key == k && matches!(i.state, State::Failed(_))));
+            items.retain(|i| !hidden.contains_key(&i.key));
+        }
         self.cockpit_fill(&mut items);
         let mut page = slot.page.borrow_mut();
         page.last_poll = Some(std::time::Instant::now());
@@ -318,6 +335,8 @@ impl KovaView {
             chat: slot.chat.get().then_some(ChatColumn { chief, found: chief_pane.is_some() }),
             can_act: crate::attention::can_act(),
             can_close: crate::attention::can_close(),
+            can_snooze: crate::attention::can_snooze(),
+            limit: slot.limit.get().max(cockpit::PAGE_SIZE),
             now: now / 1000,
         };
         let parts = cockpit::parts(&view);
@@ -377,7 +396,12 @@ impl KovaView {
             "filter" => {
                 if let Some(filter) = Filter::parse(&s("scope")) {
                     slot.filter.set(filter);
+                    slot.limit.set(cockpit::PAGE_SIZE);
                 }
+                true
+            }
+            "more" => {
+                slot.limit.set(slot.limit.get().max(cockpit::PAGE_SIZE) + cockpit::PAGE_SIZE);
                 true
             }
             "chief" => {
@@ -396,6 +420,7 @@ impl KovaView {
                     // The buttons inside an opened card.
                     "routine" => self.cockpit_routine(&key, &s("arg")),
                     "answer" => self.cockpit_answer(&key, &s("arg"), text.as_deref().unwrap_or_default()),
+                    "link" => self.cockpit_link(&key, &s("arg")),
                     "pane" => {
                         self.close_cockpit();
                         self.sidebar_open_need(&key);
@@ -447,15 +472,22 @@ impl KovaView {
                     self.open_in_side_panel(target);
                 }
             }
-            (Kind::Attention, Button::Done | Button::Validate | Button::Correct) => {
+            (Kind::Attention, Button::Done | Button::Dismiss | Button::Snooze | Button::Validate | Button::Correct) => {
                 let Some(id) = attention_id else { return };
                 let (verb, text) = match button {
-                    Button::Done => (Verb::Done, None),
+                    Button::Done => (Verb::Resolve, None),
+                    Button::Dismiss => (Verb::Dismiss, None),
+                    Button::Snooze => (Verb::Snooze, text),
                     Button::Validate => (Verb::Validate, None),
                     _ => (Verb::Correct, text),
                 };
-                if let Err(why) = crate::attention::perform_with(id, verb, text) {
-                    log::warn!("cockpit: {why}");
+                match crate::attention::perform_with(id, verb, text) {
+                    // Gone from the page at once; the next read drops it.
+                    Ok(()) if matches!(verb, Verb::Resolve | Verb::Dismiss | Verb::Snooze) => {
+                        slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
+                    }
+                    Ok(()) => {}
+                    Err(why) => log::warn!("cockpit: {why}"),
                 }
             }
             (Kind::Sheet, Button::Open | Button::OpenSheet) => {
@@ -463,9 +495,18 @@ impl KovaView {
             }
             // The card opens in place, or folds back.
             (_, Button::Expand) => {
-                let mut expanded = slot.expanded.borrow_mut();
-                if !expanded.remove(key) {
-                    expanded.insert(key.to_string());
+                let opened = {
+                    let mut expanded = slot.expanded.borrow_mut();
+                    !expanded.remove(key) && expanded.insert(key.to_string())
+                };
+                // An entry that says nothing: `attn explain` writes its
+                // detail meanwhile, once at a time.
+                if opened
+                    && let Some(id) = attention_id
+                    && crate::attention::snapshot()
+                        .is_some_and(|entries| entries.iter().any(|e| e.id == id && cockpit::says_nothing(e)))
+                {
+                    crate::attention::explain(id);
                 }
             }
             (Kind::Permission, Button::Allow | Button::Deny) => {
@@ -501,6 +542,7 @@ impl KovaView {
         let perso = self.ivars().config.get().and_then(|c| c.attention.perso_root());
         let routines = crate::routines::snapshot();
         let routines = routines.as_deref().map(Vec::as_slice);
+        let entries = crate::attention::snapshot();
         slot.expanded.borrow_mut().retain(|k| items.iter().any(|i| &i.key == k));
         let expanded = slot.expanded.borrow();
         for item in items.iter_mut() {
@@ -522,7 +564,13 @@ impl KovaView {
                 item.state = State::Running;
             }
             if expanded.contains(&item.key) {
-                item.detail = self.cockpit_detail(item, routine);
+                item.detail = match item.key.strip_prefix("attention:") {
+                    Some(id) => entries
+                        .as_deref()
+                        .and_then(|list| list.iter().find(|e| e.id == id))
+                        .map(|e| cockpit::entry_detail(e, crate::attention::explaining(id))),
+                    None => self.cockpit_detail(item, routine),
+                };
             }
         }
     }
@@ -581,7 +629,8 @@ impl KovaView {
                 })?;
                 Some(Detail::Error { words: item.needs.clone(), lines: cockpit::last_lines(&visible, ERROR_LINES) })
             }
-            Kind::Ask => {
+            // A sheet's card shows its decisions; its button opens it.
+            Kind::Ask | Kind::Sheet => {
                 let q = self.waiting_ask(item.key.strip_prefix("ask:")?)?;
                 let card = crate::chat::cards::question_card(&q, crate::handoff::detail(&q).map(|d| d.card_text()));
                 let message = match &card.detail {
@@ -627,6 +676,23 @@ impl KovaView {
         let log = find_routine(routines.as_deref().map(Vec::as_slice), key).map(|r| r.log.clone()).unwrap_or_default();
         // The index names a row of the sidebar's list; the action ignores it.
         self.sidebar_sched_hit(SchedHit::Button(0, button), name, &log);
+        self.mark_dirty();
+    }
+
+    /// A link of an opened attention card, in the side panel like `Ouvrir`:
+    /// only one the card shows.
+    fn cockpit_link(&self, key: &str, link: &str) {
+        let shown = self.ivars().cockpit.page.borrow().items.iter().any(|i| {
+            i.key == key && matches!(&i.detail, Some(Detail::Entry { links, .. }) if links.iter().any(|l| l == link))
+        });
+        if !shown {
+            return;
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let exists = |p: &Path| p.is_file();
+        if let Some(target) = super::sidebar_attention::open_target(link, home.as_deref(), &exists) {
+            self.open_in_side_panel(target);
+        }
         self.mark_dirty();
     }
 

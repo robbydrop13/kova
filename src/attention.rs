@@ -95,6 +95,12 @@ pub struct Entry {
     /// 1 urgent, 2 today, 3 this week; `None` when the entry does not say.
     pub prio: Option<u8>,
     pub draft: Option<Draft>,
+    /// The agent's longer words on it, line breaks kept.
+    pub body: Option<String>,
+    /// What `attn explain` wrote for an entry that said nothing else.
+    pub detail: Option<String>,
+    /// The sources it cites: ids, paths or links.
+    pub src: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +126,12 @@ struct Raw {
     prio: Option<serde_json::Value>,
     #[serde(default)]
     draft: Option<serde_json::Value>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    src: Option<serde_json::Value>,
 }
 
 /// Parse the CLI's answer. `None` when it is not a JSON array at all; an
@@ -152,6 +164,19 @@ pub fn parse(text: &str) -> Option<Vec<Entry>> {
                         .draft
                         .and_then(|d| serde_json::from_value::<Draft>(d).ok())
                         .filter(|d| !d.text.trim().is_empty()),
+                    body: nonempty(raw.body),
+                    detail: nonempty(raw.detail),
+                    // A list of words, or one word; anything else is none.
+                    src: match raw.src {
+                        Some(serde_json::Value::Array(list)) => list
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty())
+                            .collect(),
+                        Some(serde_json::Value::String(one)) if !one.trim().is_empty() => vec![one.trim().to_string()],
+                        _ => Vec::new(),
+                    },
                 })
             })
             .collect(),
@@ -220,20 +245,44 @@ pub fn epoch_of(ts: &str) -> Option<u64> {
 // ---------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Commands {
-    list: Vec<String>,
-    act: Vec<String>,
-    close: Vec<String>,
+pub struct Commands {
+    pub list: Vec<String>,
+    pub act: Vec<String>,
+    pub close: Vec<String>,
+    /// `attn snooze`; empty: the program of `close` with `snooze`.
+    pub snooze: Vec<String>,
+    /// `attn explain`; empty: the program of `close` with `explain`.
+    pub explain: Vec<String>,
 }
 
-static COMMANDS: RwLock<Commands> =
-    RwLock::new(Commands { list: Vec::new(), act: Vec::new(), close: Vec::new() });
+static COMMANDS: RwLock<Commands> = RwLock::new(Commands {
+    list: Vec::new(),
+    act: Vec::new(),
+    close: Vec::new(),
+    snooze: Vec::new(),
+    explain: Vec::new(),
+});
+
+/// The argv of a verb the config may leave out: as given, or the program of
+/// `close` followed by `verb`.
+fn or_close_bin(given: &[String], close: &[String], verb: &str) -> Vec<String> {
+    if !given.is_empty() {
+        return given.to_vec();
+    }
+    close.first().map(|bin| vec![bin.clone(), verb.to_string()]).unwrap_or_default()
+}
 
 /// Adopt the configured commands. An empty `list` turns the queue off: the
 /// Asks view is as it was and nothing is spawned. Called at startup and on
 /// `reload-config`.
-pub fn set_commands(list: &[String], act: &[String], close: &[String]) {
-    let next = Commands { list: list.to_vec(), act: act.to_vec(), close: close.to_vec() };
+pub fn set_commands(config: &Commands) {
+    let next = Commands {
+        list: config.list.clone(),
+        act: config.act.clone(),
+        close: config.close.clone(),
+        snooze: or_close_bin(&config.snooze, &config.close, "snooze"),
+        explain: or_close_bin(&config.explain, &config.close, "explain"),
+    };
     if *COMMANDS.read() == next {
         return;
     }
@@ -258,6 +307,10 @@ pub fn can_act() -> bool {
 
 pub fn can_close() -> bool {
     !COMMANDS.read().close.is_empty()
+}
+
+pub fn can_snooze() -> bool {
+    !COMMANDS.read().snooze.is_empty()
 }
 
 static CACHE: RwLock<Option<Arc<Vec<Entry>>>> = RwLock::new(None);
@@ -370,6 +423,12 @@ pub enum Verb {
     Validate,
     /// A draft the user rewrote: `act_command <id> Corriger --text=<text>`.
     Correct,
+    /// The Cockpit's check: `close_command <id> --reason done`.
+    Resolve,
+    /// The Cockpit's x, not relevant: `close_command <id> --reason dismissed`.
+    Dismiss,
+    /// Out of the list until a date: `snooze_command <id> --until=<ISO>`.
+    Snooze,
 }
 
 impl Verb {
@@ -381,6 +440,9 @@ impl Verb {
             Verb::Ignore => "Ignorer",
             Verb::Validate => "Valider",
             Verb::Correct => "Corriger",
+            Verb::Resolve => "C'est fait",
+            Verb::Dismiss => "Retirer",
+            Verb::Snooze => "Plus tard",
         }
     }
 }
@@ -418,12 +480,30 @@ fn set_outcome(id: &str, outcome: Outcome) {
 /// one Kova passes on.
 /// A correction carries its text as one `--text=...` element, never as a
 /// word of its own, so the CLI can never read it as an option.
+/// A snooze carries its date the same way, as `--until=<ISO 8601>`, and only
+/// a date that reads as one.
+#[cfg(test)]
 fn verb_argv(act: &[String], close: &[String], id: &str, verb: Verb, text: Option<&str>) -> Option<(String, Vec<String>)> {
+    verb_argv_with(act, close, &[], id, verb, text)
+}
+
+fn verb_argv_with(
+    act: &[String],
+    close: &[String],
+    snooze: &[String],
+    id: &str,
+    verb: Verb,
+    text: Option<&str>,
+) -> Option<(String, Vec<String>)> {
     if !valid_id(id) {
         return None;
     }
     let acts = matches!(verb, Verb::Send | Verb::Validate | Verb::Correct);
-    let base = if acts { act } else { close };
+    let base = match verb {
+        Verb::Snooze => snooze,
+        _ if acts => act,
+        _ => close,
+    };
     let (bin, words) = base.split_first()?;
     let mut args: Vec<String> = words.to_vec();
     args.push(id.to_string());
@@ -435,6 +515,12 @@ fn verb_argv(act: &[String], close: &[String], id: &str, verb: Verb, text: Optio
         }
         Verb::Done => args.extend(["--note".to_string(), "Fait (Kova)".to_string()]),
         Verb::Ignore => args.extend(["--note".to_string(), "Ignoré (Kova)".to_string()]),
+        Verb::Resolve => args.extend(["--reason".to_string(), "done".to_string()]),
+        Verb::Dismiss => args.extend(["--reason".to_string(), "dismissed".to_string()]),
+        Verb::Snooze => {
+            let until = text.map(str::trim).filter(|t| epoch_of(t).is_some())?;
+            args.push(format!("--until={until}"));
+        }
     }
     Some((bin.clone(), args))
 }
@@ -457,7 +543,7 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
     }
     let (bin, args) = {
         let commands = COMMANDS.read();
-        verb_argv(&commands.act, &commands.close, id, verb, text.as_deref())
+        verb_argv_with(&commands.act, &commands.close, &commands.snooze, id, verb, text.as_deref())
     }
     .ok_or_else(|| format!("attention: no command for {}", verb.label()))?;
     {
@@ -493,6 +579,47 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
         refresh();
     });
     Ok(())
+}
+
+/// How long `attn explain` may take: a model writes the detail.
+const EXPLAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(150);
+/// The ids an explain runs for: never two at once for one entry.
+static EXPLAINING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether an explain runs for this entry.
+pub fn explaining(id: &str) -> bool {
+    EXPLAINING.lock().iter().any(|i| i == id)
+}
+
+/// Ask the CLI to write an entry's detail, in the background
+/// (`explain_command <id>`); the next read brings it. False when it cannot
+/// run: no command, an id not in the last read, one already running.
+pub fn explain(id: &str) -> bool {
+    let known = CACHE.read().as_ref().is_some_and(|entries| entries.iter().any(|e| e.id == id));
+    let argv = COMMANDS.read().explain.clone();
+    let Some((bin, words)) = argv.split_first() else { return false };
+    if !known || !valid_id(id) {
+        return false;
+    }
+    {
+        let mut running = EXPLAINING.lock();
+        if running.iter().any(|i| i == id) {
+            return false;
+        }
+        running.push(id.to_string());
+    }
+    let (bin, mut args, id) = (bin.clone(), words.to_vec(), id.to_string());
+    args.push(id.clone());
+    std::thread::spawn(move || {
+        match crate::exec::run_with_deadline(std::process::Command::new(&bin).args(&args), EXPLAIN_DEADLINE) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => log::warn!("attention explain {id}: {bin} exited with {}", out.status),
+            Err(e) => log::warn!("attention explain {id}: {e}"),
+        }
+        EXPLAINING.lock().retain(|i| i != &id);
+        refresh();
+    });
+    true
 }
 
 /// The most a correction carries: a long email, with room to spare.
@@ -590,6 +717,20 @@ mod tests {
             ))
         );
         assert_eq!(verb_argv(&act, &close, "a-1", Verb::Ignore, None).map(|(_, a)| a[5].clone()), Some("Ignoré (Kova)".into()));
+        assert_eq!(
+            verb_argv(&act, &close, "a-1", Verb::Dismiss, None).map(|(_, a)| a[4..].to_vec()),
+            Some(vec!["--reason".to_string(), "dismissed".to_string()])
+        );
+        assert_eq!(verb_argv(&act, &close, "a-1", Verb::Resolve, None).map(|(_, a)| a[5].clone()), Some("done".into()));
+        let snooze = or_close_bin(&[], &close, "snooze");
+        assert_eq!(snooze, ["/bin/attn", "snooze"]);
+        assert_eq!(
+            verb_argv_with(&act, &close, &snooze, "a-1", Verb::Snooze, Some("2026-11-07T09:00:00+01:00")),
+            Some(("/bin/attn".to_string(), vec!["snooze".into(), "a-1".into(), "--until=2026-11-07T09:00:00+01:00".into()]))
+        );
+        assert_eq!(verb_argv_with(&act, &close, &snooze, "a-1", Verb::Snooze, Some("--by x")), None, "only a date");
+        assert_eq!(or_close_bin(&["/x/explain".into()], &close, "explain"), ["/x/explain"]);
+        assert!(or_close_bin(&[], &[], "explain").is_empty());
         // No close command: Fait and Ignorer have nothing to run.
         assert_eq!(verb_argv(&act, &[], "a-1", Verb::Done, None), None);
         // An id that could be read as an option never reaches the argv.
@@ -630,6 +771,13 @@ mod tests {
         assert_eq!(entries[1].prio, None);
         assert_eq!(entries[1].draft, None);
         assert_eq!(entries[2].prio, Some(3));
+        let more = parse(r#"[{"id":"a-9","level":"point","title":"t","body":"line 1\nline 2","detail":" ","src":["s-1"," "]},
+            {"id":"a-8","level":"point","title":"t","src":"https://x.y"}]"#)
+        .unwrap();
+        assert_eq!(more[0].body.as_deref(), Some("line 1\nline 2"));
+        assert_eq!(more[0].detail, None);
+        assert_eq!(more[0].src, ["s-1"]);
+        assert_eq!(more[1].src, ["https://x.y"]);
     }
 
     #[test]
@@ -650,7 +798,7 @@ mod tests {
 
     #[test]
     fn the_feature_is_off_without_a_command() {
-        set_commands(&[], &[], &[]);
+        set_commands(&Commands::default());
         assert!(!configured());
         assert!(snapshot().is_none());
         assert!(perform("a-100001", Verb::Done).is_err());

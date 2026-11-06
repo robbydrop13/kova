@@ -257,6 +257,12 @@ pub struct AttentionConfig {
     /// Closes an entry: Kova appends the id, then `--note` and its words
     /// (`["/usr/local/bin/attn", "close", "--by", "me"]`).
     pub close_command: Vec<String>,
+    /// Snoozes an entry: Kova appends the id and `--until=<ISO 8601>`.
+    /// Absent: `close_command`'s program with `snooze`.
+    pub snooze_command: Vec<String>,
+    /// Writes the detail of an entry that says nothing (`attn explain`):
+    /// Kova appends the id. Absent: `close_command`'s program with `explain`.
+    pub explain_command: Vec<String>,
     /// The folder whose work is personal (`"~/Perso"`): a failed routine,
     /// a permission or an error whose cwd sits under it is scoped Perso in
     /// the Cockpit, anything else Pro. Empty: everything is Pro.
@@ -264,6 +270,16 @@ pub struct AttentionConfig {
 }
 
 impl AttentionConfig {
+    pub fn commands(&self) -> crate::attention::Commands {
+        crate::attention::Commands {
+            list: self.command.clone(),
+            act: self.act_command.clone(),
+            close: self.close_command.clone(),
+            snooze: self.snooze_command.clone(),
+            explain: self.explain_command.clone(),
+        }
+    }
+
     /// `perso_dir` with a leading `~/` expanded, `None` when unset.
     pub fn perso_root(&self) -> Option<std::path::PathBuf> {
         let dir = self.perso_dir.trim();

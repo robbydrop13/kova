@@ -28,6 +28,8 @@
 
 # [attention]
 # perso_dir = "~/Perso"        # cwd under this folder = Perso in the Cockpit, else Pro
+# snooze_command = []         # default: close_command's program + "snooze"
+# explain_command = []        # default: close_command's program + "explain"
 
 # [splits]
 # min_width = 300.0            # minimum pane width before horizontal scroll kicks in

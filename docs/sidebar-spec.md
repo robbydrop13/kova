@@ -625,6 +625,12 @@ shell line, and only for an id the last read returned (letters, digits, `-`,
 `_`, no leading dash). `tests/fixtures/attention/list.json` is the made-up
 queue the tests read.
 
+The Cockpit (`docs/cockpit.md`) also reads `body`, `detail` and `src` (a list
+or one word), and uses three more keys of `[attention]`: `snooze_command`
+(`<id> --until=<ISO 8601>`) and `explain_command` (`<id>`), each defaulting to
+`close_command`'s program followed by `snooze` / `explain`, and `perso_dir`,
+the folder whose live needs are scoped Perso.
+
 ### 3.7.4 Agents list (`SidebarList::Agents`)
 
 `src/window/sidebar_agents.rs` owns this list: the view state, the pure model
