@@ -3,6 +3,9 @@
 //! (`window::side_panel::target_for`). A click opens them there. Any other
 //! path stays text.
 //!
+//! In an agent's answer, a bare Linear id (`CLA-123`, `CLAR-`, `CLAD-`) links
+//! to its issue and a bare `#12345` to that pull request of the Claap repo.
+//!
 //! A path may hold spaces (`~/AI directory/x.md`): one is linked only when
 //! the file exists, so a sentence that happens to start with `/` is never
 //! taken for one.
@@ -21,7 +24,14 @@ pub struct Link {
 pub enum Kind {
     Url,
     Path,
+    /// A Linear issue id, `CLA-123`.
+    Issue,
+    /// A pull request number, `#12345`.
+    Pull,
 }
+
+const LINEAR_ISSUE: &str = "https://linear.app/claap/issue/";
+const GITHUB_PULL: &str = "https://github.com/claap-app/claap/pull/";
 
 /// The longest path with spaces looked for, in bytes.
 const SPACED_PATH_MAX: usize = 240;
@@ -47,6 +57,50 @@ pub fn find(text: &str, exists: &dyn Fn(&str) -> bool) -> Vec<Link> {
     }
     links.sort_by_key(|l| l.start);
     links
+}
+
+/// `find`, plus the bare issue ids and pull request numbers (`refs`).
+pub fn find_with_refs(text: &str, exists: &dyn Fn(&str) -> bool) -> Vec<Link> {
+    let mut links = find(text, exists);
+    let found = refs(text, &links);
+    links.extend(found);
+    links.sort_by_key(|l| l.start);
+    links
+}
+
+/// `CLA-123`, `CLAR-123`, `CLAD-123` and `#12345` standing alone: not glued
+/// to a word, a path or a URL, nor inside a link already found.
+fn refs(text: &str, taken: &[Link]) -> Vec<Link> {
+    let bytes = text.as_bytes();
+    let word = |i: usize| bytes[i].is_ascii_alphanumeric() || b"_/-#".contains(&bytes[i]);
+    let digits = |from: usize| bytes[from..].iter().take_while(|b| b.is_ascii_digit()).count();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let free = i == 0 || !word(i - 1);
+        let found = if !free {
+            None
+        } else if bytes[i] == b'#' {
+            let n = digits(i + 1);
+            (n == 5).then(|| (i + 1 + n, Kind::Pull))
+        } else {
+            ["CLA-", "CLAR-", "CLAD-"].iter().find(|p| bytes[i..].starts_with(p.as_bytes())).and_then(|p| {
+                let n = digits(i + p.len());
+                (n > 0).then(|| (i + p.len() + n, Kind::Issue))
+            })
+        };
+        match found {
+            Some((end, kind))
+                if (end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_')
+                    && !taken.iter().any(|l| l.start < end && i < l.end) =>
+            {
+                out.push(Link { start: i, end, kind });
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 fn starts_token(text: &str, at: usize) -> bool {
@@ -125,9 +179,18 @@ fn paths(text: &str, urls: &[Link], exists: &dyn Fn(&str) -> bool) -> Vec<Link> 
 /// `text` as HTML: escaped, its links as anchors the page opens in the side
 /// panel (`data-path` for a file, `href` for a URL).
 pub fn linkify_with(text: &str, exists: &dyn Fn(&str) -> bool) -> String {
+    render(text, find(text, exists))
+}
+
+/// `linkify_with`, the bare issue ids and pull request numbers linked too.
+pub fn linkify_refs_with(text: &str, exists: &dyn Fn(&str) -> bool) -> String {
+    render(text, find_with_refs(text, exists))
+}
+
+fn render(text: &str, links: Vec<Link>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
-    for link in find(text, exists) {
+    for link in links {
         if link.start < at {
             continue;
         }
@@ -147,12 +210,19 @@ pub fn anchor(target: &str, kind: Kind) -> String {
     match kind {
         Kind::Url => format!(r#"<a href="{}">"#, escape(target)),
         Kind::Path => format!(r##"<a href="#" class="path" data-path="{}">"##, escape(target)),
+        Kind::Issue => format!(r#"<a href="{LINEAR_ISSUE}{}">"#, escape(target)),
+        Kind::Pull => format!(r#"<a href="{GITHUB_PULL}{}">"#, escape(target.trim_start_matches('#'))),
     }
 }
 
 /// `linkify_with` against the real filesystem.
 pub fn linkify(text: &str) -> String {
     linkify_with(text, &on_disk)
+}
+
+/// `linkify_refs_with` against the real filesystem.
+pub fn linkify_refs(text: &str) -> String {
+    linkify_refs_with(text, &on_disk)
 }
 
 fn on_disk(path: &str) -> bool {
@@ -222,5 +292,26 @@ mod tests {
             html,
             r##"&lt;b&gt; <a href="#" class="path" data-path="/x/y.md">/x/y.md</a> &amp; <a href="https://a.b/?q=1&amp;r=2">https://a.b/?q=1&amp;r=2</a>"##
         );
+    }
+
+    #[test]
+    fn bare_issue_ids_and_pull_numbers_link_to_linear_and_github() {
+        let html = linkify_refs_with("Fixed CLA-9513 and CLAR-12 (CLAD-3), see #13544.", &none);
+        assert_eq!(
+            html,
+            r#"Fixed <a href="https://linear.app/claap/issue/CLA-9513">CLA-9513</a> and <a href="https://linear.app/claap/issue/CLAR-12">CLAR-12</a> (<a href="https://linear.app/claap/issue/CLAD-3">CLAD-3</a>), see <a href="https://github.com/claap-app/claap/pull/13544">#13544</a>."#
+        );
+        assert_eq!(linkify_with("CLA-1 #13544", &none), "CLA-1 #13544", "only answers get them");
+    }
+
+    #[test]
+    fn ids_inside_a_url_a_word_or_too_short_stay_text() {
+        let refs_of = |t: &str| find_with_refs(t, &none).into_iter().filter(|l| matches!(l.kind, Kind::Issue | Kind::Pull)).count();
+        assert_eq!(refs_of("https://linear.app/claap/issue/CLA-9513"), 0);
+        assert_eq!(refs_of("https://github.com/claap-app/claap/pull/1#13544 x"), 0);
+        assert_eq!(refs_of("linear.app/claap/issue/CLA-1 and a#12345"), 0);
+        assert_eq!(refs_of("#1234, #123456, CLA-, XCLA-1, CLA-12a"), 0);
+        assert_eq!(refs_of("CLA-1."), 1);
+        assert_eq!(refs_of("été CLA-2 — #12345"), 2, "after accented text, no cut inside a char");
     }
 }

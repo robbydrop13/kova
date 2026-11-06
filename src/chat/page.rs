@@ -18,7 +18,7 @@
 use serde::Serialize;
 
 use super::conversation::{BlockKind, Conversation, Item, Tool};
-use super::links::linkify;
+use super::links::{linkify, linkify_refs};
 
 /// How many exchanges (a user message and what follows it) the page opens
 /// on; `Show earlier` adds as many again.
@@ -96,9 +96,20 @@ pub fn markdown(source: &str) -> String {
     let mut path_link = false;
     let mut in_link = 0usize;
     let mut in_code = false;
+    // A heading is a title: its ids stay text.
+    let mut in_heading = false;
     let parser = TextMergeStream::new(Parser::new_ext(source, options)).map(|event| match event {
         Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
-        Event::Text(text) if in_link == 0 && !in_code => Event::InlineHtml(CowStr::from(linkify(&text))),
+        Event::Text(text) if in_link == 0 && !in_code && in_heading => Event::InlineHtml(CowStr::from(linkify(&text))),
+        Event::Text(text) if in_link == 0 && !in_code => Event::InlineHtml(CowStr::from(linkify_refs(&text))),
+        Event::Start(Tag::Heading { level, id, classes, attrs }) => {
+            in_heading = true;
+            Event::Start(Tag::Heading { level, id, classes, attrs })
+        }
+        Event::End(TagEnd::Heading(level)) => {
+            in_heading = false;
+            Event::End(TagEnd::Heading(level))
+        }
         Event::Start(Tag::CodeBlock(kind)) => {
             in_code = true;
             Event::Start(Tag::CodeBlock(kind))
@@ -1102,6 +1113,17 @@ mod tests {
         assert_eq!(ids(&e), ["u:u1", "r:live"], "the reasoning going on is not also behind the scenes");
         let (e, _) = entries(&conv(vec![user("u1", "go"), think("x")]), EXCHANGES_STEP, false);
         assert!(!e.iter().any(|x| x.id == "r:live"), "idle: no Réflexion");
+    }
+
+    #[test]
+    fn bare_ids_link_outside_code_links_and_headings() {
+        let html = markdown("## CLA-1 done\n\nShipped CLA-9513 in #13544, not `CLA-2` nor [CLA-3](https://x.io/3) nor #1234.\n\n```\nCLA-4 #13545\n```");
+        assert!(html.contains(r#"<a href="https://linear.app/claap/issue/CLA-9513">CLA-9513</a>"#));
+        assert!(html.contains(r#"<a href="https://github.com/claap-app/claap/pull/13544">#13544</a>"#));
+        assert!(html.contains("<h2>CLA-1 done</h2>"), "a heading stays a title: {html}");
+        assert!(html.contains("<code>CLA-2</code>"));
+        assert!(html.contains(r#"<a href="https://x.io/3">CLA-3</a>"#));
+        assert!(!html.contains("issue/CLA-4") && !html.contains("pull/13545") && !html.contains("pull/1234"));
     }
 
     #[test]
