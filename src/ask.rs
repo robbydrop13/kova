@@ -800,12 +800,56 @@ fn wake_sleeping_asker(asker: &Asker, own_socket: &str) -> Option<Woken> {
         if list_panes(socket)
             .is_some_and(|panes| reports_session(&panes, pane_id, asker.agent, session))
         {
-            // Registered is not drawn yet: give the agent's input a moment.
+            // Registered is not drawn yet: wait for its empty input line. Typed
+            // before that, the start of a long answer was lost (06/11, a
+            // decision sheet's answer arrived cut after its first lines).
             std::thread::sleep(Duration::from_secs(2));
+            while std::time::Instant::now() < deadline && !prompt_ready(socket, pane_id) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            // The prompt drawn, its key handling may still be settling.
+            std::thread::sleep(Duration::from_secs(1));
             return Some(Woken::Ready { socket: socket.to_string(), pane_id });
         }
     }
     Some(Woken::NotYet { pane_id })
+}
+
+/// Whether a pane shows an agent waiting at an empty input line, and is not
+/// working: the moment typed text lands whole.
+fn prompt_ready(socket: &str, pane_id: u32) -> bool {
+    let working = list_panes(socket).is_some_and(|panes| {
+        panes.iter().any(|p| {
+            p.get("id").and_then(|v| v.as_u64()) == Some(u64::from(pane_id))
+                && p.get("working").and_then(|v| v.as_bool()) == Some(true)
+        })
+    });
+    if working {
+        return false;
+    }
+    let reply = request(
+        socket,
+        serde_json::json!({"cmd": "get-pane-content", "panes": [pane_id], "mode": "visible", "trim_trailing_blank_lines": true}),
+        Duration::from_secs(3),
+    );
+    let text = reply
+        .as_ref()
+        .and_then(|r| r.get("data"))
+        .and_then(|d| d.get("panes"))
+        .and_then(|p| p.get(0))
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    shows_empty_prompt(text)
+}
+
+/// The last input line on screen is empty: `❯` (Claude Code) or `>` alone.
+fn shows_empty_prompt(text: &str) -> bool {
+    text.lines()
+        .rev()
+        .map(|l| l.trim_matches(|c: char| c.is_whitespace() || c == '\u{2502}'))
+        .find(|l| l.starts_with('\u{276f}') || *l == ">")
+        .is_some_and(|l| l.trim_start_matches('\u{276f}').trim().is_empty())
 }
 
 /// Whether the asker's Kova pane still runs the asker's conversation, read now
@@ -2023,6 +2067,13 @@ pub fn agent_rgb(name: &str) -> (f64, f64, f64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_prompt_is_the_last_input_line_with_nothing_typed() {
+        assert!(super::shows_empty_prompt("hello\n\u{276f} \n  bypass permissions on"));
+        assert!(!super::shows_empty_prompt("hello\n\u{276f} half typed\n"));
+        assert!(!super::shows_empty_prompt("Resuming conversation..."));
+    }
+
     use super::*;
 
     fn asker() -> Asker {
