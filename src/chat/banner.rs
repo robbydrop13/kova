@@ -1,15 +1,76 @@
-//! The band at the top of the chat that says, at a glance, what the agent
-//! is doing (KovaLink's readability rule 1): `Working · 1 min 12 s`,
-//! `Waiting for you`, `Done 3 min ago`, `Offline`.
+//! The turn's state, shown above the chat's box so the user knows whether
+//! a message leaves now: `Travaille · 1 min 12 s`, `Attend ta réponse`,
+//! `Prêt`, `Hors ligne` (KovaLink's readability rule 1).
+//!
+//! Driven by the session's own events, never by a timer guessing:
+//! - Claude Code's title spinner, pushed through the PTY (`Pane::is_working`);
+//! - the session's hooks (`~/.claude/state/turns/<session id>`, written by
+//!   `claude-config/hooks/harness.py` on UserPromptSubmit and Stop, by
+//!   `notify.sh` on a permission prompt or a question), read when the file
+//!   changes;
+//! - the transcript: an `AskUserQuestion` or `ExitPlanMode` call with no
+//!   result yet is a question on screen;
+//! - the cards (a permission prompt read on screen, a `kova ask` of the pane).
 
-/// What the pane says about its agent, read on the tick.
+use std::path::{Path, PathBuf};
+
+/// What a hook of the session said last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Turn {
+    Working,
+    Waiting,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HookTurn {
+    pub turn: Turn,
+    /// Epoch milliseconds of the hook.
+    pub at_ms: u64,
+}
+
+/// A prompt just submitted counts as working this long before the spinner
+/// shows; past it, the spinner alone says so (a turn interrupted with Esc
+/// never runs the Stop hook).
+pub const HOOK_BRIDGE_MS: u64 = 5_000;
+
+/// Where the hooks write the turn of `session_id`: under `~/.claude` even
+/// for a session with its own config dir (the hook writes under `$HOME`).
+pub fn hook_path(home: &Path, session_id: &str) -> Option<PathBuf> {
+    crate::claude_session::is_safe_session_id(session_id).then(|| home.join(".claude/state/turns").join(session_id))
+}
+
+/// `working 1762430000.123`: the state, then epoch seconds.
+pub fn parse_hook(text: &str) -> Option<HookTurn> {
+    let mut words = text.split_whitespace();
+    let turn = match words.next()? {
+        "working" => Turn::Working,
+        "waiting" => Turn::Waiting,
+        "ready" => Turn::Ready,
+        _ => return None,
+    };
+    let secs: f64 = words.next()?.parse().ok()?;
+    (secs.is_finite() && secs > 0.0).then(|| HookTurn { turn, at_ms: (secs * 1000.0) as u64 })
+}
+
+/// What the pane, its hooks and its transcript say, read on the tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BannerInput {
     /// A Claude session runs in the pane.
     pub has_session: bool,
-    pub working: bool,
-    /// A permission prompt on screen, or a `kova ask` of this pane on the board.
-    pub waiting: bool,
+    /// Claude Code's title spinner is on.
+    pub spinner: bool,
+    /// When the spinner last went off, epoch ms.
+    pub spinner_off_at: Option<u64>,
+    /// A card waits: a permission prompt on screen, a `kova ask` of the pane.
+    pub cards: bool,
+    /// The transcript ends on a question to the user (`AskUserQuestion`,
+    /// `ExitPlanMode`) still unanswered.
+    pub question: bool,
+    /// Claude Code's `❯` line is on screen, empty or not: no dialog over it.
+    pub prompt_line: bool,
+    pub hook: Option<HookTurn>,
+    pub now_ms: u64,
     /// When the turn in flight started, epoch seconds (the user's last
     /// message, else the moment the chat saw it working).
     pub working_since: Option<u64>,
@@ -25,17 +86,25 @@ pub enum Banner {
     Offline,
 }
 
-/// The banner for what the pane says. A question waiting wins over the
+/// The state for what the pane says. A question waiting wins over the
 /// spinner: a permission prompt keeps the title of a working Claude for a
-/// moment, and the answer is what the user must give.
+/// moment, and the answer is what the user must give. A hook's `waiting`
+/// holds only while a dialog covers the prompt line and the spinner is off:
+/// answered, or dismissed with Esc, it is over.
 pub fn banner(input: BannerInput) -> Banner {
     if !input.has_session {
         return Banner::Offline;
     }
-    if input.waiting {
+    let hook = |turn| input.hook.filter(|h| h.turn == turn);
+    let asked = input.question || hook(Turn::Waiting).is_some();
+    if input.cards || (asked && !input.spinner && !input.prompt_line) {
         return Banner::Waiting;
     }
-    if input.working {
+    let working = input.spinner
+        || hook(Turn::Working).is_some_and(|h| {
+            input.now_ms < h.at_ms + HOOK_BRIDGE_MS && input.spinner_off_at.is_none_or(|off| off < h.at_ms)
+        });
+    if working {
         return Banner::Working { since: input.working_since };
     }
     Banner::Done { at: input.last_activity }
@@ -62,13 +131,13 @@ pub fn duration(secs: u64) -> String {
     }
 }
 
-/// `just now`, `3 min ago`, `2 h ago`, `3 d ago`.
+/// `à l'instant`, `il y a 3 min`, `il y a 2 h`, `il y a 3 j`.
 pub fn ago(secs: u64) -> String {
     match secs {
-        s if s < 60 => "just now".to_string(),
-        s if s < 3600 => format!("{} min ago", s / 60),
-        s if s < 86_400 => format!("{} h ago", s / 3600),
-        s => format!("{} d ago", s / 86_400),
+        s if s < 60 => "à l'instant".to_string(),
+        s if s < 3600 => format!("il y a {} min", s / 60),
+        s if s < 86_400 => format!("il y a {} h", s / 3600),
+        s => format!("il y a {} j", s / 86_400),
     }
 }
 
@@ -76,12 +145,12 @@ pub fn ago(secs: u64) -> String {
 /// the clock moves once a second while the agent works.
 pub fn text(banner: Banner, now: u64) -> String {
     match banner {
-        Banner::Working { since: Some(t) } => format!("Working · {}", duration(now.saturating_sub(t))),
-        Banner::Working { since: None } => "Working".to_string(),
-        Banner::Waiting => "Waiting for you".to_string(),
-        Banner::Done { at: Some(t) } => format!("Done {}", ago(now.saturating_sub(t))),
-        Banner::Done { at: None } => "Done".to_string(),
-        Banner::Offline => "Offline".to_string(),
+        Banner::Working { since: Some(t) } => format!("Travaille · {}", duration(now.saturating_sub(t))),
+        Banner::Working { since: None } => "Travaille".to_string(),
+        Banner::Waiting => "Attend ta réponse".to_string(),
+        Banner::Done { at: Some(t) } => format!("Prêt · fini {}", ago(now.saturating_sub(t))),
+        Banner::Done { at: None } => "Prêt".to_string(),
+        Banner::Offline => "Hors ligne".to_string(),
     }
 }
 
@@ -90,32 +159,74 @@ mod tests {
     use super::*;
 
     fn input() -> BannerInput {
-        BannerInput { has_session: true, ..Default::default() }
+        BannerInput { has_session: true, prompt_line: true, now_ms: 100_000, ..Default::default() }
+    }
+
+    fn hook(turn: Turn, at_ms: u64) -> Option<HookTurn> {
+        Some(HookTurn { turn, at_ms })
     }
 
     #[test]
     fn no_session_is_offline_whatever_else_holds() {
-        assert_eq!(banner(BannerInput { working: true, waiting: true, ..Default::default() }), Banner::Offline);
+        assert_eq!(banner(BannerInput { spinner: true, cards: true, ..Default::default() }), Banner::Offline);
     }
 
     #[test]
     fn a_question_wins_over_the_spinner() {
-        assert_eq!(banner(BannerInput { working: true, waiting: true, ..input() }), Banner::Waiting);
+        assert_eq!(banner(BannerInput { spinner: true, cards: true, ..input() }), Banner::Waiting);
+    }
+
+    #[test]
+    fn the_hook_file_is_read() {
+        assert_eq!(parse_hook("working 1762430000.123\n"), hook(Turn::Working, 1_762_430_000_123));
+        assert_eq!(parse_hook("waiting 5"), hook(Turn::Waiting, 5000));
+        assert_eq!(parse_hook("ready 5"), hook(Turn::Ready, 5000));
+        assert_eq!(parse_hook("busy 5"), None);
+        assert_eq!(parse_hook("ready"), None);
+        assert_eq!(parse_hook(""), None);
+        assert_eq!(hook_path(Path::new("/h"), "../x"), None);
+        assert_eq!(hook_path(Path::new("/h"), "abc-1"), Some(PathBuf::from("/h/.claude/state/turns/abc-1")));
+    }
+
+    #[test]
+    fn a_submitted_prompt_is_working_before_the_spinner_shows() {
+        let now = input().now_ms;
+        assert_eq!(banner(BannerInput { hook: hook(Turn::Working, now - 100), ..input() }), Banner::Working { since: None });
+        // The spinner came and went after it: the turn is over (Esc, no Stop hook).
+        let after = BannerInput { hook: hook(Turn::Working, now - 3000), spinner_off_at: Some(now - 1000), ..input() };
+        assert_eq!(banner(after), Banner::Done { at: None });
+        // Too old to bridge anything.
+        assert_eq!(banner(BannerInput { hook: hook(Turn::Working, now - HOOK_BRIDGE_MS), ..input() }), Banner::Done { at: None });
+        assert_eq!(banner(BannerInput { spinner: true, hook: hook(Turn::Ready, now), ..input() }), Banner::Working { since: None }, "the spinner wins");
+    }
+
+    #[test]
+    fn a_question_waits_while_its_dialog_is_on_screen() {
+        let now = input().now_ms;
+        let dialog = BannerInput { prompt_line: false, ..input() };
+        assert_eq!(banner(BannerInput { hook: hook(Turn::Waiting, now - 60_000), ..dialog }), Banner::Waiting, "however long ago");
+        assert_eq!(banner(BannerInput { question: true, ..dialog }), Banner::Waiting, "AskUserQuestion, from the transcript");
+        // Answered: Claude works again, or the dialog left the screen.
+        assert_eq!(banner(BannerInput { hook: hook(Turn::Waiting, now), spinner: true, ..dialog }), Banner::Working { since: None });
+        assert_eq!(banner(BannerInput { hook: hook(Turn::Waiting, now), ..input() }), Banner::Done { at: None });
+        assert_eq!(banner(BannerInput { question: true, ..input() }), Banner::Done { at: None });
     }
 
     #[test]
     fn working_counts_from_the_turn_start() {
-        let b = banner(BannerInput { working: true, working_since: Some(1000), ..input() });
-        assert_eq!(text(b, 1072), "Working · 1 min 12 s");
-        assert_eq!(text(Banner::Working { since: Some(0) }, 7380), "Working · 2 h 03 min");
+        let b = banner(BannerInput { spinner: true, working_since: Some(1000), ..input() });
+        assert_eq!(text(b, 1072), "Travaille · 1 min 12 s");
+        assert_eq!(text(Banner::Working { since: Some(0) }, 7380), "Travaille · 2 h 03 min");
     }
 
     #[test]
-    fn idle_says_how_long_ago_it_finished() {
+    fn idle_says_it_is_ready() {
         let b = banner(BannerInput { last_activity: Some(1000), ..input() });
-        assert_eq!(text(b, 1000 + 180), "Done 3 min ago");
-        assert_eq!(text(b, 1010), "Done just now");
-        assert_eq!(text(Banner::Done { at: None }, 5), "Done");
+        assert_eq!(text(b, 1000 + 180), "Prêt · fini il y a 3 min");
+        assert_eq!(text(b, 1010), "Prêt · fini à l'instant");
+        assert_eq!(text(Banner::Done { at: None }, 5), "Prêt");
+        assert_eq!(text(Banner::Waiting, 5), "Attend ta réponse");
+        assert_eq!(text(Banner::Offline, 5), "Hors ligne");
     }
 
     #[test]

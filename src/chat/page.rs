@@ -9,7 +9,7 @@
 //! through still could not run anything; the script uses no inline handler.
 //!
 //! The layout follows KovaLink's readability rules
-//! (`link/docs/13-chat-lisibilite.md`): a state banner at the top, the
+//! (`link/docs/13-chat-lisibilite.md`): the turn's state above the box, the
 //! assistant's text full width without a bubble, the user's message in a
 //! quiet bubble on the right, tool calls as compact one-line rows grouped
 //! and folded past five, the last exchanges first, nothing folding by
@@ -443,8 +443,8 @@ pub struct Update {
     pub entries: Option<Vec<WireEntry>>,
     pub more: bool,
     pub cards: Option<Vec<WireEntry>>,
-    /// The message waiting in the queue, and why.
-    pub queued: Option<Queued>,
+    /// The messages waiting in the queue, in order, when it changed.
+    pub queued: Option<Vec<Queued>>,
     /// A one-off line under the box.
     pub note: Option<String>,
     /// Text to put back in the box (a message that was not sent).
@@ -486,8 +486,8 @@ pub struct Attach {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Queued {
+    pub id: u64,
     pub text: String,
-    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -542,8 +542,9 @@ pub fn shell(theme: &Theme, title: &str, nonce: &str) -> String {
 html, body {{ margin: 0; height: 100%; background: var(--bg); color: var(--t1);
   font: 14.5px/1.6 "Inter", -apple-system, system-ui, sans-serif; }}
 body {{ display: flex; flex-direction: column; }}
-#banner {{ flex: none; display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px;
-  border-bottom: 1px solid var(--b3); font-size: 13px; color: var(--t2); background: var(--bg); }}
+#banner {{ display: flex; align-items: center; gap: 8px; min-height: 26px; padding: 0 2px; margin-bottom: 4px;
+  font-size: 12.5px; color: var(--t2); }}
+#banner #state {{ min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }}
 #banner .dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--t3); flex: none; }}
 #banner.working .dot {{ background: var(--working); animation: pulse 1.2s ease-in-out infinite; }}
 #banner.waiting .dot {{ background: var(--awaiting); }}
@@ -610,9 +611,14 @@ body {{ display: flex; flex-direction: column; }}
 .btn:disabled {{ opacity: .5; cursor: default; }}
 .chint {{ margin-top: 6px; font-size: 12px; color: var(--t3); }}
 #foot {{ flex: none; max-width: 860px; width: 100%; margin: 0 auto; padding: 6px 18px 12px; }}
-#queued {{ display: none; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12.5px; color: var(--t2); }}
-#queued.on {{ display: flex; }}
-#queued .qtext {{ flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }}
+#pending {{ max-width: 860px; margin: 0 auto; }}
+.pend {{ flex-direction: column; align-items: flex-end; margin: 10px 0; }}
+.pend .bubble {{ opacity: .7; border-style: dashed; white-space: pre-wrap; }}
+.pend textarea {{ width: 80%; resize: none; font: inherit; color: var(--t1); background: var(--bg2); border: 1px solid var(--accent);
+  border-radius: 14px; padding: 7px 12px; outline: none; }}
+.pmeta {{ display: flex; gap: 8px; align-items: center; margin-top: 3px; font-size: 12px; color: var(--t3); }}
+.pmeta button {{ font: inherit; color: var(--t3); background: none; border: 0; padding: 0; cursor: pointer; }}
+.pmeta button:hover {{ color: var(--t1); text-decoration: underline; }}
 #inrow {{ display: flex; align-items: flex-end; gap: 6px; }}
 .mic {{ flex: none; display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; padding: 0;
   color: var(--t3); background: var(--bg2); border: 1px solid var(--b2); border-radius: 10px; cursor: pointer; }}
@@ -667,13 +673,12 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
 .chip button {{ position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; padding: 0; border: 0; border-radius: 50%;
   font-size: 11px; line-height: 16px; color: #fff; background: rgba(0,0,0,.6); cursor: pointer; }}
 </style></head><body>
-<div id="banner"><span class="dot"></span><span id="state">…</span><span class="grow"></span><button data-act="terminal">Terminal</button></div>
-<div id="scroll"><div id="log"><button id="more" data-act="more">Show earlier</button></div></div>
+<div id="scroll"><div id="log"><button id="more" data-act="more">Show earlier</button></div><div id="pending"></div></div>
 <div id="cards"></div>
-<div id="foot"><div id="chips"></div><div id="queued"><span>Queued:</span><span class="qtext"></span><span class="qwhy"></span><button class="btn" data-act="cancel">Cancel</button></div>
+<div id="foot"><div id="chips"></div><div id="banner"><span class="dot"></span><span id="state">…</span><span class="grow"></span><button data-act="terminal">Terminal</button></div>
 <div id="pill"><span class="bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span><span id="pline"></span><button class="pbtn" data-act="vcancel" title="Annuler">✕</button><button class="pbtn ok" data-act="vfinish" title="Terminer">✓</button></div>
 <div id="vhist"></div>
-<div id="inrow"><textarea id="box" rows="1" placeholder="Message Claude"></textarea><button id="hist" class="mic" data-act="vhist" title="Dictées récentes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button><button id="mic" class="mic" title="Dictée : maintenir ⌘⇧M pour parler, toucher pour continuer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button></div><div id="note"></div></div>
+<div id="inrow"><textarea id="box" rows="1" placeholder="Message à Claude"></textarea><button id="hist" class="mic" data-act="vhist" title="Dictées récentes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button><button id="mic" class="mic" title="Dictée : maintenir ⌘⇧M pour parler, toucher pour continuer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button></div><div id="note"></div></div>
 <script nonce="{nonce}">
 (function () {{
   // Each message carries this load's nonce: Kova drops one from another load.
@@ -793,9 +798,10 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     const last = log.lastElementChild;
     log.querySelectorAll(".streaming").forEach((n) => {{ if (n !== last || !m.working) n.classList.remove("streaming"); }});
     if (last && m.working && last.classList.contains("asst")) last.classList.add("streaming");
-    const q = $("queued");
-    q.classList.toggle("on", !!m.queued);
-    if (m.queued) {{ q.querySelector(".qtext").textContent = m.queued.text; q.querySelector(".qwhy").textContent = m.queued.reason; }}
+    if (m.banner) {{
+      box.placeholder = m.banner.state === "done" ? "Message à Claude" : "Message à Claude, il partira à son tour";
+    }}
+    if (m.queued) pending(m.queued);
     if (m.attach) {{ images.push(...m.attach); chips(); }}
     if (m.voice) applyVoice(m.voice);
     if (m.dictated) {{ insertAt(m.dictated.text); if (m.dictated.send) send(); }}
@@ -815,6 +821,45 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     }}
     if (m.focus) box.focus();
     if (missing) post({{ type: "resync" }});
+  }}
+  // The queue as "en attente" bubbles, editable and cancellable until they
+  // leave. One being edited keeps its field.
+  let editing = null;
+  function pending(list) {{
+    const el = $("pending");
+    if (editing !== null && !list.some((p) => p.id === editing)) editing = null;
+    el.querySelectorAll(".pend").forEach((n) => {{ if (Number(n.dataset.id) !== editing) n.remove(); }});
+    for (const p of list) {{
+      let n = el.querySelector(`.pend[data-id="${{p.id}}"]`);
+      if (n) {{ el.appendChild(n); continue; }}
+      n = document.createElement("div");
+      n.className = "user pend"; n.dataset.id = p.id;
+      const b = document.createElement("div"); b.className = "bubble"; b.textContent = p.text;
+      const meta = document.createElement("div"); meta.className = "pmeta";
+      meta.innerHTML = '<span>En attente</span><button data-act="pedit">Modifier</button><button data-act="pcancel">Annuler</button>';
+      n.append(b, meta);
+      el.appendChild(n);
+    }}
+  }}
+  function editPending(n) {{
+    const b = n.querySelector(".bubble");
+    if (!b) return;
+    editing = Number(n.dataset.id);
+    const f = document.createElement("textarea");
+    f.value = b.textContent; f.rows = Math.min(8, f.value.split("\n").length + 1);
+    b.replaceWith(f);
+    n.querySelector(".pmeta").innerHTML = '<button data-act="psave">Enregistrer</button><button data-act="pcancel">Annuler le message</button>';
+    f.focus();
+    f.addEventListener("keydown", (e) => {{
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {{ e.preventDefault(); savePending(n); }}
+    }});
+  }}
+  function savePending(n) {{
+    const f = n.querySelector("textarea");
+    const id = Number(n.dataset.id);
+    editing = null;
+    n.remove();
+    post({{ type: "edit", id, text: f ? f.value : "" }});
   }}
   function grow() {{ box.style.height = "auto"; box.style.height = Math.min(box.scrollHeight + 2, window.innerHeight * 0.4) + "px"; }}
   box.addEventListener("input", grow);
@@ -878,7 +923,13 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
       post({{ type: act === "vcancel" ? "voice-cancel" : "voice-finish" }});
     }} else if (act === "vhist") {{
       if ($("vhist").classList.toggle("on")) histList();
-    }} else if (act === "more" || act === "cancel" || act === "terminal") {{
+    }} else if (act === "pedit" || act === "psave" || act === "pcancel") {{
+      const n = b.closest(".pend");
+      if (!n) return;
+      if (act === "pedit") editPending(n);
+      else if (act === "psave") savePending(n);
+      else {{ if (editing === Number(n.dataset.id)) editing = null; n.remove(); post({{ type: "cancel", id: Number(n.dataset.id) }}); }}
+    }} else if (act === "more" || act === "terminal") {{
       post({{ type: act }});
     }}
   }});

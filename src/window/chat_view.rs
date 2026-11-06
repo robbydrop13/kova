@@ -28,15 +28,20 @@ use objc2_web_kit::{
 };
 use serde_json::Value;
 
-use crate::chat::{banner, cards, conversation::Conversation, input, page, tail::Tail};
+use crate::chat::{banner, cards, conversation::Conversation, input, page, tail::Tail, watch::Watch};
 use crate::pane::Pane;
 use crate::surface::PaneId;
 
 use super::sidebar::tokens;
 use super::KovaView;
 
-/// How often the transcript, the cards and the gate are read again.
+/// How often the screen (cards, the prompt line) is read again. The
+/// transcript and the hooks' turn file are read when the kqueue says they
+/// changed, the spinner as soon as it flips.
 const POLL_MS: u128 = 200;
+/// The files are read this often anyway: a watch can miss a file not
+/// written yet, or one replaced under it.
+const FILES_FALLBACK_MS: u128 = 1_000;
 /// A page message longer than this is not one the page sends.
 const MESSAGE_MAX: usize = 64 * 1024;
 
@@ -71,14 +76,25 @@ struct ChatState {
     shown: Option<(u64, bool, usize)>,
     shown_cards: Option<Vec<(String, u64)>>,
     shown_banner: Option<page::BannerWire>,
-    shown_queued: Option<Option<page::Queued>>,
+    shown_queued: Option<Vec<page::Queued>>,
     working_since: Option<u64>,
+    /// The kqueue on the transcript and the turns folder, and when the files
+    /// were last read.
+    watch: Option<Watch>,
+    files_read: Option<std::time::Instant>,
+    /// What the session's hooks said last (`banner::parse_hook`).
+    hook: Option<banner::HookTurn>,
+    /// The title spinner as last seen, and when it last went off (epoch ms).
+    spinner: bool,
+    spinner_off_at: Option<u64>,
+    status: banner::Banner,
     /// The page posted `ready`: updates reach it.
     ready: bool,
     first: bool,
     focus: bool,
     outbox: input::Outbox,
-    queued_reason: &'static str,
+    /// Why the queue waits, as the gate said last.
+    queue_reason: &'static str,
     note: Option<String>,
     restore: Option<String>,
     /// The images pasted into the box, by their files: only these go with a message.
@@ -114,11 +130,17 @@ impl ChatState {
             shown_banner: None,
             shown_queued: None,
             working_since: None,
+            watch: None,
+            files_read: None,
+            hook: None,
+            spinner: false,
+            spinner_off_at: None,
+            status: banner::Banner::Offline,
             ready: false,
             first: true,
             focus: false,
             outbox: input::Outbox::default(),
-            queued_reason: "",
+            queue_reason: "",
             note: None,
             restore: None,
             pasted: Vec::new(),
@@ -379,10 +401,14 @@ impl KovaView {
                     Reply::Nothing => {}
                 }
             }
+            // The session moved (a file written, the spinner flipped) or a
+            // message is on its way: now, not at the next poll.
+            let files = st.watch.as_ref().is_some_and(Watch::fired);
+            let moved = files || pane.is_working() != st.spinner || st.outbox.enter_pending();
             let due = st.last_poll.is_none_or(|t| t.elapsed().as_millis() >= POLL_MS);
-            if due || force {
+            if due || force || moved {
                 st.last_poll = Some(std::time::Instant::now());
-                update = chat_poll(st, pane);
+                update = chat_poll(st, pane, files);
             }
         }
         if let Some(update) = update {
@@ -431,7 +457,24 @@ impl KovaView {
             }
             "terminal" => Reply::Leave,
             "cancel" => {
-                st.restore = st.outbox.cancel();
+                // Taken back: its text returns to the box, to rework or drop.
+                match msg.get("id").and_then(Value::as_u64).and_then(|id| st.outbox.cancel(id)) {
+                    Some(text) => st.restore = Some(text),
+                    None => st.note = Some("Déjà envoyé".to_string()),
+                }
+                Reply::Push
+            }
+            "edit" => {
+                let id = msg.get("id").and_then(Value::as_u64).unwrap_or_default();
+                match input::sanitize(&s("text")) {
+                    Ok(text) => {
+                        if !st.outbox.edit(id, text) {
+                            st.note = Some("Déjà envoyé".to_string());
+                        }
+                    }
+                    Err(reason) => st.note = Some(reason.to_string()),
+                }
+                st.shown_queued = None;
                 Reply::Push
             }
             "voice-press" => {
@@ -484,13 +527,9 @@ impl KovaView {
                         st.note = Some(reason.to_string());
                         st.restore = Some(text);
                     }
-                    Ok(text) => match st.outbox.submit(text, gate(pane), crate::surface::monotonic_ms()) {
+                    Ok(text) => match st.outbox.submit(text, gate(pane, st.status), crate::surface::monotonic_ms()) {
                         input::Step::Type(text) => type_into(pane, &text),
-                        input::Step::Queued(reason) => st.queued_reason = reason,
-                        input::Step::Refused { reason, text } => {
-                            st.note = Some(reason.to_string());
-                            st.restore = Some(text);
-                        }
+                        input::Step::Queued(reason) => st.queue_reason = reason,
                         input::Step::Enter | input::Step::Stale | input::Step::Nothing => {}
                     },
                 }
@@ -645,14 +684,15 @@ fn type_into(pane: &Pane, text: &str) {
 }
 
 /// Whether the pane's prompt takes a message now (`chat::input::gate`).
-fn gate(pane: &Pane) -> input::Verdict {
+fn gate(pane: &Pane, status: banner::Banner) -> input::Verdict {
     let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+    // A permission prompt that came up since the last poll waits too.
+    let prompt = pane.has_permission_prompt() || crate::prompt_preview::parse_permission_prompt(&visible).is_some();
     input::gate(input::GateInput {
         // The session id lags Claude's exit; a fresh probe of the foreground
         // process does not, so a shell's own `❯` never reads as Claude's.
         has_session: pane.claude_session_id().is_some() && pane.pty.foreground_process().is_some(),
-        working: pane.is_working(),
-        permission_prompt: pane.has_permission_prompt() || crate::prompt_preview::parse_permission_prompt(&visible).is_some(),
+        status: if prompt { banner::Banner::Waiting } else { status },
         composer: input::composer(&visible),
     })
 }
@@ -678,29 +718,25 @@ fn thumbnail(path: &str) -> Option<String> {
 }
 
 /// The note when the Enter after a paste was not written.
-const NOT_ENTERED: &str = "Not sent: the text is in the terminal's prompt, press Enter there";
+const NOT_ENTERED: &str = "Pas envoyé : le texte attend dans l'invite du terminal, Entrée là-bas";
 
-/// Read the transcript, the cards and the gate again; the update to push,
-/// if the page is ready and something changed.
-fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
-    let now = crate::ask::now_epoch();
-    // The conversation: a new id (a `/clear`, a resume) is another transcript.
-    let session = pane.last_claude_session_id();
-    if session != st.session {
-        st.session = session;
-        st.tail = None;
-        st.conv = Conversation::new();
-        st.first = true;
-    }
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The transcript: what was appended since the last read, or the file
+/// looked for (and watched) once it exists.
+fn read_transcript(st: &mut ChatState, pane: &Pane, home: &std::path::Path) {
     match (&mut st.tail, &st.session) {
         (Some(tail), _) => {
             let read = tail.read_more();
             if read.reopened {
                 st.conv = Conversation::new();
                 st.first = true;
+                st.watch = None;
             }
             st.conv.apply_all(&read.lines);
-            // Not there yet: the next poll looks for it again, in case it
+            // Not there yet: the next read looks for it again, in case it
             // appears under another project folder than the guessed one.
             if tail.waiting() {
                 st.tail = None;
@@ -709,27 +745,65 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
         (None, Some(_)) if st.looked.is_some_and(|t| t.elapsed().as_millis() < 1000) => {}
         (None, Some(id)) => {
             st.looked = Some(std::time::Instant::now());
-            let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
             let cwd = pane.cached_cwd();
-            if let Some(path) = crate::chat::transcript_path(&home, pane.claude_config_dir().as_deref(), cwd.as_deref(), id) {
+            if let Some(path) = crate::chat::transcript_path(home, pane.claude_config_dir().as_deref(), cwd.as_deref(), id) {
                 let (tail, lines) = Tail::open(&path);
                 if !tail.waiting() {
                     log::info!("pane {}: chat reads {} ({} lines)", pane.id, path.display(), lines.len());
                 }
                 st.conv.apply_all(&lines);
                 st.tail = Some(tail);
+                st.watch = None;
             }
         }
         (None, None) => {}
     }
-
-    let working = pane.is_working();
-    if !working {
-        st.working_since = None;
-    } else if st.working_since.is_none() {
-        // The turn started when the user last wrote, if that is recent.
-        st.working_since = Some(st.conv.last_user_ts().filter(|t| *t <= now && now - t < 6 * 3600).unwrap_or(now));
+    // Watch what is read: the transcript (or its folder until it exists)
+    // and the hooks' turns folder, where a turn file is renamed into place.
+    if st.watch.is_none()
+        && let (Some(tail), Some(_)) = (&st.tail, &st.session)
+    {
+        let turns = home.join(".claude/state/turns");
+        let file = tail.path();
+        let target = if tail.waiting() { file.parent().unwrap_or(file) } else { file };
+        st.watch = Watch::new(&[target, &turns]);
     }
+}
+
+/// Read the transcript, the cards and the gate again; the update to push,
+/// if the page is ready and something changed. `files`: the kqueue said the
+/// transcript or the turn file changed.
+fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Update> {
+    let now = crate::ask::now_epoch();
+    let now_ms = now_epoch_ms();
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    // The conversation: a new id (a `/clear`, a resume) is another transcript.
+    let session = pane.last_claude_session_id();
+    if session != st.session {
+        st.session = session;
+        st.tail = None;
+        st.watch = None;
+        st.hook = None;
+        st.conv = Conversation::new();
+        st.first = true;
+    }
+    let read_files = files || st.files_read.is_none_or(|t| t.elapsed().as_millis() >= FILES_FALLBACK_MS);
+    if read_files {
+        st.files_read = Some(std::time::Instant::now());
+        read_transcript(st, pane, &home);
+        st.hook = st
+            .session
+            .as_deref()
+            .and_then(|id| banner::hook_path(&home, id))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| banner::parse_hook(&t));
+    }
+
+    let spinner = pane.is_working();
+    if st.spinner && !spinner {
+        st.spinner_off_at = Some(now_ms);
+    }
+    st.spinner = spinner;
 
     // The cards: this pane's questions, then its permission prompt.
     let mut questions = Vec::new();
@@ -753,16 +827,42 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
     st.questions = questions;
     st.cards = list;
 
-    let b = banner::banner(banner::BannerInput {
+    // The turn's state. The screen is read only when a question may be up.
+    let question = st.conv.question_pending();
+    let asked = question || st.hook.is_some_and(|h| h.turn == banner::Turn::Waiting);
+    let prompt_line = !(asked && !spinner) || {
+        let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+        input::composer(&visible) != input::Composer::Unreadable
+    };
+    let status_input = banner::BannerInput {
         has_session: pane.claude_session_id().is_some(),
-        working,
-        waiting: !st.cards.is_empty(),
+        spinner,
+        spinner_off_at: st.spinner_off_at,
+        cards: !st.cards.is_empty(),
+        question,
+        prompt_line,
+        hook: st.hook,
+        now_ms,
         working_since: st.working_since,
         last_activity: st.conv.last_ts.or_else(|| pane.awaiting_since()),
-    });
+    };
+    let working = matches!(banner::banner(status_input), banner::Banner::Working { .. });
+    if !working {
+        st.working_since = None;
+    } else if st.working_since.is_none() {
+        // The turn started when the user last wrote, if that is recent.
+        st.working_since = Some(st.conv.last_user_ts().filter(|t| *t <= now && now - t < 6 * 3600).unwrap_or(now));
+    }
+    let b = banner::banner(banner::BannerInput { working_since: st.working_since, ..status_input });
+    st.status = b;
 
-    // The message in flight.
-    let verdict = if st.outbox.queued().is_some() { gate(pane) } else { input::Verdict::Wait("") };
+    // The queue: its first message once the turn is over.
+    let verdict = if st.outbox.queue().is_empty() { input::Verdict::Wait("") } else { gate(pane, b) };
+    if let input::Verdict::Wait(reason) = verdict
+        && !reason.is_empty()
+    {
+        st.queue_reason = reason;
+    }
     match st.outbox.poll(verdict, crate::surface::monotonic_ms()) {
         input::Step::Type(text) => type_into(pane, &text),
         input::Step::Enter => {
@@ -778,10 +878,6 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
             }
         }
         input::Step::Stale => st.note = Some(NOT_ENTERED.to_string()),
-        input::Step::Refused { reason, text } => {
-            st.note = Some(reason.to_string());
-            st.restore = Some(text);
-        }
         input::Step::Queued(_) | input::Step::Nothing => {}
     }
 
@@ -792,8 +888,14 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
         return None;
     }
     let mut update = page::Update { working, ..Default::default() };
+    let queued: Vec<page::Queued> = st.outbox.queue().iter().map(|p| page::Queued { id: p.id, text: p.text.clone() }).collect();
     let mut changed = false;
-    let banner = page::BannerWire { state: b.name(), text: banner::text(b, now) };
+    // The queue's reason goes with the state: `Travaille · 2 en attente, part à la fin du tour`.
+    let mut text = banner::text(b, now);
+    if !queued.is_empty() {
+        text = format!("{text} · {} en attente, {}", queued.len(), st.queue_reason);
+    }
+    let banner = page::BannerWire { state: b.name(), text };
     if st.shown_banner.as_ref() != Some(&banner) {
         st.shown_banner = Some(banner.clone());
         update.banner = Some(banner);
@@ -815,12 +917,11 @@ fn chat_poll(st: &mut ChatState, pane: &Pane) -> Option<page::Update> {
         update.cards = Some(page::wire(&card_entries, &mut st.sent_cards));
         changed = true;
     }
-    let queued = st.outbox.queued().map(|t| page::Queued { text: t.to_string(), reason: st.queued_reason.to_string() });
     if st.shown_queued.as_ref() != Some(&queued) {
         st.shown_queued = Some(queued.clone());
+        update.queued = Some(queued);
         changed = true;
     }
-    update.queued = queued;
     update.note = st.note.take();
     update.restore = st.restore.take();
     update.attach = (!st.attach.is_empty()).then(|| std::mem::take(&mut st.attach));

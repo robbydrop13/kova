@@ -55,12 +55,16 @@ impl Tail {
         (tail, lines)
     }
 
-    /// The lines added since the last read.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The file has not been seen yet (`inode` still 0).
     pub fn waiting(&self) -> bool {
         self.inode == 0
     }
 
+    /// The lines added since the last read.
     pub fn read_more(&mut self) -> Read {
         let Ok(meta) = std::fs::metadata(&self.path) else { return Read::default() };
         if meta.ino() != self.inode || meta.len() < self.offset || !self.head_matches() {

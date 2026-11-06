@@ -287,6 +287,16 @@ impl Conversation {
         }
     }
 
+    /// The last thing the assistant did is a question to the user still
+    /// unanswered (`AskUserQuestion`, `ExitPlanMode`): its dialog is up.
+    pub fn question_pending(&self) -> bool {
+        let last = self.items.iter().rev().find(|i| matches!(i, Item::User { .. } | Item::Assistant { .. }));
+        let Some(Item::Assistant { blocks, .. }) = last else { return false };
+        blocks.iter().max_by_key(|b| b.key).is_some_and(|b| {
+            matches!(&b.kind, BlockKind::Tool(t) if t.result.is_none() && matches!(t.name.as_str(), "AskUserQuestion" | "ExitPlanMode"))
+        })
+    }
+
     /// When the user last wrote, epoch seconds.
     pub fn last_user_ts(&self) -> Option<u64> {
         self.items.iter().rev().find_map(|i| match i {
@@ -567,6 +577,45 @@ mod tests {
                 BlockKind::Tool(t) => format!("{} {}", t.verb, t.target),
             })
             .collect()
+    }
+
+    /// Real transcript lines (Claude Code 2.1.319, texts made generic) fed
+    /// through the tail as Claude Code appends them, a write cutting a line in
+    /// two: the turn, its tool call, then a question left open, answered.
+    #[test]
+    fn a_real_turn_read_as_it_is_written() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/transcripts/chat_turn.jsonl");
+        let path = std::env::temp_dir().join(format!("kova-chat-turn-{}.jsonl", crate::ask::new_question_id()));
+        std::fs::write(&path, "").unwrap();
+        let (mut tail, _) = super::super::tail::Tail::open(&path);
+        let mut c = Conversation::new();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut pending = Vec::new();
+        for (n, l) in FIXTURE.lines().enumerate() {
+            use std::io::Write as _;
+            let (a, b) = l.split_at(l.len() / 2);
+            file.write_all(a.as_bytes()).unwrap();
+            c.apply_all(&tail.read_more().lines);
+            file.write_all(format!("{b}\n").as_bytes()).unwrap();
+            c.apply_all(&tail.read_more().lines);
+            pending.push((n, c.question_pending()));
+        }
+        std::fs::remove_file(&path).ok();
+        let open: Vec<usize> = pending.iter().filter(|(_, p)| *p).map(|(n, _)| *n).collect();
+        assert_eq!(open, [6], "open from the AskUserQuestion call to its answer");
+        let kinds: Vec<&str> = c
+            .items
+            .iter()
+            .map(|i| match i {
+                Item::User { .. } => "user",
+                Item::Assistant { .. } => "assistant",
+                Item::Note { .. } => "note",
+                Item::Behind { .. } => "behind",
+            })
+            .collect();
+        assert_eq!(kinds, ["user", "assistant", "assistant", "assistant", "user"], "the queued message is the user's");
+        assert_eq!(block_texts(&c.items[1]), ["thinking", "Let me run the tests.", "Run cargo test"]);
+        assert!(matches!(&c.items[4], Item::User { text, .. } if text == "also update the changelog"));
     }
 
     #[test]

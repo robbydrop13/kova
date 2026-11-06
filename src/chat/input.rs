@@ -1,10 +1,10 @@
 //! The chat's input box: what may be typed into the pane's PTY, and when.
 //!
-//! The text goes to Claude Code as typed text then Enter, only while its
-//! prompt is idle and empty: never into a permission prompt, never on top of
-//! what the user typed in the terminal, never mid-turn. A message sent while
-//! the agent works waits in the box's queue (shown, cancellable) and leaves
-//! once the prompt is free.
+//! The text goes to Claude Code as typed text then Enter, only once its turn
+//! is over: never into a permission prompt or a question, never mid-turn. A
+//! message sent meanwhile waits in the box's queue (shown, editable,
+//! cancellable) and the queue leaves in order, one message per turn. A draft
+//! left in the terminal's prompt goes along with the message.
 //!
 //! The text is the user's, typed in Kova's own box, but it lands in a
 //! terminal: every control character is removed (an ESC would start a
@@ -73,8 +73,8 @@ pub fn composer(visible: &str) -> Composer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GateInput {
     pub has_session: bool,
-    pub working: bool,
-    pub permission_prompt: bool,
+    /// The turn's state (`banner::status`): only `Ready` takes a message.
+    pub status: super::banner::Banner,
     pub composer: Composer,
 }
 
@@ -84,24 +84,25 @@ pub enum Verdict {
     Send,
     /// Not now, later: the message waits in the queue.
     Wait(&'static str),
-    /// Not at all: the message goes back to the box.
-    Refuse(&'static str),
 }
 
+/// A draft in the terminal's prompt does not bounce the message: the text is
+/// pasted after it and both leave together (Claude Code's own grey prompt
+/// suggestion reads as text too, and a paste replaces it).
 pub fn gate(input: GateInput) -> Verdict {
+    use super::banner::Banner;
     if !input.has_session {
-        return Verdict::Refuse("Claude is not running in this pane");
+        return Verdict::Wait("part quand Claude tourne dans ce pane");
     }
-    if input.permission_prompt {
-        return Verdict::Wait("Sends once the prompt is answered");
-    }
-    if input.working {
-        return Verdict::Wait("Sends when Claude is idle");
+    match input.status {
+        Banner::Waiting => return Verdict::Wait("part une fois la question répondue"),
+        Banner::Working { .. } => return Verdict::Wait("part à la fin du tour"),
+        Banner::Offline => return Verdict::Wait("part quand Claude tourne dans ce pane"),
+        Banner::Done { .. } => {}
     }
     match input.composer {
-        Composer::Empty => Verdict::Send,
-        Composer::Typed => Verdict::Refuse("The terminal's prompt already holds text: send or clear it there"),
-        Composer::Unreadable => Verdict::Wait("Sends once Claude's prompt is back"),
+        Composer::Empty | Composer::Typed => Verdict::Send,
+        Composer::Unreadable => Verdict::Wait("part quand l'invite de Claude revient"),
     }
 }
 
@@ -150,12 +151,26 @@ pub fn typed(text: &str, bracketed: bool) -> String {
     if bracketed { text.to_string() } else { text.replace('\n', " ") }
 }
 
-/// The box's one message in flight: waiting in the queue, or typed and
-/// waiting for its Enter. Times are milliseconds on any monotonic clock.
+/// After an Enter, the next queued message waits this long at least: the
+/// turn it started has to show (hook, spinner) before the gate reads idle.
+pub const SETTLE_MS: u64 = 1_500;
+
+/// A message waiting for its turn, editable and cancellable until it leaves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    pub id: u64,
+    pub text: String,
+}
+
+/// The box's messages: the queue, in order, and the one typed and waiting
+/// for its Enter. Times are milliseconds on any monotonic clock.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outbox {
-    queued: Option<String>,
+    queue: Vec<Pending>,
+    next_id: u64,
     enter_due: Option<u64>,
+    /// When the last Enter went: the next message waits `SETTLE_MS`.
+    entered_at: Option<u64>,
 }
 
 /// What the caller does now.
@@ -170,57 +185,70 @@ pub enum Step {
     Stale,
     /// Kept in the queue, for this reason.
     Queued(&'static str),
-    /// Not sent: the text goes back to the box.
-    Refused { reason: &'static str, text: String },
 }
 
 impl Outbox {
-    pub fn queued(&self) -> Option<&str> {
-        self.queued.as_deref()
+    pub fn queue(&self) -> &[Pending] {
+        &self.queue
     }
 
-    /// The user pressed Enter in the box with `text` (already sanitized).
+    /// A typed message waits for its Enter: the tick polls every frame.
+    pub fn enter_pending(&self) -> bool {
+        self.enter_due.is_some()
+    }
+
+    fn busy(&self, now: u64) -> bool {
+        self.enter_due.is_some() || self.entered_at.is_some_and(|t| now < t + SETTLE_MS)
+    }
+
+    /// The user pressed Enter in the box with `text` (already sanitized). It
+    /// goes now only when nothing waits before it: the order is kept.
     pub fn submit(&mut self, text: String, verdict: Verdict, now: u64) -> Step {
-        if self.queued.is_some() || self.enter_due.is_some() {
-            return Step::Refused { reason: "A message is already on its way", text };
+        if self.queue.is_empty() && !self.busy(now) && verdict == Verdict::Send {
+            self.enter_due = Some(now + ENTER_DELAY_MS);
+            return Step::Type(text);
         }
-        match verdict {
-            Verdict::Send => {
-                self.enter_due = Some(now + ENTER_DELAY_MS);
-                Step::Type(text)
-            }
-            Verdict::Wait(reason) => {
-                self.queued = Some(text);
-                Step::Queued(reason)
-            }
-            Verdict::Refuse(reason) => Step::Refused { reason, text },
-        }
+        self.next_id += 1;
+        self.queue.push(Pending { id: self.next_id, text });
+        Step::Queued(match verdict {
+            Verdict::Wait(reason) => reason,
+            Verdict::Send => "part après le message précédent",
+        })
     }
 
     /// On the tick: the Enter of a typed message once its delay ran out, or
-    /// the queued message once the gate opens (or back to the box once it
-    /// refuses).
+    /// the first queued message once the gate opens.
     pub fn poll(&mut self, verdict: Verdict, now: u64) -> Step {
         if let Some(due) = self.enter_due {
             if now < due {
                 return Step::Nothing;
             }
             self.enter_due = None;
+            self.entered_at = Some(now);
             return if now - due > ENTER_STALE_MS { Step::Stale } else { Step::Enter };
         }
-        match (verdict, self.queued.is_some()) {
-            (_, false) | (Verdict::Wait(_), true) => Step::Nothing,
-            (Verdict::Send, true) => {
-                self.enter_due = Some(now + ENTER_DELAY_MS);
-                Step::Type(self.queued.take().unwrap_or_default())
+        if self.queue.is_empty() || self.busy(now) || verdict != Verdict::Send {
+            return Step::Nothing;
+        }
+        self.enter_due = Some(now + ENTER_DELAY_MS);
+        Step::Type(self.queue.remove(0).text)
+    }
+
+    /// A queued message rewritten; false once it left (or never was).
+    pub fn edit(&mut self, id: u64, text: String) -> bool {
+        match self.queue.iter_mut().find(|p| p.id == id) {
+            Some(p) => {
+                p.text = text;
+                true
             }
-            (Verdict::Refuse(reason), true) => Step::Refused { reason, text: self.queued.take().unwrap_or_default() },
+            None => false,
         }
     }
 
-    /// The queue's Cancel: the text goes back to the box.
-    pub fn cancel(&mut self) -> Option<String> {
-        self.queued.take()
+    /// A queued message taken back; `None` once it left.
+    pub fn cancel(&mut self, id: u64) -> Option<String> {
+        let i = self.queue.iter().position(|p| p.id == id)?;
+        Some(self.queue.remove(i).text)
     }
 }
 
@@ -239,8 +267,10 @@ mod tests {
     }
 
     fn idle() -> GateInput {
-        GateInput { has_session: true, working: false, permission_prompt: false, composer: Composer::Empty }
+        GateInput { has_session: true, status: Banner::Done { at: None }, composer: Composer::Empty }
     }
+
+    use crate::chat::banner::Banner;
 
     #[test]
     fn the_composer_is_read_off_the_screen() {
@@ -257,15 +287,15 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_sends_only_to_an_idle_empty_prompt() {
+    fn the_gate_sends_only_when_the_turn_is_over() {
         assert_eq!(gate(idle()), Verdict::Send);
-        assert!(matches!(gate(GateInput { working: true, ..idle() }), Verdict::Wait(_)));
-        assert!(matches!(gate(GateInput { permission_prompt: true, ..idle() }), Verdict::Wait(_)));
+        assert!(matches!(gate(GateInput { status: Banner::Working { since: None }, ..idle() }), Verdict::Wait(_)));
+        assert!(matches!(gate(GateInput { status: Banner::Waiting, ..idle() }), Verdict::Wait(_)));
         assert!(matches!(gate(GateInput { composer: Composer::Unreadable, ..idle() }), Verdict::Wait(_)));
-        assert!(matches!(gate(GateInput { composer: Composer::Typed, ..idle() }), Verdict::Refuse(_)));
-        assert!(matches!(gate(GateInput { has_session: false, ..idle() }), Verdict::Refuse(_)));
-        // A prompt on screen wins over a draft: answering it comes first.
-        assert!(matches!(gate(GateInput { permission_prompt: true, composer: Composer::Typed, ..idle() }), Verdict::Wait(_)));
+        assert!(matches!(gate(GateInput { has_session: false, ..idle() }), Verdict::Wait(_)), "kept until Claude is back");
+        // A draft in the terminal never bounces the message: it goes with it.
+        assert_eq!(gate(GateInput { composer: Composer::Typed, ..idle() }), Verdict::Send);
+        assert!(matches!(gate(GateInput { status: Banner::Waiting, composer: Composer::Typed, ..idle() }), Verdict::Wait(_)));
     }
 
     #[test]
@@ -282,9 +312,9 @@ mod tests {
         let mut out = Outbox::default();
         assert_eq!(out.submit("hi".into(), Verdict::Send, 1000), Step::Type("hi".into()));
         assert_eq!(out.poll(Verdict::Send, 1000 + ENTER_DELAY_MS - 1), Step::Nothing);
-        assert!(matches!(out.submit("again".into(), Verdict::Send, 1100), Step::Refused { .. }), "one at a time");
+        assert_eq!(out.submit("again".into(), Verdict::Send, 1100), Step::Queued("part après le message précédent"), "queued, never refused");
         assert_eq!(out.poll(Verdict::Wait("busy"), 1000 + ENTER_DELAY_MS), Step::Enter, "the Enter of a typed text always follows");
-        assert_eq!(out.poll(Verdict::Send, 2000), Step::Nothing);
+        assert_eq!(out.queue().len(), 1);
     }
 
     #[test]
@@ -296,22 +326,35 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_message_leaves_when_the_prompt_frees_up() {
+    fn queued_messages_leave_in_order_one_turn_each() {
         let mut out = Outbox::default();
-        assert_eq!(out.submit("next".into(), Verdict::Wait("busy"), 0), Step::Queued("busy"));
-        assert_eq!(out.queued(), Some("next"));
+        assert_eq!(out.submit("one".into(), Verdict::Wait("busy"), 0), Step::Queued("busy"));
+        assert!(matches!(out.submit("two".into(), Verdict::Wait("busy"), 1), Step::Queued(_)));
+        // The gate opens while one waits: a new message still goes behind it.
+        assert!(matches!(out.submit("three".into(), Verdict::Send, 2), Step::Queued(_)));
+        assert_eq!(out.queue().iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["one", "two", "three"]);
         assert_eq!(out.poll(Verdict::Wait("busy"), 10), Step::Nothing);
-        assert_eq!(out.poll(Verdict::Send, 20), Step::Type("next".into()));
+        assert_eq!(out.poll(Verdict::Send, 20), Step::Type("one".into()));
         assert_eq!(out.poll(Verdict::Send, 20 + ENTER_DELAY_MS), Step::Enter);
+        // The turn it started has not shown yet: the next one waits.
+        let entered = 20 + ENTER_DELAY_MS;
+        assert_eq!(out.poll(Verdict::Send, entered + SETTLE_MS - 1), Step::Nothing);
+        assert_eq!(out.poll(Verdict::Wait("busy"), entered + SETTLE_MS), Step::Nothing);
+        assert_eq!(out.poll(Verdict::Send, entered + 9_000), Step::Type("two".into()));
     }
 
     #[test]
-    fn a_queued_message_goes_back_to_the_box_when_refused_or_cancelled() {
+    fn a_queued_message_can_be_edited_or_cancelled_until_it_leaves() {
         let mut out = Outbox::default();
-        out.submit("next".into(), Verdict::Wait("busy"), 0);
-        assert_eq!(out.poll(Verdict::Refuse("gone"), 5), Step::Refused { reason: "gone", text: "next".into() });
-        out.submit("other".into(), Verdict::Wait("busy"), 0);
-        assert_eq!(out.cancel().as_deref(), Some("other"));
-        assert_eq!(out.queued(), None);
+        out.submit("one".into(), Verdict::Wait("busy"), 0);
+        out.submit("two".into(), Verdict::Wait("busy"), 0);
+        let (one, two) = (out.queue()[0].id, out.queue()[1].id);
+        assert!(out.edit(two, "two, better".into()));
+        assert_eq!(out.cancel(one).as_deref(), Some("one"));
+        assert_eq!(out.cancel(one), None, "already gone");
+        assert_eq!(out.poll(Verdict::Send, 5), Step::Type("two, better".into()));
+        assert!(!out.edit(two, "too late".into()), "it left");
+        assert_eq!(out.cancel(two), None);
+        assert!(out.queue().is_empty());
     }
 }

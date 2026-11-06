@@ -40,7 +40,10 @@ shortcut stays Kova's.
 Read from `~/.claude/projects/<slug>/<sessionId>.jsonl` (under the
 session's `CLAUDE_CONFIG_DIR` when it has one; found in another project
 folder when the session started elsewhere), the last 4 MB at open, then
-only what is appended, every 200 ms. A line still missing its `\n` waits for
+only what is appended, as soon as it is: a kqueue on the file
+(`src/chat/watch.rs`) is asked once per frame without waiting, so a line
+reaches the chat one frame after Claude Code wrote it (a read every second
+anyway, for a file replaced or not written yet). A line still missing its `\n` waits for
 it; a file rewritten in place (`/clear`) is read again. On KovaLink's rules
 (`link/daemon/src/transcript/jsonl.ts`): the lines of one request grouped by
 `requestId` and ordered by `apiBlockIndex`, tool results joined to their
@@ -52,8 +55,19 @@ the transcript holds it, cut.
 
 Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
 
-- a banner at the top: `Working · 1 min 12 s` (pulsing), `Waiting for you`
-  (a card waits), `Done 3 min ago`, `Offline` (no Claude in the pane);
+- the turn's state on the line above the box, with the Terminal button
+  (`src/chat/banner.rs`): `Travaille · 1 min 12 s` (pulsing),
+  `Attend ta réponse`, `Prêt · fini il y a 3 min`, `Hors ligne`, and the
+  queue (`2 en attente, part à la fin du tour`). Driven by the session's
+  events, never guessed: Claude Code's title spinner (through the PTY), its
+  hooks (`~/.claude/state/turns/<session id>`: `working` on
+  UserPromptSubmit and `ready` on Stop from `claude-config/hooks/harness.py`,
+  `waiting` on a permission prompt or a question from `notify.sh`; the folder
+  is watched), an `AskUserQuestion` or `ExitPlanMode` call still without its
+  result in the transcript, and the cards. A hook's `waiting` holds only
+  while a dialog covers the `❯` line and the spinner is off; its `working`
+  bridges the moment before the spinner shows (5 s at most, and not past a
+  spinner that went off after it: Esc runs no Stop hook);
 - the assistant's text full width, rendered markdown, no bubble; the user's
   message in a quiet bubble on the right;
 - only the user's messages and the assistant's final text (no tool call
@@ -86,22 +100,27 @@ only the script carrying the load's nonce.
 
 ## The input box
 
-Enter sends, Shift+Enter is a new line. The text goes to the pane's PTY as
-a paste (bracketed when Claude Code asked for it), then Enter on its own
-300 ms later, only when Claude is the pane's foreground process, idle, with
-an empty prompt (`chat::input::gate`). The Enter is written only while the
-prompt still shows the pasted text and no permission prompt came up, and
-not at all when it is more than 2 s late: the text then waits in the
-terminal's prompt, with a note.
+Enter sends, Shift+Enter is a new line, at any time: the box never refuses
+a message. The text goes to the pane's PTY as a paste (bracketed when
+Claude Code asked for it), then Enter on its own 300 ms later, only when
+Claude is the pane's foreground process and its turn is over (`Prêt`,
+`chat::input::gate`). The Enter is written only while the prompt still
+shows the pasted text and no permission prompt came up, and not at all when
+it is more than 2 s late: the text then waits in the terminal's prompt, with
+a note.
 
 | The pane | The message |
 |---|---|
-| idle, the `❯` line empty | sent |
-| working | queued, sent once idle (`Queued: …`, Cancel) |
-| a permission prompt on screen | queued |
-| no `❯` line in the first column (a menu, a dialog) | queued |
-| the `❯` line holds text (the user's draft in the terminal) | refused, back in the box |
-| no Claude | refused, back in the box |
+| `Prêt`, the `❯` line empty | sent |
+| `Prêt`, the `❯` line holds text (a draft typed in the terminal, Claude Code's grey suggestion) | sent, pasted after it: both leave as one message |
+| `Travaille`, `Attend ta réponse`, no `❯` line (a menu, a dialog), no Claude | queued |
+
+The queue shows at the end of the thread as `En attente` bubbles, in order,
+each with Modifier (edited in place, Enter saves) and Annuler (its text goes
+back to the box) until it leaves. It leaves one message per turn, the first
+once the turn is over, the next at least 1.5 s after an Enter (the turn it
+started has to show first). A message sent while others wait goes behind
+them.
 
 Cmd+V or Ctrl+V with an image on the pasteboard writes it where a terminal
 paste does (`/tmp/kova-paste-<ms>.png`, `appkit_input::pasted_image_path`)
@@ -110,7 +129,7 @@ before the text of the next message, as the terminal hands an image to
 Claude Code. Only a file Kova wrote for this page's paste goes along
 (`chat::input::with_images`). Text pastes as usual.
 
-One message at a time. Control characters are removed (tab and newline
+Control characters are removed (tab and newline
 kept), 8 KB at most. The empty prompt is read off the screen like KovaLink's
 daemon does (`composerIsEmpty`); Claude Code's start hint (`Try "…"`) counts
 as empty.
@@ -180,7 +199,7 @@ At the bottom of the thread, above the box:
   switch made while it is shown.
 - The expanded state of tool rows is lost when the page reloads (another
   pane shown as a chat in the window).
-- The outbox lives with the page: a message still queued is dropped when
+- The queue lives with the page: messages still queued are dropped when
   the window shows another pane as a chat.
 - The first 4 MB are parsed on the main thread, and every change renders the
   shown entries' markdown again.

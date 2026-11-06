@@ -4,8 +4,9 @@
 //!
 //! Everything here is pure and tested: reading the transcript as it grows
 //! (`tail`), turning its lines into messages and tool calls
-//! (`conversation`), the state banner (`banner`), what the input box may
-//! type and when (`input`), the cards (`cards`) and the page (`page`). The
+//! (`conversation`), the turn's state (`banner`), what the input box may
+//! type and when (`input`), the cards (`cards`), the page (`page`) and the
+//! kqueue that says when the session's files changed (`watch`). The
 //! AppKit side, a web view laid over the pane, is `window::chat_view`.
 
 pub mod banner;
@@ -15,6 +16,7 @@ pub mod input;
 pub mod links;
 pub mod page;
 pub mod tail;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 
