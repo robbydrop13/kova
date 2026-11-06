@@ -38,7 +38,7 @@ it: one `WKWebView` per window over the active tab's panes area
   | Card | Blue button | What it does | Links |
   |---|---|---|---|
   | `would`, `review`, `decision` with a prepared action | `Valider` | `act_command ID Valider` | `Voir`, `Refuser` |
-  | Draft | `Valider` (`Valider la correction` once rewritten) | `act_command ID Valider` / `Corriger --text=` | `Corriger` (`Annuler`) |
+  | Draft | `Valider` (`Valider la correction` once rewritten) | `act_command ID Valider` / `Corriger --text=` | `Corriger` (opens the consigne field; `Annuler` once rewritten) |
   | Entry naming a waiting ask, decision sheet | `Décider` | opens the sheet in the side panel | |
   | `decision` with nothing prepared | `Décider` | opens the card on its `Consigne` | `Voir` |
   | `test` | `Tester` | opens the card (the plan) on its `Consigne` | `Voir` |
@@ -83,7 +83,10 @@ it: one `WKWebView` per window over the active tab's panes area
   Valider`; once the text is rewritten it reads `Valider la correction` and
   runs `act_command ID Corriger --text=<text>`, the text one argv element
   (`attention::clean_text`: no control character but tab and newline, 16 KiB
-  at most). `Corriger` focuses the field, `Annuler` puts the draft back. Kova
+  at most). `Corriger` opens the card on its instruction field (Robin,
+  07/11/2026: a consigne to the card's agent, `act_command ID instruct`, not an
+  edit of the text); once the text is rewritten it reads `Annuler` and puts
+  the draft back. Kova
   never sends anything: the chief who receives the click does.
 - Selecting and copying (Robin, 06/11/2026): every text of the page selects
   and copies, the Cockpit's web view gets Cmd+A/C/V/X/Z like the chat's

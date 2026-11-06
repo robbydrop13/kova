@@ -512,7 +512,9 @@ impl Button {
     /// Where an opening button puts the keyboard once the card is open.
     fn focus(self) -> Option<&'static str> {
         match self {
-            Button::Brief | Button::Decide | Button::Test => Some("ins"),
+            // A draft's Corriger is a consigne to the card's agent, not an edit
+            // of the text (07/11): it opens the card on its instruction field.
+            Button::Brief | Button::Decide | Button::Test | Button::Correct => Some("ins"),
             Button::Reply => Some("ans"),
             _ => None,
         }
@@ -1456,11 +1458,11 @@ document.addEventListener('click', e => {
   if (!card || !b.dataset.act) return;
   const t = card.querySelector('textarea.bd');
   let act = b.dataset.act;
-  if (act === 'correct' && t) {
-    if (edited(t)) { t.value = t.dataset.orig; grow(t); sync(card); }
-    t.focus();
-    return;
-  }
+  // Corriger, text untouched: the card opens on its instruction field, sent to
+  // the card's agent. Once the text is rewritten in place, it reads Annuler
+  // and puts the draft back.
+  if (act === 'correct' && t && edited(t)) { t.value = t.dataset.orig; grow(t); sync(card); t.focus(); return; }
+  if (act === 'correct') act = 'expand';
   const msg = { type: 'act', key: card.dataset.key, act };
   if (b.dataset.arg) msg.arg = b.dataset.arg;
   if (act === 'answer' && b.dataset.text) {
@@ -1815,10 +1817,11 @@ mod tests {
         assert!(html.contains("data-act=\"expand\" data-focus=\"ins\""), "{html}");
         let q = card_html(&live(NeedKind::Ask, "ask:q1", false), true, true, true, 10);
         assert!(q.contains("data-act=\"expand\" data-focus=\"ans\""), "{q}");
-        // A draft's Corriger is a link next to its blue Valider.
+        // A draft's Corriger is a link next to its blue Valider; it opens the
+        // card on its consigne field.
         let e = Entry { kind: "would".into(), draft: Some(Draft { to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
         let d = card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10);
-        assert!(d.contains("<button type=\"button\" class=\"link\" data-act=\"correct\">Corriger</button>"), "{d}");
+        assert!(d.contains("<button type=\"button\" class=\"link\" data-act=\"correct\" data-focus=\"ins\">Corriger</button>"), "{d}");
     }
 
     #[test]
