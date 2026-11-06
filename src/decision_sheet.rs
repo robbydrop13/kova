@@ -797,6 +797,24 @@ mod tests {
     }
 
     #[test]
+    fn every_decision_offers_other_and_its_note_with_or_without_images() {
+        let dir = image_dir();
+        let shot = dir.join("other.png");
+        std::fs::write(&shot, b"png!").unwrap();
+        let json = serde_json::json!({"title":"UI","decisions":[
+            {"id":"D1","title":"With","options":[{"id":"A","label":"New","images":[{"label":"Now","path":shot},{"label":"Then","path":shot}]},{"id":"B","label":"Old"}]},
+            {"id":"D2","title":"Without","options":[{"id":"A","label":"Yes"}]},
+            {"id":"D3","title":"All images","options":[{"id":"A","label":"X","images":[{"label":"Gone","path":dir.join("gone.png")}]}]}
+        ]});
+        let html = render(&Sheet::from_json(&json.to_string()).unwrap(), &SheetAnswers::default(), "a", &tokens::DARK, Some(&dir));
+        for id in ["D1", "D2", "D3"] {
+            let card = html.split(&format!("data-id=\"{id}\"")).nth(1).unwrap().split("</article>").next().unwrap();
+            assert!(card.contains(&format!("name=\"d-{id}\" value=\"other\"")), "{id} offers Other");
+            assert!(card.contains("<textarea"), "{id} has its note");
+        }
+    }
+
+    #[test]
     fn base64_matches_the_standard_alphabet() {
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");
