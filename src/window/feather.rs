@@ -48,8 +48,6 @@ pub enum Icon {
     Sidebar,
     /// `clock`: the routines view of the sidebar.
     Clock,
-    /// `message-square`: the Asks view, a question waiting for an answer.
-    Message,
     /// `users`: the Agents view, the sessions an agent runs.
     Users,
     /// `file-text`: a scheduled action and the prompt it runs.
@@ -90,7 +88,7 @@ pub enum Icon {
 
 /// Every icon, walked by the grid test so a new variant is never forgotten.
 #[cfg(test)]
-pub const ALL: [Icon; 32] = [
+pub const ALL: [Icon; 31] = [
     Icon::ChevronDown,
     Icon::ChevronRight,
     Icon::ChevronLeft,
@@ -104,7 +102,6 @@ pub const ALL: [Icon; 32] = [
     Icon::Check,
     Icon::Sidebar,
     Icon::Clock,
-    Icon::Message,
     Icon::Users,
     Icon::FileText,
     Icon::Edit,
@@ -184,14 +181,6 @@ impl Icon {
             Icon::Clock => vec![
                 RoundRect(2.0, 2.0, 20.0, 20.0, 10.0),
                 Polyline(vec![(12.0, 6.0), (12.0, 12.0), (16.0, 14.0)]),
-            ],
-            Icon::Message => vec![
-                svg_arc((21.0, 15.0), (19.0, 17.0), 2.0, false, true),
-                Polyline(vec![(19.0, 17.0), (7.0, 17.0), (3.0, 21.0), (3.0, 5.0)]),
-                svg_arc((3.0, 5.0), (5.0, 3.0), 2.0, false, true),
-                Polyline(vec![(5.0, 3.0), (19.0, 3.0)]),
-                svg_arc((19.0, 3.0), (21.0, 5.0), 2.0, false, true),
-                Polyline(vec![(21.0, 5.0), (21.0, 15.0)]),
             ],
             Icon::Users => vec![
                 Polyline(vec![(17.0, 21.0), (17.0, 19.0)]),
@@ -542,10 +531,6 @@ mod tests {
             Segment::RoundRect(6.0, 4.0, 4.0, 16.0, 1.0),
             Segment::RoundRect(14.0, 4.0, 4.0, 16.0, 1.0),
         ]);
-        assert!(matches!(
-            &Icon::Message.segments()[0],
-            Segment::Arc { cx, cy, r, .. } if *cx == 19.0 && *cy == 15.0 && *r == 2.0
-        ));
         assert!(matches!(&Icon::Send.segments()[1], Segment::Polygon(p) if p.len() == 4));
         assert!(matches!(&Icon::Mic.segments()[8], Segment::Polyline(p) if p == &[(12.0, 19.0), (12.0, 23.0)]));
         assert!(matches!(&Icon::Off.segments()[0], Segment::Circle(12.0, 12.0, 10.0)));

@@ -1907,7 +1907,7 @@ pub struct Pane {
     /// Refreshed by the throttled probe, never per frame.
     pub prompt_preview: RefCell<Option<crate::prompt_preview::PromptPreview>>,
     /// What `prompt_preview` was read from when it is a permission prompt: its
-    /// numbered options, and the fingerprint the Asks card answers against
+    /// numbered options, and the fingerprint a permission card answers against
     /// (`prompt_preview::permission_answer`). Written with the preview, never
     /// apart from it.
     pub permission: RefCell<Option<crate::prompt_preview::ParsedPrompt>>,
@@ -2153,7 +2153,7 @@ impl Pane {
     }
 
     /// Read the screen now and keep what it says, the way `probe_prompt` does
-    /// once a turn settles. The Asks card goes through here before it types
+    /// once a turn settles. A permission card goes through here before it types
     /// anything: a click answers the screen the user can see at that moment,
     /// not the one an earlier probe took. Returns the prompt when the screen
     /// is a permission one. The `since` and `seen` marks of an unchanged
@@ -2195,7 +2195,7 @@ impl Pane {
     }
 
     /// The permission prompt on screen, when the preview is one: what the
-    /// Asks card is built from. Cloned, so the card keeps the screen it was
+    /// permission card is built from. Cloned, so the card keeps the screen it was
     /// drawn for while the pane moves on.
     pub fn permission_prompt(&self) -> Option<crate::prompt_preview::ParsedPrompt> {
         if self.is_working() {

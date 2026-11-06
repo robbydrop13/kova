@@ -1,7 +1,7 @@
 //! What waits on the user in this pane, as cards in the chat: the pane's
 //! `kova ask` questions (decision sheets and handoffs included) and the
 //! permission prompt on its screen. A button answers through the path the
-//! sidebar's Asks use: the board's answer queue, the side panel for a sheet,
+//! Cockpit uses: the board's answer queue, the side panel for a sheet,
 //! `Pane::answer_permission` for a prompt.
 
 use serde::Serialize;

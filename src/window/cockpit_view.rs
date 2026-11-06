@@ -144,6 +144,13 @@ impl KovaView {
         self.mark_dirty();
     }
 
+    /// Open the page, or leave it open.
+    pub(super) fn open_cockpit(&self) {
+        if !self.ivars().cockpit.open.get() {
+            self.toggle_cockpit();
+        }
+    }
+
     pub(super) fn close_cockpit(&self) {
         let slot = &self.ivars().cockpit;
         if !slot.open.get() {
@@ -241,7 +248,7 @@ impl KovaView {
                 let openable = entry
                     .action
                     .as_deref()
-                    .is_some_and(|a| super::sidebar_attention::open_target(a, home.as_deref(), exists).is_some());
+                    .is_some_and(|a| super::side_panel::open_target(a, home.as_deref(), exists).is_some());
                 items.extend(cockpit::from_attention(entry, outcomes.get(&entry.id), openable).map(|mut item| {
                     item.instruction = instructions.get(&entry.id).cloned();
                     item
@@ -423,7 +430,7 @@ impl KovaView {
         let opened = slot.band_open.borrow();
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let exists = |p: &Path| p.is_file();
-        let opens = |l: &str| super::sidebar_attention::open_target(l, home.as_deref(), &exists).is_some();
+        let opens = |l: &str| super::side_panel::open_target(l, home.as_deref(), &exists).is_some();
         let is_card = |k: &str| items.iter().any(|i| i.key == k);
         crate::catchup::band_html(&crate::catchup::Band {
             data: &data,
@@ -458,7 +465,7 @@ impl KovaView {
                 if crate::catchup::snapshot().is_some_and(|d| crate::catchup::shows_link(&d, project, link)) {
                     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                     let exists = |p: &Path| p.is_file();
-                    if let Some(target) = super::sidebar_attention::open_target(link, home.as_deref(), &exists) {
+                    if let Some(target) = super::side_panel::open_target(link, home.as_deref(), &exists) {
                         self.open_in_side_panel(target);
                     }
                 }
@@ -625,7 +632,7 @@ impl KovaView {
                     .and_then(|entries| entries.iter().find(|e| Some(e.id.as_str()) == attention_id).and_then(|e| e.action.clone()));
                 let exists = |p: &Path| p.is_file();
                 if let Some(target) =
-                    action.and_then(|a| super::sidebar_attention::open_target(&a, home.as_deref(), &exists))
+                    action.and_then(|a| super::side_panel::open_target(&a, home.as_deref(), &exists))
                 {
                     self.open_in_side_panel(target);
                 }
@@ -868,7 +875,7 @@ impl KovaView {
         }
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let exists = |p: &Path| p.is_file();
-        if let Some(target) = super::sidebar_attention::open_target(link, home.as_deref(), &exists) {
+        if let Some(target) = super::side_panel::open_target(link, home.as_deref(), &exists) {
             self.open_in_side_panel(target);
         }
         self.mark_dirty();
@@ -886,7 +893,7 @@ impl KovaView {
         match checked {
             Ok(()) => {
                 let mtm = MainThreadMarker::from(self);
-                crate::app::app_delegate(mtm).ivars().queue_ask_action(super::sidebar_asks::AskAction::Answer {
+                crate::app::app_delegate(mtm).ivars().queue_ask_action(super::ask_actions::AskAction::Answer {
                     id: q.id.clone(),
                     action: action.to_string(),
                     text: text.to_string(),

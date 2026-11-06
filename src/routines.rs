@@ -447,7 +447,7 @@ pub struct ActionResult {
 }
 
 /// Where a background action leaves its outcome. The tick drains it, exactly
-/// like the Asks view's `AskQueue` between the card and the board.
+/// like `ask_actions::AskQueue` between a card and the board.
 static RESULTS: parking_lot::Mutex<Vec<ActionResult>> = parking_lot::Mutex::new(Vec::new());
 
 /// Everything the actions finished since the last drain.

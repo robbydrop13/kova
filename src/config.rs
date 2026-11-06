@@ -272,7 +272,7 @@ pub struct SidebarConfig {
     pub roster_command: Vec<String>,
 }
 
-/// The attention queue the Asks view lists above the questions
+/// The attention queue the Cockpit lists with the live needs
 /// (`crate::attention`): three argv, never a shell line. Absent `command`
 /// turns the whole feature off; an absent `act_command` or `close_command`
 /// only leaves out the buttons that need it.

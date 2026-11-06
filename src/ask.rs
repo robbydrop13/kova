@@ -156,7 +156,7 @@ pub struct Question {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<crate::decision_sheet::SheetAnswers>,
     /// Kova's too: the decisions a sheet still had open when the user clicked
-    /// Done, kept in the Asks until answered or dropped (`kova ask --drop`).
+    /// Done, kept in the Cockpit until answered or dropped (`kova ask --drop`).
     /// A message in the conversation does not withdraw it: it did not answer them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub follow_up: bool,
@@ -250,8 +250,7 @@ pub const ANSWER_TEXT_MAX: usize = 8 * 1024;
 /// agent: the action is one of the buttons the card shows, except that the
 /// free answer `Other` is accepted on any question, and the text is of human
 /// size. The text itself is allowed even when the question asked for none:
-/// the Asks list's Brief gives an instruction on every question, and a socket
-/// client is held to the same rule.
+/// a socket client can attach an instruction to any answer.
 pub fn accepts_external_answer(question: &Question, action: &str, text: &str) -> Result<(), String> {
     // A handoff has no field: it ends on Fait, which the agent waits for.
     if action == OTHER && crate::handoff::is_handoff(question) {
@@ -1098,7 +1097,7 @@ pub struct Board {
     /// The card must be redrawn on the next tick.
     dirty: bool,
     /// Decisions opened in the side panel: off the floating card, answered
-    /// on their sheet (still in the sidebar's Asks). Not kept across a restart.
+    /// on their sheet (still in the Cockpit). Not kept across a restart.
     opened: std::collections::HashSet<String>,
     /// Handoff steps pressed since the last `take_steps` (`crate::handoff`):
     /// the app performs them, the questions stay open.
@@ -1263,7 +1262,7 @@ impl Board {
                     .or_else(|| question.draft.clone())
                     .unwrap_or_default();
                 let mut text = sheet.summary(&answers);
-                // What is still open stays in the Asks, a sheet of its own,
+                // What is still open stays in the Cockpit, a sheet of its own,
                 // answered late to the same conversation.
                 if let Some(rest) = sheet.still_open(&answers) {
                     let ids: Vec<String> = rest.decisions.iter().map(|d| d.id.clone()).collect();
@@ -1283,7 +1282,7 @@ impl Board {
                         follow_up: true,
                     };
                     text.push_str(&format!(
-                        "\nStill open in the user's Kova Asks: {} (question {}). Their answer will come later as a message; if it no longer matters, drop it: kova ask --drop {}",
+                        "\nStill open in the user's Kova Cockpit: {} (question {}). Their answer will come later as a message; if it no longer matters, drop it: kova ask --drop {}",
                         ids.join(", "), q.id, q.id
                     ));
                     follow_up = Some(q);
@@ -1293,7 +1292,7 @@ impl Board {
             None => (action, text),
         };
         if let Some(q) = follow_up {
-            log::info!("ask {}: {} kept in the Asks as {}", id, q.message, q.id);
+            log::info!("ask {}: {} kept in the Cockpit as {}", id, q.message, q.id);
             if self.owns_store() {
                 self.store.save_question(&q);
             }
@@ -1323,7 +1322,7 @@ impl Board {
         std::mem::take(&mut self.steps)
     }
 
-    /// Take `id` off the Asks without answering it: the asker says it no
+    /// Take `id` off the Cockpit without answering it: the asker says it no
     /// longer matters (`kova ask --drop`). A `kova ask` still waiting on it
     /// exits 3, as on a withdrawal.
     pub fn drop_question(&mut self, id: &str) -> Result<(), String> {
@@ -1332,7 +1331,7 @@ impl Board {
 
     /// The user closed `id` from its card without answering it: the X
     /// (`dismissed`) or the check (`done`), logged with that reason. Off the
-    /// Asks like a drop: a `kova ask` still waiting on it exits 3.
+    /// Cockpit like a drop: a `kova ask` still waiting on it exits 3.
     pub fn close(&mut self, id: &str, reason: &str) -> Result<(), String> {
         self.take_off(id, &format!("closed by the user, reason {reason}"))
     }
@@ -1452,22 +1451,6 @@ impl Board {
         question.snoozed_until = until;
         let saved = question.clone();
         log::info!("ask {}: snoozed for {} s", id, until.saturating_sub(now_epoch()));
-        if self.owns_store() {
-            self.store.save_question(&saved);
-        }
-        self.dirty = true;
-        Ok(())
-    }
-
-    /// The user cancelled a snooze from the sidebar: the question is open
-    /// now. The same field, set back to zero, so the card comes back now.
-    pub fn unsnooze(&mut self, id: &str) -> Result<(), String> {
-        let Some((question, _)) = self.pending.iter_mut().find(|(q, _)| q.id == id) else {
-            return Err(format!("no question {}", id));
-        };
-        question.snoozed_until = 0;
-        let saved = question.clone();
-        log::info!("ask {}: snooze cancelled, back on the card", id);
         if self.owns_store() {
             self.store.save_question(&saved);
         }
@@ -1609,14 +1592,12 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
 
   --actions     buttons, comma-separated (default: a single \"Reply\" button). With a text field, the
                 card adds an \"Other\" button after them, and text sent with Enter answers \"Other: text\"
-  --no-input    no text field, buttons only. Brief (in the Asks view) can still attach an
-                instruction to the answer: \"<button>: text\" with the button it names, or
-                \"Other: text\" when none was picked
+  --no-input    no text field, buttons only
   --decision    a decision sheet to fill in at this http(s) URL (an artifact): the card says
                 \"New decision\", its Open button shows the page in Kova's side panel, and the
                 answer comes when the user clicks Done (default actions: Done; no text field
                 unless --actions is given too)
-  --drop <id>   (alone) take a question off the user's Asks unanswered: a decision a sheet left
+  --drop <id>   (alone) take a question off the user's Cockpit unanswered: a decision a sheet left
                 open (its id is in the answer) that no longer matters
   --decisions   a decision sheet Kova shows itself, from a JSON file (the decision-sheet skill's
                 format: title, intro, links, decisions with options, one marked reco). The card
@@ -1871,7 +1852,7 @@ fn run_withdraw(args: &[String]) -> i32 {
     0
 }
 
-/// `kova ask --drop <id>`: take a question off the Asks, unanswered (a
+/// `kova ask --drop <id>`: take a question off the Cockpit, unanswered (a
 /// decision left open that no longer matters).
 fn run_drop(args: &[String]) -> i32 {
     let (Some(id), None) = (args.first(), args.get(1)) else {
@@ -2630,7 +2611,7 @@ mod tests {
         let (summary, still) = a.text.split_once("\nStill open").unwrap();
         assert_eq!(summary, "D1: B (Later). Note: next week\nD2: open");
         assert!(board.sheet(&id).is_none());
-        // D2 stays in the Asks, a sheet of its own, delivered late.
+        // D2 stays in the Cockpit, a sheet of its own, delivered late.
         let rest = board.questions()[0].clone();
         assert!(still.contains(&format!("kova ask --drop {}", rest.id)));
         assert!(rest.follow_up && rest.is_decision());

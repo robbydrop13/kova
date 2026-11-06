@@ -111,7 +111,7 @@ pub struct AskNeed {
 }
 
 /// An entry of the attention queue. Only level `now` is a need: `point` and
-/// `memo` wait for a later look, the Asks view lists them on their own.
+/// `memo` wait for a later look, the Cockpit lists `point` on its own.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttentionNeed {

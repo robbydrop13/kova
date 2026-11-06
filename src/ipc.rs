@@ -226,7 +226,7 @@ pub enum IpcCommand {
     /// from a remote client), so the card would only deliver a stale answer.
     /// Nothing is delivered late; a `kova ask` still waiting exits with code 3.
     WithdrawAsks { session_id: String },
-    /// Take one question off the Asks, unanswered: its asker says it no longer
+    /// Take one question off the Cockpit, unanswered: its asker says it no longer
     /// matters (`kova ask --drop`).
     DropAsk { id: String },
     /// A native decision sheet and its answers so far (KovaLink renders it).

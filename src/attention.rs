@@ -1,4 +1,4 @@
-//! The attention queue the Asks view lists above the questions: the command
+//! The attention queue the Cockpit lists with the live needs: the command
 //! named by `[attention] command` (nothing runs when it is absent), read like
 //! `team::snapshot` (cached, refreshed on a background thread, never on the
 //! tick), and the two commands a row's buttons run, `act_command` and
@@ -273,7 +273,7 @@ fn or_close_bin(given: &[String], close: &[String], verb: &str) -> Vec<String> {
 }
 
 /// Adopt the configured commands. An empty `list` turns the queue off: the
-/// Asks view is as it was and nothing is spawned. Called at startup and on
+/// Cockpit shows the live needs only and nothing is spawned. Called at startup and on
 /// `reload-config`.
 pub fn set_commands(config: &Commands) {
     let next = Commands {
@@ -413,13 +413,6 @@ fn read(argv: &[String]) -> Option<Vec<Entry>> {
 /// What a row's button asks the CLI to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Verb {
-    /// Pass the go on: `act_command <id> Envoyer`. The entry stays open
-    /// until whoever receives it closes it.
-    Send,
-    /// `close_command <id> --note "Fait (Kova)"`.
-    Done,
-    /// `close_command <id> --note "Ignoré (Kova)"`.
-    Ignore,
     /// A draft approved as it is: `act_command <id> Valider`.
     Validate,
     /// A draft the user rewrote: `act_command <id> Corriger --text=<text>`.
@@ -440,9 +433,6 @@ impl Verb {
     /// The word the button shows, and the one `act_command` receives.
     pub fn label(self) -> &'static str {
         match self {
-            Verb::Send => "Envoyer",
-            Verb::Done => "Fait",
-            Verb::Ignore => "Ignorer",
             Verb::Validate => "Valider",
             Verb::Correct => "Corriger",
             Verb::Resolve => "C'est fait",
@@ -538,7 +528,7 @@ fn verb_argv_with(
     if !valid_id(id) {
         return None;
     }
-    let acts = matches!(verb, Verb::Send | Verb::Validate | Verb::Correct | Verb::Instruct);
+    let acts = matches!(verb, Verb::Validate | Verb::Correct | Verb::Instruct);
     let base = match verb {
         Verb::Snooze => snooze,
         _ if acts => act,
@@ -548,7 +538,7 @@ fn verb_argv_with(
     let mut args: Vec<String> = words.to_vec();
     args.push(id.to_string());
     match verb {
-        Verb::Send | Verb::Validate => args.push(verb.label().to_string()),
+        Verb::Validate => args.push(verb.label().to_string()),
         Verb::Correct => {
             let text = text.filter(|t| !t.trim().is_empty())?;
             args.extend([verb.label().to_string(), format!("--text={text}")]);
@@ -557,8 +547,6 @@ fn verb_argv_with(
             let text = text.filter(|t| !t.trim().is_empty())?;
             args.extend([verb.label().to_string(), format!("--text={text}")]);
         }
-        Verb::Done => args.extend(["--note".to_string(), "Fait (Kova)".to_string()]),
-        Verb::Ignore => args.extend(["--note".to_string(), "Ignoré (Kova)".to_string()]),
         Verb::Resolve => args.extend(["--reason".to_string(), "done".to_string()]),
         Verb::Dismiss => {
             args.extend(["--reason".to_string(), "dismissed".to_string()]);
@@ -575,16 +563,12 @@ fn verb_argv_with(
     Some((bin.clone(), args))
 }
 
-/// Run a row's button on a background thread. Refused at once when the id is
-/// not in the last read, when a click on it already runs, or when the
-/// command is not configured; the row then keeps its buttons.
-pub fn perform(id: &str, verb: Verb) -> Result<(), String> {
-    perform_with(id, verb, None)
-}
-
-/// `perform` with the text a correction sends. The text is the user's own,
-/// typed on the Cockpit's card: control characters but tab and newline are
-/// dropped, and it is capped at `MAX_TEXT`.
+/// Run a card's button on a background thread, with the text a correction
+/// sends. Refused at once when the id is not in the last read, when a click
+/// on it already runs, or when the command is not configured; the card then
+/// keeps its buttons. The text is the user's own, typed on the Cockpit's
+/// card: control characters but tab and newline are dropped, and it is
+/// capped at `MAX_TEXT`.
 pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), String> {
     let text = text.map(clean_text);
     let known = CACHE.read().as_ref().is_some_and(|entries| entries.iter().any(|e| e.id == id));
@@ -635,7 +619,7 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
         match run_click(&bin, &args) {
             Ok(()) => set_outcome(
                 &id,
-                if matches!(verb, Verb::Send | Verb::Validate | Verb::Correct) { Outcome::Sent } else { Outcome::Closed },
+                if matches!(verb, Verb::Validate | Verb::Correct) { Outcome::Sent } else { Outcome::Closed },
             ),
             Err(words) => {
                 log::warn!("attention {} {id}: {words}", verb.label());
@@ -788,17 +772,12 @@ mod tests {
         let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
         let close: Vec<String> = ["/bin/attn", "close", "--by", "me"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
-            verb_argv(&act, &close, "a-1", Verb::Send, None),
-            Some(("/bin/attn".to_string(), vec!["act".into(), "a-1".into(), "Envoyer".into()]))
-        );
-        assert_eq!(
-            verb_argv(&act, &close, "a-1", Verb::Done, None),
+            verb_argv(&act, &close, "a-1", Verb::Resolve, None),
             Some((
                 "/bin/attn".to_string(),
-                vec!["close".into(), "--by".into(), "me".into(), "a-1".into(), "--note".into(), "Fait (Kova)".into()]
+                vec!["close".into(), "--by".into(), "me".into(), "a-1".into(), "--reason".into(), "done".into()]
             ))
         );
-        assert_eq!(verb_argv(&act, &close, "a-1", Verb::Ignore, None).map(|(_, a)| a[5].clone()), Some("Ignoré (Kova)".into()));
         assert_eq!(
             verb_argv(&act, &close, "a-1", Verb::Dismiss, None).map(|(_, a)| a[4..].to_vec()),
             Some(vec!["--reason".to_string(), "dismissed".to_string()])
@@ -819,10 +798,10 @@ mod tests {
         assert_eq!(verb_argv_with(&act, &close, &snooze, "a-1", Verb::Snooze, Some("--by x")), None, "only a date");
         assert_eq!(or_close_bin(&["/x/explain".into()], &close, "explain"), ["/x/explain"]);
         assert!(or_close_bin(&[], &[], "explain").is_empty());
-        // No close command: Fait and Ignorer have nothing to run.
-        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Done, None), None);
+        // No close command: C'est fait has nothing to run.
+        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Resolve, None), None);
         // An id that could be read as an option never reaches the argv.
-        assert_eq!(verb_argv(&act, &close, "--help", Verb::Send, None), None);
+        assert_eq!(verb_argv(&act, &close, "--help", Verb::Validate, None), None);
     }
 
     #[test]
@@ -906,7 +885,7 @@ mod tests {
         set_commands(&Commands::default());
         assert!(!configured());
         assert!(snapshot().is_none());
-        assert!(perform("a-100001", Verb::Done).is_err());
+        assert!(perform_with("a-100001", Verb::Resolve, None).is_err());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! A port of an earlier Swift prototype's `QuestionCard.swift`. Its structure
 //! stays (header, message, field, buttons, one card at a time); its look moved
 //! to the Claap design system on 04/11/2026 at the user's request, the same
-//! tokens and type as the sidebar's Asks cards (`sidebar::tokens`, Inter): a
+//! tokens and type as the sidebar (`sidebar::tokens`, Inter): a
 //! `bg1` card with a `b3` rim and a 12 pt radius, the asker's colour on a dot,
 //! the primary answer on the accent fill, the others secondary.
 //!
@@ -905,7 +905,7 @@ pub fn take_answers() -> Vec<CardAnswer> {
 
 /// Queue question `id`'s sheet (`link`) for the front window's side panel.
 /// Opened, it leaves the floating card: it is answered on the sheet, and
-/// stays in the sidebar's Asks.
+/// stays in the Cockpit.
 pub fn open_in_panel(id: String, link: String) {
     if let Ok(mut opens) = PANEL_OPENS.lock() {
         opens.push((id, link));

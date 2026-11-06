@@ -5,7 +5,6 @@
 //! the facts to the model is pure and tested here.
 
 use super::needs::{NeedItem, NeedKind};
-use super::sidebar_asks::AsksState;
 use super::sidebar_agents::{AgentsState, AgentsVm};
 use super::sidebar_sched::SchedState;
 use super::sidebar::{
@@ -25,8 +24,6 @@ pub enum SidebarList {
     /// The panes of this window, grouped by tab.
     #[default]
     Panes,
-    /// The open questions of the agent (`kova ask`).
-    Asks,
     /// The agents running in this window.
     Agents,
     /// The scheduled local routines (`crate::routines`).
@@ -38,7 +35,6 @@ impl SidebarList {
     pub fn title(self) -> &'static str {
         match self {
             SidebarList::Panes => "Panes",
-            SidebarList::Asks => "Asks",
             SidebarList::Agents => "Agents",
             SidebarList::Scheduled => "Scheduled",
         }
@@ -169,18 +165,6 @@ pub fn next_pill(needs: &[NeedItem], unread: usize) -> NextPill {
     }
 }
 
-/// The Asks list's meta line: `N need you · newest first`, and nothing at all
-/// while no question waits.
-pub fn asks_summary(open: usize) -> Vec<(String, SummaryRun)> {
-    if open == 0 {
-        return Vec::new();
-    }
-    vec![
-        (format!("{open} need you"), SummaryRun::Waiting),
-        (" \u{b7} newest first".to_string(), SummaryRun::Dot),
-    ]
-}
-
 /// Everything the sidebar shows for one window.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarModel {
@@ -191,11 +175,8 @@ pub struct SidebarModel {
     /// False until the first background read lands: an empty list then means
     /// "not read yet", not "nothing scheduled".
     pub routines_loaded: bool,
-    /// What a human has to answer, for the Asks badge (`needs::waits_on_you`).
-    /// `build` leaves it at zero; `sync_sidebar` fills it from `sync_needs`.
-    pub asks_waiting: u32,
-    /// A scheduled routine's last run failed: the red dot on its icon. Same
-    /// path as the count above.
+    /// A scheduled routine's last run failed: the red dot on its icon.
+    /// `build` leaves it false; `sync_sidebar` fills it from `sync_needs`.
     pub routine_failed: bool,
     /// Panes of this window whose agent is working (`list-panes` `working`):
     /// the count on the Agents icon.
@@ -212,8 +193,6 @@ pub struct SidebarModel {
     /// The Cockpit entry, when the list shows it. `build` leaves it out;
     /// `sync_sidebar` sets it on the Panes list.
     pub cockpit: Option<CockpitVm>,
-    /// The Asks list's cards and transient state. Empty for every other list.
-    pub asks: AsksState,
     /// Fewer than three panes in the window: show the `⌘T new tab · ⌘D split` hint.
     pub show_hint: bool,
     /// The Scheduled view's folding, in-flight actions and inline
@@ -549,9 +528,8 @@ impl SidebarModel {
             view,
             routines_loaded: routines.is_some(),
             routines: routines.unwrap_or_default(),
-            // Both badges come from the needs model, which needs the live
-            // panes and the board: `sync_sidebar` sets them right after.
-            asks_waiting: 0,
+            // The badge comes from the needs model, which needs the live
+            // panes and the board: `sync_sidebar` sets it right after.
             routine_failed: false,
             agents_working,
             summary: summary_runs(waiting, working, idle_here),
@@ -560,7 +538,6 @@ impl SidebarModel {
             groups,
             needs: Vec::new(),
             cockpit: None,
-            asks: AsksState::default(),
             show_hint: total_panes < 3,
             sched: SchedState::default(),
             sched_meta: Vec::new(),
@@ -661,11 +638,11 @@ mod tests {
 
     #[test]
     fn every_list_names_itself_in_the_chrome() {
-        let titles: Vec<&str> = [SidebarList::Panes, SidebarList::Asks, SidebarList::Agents, SidebarList::Scheduled]
+        let titles: Vec<&str> = [SidebarList::Panes, SidebarList::Agents, SidebarList::Scheduled]
             .iter()
             .map(|l| l.title())
             .collect();
-        assert_eq!(titles, ["Panes", "Asks", "Agents", "Scheduled"]);
+        assert_eq!(titles, ["Panes", "Agents", "Scheduled"]);
     }
 
     fn pane(id: PaneId, flags: PaneFlags) -> PaneFacts {
@@ -947,14 +924,5 @@ mod tests {
             detail: "Routine failed".into(),
         };
         assert_eq!(next_pill(&[routine], 0), NextPill::Nothing);
-    }
-
-    #[test]
-    fn the_asks_meta_line_only_names_a_count_when_something_waits() {
-        assert!(asks_summary(0).is_empty());
-        let runs = asks_summary(2);
-        assert_eq!(runs.iter().map(|(t, _)| t.as_str()).collect::<String>(), "2 need you \u{b7} newest first");
-        assert_eq!(runs[0].1, SummaryRun::Waiting);
-        assert_eq!(runs[1].1, SummaryRun::Dot);
     }
 }

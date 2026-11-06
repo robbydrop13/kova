@@ -767,6 +767,11 @@ pub fn unread_count(order: &[(PaneId, bool)]) -> usize {
     order.iter().filter(|&&(_, unread)| unread).count()
 }
 
+/// Epoch milliseconds, for the views' transient deadlines.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
 /// `4s`, `12m`, `3h`: how long a pane has been waiting.
 pub fn format_age(secs: u64) -> String {
     if secs < 60 {

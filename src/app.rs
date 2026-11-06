@@ -44,9 +44,9 @@ pub struct AppDelegateIvars {
     main_busy: Cell<bool>,
     /// Agents' questions waiting for the user (`kova ask`), shown on the card.
     asks: RefCell<crate::ask::Board>,
-    /// The Asks cards' clicks, queued by the sidebar and served by the same
+    /// The Cockpit's and the chat's clicks on a question, served by the same
     /// tick as the floating card's answers: the board lives here.
-    sidebar_asks: RefCell<crate::window::sidebar_asks::AskQueue>,
+    ask_actions: RefCell<crate::window::ask_actions::AskQueue>,
     /// Wakes the agents a launch restore left asleep, one at a time
     /// (`[session] wake_on_launch`); `None` once none is left.
     launch_wake: RefCell<Option<crate::launch_wake::LaunchWaker>>,
@@ -61,9 +61,9 @@ impl AppDelegateIvars {
         self.asks.borrow().for_each_waiting(visit);
     }
 
-    /// Queue a click from an Asks card. The main loop drains it.
-    pub fn queue_ask_action(&self, action: crate::window::sidebar_asks::AskAction) {
-        self.sidebar_asks.borrow_mut().push(action);
+    /// Queue a click on a question. The main loop drains it.
+    pub fn queue_ask_action(&self, action: crate::window::ask_actions::AskAction) {
+        self.ask_actions.borrow_mut().push(action);
     }
 }
 
@@ -291,7 +291,7 @@ impl AppDelegate {
             app_active: Cell::new(false),
             main_busy: Cell::new(false),
             asks: RefCell::new(crate::ask::Board::new()),
-            sidebar_asks: RefCell::new(crate::window::sidebar_asks::AskQueue::default()),
+            ask_actions: RefCell::new(crate::window::ask_actions::AskQueue::default()),
             launch_wake: RefCell::new(None),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -375,9 +375,9 @@ impl AppDelegate {
                     // Answers given on the question card, then the card itself.
                     {
                         let mut asks = ivars.asks.borrow_mut();
-                        let queued = ivars.sidebar_asks.borrow_mut().drain();
+                        let queued = ivars.ask_actions.borrow_mut().drain();
                         for action in queued {
-                            use crate::window::sidebar_asks::AskAction;
+                            use crate::window::ask_actions::AskAction;
                             match action {
                                 AskAction::Answer { id, action, text } => {
                                     asks.answer(&id, action, text);
@@ -385,11 +385,6 @@ impl AppDelegate {
                                 AskAction::Snooze { id, until } => {
                                     if let Err(e) = asks.snooze(&id, until) {
                                         log::warn!("ask: cannot put {} off: {}", id, e);
-                                    }
-                                }
-                                AskAction::Unsnooze { id } => {
-                                    if let Err(e) = asks.unsnooze(&id) {
-                                        log::warn!("ask: cannot bring {} back: {}", id, e);
                                     }
                                 }
                                 AskAction::Close { id, reason } => {

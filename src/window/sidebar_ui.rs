@@ -8,10 +8,8 @@
 use super::*;
 use super::sidebar::{self, swap_chain, PaneFlags, SidebarSort};
 use super::needs::{self, AskNeed, AttentionNeed, NeedInput, NeedItem, NeedKind, PaneNeed, RoutineNeed};
-use super::sidebar_asks::{self, AskCardVm, AsksHit, AsksState, Highlight};
 use super::sidebar_agents;
-use super::sidebar_attention;
-use super::sidebar_model::{asks_summary, header_title, next_pill, CockpitVm, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
+use super::sidebar_model::{header_title, next_pill, CockpitVm, PaneFacts, RoutineVm, SidebarList, SidebarModel, TabFacts};
 use super::sidebar_sched::{self, SchedButton, SchedHit, SchedState};
 use crate::config::LayoutMode;
 use crate::renderer::{TAB_COLORS, TAB_COLOR_NAMES};
@@ -155,15 +153,10 @@ pub(super) struct SidebarState {
     /// Which build of the shared list `needs` holds, so a tick that changed
     /// nothing copies nothing.
     needs_generation: u64,
-    /// `needs::waits_on_you`, the badge on the Asks icon.
+    /// `needs::waits_on_you`, the count on the Cockpit entry.
     pub(super) waits_on_you: u32,
     /// A scheduled routine's last run failed, the badge on the Scheduled icon.
     pub(super) routine_failed: bool,
-    /// The Asks list's cards and transient state, read from the board while
-    /// the Asks list is up.
-    pub(super) asks: AsksState,
-    /// The ask a highlight already scrolled to, so it reveals its card once.
-    last_revealed_ask: Option<String>,
     /// The failed routine Cmd+J already showed, so it shows it once rather
     /// than on every press until the routine runs clean again.
     pub(super) routine_shown: Option<String>,
@@ -189,8 +182,6 @@ impl SidebarState {
             needs_generation: 0,
             waits_on_you: 0,
             routine_failed: false,
-            asks: AsksState::default(),
-            last_revealed_ask: None,
             routine_shown: None,
             sched: SchedState::default(),
             agents: sidebar_agents::AgentsState::default(),
@@ -440,7 +431,7 @@ impl KovaView {
         if results.is_empty() {
             return;
         }
-        let now = sidebar_asks::now_ms();
+        let now = sidebar::now_ms();
         let mut state = self.ivars().sidebar.borrow_mut();
         for result in &results {
             state.sched.finish(result, now);
@@ -455,7 +446,7 @@ impl KovaView {
         if results.is_empty() {
             return;
         }
-        let now = sidebar_asks::now_ms();
+        let now = sidebar::now_ms();
         let mut state = self.ivars().sidebar.borrow_mut();
         for result in &results {
             state.agents.finish(result, now);
@@ -551,6 +542,8 @@ impl KovaView {
         // the queue still holds it; a date that did not read is taken as now.
         let attention = crate::attention::snapshot()
             .map(|entries| {
+                // Forget the clicks on entries the queue let go of.
+                crate::attention::prune(&entries);
                 let outcomes = crate::attention::outcomes();
                 entries
                     .iter()
@@ -573,78 +566,6 @@ impl KovaView {
         NeedInput { panes, routines, asks, attention, now }
     }
 
-    /// The Asks cards at `now`: every question the board holds and every
-    /// permission prompt waiting in a pane, with the tab they came from
-    /// (across every window, like `need_input`) and whether a question's
-    /// conversation is still alive somewhere.
-    fn ask_cards(&self, now: u64) -> Vec<AskCardVm> {
-        use crate::prompt_preview::PromptPreview;
-        let mut panes: std::collections::HashMap<PaneId, String> = std::collections::HashMap::new();
-        let mut permissions = Vec::new();
-        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let app = NSApplication::sharedApplication(mtm);
-        let ns_windows = app.windows();
-        for i in 0..ns_windows.count() {
-            let win = ns_windows.objectAtIndex(i);
-            let Some(view) = crate::app::kova_view(&win) else { continue };
-            let tabs = view.ivars().tabs.borrow();
-            for tab in tabs.iter() {
-                let title = tab.title();
-                tab.for_each_pane(&mut |pane| {
-                    panes.insert(pane.id, title.clone());
-                    if pane.is_working() {
-                        return;
-                    }
-                    // The `since` of the preview and the parsed prompt behind
-                    // it are written together (`Pane::refresh_prompt_preview`).
-                    let since = match pane.prompt_preview.borrow().as_ref() {
-                        Some(PromptPreview::Permission { since, .. }) => *since,
-                        _ => return,
-                    };
-                    let Some(prompt) = pane.permission_prompt() else { return };
-                    let from = pane
-                        .agent_session_name()
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or_else(|| pane.display_title("Shell"));
-                    permissions.push(AskCardVm::from_permission(prompt, (pane.id, title.clone()), from, since, now));
-                });
-            }
-        }
-        let live = crate::claude_session::live_session_ids();
-        let mut cards = permissions;
-        crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|question| {
-            let pane = question
-                .from
-                .pane_id
-                .and_then(|id| PaneId::try_from(id).ok())
-                .and_then(|id| panes.get(&id).map(|tab| (id, tab.clone())));
-            let alive = question.from.agent == crate::agent_session::Agent::Claude
-                && question
-                    .from
-                    .session_id
-                    .as_deref()
-                    .is_some_and(|session| live.iter().any(|id| id == session));
-            cards.push(AskCardVm::from_question(question, pane, alive, now));
-        });
-        cards
-    }
-
-    /// Clear what the Asks view only keeps for a moment, and notice a card
-    /// the board has just let go of. Runs whether or not the list is up: the
-    /// transient card must not outlive a view switch. A permission card lives
-    /// as long as its pane's screen shows the prompt, which is the list the
-    /// last read left in `asks.cards`.
-    fn sync_sidebar_asks_state(&self) {
-        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let mut waiting = Vec::new();
-        crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|question| {
-            waiting.push(sidebar_asks::ask_key(&question.id));
-        });
-        let mut state = self.ivars().sidebar.borrow_mut();
-        waiting.extend(state.asks.cards.iter().filter(|card| card.permission.is_some()).map(|card| card.key));
-        state.asks.prune(&waiting, sidebar_asks::now_ms());
-    }
-
     /// Read the tabs into a model and hand it to the sidebar view, which
     /// redraws only when something changed. Also where the list follows a
     /// focus change. Runs once per tick.
@@ -652,7 +573,6 @@ impl KovaView {
         self.sync_sched_results();
         self.sync_team_results();
         self.sync_needs();
-        self.sync_sidebar_asks_state();
         let Some(view) = self.ivars().sidebar_view.get() else { return };
         if !self.sidebar_active() {
             return;
@@ -674,10 +594,9 @@ impl KovaView {
                 crate::routines::snapshot()
                     .map(|rs| rs.iter().map(|r| RoutineVm::of(r, open.as_deref() == Some(&r.name))).collect())
             }
-            SidebarList::Panes | SidebarList::Asks | SidebarList::Agents => None,
+            SidebarList::Panes | SidebarList::Agents => None,
         };
         let mut model = SidebarModel::build(&facts, sort, unread, list, routines, &needs);
-        model.asks_waiting = waits_on_you;
         model.routine_failed = routine_failed;
         model.apply_needs(&needs, now);
         if list == SidebarList::Panes {
@@ -693,30 +612,10 @@ impl KovaView {
             // actions in flight, and the clock the meta row reads.
             let mut st = self.ivars().sidebar.borrow_mut();
             st.sched.now = Some(crate::routines::When::now());
-            st.sched.prune(sidebar_asks::now_ms());
+            st.sched.prune(sidebar::now_ms());
             model.sched = st.sched.clone();
             model.sched_meta = sidebar_sched::meta_left(&model.routines);
             model.meta_right = sidebar_sched::clock_words(&st.sched);
-        }
-        if list == SidebarList::Asks {
-            let cards = self.ask_cards(now);
-            let attention = attention_vm(now);
-            let mut st = self.ivars().sidebar.borrow_mut();
-            st.asks.set_cards(cards);
-            st.asks.attention = attention;
-            // A need row's `Answer` on a permission named its pane: the card
-            // for that pane exists only now, so it is this read that lights it.
-            if let Some(pane) = st.asks.highlight_pane.take()
-                && let Some(card) =
-                    st.asks.cards.iter().find(|card| card.permission.is_some() && card.pane_id == Some(pane))
-            {
-                st.asks.highlight = Some(Highlight {
-                    id: card.id.clone(),
-                    until_ms: sidebar_asks::now_ms() + sidebar_asks::HIGHLIGHT_MS,
-                });
-            }
-            model.asks = st.asks.clone();
-            model.summary = asks_summary(model.asks.open_count() + model.asks.attention.now.len());
         }
         if list == SidebarList::Agents {
             // The roster is read only while this list is up; the clock marks
@@ -725,33 +624,13 @@ impl KovaView {
             let mut st = self.ivars().sidebar.borrow_mut();
             st.agents_clock.observe(&facts, now);
             let agents = sidebar_agents::build(&facts, &needs, &st.agents_clock, now, roster.as_deref());
-            st.agents.prune(sidebar_asks::now_ms(), &agents.open_names());
+            st.agents.prune(sidebar::now_ms(), &agents.open_names());
             model.agents = agents;
             model.agent_state = st.agents.clone();
             model.summary = vec![(sidebar_agents::summary_words(&model.agents), sidebar::SummaryRun::Dot)];
             model.meta_right = None;
         }
         view.set_model(model);
-
-        // A need row that walked to an ask scrolls its card into view, once.
-        let reveal = {
-            let mut st = self.ivars().sidebar.borrow_mut();
-            let highlighted = st.asks.highlight.as_ref().map(|h| h.id.clone());
-            match highlighted {
-                Some(id) if st.last_revealed_ask.as_deref() != Some(id.as_str()) => {
-                    st.last_revealed_ask = Some(id.clone());
-                    Some(id)
-                }
-                Some(_) => None,
-                None => {
-                    st.last_revealed_ask = None;
-                    None
-                }
-            }
-        };
-        if let Some(id) = reveal {
-            view.reveal_ask(&id);
-        }
 
         // Follow the focus: reveal the focused pane's tile (its header when
         // the group is folded), once per focus change.
@@ -877,15 +756,7 @@ impl KovaView {
     /// The view switcher: show `list`. Clicking the selected icon is a no-op,
     /// like a segmented control.
     pub(super) fn sidebar_show_list(&self, list: SidebarList) {
-        let mut st = self.ivars().sidebar.borrow_mut();
-        st.list = list;
-        if list != SidebarList::Asks {
-            // The field and the overlay belong to the Asks list; the draft
-            // stays in `asks.drafts` for when the user comes back. A pending
-            // permission highlight would name a card nobody can see.
-            st.asks.brief = None;
-            st.asks.highlight_pane = None;
-        }
+        self.ivars().sidebar.borrow_mut().list = list;
     }
 
     /// Click a routine: open it, or close it when it is the open one.
@@ -954,7 +825,7 @@ impl KovaView {
             return;
         };
         if let Err(words) = opened {
-            self.ivars().sidebar.borrow_mut().sched.failed(name, words, sidebar_asks::now_ms());
+            self.ivars().sidebar.borrow_mut().sched.failed(name, words, sidebar::now_ms());
         }
     }
 
@@ -982,7 +853,7 @@ impl KovaView {
     /// The `Open` button of a closed roster entry: validate its argv, say
     /// `Opening…`, and let `crate::team` run it on a background thread.
     pub(super) fn sidebar_agents_open(&self, name: &str) {
-        let now = sidebar_asks::now_ms();
+        let now = sidebar::now_ms();
         if self.ivars().sidebar.borrow().agents.busy(name) {
             return;
         }
@@ -997,9 +868,9 @@ impl KovaView {
         self.ivars().sidebar.borrow_mut().agents.start(name, now);
     }
 
-    /// A row of the `Needs you` block, by its stable key: an error focuses
-    /// its pane, a failed routine opens it in the Scheduled list, an ask or
-    /// a permission opens the Asks list on its card.
+    /// A need, by its stable key: an error focuses its pane, a failed
+    /// routine opens it in the Scheduled list, and what is answered (a
+    /// question, a permission prompt, an attention entry) opens the Cockpit.
     pub(super) fn sidebar_open_need(&self, key: &str) {
         let item = {
             let st = self.ivars().sidebar.borrow();
@@ -1017,138 +888,7 @@ impl KovaView {
                 st.list = SidebarList::Scheduled;
                 st.open_routine = Some(item.title);
             }
-            // An attention entry has no card to light: the Asks list opens on
-            // its section, at the top.
-            NeedKind::Attention => {
-                self.ivars().sidebar.borrow_mut().list = SidebarList::Asks;
-            }
-            NeedKind::Ask | NeedKind::Permission => {
-                let mut st = self.ivars().sidebar.borrow_mut();
-                st.list = SidebarList::Asks;
-                st.asks.highlight = match item.kind {
-                    NeedKind::Ask => item.key.strip_prefix("ask:").map(|id| Highlight {
-                        id: id.to_string(),
-                        until_ms: sidebar_asks::now_ms() + sidebar_asks::HIGHLIGHT_MS,
-                    }),
-                    _ => None,
-                };
-                // A permission card's id carries the screen's fingerprint, which
-                // the list only learns on its next read: name the pane now, the
-                // card is lit there (`sync_sidebar`).
-                st.asks.highlight_pane = if item.kind == NeedKind::Permission {
-                    item.pane_id.and_then(|id| PaneId::try_from(id).ok())
-                } else {
-                    None
-                };
-                st.last_revealed_ask = None;
-            }
-        }
-    }
-
-    /// A click on an Asks card, or in the Brief overlay: run the state
-    /// machine, queue the answer, and land the view where the button says.
-    /// A permission button is the one click that types into a pane: it reads
-    /// the screen again first and gives up when it moved on.
-    pub(super) fn sidebar_ask_hit(&self, hit: AsksHit) {
-        if let Some((key, choice)) = hit.permission() {
-            self.sidebar_permission_hit(key, choice);
-            return;
-        }
-        let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        let now = sidebar_asks::now_ms();
-        let (action, asks) = {
-            let mut st = self.ivars().sidebar.borrow_mut();
-            let action = sidebar_asks::click(&mut st.asks, hit, now);
-            (action, st.asks.clone())
-        };
-        if let Some(view) = self.ivars().sidebar_view.get() {
-            // The state machine lives here, the field and the overlay live in
-            // the view: hand it the result now, not on the next tick.
-            view.adopt_asks(asks);
-        }
-        if let Some(action) = action {
-            crate::app::app_delegate(mtm).ivars().queue_ask_action(action);
-        }
-        if let AsksHit::Open(pane_id) = hit {
-            focus_pane_anywhere(pane_id);
-        }
-        if let AsksHit::Attention(sidebar_attention::AttnHit::Button(key, button)) = hit {
-            self.sidebar_attention_button(key, button);
-        }
-        if let AsksHit::OpenDoc(key) = hit {
-            let open = self.ivars().sidebar.borrow().asks.card(key).and_then(|card| Some((card.id.clone(), card.decision_url.clone()?)));
-            if let Some((id, url)) = open {
-                crate::ask_card::open_in_panel(id, url);
-            }
-        }
-    }
-
-    /// A button on a row of the attention queue: `Ouvrir` shows the link or
-    /// the file in the side panel, the others run their command in the
-    /// background (`crate::attention::perform`). The row shows the click at
-    /// once rather than on the next read.
-    fn sidebar_attention_button(&self, key: u64, button: sidebar_attention::Button) {
-        let row = self.ivars().sidebar.borrow().asks.attention.row(key).cloned();
-        let Some(row) = row else { return };
-        match button {
-            sidebar_attention::Button::Open => {
-                if let Some(target) = row.open {
-                    self.open_in_side_panel(target);
-                }
-            }
-            sidebar_attention::Button::Verb(verb) => {
-                if let Err(why) = crate::attention::perform(&row.id, verb) {
-                    log::warn!("{why}");
-                }
-                let attention = attention_vm(now_epoch_secs());
-                let asks = {
-                    let mut st = self.ivars().sidebar.borrow_mut();
-                    st.asks.attention = attention;
-                    st.asks.clone()
-                };
-                if let Some(view) = self.ivars().sidebar_view.get() {
-                    view.adopt_asks(asks);
-                }
-            }
-        }
-    }
-
-    /// Answer a permission prompt from its card: the pane reads its screen
-    /// again and types the digit only while it is still the prompt the card
-    /// shows. On a match the card goes to `Sending`; otherwise it says
-    /// `Prompt changed, open the pane` in crit and the pane keeps its new
-    /// preview, which the next read of the list shows.
-    fn sidebar_permission_hit(&self, key: u64, choice: crate::prompt_preview::PermissionChoice) {
-        let typed = {
-            let st = self.ivars().sidebar.borrow();
-            let Some(card) = st.asks.card(key) else { return };
-            let (Some(permission), Some(pane_id)) = (card.permission.as_ref(), card.pane_id) else { return };
-            with_pane(pane_id, |pane| pane.answer_permission(&permission.prompt, choice)).unwrap_or(false)
-        };
-        let now = sidebar_asks::now_ms();
-        let asks = {
-            let mut st = self.ivars().sidebar.borrow_mut();
-            if typed {
-                sidebar_asks::permission_sending(&mut st.asks, key, now);
-            } else if let Some(pane_id) = st.asks.card(key).and_then(|card| card.pane_id) {
-                sidebar_asks::permission_refused(&mut st.asks, pane_id, now);
-            }
-            st.asks.clone()
-        };
-        if let Some(view) = self.ivars().sidebar_view.get() {
-            view.adopt_asks(asks);
-        }
-    }
-
-    /// The Brief field's live text: kept in the state so reopening the
-    /// overlay on the same ask restores it. The view's own model copy is
-    /// updated on the same keystroke, for the card's height.
-    pub(super) fn sidebar_brief_draft(&self, id: &str, text: &str) {
-        let mut st = self.ivars().sidebar.borrow_mut();
-        if text.is_empty() {
-            st.asks.drafts.remove(id);
-        } else {
-            st.asks.drafts.insert(id.to_string(), text.to_string());
+            NeedKind::Ask | NeedKind::Permission | NeedKind::Attention => self.open_cockpit(),
         }
     }
 
@@ -1576,48 +1316,6 @@ fn rect_eq(a: CGRect, b: CGRect) -> bool {
         && (a.origin.y - b.origin.y).abs() < 0.01
         && (a.size.width - b.size.width).abs() < 0.01
         && (a.size.height - b.size.height).abs() < 0.01
-}
-
-/// The attention rows at `now`, from the last read and the clicks' states.
-/// Off (`[attention]` absent): an empty, disabled model, and the Asks view is
-/// as it was. The file check behind `Ouvrir` is cached for `MAX_AGE_SECS`:
-/// this runs on every tick while the list is up.
-fn attention_vm(now: u64) -> sidebar_attention::AttentionVm {
-    let entries = crate::attention::snapshot();
-    if let Some(entries) = &entries {
-        crate::attention::prune(entries);
-    }
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    sidebar_attention::build(
-        entries.as_deref().map(Vec::as_slice),
-        &crate::attention::outcomes(),
-        now,
-        crate::attention::can_act(),
-        crate::attention::can_close(),
-        home.as_deref(),
-        &|path| file_exists_cached(path, now),
-    )
-}
-
-thread_local! {
-    /// `is_file` answers by path, with the second they were read at.
-    static FILE_CHECKS: std::cell::RefCell<std::collections::HashMap<std::path::PathBuf, (bool, u64)>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-fn file_exists_cached(path: &std::path::Path, now: u64) -> bool {
-    FILE_CHECKS.with(|checks| {
-        let mut checks = checks.borrow_mut();
-        if let Some((exists, at)) = checks.get(path)
-            && now.saturating_sub(*at) < crate::attention::MAX_AGE_SECS
-        {
-            return *exists;
-        }
-        checks.retain(|_, (_, at)| now.saturating_sub(*at) < crate::attention::MAX_AGE_SECS);
-        let exists = path.is_file();
-        checks.insert(path.to_path_buf(), (exists, now));
-        exists
-    })
 }
 
 /// Wall-clock seconds since the epoch, for the awaiting age.

@@ -296,7 +296,7 @@ pub struct AgentsVm {
     pub tabs: Vec<AgentTab>,
     pub team: Vec<TeamRow>,
     pub dedicated: Vec<TeamRow>,
-    /// Asks and permissions across the app, the stat tile's number: the panes
+    /// Questions and permissions across the app, the stat tile's number: the panes
     /// that need you (an attention entry has no pane, it is not counted). A
     /// row only appears for a pane of this window.
     pub need_count: usize,
@@ -1260,10 +1260,6 @@ mod tests {
     impl TextMetrics for FakeMetrics {
         fn width(&self, text: &str, _style: Style) -> f64 {
             text.chars().count() as f64 * 6.0
-        }
-
-        fn lines(&self, text: &str, _style: Style, width: f64, max: usize) -> usize {
-            ((text.chars().count() as f64 * 6.0 / width).ceil() as usize).clamp(1, max)
         }
     }
 

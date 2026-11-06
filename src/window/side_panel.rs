@@ -228,6 +228,22 @@ pub fn target_on_disk(raw: &str, cwd: Option<&Path>) -> Option<PanelTarget> {
     target_for(raw, cwd, home.as_deref(), |p| p.is_file())
 }
 
+/// What `Ouvrir` would show for an attention entry's action: `target_for`
+/// (an http(s) link, or an existing `.md` / `.html` file, `~/` read as home),
+/// after the `#anchor` of a file is stripped. No working folder: a relative
+/// path names nothing here. Plain words show nothing.
+pub fn open_target(action: &str, home: Option<&Path>, exists: &dyn Fn(&Path) -> bool) -> Option<PanelTarget> {
+    let action = action.trim();
+    if crate::ask::is_panel_url(action) {
+        return Some(PanelTarget::Web(action.to_string()));
+    }
+    let file = match action.rfind('#') {
+        Some(at) if !action[at..].contains('/') => &action[..at],
+        _ => action,
+    };
+    target_for(file, None, home, exists)
+}
+
 // ---------------------------------------------------------------
 // The window's split, pure
 // ---------------------------------------------------------------
@@ -1250,6 +1266,37 @@ fn panel_of(web: &WKWebView) -> Option<Retained<SidePanelView>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ouvrir_takes_a_link_or_an_existing_markdown_or_html_file() {
+        let none = |_: &Path| false;
+        let yes = |_: &Path| true;
+        assert_eq!(open_target("https://example.com/a", None, &none), Some(PanelTarget::Web("https://example.com/a".into())));
+        assert_eq!(
+            open_target("/tmp/x/draft notes.md#P1", None, &yes),
+            Some(PanelTarget::Markdown(PathBuf::from("/tmp/x/draft notes.md")))
+        );
+        assert_eq!(open_target("/tmp/x/page.html", None, &yes), Some(PanelTarget::Html(PathBuf::from("/tmp/x/page.html"))));
+        assert_eq!(
+            open_target("~/notes/a.md", Some(Path::new("/Users/me")), &yes),
+            Some(PanelTarget::Markdown(PathBuf::from("/Users/me/notes/a.md")))
+        );
+        // Missing, relative, another type, or plain words: nothing to open.
+        assert_eq!(open_target("/tmp/x/draft.md", None, &none), None);
+        assert_eq!(open_target("artifacts/a.md", None, &yes), None);
+        assert_eq!(open_target("/tmp/x/a.pdf", None, &yes), None);
+        assert_eq!(open_target("call the bank", None, &yes), None);
+        assert_eq!(open_target("https://example.com/a b", None, &yes), None);
+        assert_eq!(open_target("file:///tmp/x/a.md", None, &yes), Some(PanelTarget::Markdown(PathBuf::from("/tmp/x/a.md"))));
+        // The anchor is checked off the file name only: a `#` in a folder stays.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let record = |p: &Path| {
+            seen.borrow_mut().push(p.to_path_buf());
+            true
+        };
+        open_target("/tmp/a#b/c.md", None, &record);
+        assert_eq!(seen.borrow()[0], PathBuf::from("/tmp/a#b/c.md"));
+    }
 
     const MIN: f64 = 300.0;
 

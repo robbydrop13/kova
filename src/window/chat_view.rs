@@ -501,7 +501,7 @@ impl KovaView {
                         let mtm = MainThreadMarker::from(self);
                         crate::app::app_delegate(mtm)
                             .ivars()
-                            .queue_ask_action(super::sidebar_asks::AskAction::Answer { id: id.clone(), action, text });
+                            .queue_ask_action(super::ask_actions::AskAction::Answer { id: id.clone(), action, text });
                         step
                     }
                     Err(e) => {
@@ -548,13 +548,13 @@ impl KovaView {
 
     /// An ask card's icon or instruction, as the Cockpit's: snooze puts the
     /// question off until the date picked, remove (`dismissed`) and done take
-    /// it off the Asks, its asker told it was withdrawn. The attention entry
+    /// it off the Cockpit, its asker told it was withdrawn. The attention entry
     /// standing for it gets the same verb (`attn snooze`, `attn close --reason
     /// dismissed|done`), and the instruction (`attn act ID instruct`), which
     /// only such an entry takes. Queued or spawned: nothing here touches the
     /// window (this runs under the tabs' borrow).
     fn chat_ask_act(&self, st: &mut ChatState, id: &str, act: &str, text: &str) {
-        use super::sidebar_asks::AskAction;
+        use super::ask_actions::AskAction;
         if !st.questions.iter().any(|q| q.id == id) {
             st.note = Some("Cette question n'attend plus".to_string());
             return;

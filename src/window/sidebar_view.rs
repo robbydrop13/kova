@@ -16,17 +16,15 @@ use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2::runtime::AnyObject;
+use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAffineTransformNSAppKitAdditions, NSApplication, NSBezierPath, NSColor, NSControl,
-    NSControlTextEditingDelegate, NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSFocusRingType, NSFont,
+    NSAffineTransformNSAppKitAdditions, NSBezierPath, NSColor, NSCursor, NSEvent, NSEventMask, NSFont,
     NSGraphicsContext, NSImage, NSLineBreakMode, NSMutableParagraphStyle, NSScrollElasticity, NSScrollView,
-    NSScrollerStyle, NSShadow, NSStringDrawing, NSStringDrawingOptions, NSStringNSExtendedStringDrawing, NSTextField,
-    NSTextFieldDelegate, NSTextView, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSScrollerStyle, NSShadow, NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSAffineTransform, NSDictionary, NSNotification, NSObjectProtocol, NSString};
+use objc2_foundation::{NSAffineTransform, NSDictionary, NSObjectProtocol, NSString};
 
 use super::feather::{self, Icon};
 use super::needs::NeedKind;
@@ -34,7 +32,6 @@ use super::sidebar::{
     self, displacements, drag_bounds, next_slot, placeholder_y, tab_tint, tokens, NextPill, SidebarSort, Slot,
     SummaryRun, TileButton, TileState, RESUME_LABEL, START_CLAUDE_LABEL,
 };
-use super::sidebar_asks::{self, AsksHit, AsksLayout};
 use super::sidebar_model::{CockpitVm, GroupVm, SidebarList, SidebarModel, TileVm};
 #[cfg(test)]
 use super::sidebar_model::RoutineVm;
@@ -268,13 +265,10 @@ impl Style {
     }
 }
 
-/// Text measurement, so the layout can right-align chips and links and count
-/// the lines a question takes. The view answers with AppKit, tests with a
-/// stand-in.
+/// Text measurement, so the layout can right-align chips and links. The view
+/// answers with AppKit, tests with a stand-in.
 pub trait TextMetrics {
     fn width(&self, text: &str, style: Style) -> f64;
-    /// Lines `text` wraps into within `width`, capped at `max`.
-    fn lines(&self, text: &str, style: Style, width: f64, max: usize) -> usize;
 }
 
 // ---------------------------------------------------------------
@@ -391,8 +385,6 @@ pub enum ListHit {
     /// The `Answer` link of a waiting tile: the same landing as the pane's
     /// ask row.
     NeedAnswer(PaneId),
-    /// A button of the Asks list: an answer, Brief, the pane, a snooze.
-    Ask(AsksHit),
     /// A row or button of the Agents list.
     Agent(AgentsHit),
     Empty,
@@ -414,7 +406,6 @@ fn arms_press(hit: ListHit) -> bool {
         | ListHit::Sched(_)
         | ListHit::Cockpit
         | ListHit::NeedAnswer(_)
-        | ListHit::Ask(_)
         | ListHit::Agent(_) => true,
         // Headers and tiles arm themselves: they may become a drag instead.
         ListHit::Header(_) | ListHit::Tile(_) | ListHit::Empty => false,
@@ -439,7 +430,6 @@ impl ListHit {
     pub fn pane(self) -> Option<PaneId> {
         match self {
             ListHit::Tile(id) | ListHit::TileButton(id, _) | ListHit::NeedAnswer(id) => Some(id),
-            ListHit::Ask(AsksHit::Open(id)) => Some(id),
             _ => None,
         }
     }
@@ -463,8 +453,6 @@ pub struct ListLayout {
     pub groups: Vec<Rect>,
     pub hint_y: Option<f64>,
     pub content_h: f64,
-    /// The Asks list's cards, when `view` is `SidebarList::Asks`.
-    pub asks: AsksLayout,
     /// The Scheduled list's sections and rows, when `view` is
     /// `SidebarList::Scheduled`.
     pub sched: SchedLayout,
@@ -479,7 +467,6 @@ fn hint_text(model: &SidebarModel) -> &'static str {
     match model.view {
         SidebarList::Scheduled if !model.routines_loaded => "reading routines\u{2026}",
         SidebarList::Scheduled => "no routines scheduled",
-        SidebarList::Asks => "No open questions",
         SidebarList::Agents if model.agents.panes.is_empty() => "No agents in this window",
         SidebarList::Agents => "",
         SidebarList::Panes => "\u{2318}T new tab \u{b7} \u{2318}D split",
@@ -493,13 +480,6 @@ impl ListLayout {
         let mut rows = Vec::new();
         let mut groups = Vec::with_capacity(model.groups.len());
         let mut y = LIST_TOP;
-        if model.view == SidebarList::Asks {
-            // The cards carry their own geometry: padding, wrapped message,
-            // the action row's buttons and the folded snoozed section.
-            let asks = sidebar_asks::layout(&model.asks, width, m);
-            let content_h = asks.content_h;
-            return ListLayout { width, asks, content_h, ..Default::default() };
-        }
         if model.view == SidebarList::Agents {
             // Tiles, sections and rows all come from `sidebar_agents`: one
             // place lays out and draws the view, so the two agree.
@@ -579,7 +559,6 @@ impl ListLayout {
             groups,
             hint_y,
             content_h: y,
-            asks: AsksLayout::default(),
             sched: SchedLayout::default(),
             agents: AgentsLayout::default(),
         }
@@ -615,9 +594,6 @@ impl ListLayout {
     }
 
     pub fn hit(&self, x: f64, y: f64) -> ListHit {
-        if self.asks.shown {
-            return self.asks.hit(x, y).map_or(ListHit::Empty, ListHit::Ask);
-        }
         for row in &self.rows {
             if !row.frame.contains(x, y) {
                 continue;
@@ -924,7 +900,7 @@ pub enum ChromeHit {
     TopArea,
     SortToggle,
     NextPill,
-    /// One of the four view-switcher buttons, at the right end of the top row.
+    /// One of the three view-switcher buttons, at the right end of the top row.
     ViewSwitch(SidebarList),
     /// The resize handle at the right edge.
     Edge,
@@ -944,14 +920,13 @@ pub struct ChromeLayout {
     /// The Next pill: sized to its content, against the right edge. Also
     /// its hit region.
     pub pill: Rect,
-    /// The four view-switcher buttons on the top row, left to right.
-    pub switch: [Rect; 4],
+    /// The three view-switcher buttons on the top row, left to right.
+    pub switch: [Rect; 3],
     pub list: Rect,
 }
 
 /// The list each switcher button selects, in the order they are drawn.
-pub const SWITCH_LISTS: [SidebarList; 4] =
-    [SidebarList::Panes, SidebarList::Asks, SidebarList::Agents, SidebarList::Scheduled];
+pub const SWITCH_LISTS: [SidebarList; 3] = [SidebarList::Panes, SidebarList::Agents, SidebarList::Scheduled];
 
 /// The width of the Next pill around its content: the side padding, the
 /// filled play and its gap when the pill is clickable, the label, and the
@@ -1093,23 +1068,6 @@ impl TextMetrics for AppKitMetrics<'_> {
         let size = unsafe { NSString::from_str(text).sizeWithAttributes(Some(&attrs)) };
         size.width.ceil()
     }
-
-    fn lines(&self, text: &str, style: Style, width: f64, max: usize) -> usize {
-        if text.is_empty() {
-            return 1;
-        }
-        let attrs = attrs(self.0.font(style), tokens::get().text_primary, 1.0, NSLineBreakMode::ByWordWrapping);
-        let one = unsafe { NSString::from_str("X").sizeWithAttributes(Some(&attrs)) }.height.max(1.0);
-        let rect = unsafe {
-            NSString::from_str(text).boundingRectWithSize_options_attributes_context(
-                CGSize { width, height: 10_000.0 },
-                NSStringDrawingOptions::UsesLineFragmentOrigin,
-                Some(&attrs),
-                None,
-            )
-        };
-        ((rect.size.height / one).round() as usize).clamp(1, max)
-    }
 }
 
 // ---------------------------------------------------------------
@@ -1245,20 +1203,6 @@ pub(super) fn draw_text(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32
     w
 }
 
-/// Draw a wrapped text of at most `lines` lines in `r`, the last line ending
-/// with an ellipsis when cut.
-pub(super) fn draw_wrapped(sh: &Shared, text: &str, r: &Rect, style: Style, c: [f32; 3], alpha: f64) {
-    let a = attrs(sh.font(style), c, alpha, NSLineBreakMode::ByWordWrapping);
-    unsafe {
-        NSString::from_str(text).drawWithRect_options_attributes_context(
-            r.cg(),
-            NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::TruncatesLastVisibleLine,
-            Some(&a),
-            None,
-        )
-    };
-}
-
 /// A link: a filled Feather icon, a gap, the word, the pair centred in `r`.
 fn draw_link(sh: &Shared, icon: Icon, label: &str, r: &Rect, c: [f32; 3], alpha: f64) {
     let text_w = AppKitMetrics(sh).width(label, Style::Link).min(r.w - LINK_ICON_D - LINK_ICON_GAP).max(0.0);
@@ -1313,29 +1257,10 @@ fn build_fonts() -> Vec<(Style, Retained<NSFont>)> {
 // SidebarView: chrome and scroll view
 // ---------------------------------------------------------------
 
-/// The Brief overlay's one native field: the question it edits, the box that
-/// carries its ground and border, and the rect the last layout gave it (moved
-/// only when that changes, never rebuilt on a tick).
-struct BriefField {
-    id: String,
-    box_: Retained<NSView>,
-    field: Retained<NSTextField>,
-    rect: Rect,
-}
-
-impl BriefField {
-    /// The field editor is open on this field: the keys go here, not to the
-    /// terminal. `currentEditor` is AppKit's own answer to that question.
-    fn current_editor(&self) -> bool {
-        self.field.currentEditor().is_some()
-    }
-}
-
 pub struct SidebarViewIvars {
     shared: Rc<RefCell<Shared>>,
     scroll: OnceCell<Retained<NSScrollView>>,
     list: OnceCell<Retained<SidebarListView>>,
-    brief_field: RefCell<Option<BriefField>>,
 }
 
 define_class!(
@@ -1346,22 +1271,6 @@ define_class!(
     pub struct SidebarView;
 
     unsafe impl NSObjectProtocol for SidebarView {}
-
-    /// The Brief field's callbacks: the text feeds the draft and grows the
-    /// card, Enter starts a new line, Cmd+Enter sends, Escape cancels.
-    unsafe impl NSControlTextEditingDelegate for SidebarView {
-        #[unsafe(method(controlTextDidChange:))]
-        fn control_text_did_change(&self, _notification: &NSNotification) {
-            self.brief_text_changed();
-        }
-
-        #[unsafe(method(control:textView:doCommandBySelector:))]
-        fn control_text_view_do_command(&self, _control: &NSControl, text_view: &NSTextView, selector: Sel) -> bool {
-            self.brief_command(text_view, selector)
-        }
-    }
-
-    unsafe impl NSTextFieldDelegate for SidebarView {}
 
     impl SidebarView {
         #[unsafe(method(isFlipped))]
@@ -1377,32 +1286,6 @@ define_class!(
         #[unsafe(method(mouseDownCanMoveWindow))]
         fn mouse_down_can_move_window(&self) -> bool {
             false
-        }
-
-        /// Cmd+Enter in the Brief field sends it. AppKit routes a key
-        /// equivalent before the field editor turns it into a command, so the
-        /// delegate never sees this one: this is its door. Return alone stays
-        /// a newline (`brief_command`), and the field must be the one being
-        /// edited, or the terminal keeps its own keys.
-        #[unsafe(method(performKeyEquivalent:))]
-        fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
-            // Whatever a subview claims stays its own.
-            let handled: objc2::runtime::Bool = unsafe { msg_send![super(self), performKeyEquivalent: event] };
-            if handled.as_bool() {
-                return handled;
-            }
-            let enter = event.keyCode() == 36 || event.keyCode() == 76;
-            if enter
-                && event.modifierFlags().contains(NSEventModifierFlags::Command)
-                && self.brief_field_editing()
-            {
-                if let Some(key) = self.brief_key() {
-                    log::info!("sidebar: brief send (cmd+enter)");
-                    self.activate_brief(AsksHit::BriefSend(key));
-                }
-                return objc2::runtime::Bool::YES;
-            }
-            objc2::runtime::Bool::NO
         }
 
         #[unsafe(method(isOpaque))]
@@ -1568,19 +1451,12 @@ fn install_tracking_area(view: &NSView) {
 }
 
 impl SidebarView {
-    /// The brief text field owns the keyboard: it is the field editor's
-    /// client right now, not just a field sitting in the view.
-    fn brief_field_editing(&self) -> bool {
-        self.ivars().brief_field.borrow().as_ref().is_some_and(|open| open.current_editor())
-    }
-
     pub fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
         let shared = Rc::new(RefCell::new(Shared {
             model: SidebarModel {
                 view: SidebarList::default(),
                 routines: Vec::new(),
                 routines_loaded: false,
-                asks_waiting: 0,
                 agents_working: 0,
                 routine_failed: false,
                 summary: Vec::new(),
@@ -1589,7 +1465,6 @@ impl SidebarView {
                 groups: Vec::new(),
                 needs: Vec::new(),
                 cockpit: None,
-                asks: Default::default(),
                 show_hint: false,
                 sched: Default::default(),
                 sched_meta: Vec::new(),
@@ -1613,7 +1488,6 @@ impl SidebarView {
             shared: shared.clone(),
             scroll: OnceCell::new(),
             list: OnceCell::new(),
-            brief_field: RefCell::new(None),
         });
         let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         view.setWantsLayer(true);
@@ -1687,16 +1561,6 @@ impl SidebarView {
         }
     }
 
-    /// Scroll the least that shows the Asks card `id`, for a need row that
-    /// walked to it.
-    pub fn reveal_ask(&self, id: &str) {
-        let Some(list) = self.ivars().list.get() else { return };
-        let frame = self.ivars().shared.borrow().layout.asks.card_frame(id);
-        if let Some(f) = frame {
-            list.scrollRectToVisible(Rect::new(f.x, f.y - GROUP_GAP, f.w, f.h + 2.0 * GROUP_GAP).cg());
-        }
-    }
-
     /// Position the scroll view for the current size, and re-lay the list.
     fn layout_chrome(&self) {
         let b = self.bounds();
@@ -1747,191 +1611,7 @@ impl SidebarView {
         if let Some(win) = list.window() {
             win.invalidateCursorRectsForView(&list);
         }
-        self.sync_brief_field(&list);
         list.setNeedsDisplay(true);
-    }
-
-    // ---------------------------------------------------------------
-    // Brief overlay's native field
-    // ---------------------------------------------------------------
-
-    /// Make the one native field match the overlay: created and focused when
-    /// a Brief opens, moved when its rect changes, removed when the overlay
-    /// closes or its question leaves the board. Never rebuilt on a tick.
-    fn sync_brief_field(&self, list: &SidebarListView) {
-        let target = {
-            let sh = self.ivars().shared.borrow();
-            match (&sh.model.asks.brief, &sh.layout.asks.brief) {
-                (Some(brief), Some(layout)) => Some((
-                    brief.id.clone(),
-                    sh.model.asks.drafts.get(&brief.id).cloned().unwrap_or_default(),
-                    layout.card,
-                    layout.field,
-                )),
-                _ => None,
-            }
-        };
-        let Some((id, text, card, rect)) = target else {
-            self.close_brief_field();
-            return;
-        };
-        let open = self.ivars().brief_field.borrow().as_ref().is_some_and(|open| open.id == id);
-        if open {
-            let mut slot = self.ivars().brief_field.borrow_mut();
-            let field = slot.as_mut().expect("just checked");
-            if field.rect != rect {
-                field.rect = rect;
-                field.box_.setFrame(rect.cg());
-                Self::place_brief_text(field);
-            }
-            return;
-        }
-        self.close_brief_field();
-        self.open_brief_field(list, &id, &text, card, rect);
-    }
-
-    /// The text area inside the box: the pads the pure layout measured with.
-    fn place_brief_text(brief: &BriefField) {
-        let inner = Rect::new(
-            sidebar_asks::BRIEF_FIELD_PAD_H,
-            sidebar_asks::BRIEF_FIELD_PAD_V,
-            (brief.rect.w - 2.0 * sidebar_asks::BRIEF_FIELD_PAD_H).max(0.0),
-            (brief.rect.h - 2.0 * sidebar_asks::BRIEF_FIELD_PAD_V).max(0.0),
-        );
-        brief.field.setFrame(inner.cg());
-    }
-
-    fn open_brief_field(&self, list: &SidebarListView, id: &str, text: &str, card: Rect, rect: Rect) {
-        let mtm = MainThreadMarker::from(self);
-        let box_ = NSView::new(mtm);
-        box_.setWantsLayer(true);
-        if let Some(layer) = box_.layer() {
-            layer.setCornerRadius(6.0);
-            layer.setBorderWidth(1.0);
-            layer.setBackgroundColor(Some(&color(tokens::get().ground, 1.0).CGColor()));
-            layer.setBorderColor(Some(&color(tokens::get().border_subtle, 1.0).CGColor()));
-        }
-        let font = self.ivars().shared.borrow().font(Style::Secondary).retain();
-        let field = NSTextField::new(mtm);
-        field.setBordered(false);
-        field.setDrawsBackground(false);
-        field.setFocusRingType(NSFocusRingType::None);
-        field.setFont(Some(&font));
-        field.setTextColor(Some(&color(tokens::get().text_primary, 1.0)));
-        field.setUsesSingleLineMode(false);
-        field.setMaximumNumberOfLines(0);
-        if let Some(cell) = field.cell() {
-            cell.setWraps(true);
-            cell.setScrollable(false);
-        }
-        field.setStringValue(&NSString::from_str(text));
-        field.setPlaceholderString(Some(&NSString::from_str("Your instruction")));
-        unsafe { field.setDelegate(Some(ProtocolObject::from_ref(self))) };
-        box_.addSubview(&field);
-        box_.setFrame(rect.cg());
-        list.addSubview(&box_);
-        let open = BriefField { id: id.to_string(), box_, field, rect };
-        Self::place_brief_text(&open);
-        *self.ivars().brief_field.borrow_mut() = Some(open);
-        log::info!("sidebar: brief field open {}", id);
-        list.scrollRectToVisible(card.inset(-4.0).cg());
-        let field = self.ivars().brief_field.borrow().as_ref().map(|open| open.field.retain());
-        if let (Some(field), Some(win)) = (field, self.window()) {
-            win.makeFirstResponder(Some(&field));
-        }
-    }
-
-    fn close_brief_field(&self) {
-        let Some(open) = self.ivars().brief_field.borrow_mut().take() else { return };
-        log::info!("sidebar: brief field close {}", open.id);
-        // The keyboard goes back to the terminal, then the box goes: removing
-        // the first responder's view first would leave the window keyless.
-        if let (Some(win), Some(kova)) = (self.window(), kova_of(self)) {
-            win.makeFirstResponder(Some(&kova));
-        }
-        open.box_.removeFromSuperview();
-    }
-
-    /// The field's live text: kept in the window's state (so reopening Brief
-    /// restores it) and in this view's model (so the card grows at once).
-    fn brief_text_changed(&self) {
-        let (id, text) = {
-            let slot = self.ivars().brief_field.borrow();
-            let Some(open) = slot.as_ref() else { return };
-            let text = match open.field.currentEditor() {
-                Some(editor) => editor.string().to_string(),
-                None => open.field.stringValue().to_string(),
-            };
-            (open.id.clone(), text)
-        };
-        {
-            let mut sh = self.ivars().shared.borrow_mut();
-            if text.is_empty() {
-                sh.model.asks.drafts.remove(&id);
-            } else {
-                sh.model.asks.drafts.insert(id.clone(), text.clone());
-            }
-        }
-        if let Some(kova) = kova_of(self) {
-            kova.sidebar_brief_draft(&id, &text);
-        }
-        self.relayout_list();
-    }
-
-    /// Enter, Cmd+Enter and Escape in the field. Enter is a new line in an
-    /// instruction; the card's own field keeps Enter for sending. The field
-    /// editor reports a Return under more than one selector, so all of them
-    /// are the same key here.
-    fn brief_command(&self, text_view: &NSTextView, selector: Sel) -> bool {
-        if selector == sel!(cancelOperation:) {
-            if let Some(key) = self.brief_key() {
-                self.activate_brief(AsksHit::BriefCancel(key));
-            }
-            return true;
-        }
-        let newline = selector == sel!(insertNewline:)
-            || selector == sel!(insertNewlineIgnoringFieldEditor:)
-            || selector == sel!(insertLineBreak:);
-        if !newline {
-            return false;
-        }
-        let cmd = NSApplication::sharedApplication(MainThreadMarker::from(self))
-            .currentEvent()
-            .map(|event| event.modifierFlags().contains(NSEventModifierFlags::Command))
-            .unwrap_or(false);
-        if cmd {
-            if let Some(key) = self.brief_key() {
-                log::info!("sidebar: brief send (cmd+enter)");
-                self.activate_brief(AsksHit::BriefSend(key));
-            }
-        } else {
-            let _: () = unsafe { msg_send![text_view, insertNewlineIgnoringFieldEditor: None::<&AnyObject>] };
-        }
-        true
-    }
-
-    fn brief_key(&self) -> Option<u64> {
-        let id = self.ivars().brief_field.borrow().as_ref().map(|open| open.id.clone())?;
-        let sh = self.ivars().shared.borrow();
-        sh.model.asks.cards.iter().find(|card| card.id == id).map(|card| card.key)
-    }
-
-    /// A command from the field goes through the list, which turns a hit
-    /// into a click on the window's state.
-    fn activate_brief(&self, hit: AsksHit) {
-        if let Some(list) = self.ivars().list.get() {
-            list.activate(ListHit::Ask(hit));
-        }
-    }
-
-    /// Mirror the window's Asks state at once: waiting for the next tick
-    /// would leave a click's open, pick or close invisible for a frame.
-    pub(super) fn adopt_asks(&self, asks: sidebar_asks::AsksState) {
-        {
-            let mut sh = self.ivars().shared.borrow_mut();
-            sh.model.asks = asks;
-        }
-        self.relayout_list();
     }
 
     fn draw_chrome(&self) {
@@ -1957,7 +1637,6 @@ impl SidebarView {
             let fg = if selected { tokens::get().sel_text } else { tokens::get().text_tertiary };
             let icon = match list {
                 SidebarList::Panes => Icon::Sidebar,
-                SidebarList::Asks => Icon::Message,
                 SidebarList::Agents => Icon::Users,
                 SidebarList::Scheduled => Icon::Clock,
             };
@@ -1968,12 +1647,8 @@ impl SidebarView {
                 fill_round(&r.inset(-SWITCH_BADGE_RING), radius + SWITCH_BADGE_RING, tokens::get().ground, 1.0);
             };
             match list {
-                SidebarList::Asks | SidebarList::Agents
-                    if (list == SidebarList::Asks && sh.model.asks_waiting > 0)
-                        || (list == SidebarList::Agents && sh.model.agents_working > 0) =>
-                {
-                    let n = if list == SidebarList::Asks { sh.model.asks_waiting } else { sh.model.agents_working };
-                    let label = n.to_string();
+                SidebarList::Agents if sh.model.agents_working > 0 => {
+                    let label = sh.model.agents_working.to_string();
                     let w = (AppKitMetrics(&sh).width(&label, Style::PillBadge) + 8.0).max(SWITCH_BADGE_H);
                     let r = switch_badge(rect, w, SWITCH_BADGE_H);
                     ring(r, SWITCH_BADGE_H / 2.0);
@@ -2143,9 +1818,7 @@ define_class!(
             // Bind the rects first: adding a cursor rect is an AppKit call.
             let panels: Vec<CGRect> = {
                 let sh = self.ivars().shared.borrow();
-                if sh.layout.asks.shown {
-                    sh.layout.asks.button_rects().iter().map(|r| r.cg()).collect()
-                } else if matches!(sh.model.view, SidebarList::Scheduled | SidebarList::Agents) {
+                if matches!(sh.model.view, SidebarList::Scheduled | SidebarList::Agents) {
                     sh.layout.rows.iter().map(|r| r.frame.cg()).collect()
                 } else {
                     // The Cockpit entry is a target of its own, like a panel.
@@ -2516,7 +2189,6 @@ impl SidebarListView {
                     kova.sidebar_open_need(&key);
                 }
             }
-            ListHit::Ask(hit) => kova.sidebar_ask_hit(hit),
             ListHit::Empty => {}
         }
     }
@@ -2611,12 +2283,6 @@ impl SidebarListView {
 
     fn draw_list(&self, dirty: CGRect) {
         let sh = self.ivars().shared.borrow();
-        if sh.layout.asks.shown {
-            let visible = self.visibleRect();
-            let scrim = Rect::new(visible.origin.x, visible.origin.y, visible.size.width, visible.size.height);
-            sidebar_asks::draw(&sh, &sh.model.asks, &sh.layout.asks, sh.hovered, sh.pressed, scrim);
-            return;
-        }
         let dirty_top = dirty.origin.y;
         let dirty_bottom = dirty.origin.y + dirty.size.height;
         let visible = |r: &Rect| r.bottom() >= dirty_top && r.y <= dirty_bottom;
@@ -2993,10 +2659,6 @@ mod tests {
         fn width(&self, text: &str, _style: Style) -> f64 {
             text.chars().count() as f64 * 6.0
         }
-
-        fn lines(&self, text: &str, _style: Style, width: f64, max: usize) -> usize {
-            ((text.chars().count() as f64 * 6.0 / width).ceil() as usize).clamp(1, max)
-        }
     }
 
     #[test]
@@ -3073,12 +2735,6 @@ mod tests {
             ListHit::Sched(SchedHit::Row(0)),
             ListHit::Cockpit,
             ListHit::NeedAnswer(1),
-            ListHit::Ask(AsksHit::ToggleSnoozed),
-            ListHit::Ask(AsksHit::Attention(crate::window::sidebar_attention::AttnHit::TogglePoint)),
-            ListHit::Ask(AsksHit::Attention(crate::window::sidebar_attention::AttnHit::Button(
-                1,
-                crate::window::sidebar_attention::Button::Verb(crate::attention::Verb::Done),
-            ))),
             ListHit::Agent(AgentsHit::Filter(sidebar_agents::AgentSection::Working)),
             ListHit::Agent(AgentsHit::Pane(1)),
             ListHit::Agent(AgentsHit::Need(0)),
@@ -3178,7 +2834,6 @@ mod tests {
             view: SidebarList::default(),
             routines: Vec::new(),
             routines_loaded: false,
-            asks_waiting: 0,
             agents_working: 0,
             routine_failed: false,
             summary: Vec::new(),
@@ -3191,7 +2846,6 @@ mod tests {
             ],
             needs: Vec::new(),
             cockpit: None,
-            asks: Default::default(),
             show_hint: false,
             sched: Default::default(),
             sched_meta: Vec::new(),
@@ -3455,12 +3109,12 @@ mod tests {
     #[test]
     fn the_chrome_stacks_the_top_row_the_title_the_meta_row_and_the_list() {
         let c = ChromeLayout::new(W, 600.0, Some(40.0), 130.0);
-        // Top row: four 26 pt buttons, 2 apart, 10 from the inner right
+        // Top row: three 26 pt buttons, 2 apart, 10 from the inner right
         // edge, on the traffic lights' own row.
-        let switch_left = W - 1.0 - 10.0 - (4.0 * 26.0 + 3.0 * 2.0);
+        let switch_left = W - 1.0 - 10.0 - (3.0 * 26.0 + 2.0 * 2.0);
         assert_eq!(c.switch[0], Rect::new(switch_left, 6.0, 26.0, 26.0));
         assert_eq!(c.switch[1].x, c.switch[0].right() + 2.0);
-        assert_eq!(c.switch[3].right(), W - 1.0 - 10.0);
+        assert_eq!(c.switch[2].right(), W - 1.0 - 10.0);
         // Title row, 40 tall: the name 14 in, the pill 12 from the right,
         // 24 tall.
         assert_eq!(c.title, Rect::new(14.0, 38.0, W - 1.0 - 12.0 - 130.0 - 8.0 - 14.0, 40.0));
@@ -3507,7 +3161,7 @@ mod tests {
             let c = ChromeLayout::new(w, 600.0, Some(40.0), 130.0);
             let inner = w - 1.0;
             assert!(c.switch[0].x >= 0.0);
-            assert_eq!(c.switch[3].right(), inner - 10.0);
+            assert_eq!(c.switch[2].right(), inner - 10.0);
             for (rect, list) in c.switch.iter().zip(SWITCH_LISTS) {
                 assert_eq!(c.hit(rect.x + 13.0, rect.y + 13.0), ChromeHit::ViewSwitch(list));
             }
@@ -3548,14 +3202,6 @@ mod tests {
         assert!(l.groups.is_empty());
         assert_eq!(l.hint_y, None);
         assert_eq!(hint_text(&m), "No agents in this window");
-
-        // Asks draws its own empty state, not the hint line.
-        m.view = SidebarList::Asks;
-        let asks = ListLayout::new(&m, 260.0, &FakeMetrics);
-        assert_eq!(asks.hint_y, None);
-        assert!(asks.asks.shown);
-        assert!(asks.asks.empty.is_some());
-        assert!(asks.asks.cards.is_empty());
     }
 
     #[test]

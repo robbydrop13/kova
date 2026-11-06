@@ -23,7 +23,7 @@
 //! ```
 //!
 //! The options are kept as `(number, label)` pairs, and the labels alone say
-//! what each button of the Asks card does (`ParsedPrompt::choices`): the
+//! what each button of a permission card does (`ParsedPrompt::choices`): the
 //! first `Yes` that is not an `always` approves once, the one that always
 //! allows is the card's `Always`, the `No` rejects. A screen whose option
 //! block strays from the numbering (a prompt scrolled so option 1 is off
@@ -69,7 +69,7 @@ pub struct ApiError {
     pub text: String,
 }
 
-/// The parts of a permission prompt the tile and the Asks card show.
+/// The parts of a permission prompt the tile and the permission card show.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedPrompt {
     /// `Bash command`, `Create file`, ...

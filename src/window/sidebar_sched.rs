@@ -835,10 +835,6 @@ mod tests {
         fn width(&self, text: &str, _style: Style) -> f64 {
             text.chars().count() as f64 * 6.0
         }
-
-        fn lines(&self, text: &str, _style: Style, width: f64, max: usize) -> usize {
-            ((text.chars().count() as f64 * 6.0 / width).ceil() as usize).clamp(1, max)
-        }
     }
 
     /// The K07 fixture's own clock, the one `routines` groups it at.

@@ -16,12 +16,11 @@ mod search_palette;
 use search_palette::{SearchPaletteState, SearchRow, is_shortcut, is_typed_char, typed_text};
 pub mod sidebar;
 pub(super) mod sidebar_agents;
-pub(super) mod sidebar_asks;
+pub(super) mod ask_actions;
 #[allow(dead_code)]
 pub mod ds_tokens;
 mod sidebar_model;
 mod sidebar_ui;
-mod sidebar_attention;
 pub(super) mod sidebar_sched;
 mod sidebar_view;
 pub(crate) mod side_panel;
