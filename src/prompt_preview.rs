@@ -602,7 +602,8 @@ pub fn parse_menu(visible: &str) -> Option<Menu> {
             .into_iter()
             .map(|(number, label, _, under)| MenuOption {
                 number,
-                free_text: FREE_TEXT_LABELS.contains(&label.as_str()),
+                // A label wrapped in a narrow pane ends on the line under it.
+                free_text: FREE_TEXT_LABELS.iter().any(|f| format!("{label} {}", under.join(" ")).starts_with(f)),
                 detail: (!under.is_empty()).then(|| under.join("\n")),
                 label,
             })
@@ -818,6 +819,8 @@ mod tests {
         assert_eq!(m.options[2].detail.as_deref(), Some("shift+tab to approve with this feedback"));
         assert!(m.body.is_empty(), "the plan itself sits above the frame: the transcript has it");
         assert_eq!(m.selected, Some(1));
+        let narrow = PLAN.replace("3. Tell Claude what to change", "3. Tell Claude what to\n        change");
+        assert!(parse_menu(&narrow).expect("narrow").options[2].free_text, "wrapped, still the text option");
     }
 
     #[test]

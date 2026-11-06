@@ -58,6 +58,11 @@ pub fn composer(visible: &str) -> Composer {
     let after = line[COMPOSER_PREFIX.len_utf8()..]
         .trim_end_matches(|c: char| c.is_whitespace() || ('\u{2500}'..='\u{257f}').contains(&c))
         .trim();
+    // An AskUserQuestion's marker sits in the first column: `❯ 1. Red`.
+    let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 && after[digits..].starts_with(". ") {
+        return Composer::Unreadable;
+    }
     if !after.is_empty() && !after.starts_with(PLACEHOLDER_PREFIX) {
         return Composer::Typed;
     }
@@ -277,6 +282,12 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ask_user_question_menu_is_no_composer() {
+        let screen = include_str!("../../tests/fixtures/prompt/ask-user-question.txt");
+        assert_eq!(composer(screen), Composer::Unreadable);
+    }
 
     #[test]
     fn pasted_images_go_before_the_text_as_their_paths() {

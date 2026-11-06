@@ -278,7 +278,13 @@ pub struct MenuAnswer {
 /// any other option is answered and the text, if any, follows as a message.
 pub fn menu_answer(menu: &Menu, label: &str, text: &str) -> Result<MenuAnswer, &'static str> {
     let option = menu.option(label).ok_or("Cette option n'est plus proposée")?;
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // One line (Enter would send it early), no control character, 8 KB at
+    // most, as everything Kova types into a PTY.
+    let clean: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let mut one_line = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    while one_line.len() > 8 * 1024 {
+        one_line.pop();
+    }
     if option.free_text {
         if one_line.is_empty() {
             return Err("Écris ta réponse dans le champ");
@@ -308,9 +314,11 @@ pub enum MenuStage {
 /// when the option shows it. `Err` says why nothing more goes.
 pub fn menu_next(answer: &MenuAnswer, stage: MenuStage, question: &str, now: Option<&Menu>) -> Result<Option<String>, &'static str> {
     let Some(menu) = now.filter(|m| m.question == question) else {
-        return match stage {
-            MenuStage::Digit => Ok(None),
-            MenuStage::Text => Err("La réponse n'est pas partie : regarde le terminal"),
+        // Gone after a plain option's digit: it took it. A text still to
+        // type has nowhere to go.
+        return match (stage, &answer.text) {
+            (MenuStage::Digit, None) => Ok(None),
+            _ => Err("La réponse n'est pas partie : regarde le terminal"),
         };
     };
     if menu.selected != Some(answer.number) {
@@ -532,6 +540,8 @@ mod tests {
         assert_eq!(menu_next(&a, MenuStage::Text, &m.question, Some(&on4)), Ok(Some("\r".into())));
         assert!(menu_next(&a, MenuStage::Digit, &m.question, Some(&m)).is_err(), "the cursor is elsewhere: nothing goes");
         assert_eq!(menu_answer(&m, "Type something.", " "), Err("Écris ta réponse dans le champ"));
+        assert_eq!(menu_answer(&m, "Type something.", "a\u{1b}[201~b\u{15}").unwrap().text.as_deref(), Some("a [201~b"));
+        assert!(menu_next(&a, MenuStage::Digit, &m.question, None).is_err(), "a text with nowhere to go is not lost silently");
         assert!(menu_answer(&m, "Yellow", "").is_err());
     }
 

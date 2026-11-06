@@ -840,7 +840,9 @@ fn type_into(pane: &Pane, text: &str) {
 fn gate(pane: &Pane, status: banner::Banner) -> input::Verdict {
     let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
     // A permission prompt that came up since the last poll waits too.
-    let prompt = pane.has_permission_prompt() || crate::prompt_preview::parse_permission_prompt(&visible).is_some();
+    let prompt = pane.has_permission_prompt()
+        || crate::prompt_preview::parse_permission_prompt(&visible).is_some()
+        || crate::prompt_preview::parse_menu(&visible).is_some();
     input::gate(input::GateInput {
         // The session id lags Claude's exit; a fresh probe of the foreground
         // process does not, so a shell's own `❯` never reads as Claude's.
@@ -971,7 +973,11 @@ fn menu_step(st: &mut ChatState, pane: &Pane, now_ms: u64) {
         Ok(None) => {}
         Err(why) => {
             st.note = Some(why.to_string());
+            // The text did not go: back in the box, and the card again.
+            st.restore = answer.text.or(answer.after);
             st.menu_job = None;
+            st.shown_cards = None;
+            st.sent_cards.clear();
             return;
         }
     }
@@ -1150,7 +1156,9 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
             // Only onto the text just pasted: the prompt still holds it and
             // nothing else came up meanwhile (a permission prompt, a menu).
             let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
-            let prompt = pane.has_permission_prompt() || crate::prompt_preview::parse_permission_prompt(&visible).is_some();
+            let prompt = pane.has_permission_prompt()
+        || crate::prompt_preview::parse_permission_prompt(&visible).is_some()
+        || crate::prompt_preview::parse_menu(&visible).is_some();
             if !prompt && input::composer(&visible) == input::Composer::Typed {
                 pane.pty.write(b"\r");
                 pane.clear_awaiting();
