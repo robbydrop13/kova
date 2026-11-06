@@ -979,6 +979,11 @@ fn vars(light: bool) -> String {
     set.iter().map(|(k, v)| format!("--{k}:{v};")).collect()
 }
 
+/// The page's colours switched in place (`theme::restyle_script`).
+pub fn restyle_script(light: bool) -> String {
+    crate::theme::restyle_script(light, &vars(light))
+}
+
 /// The page, loaded once per open; `update_script` fills it.
 pub fn shell(light: bool, nonce: &str) -> String {
     PAGE.replace("{scheme}", if light { "light" } else { "dark" })

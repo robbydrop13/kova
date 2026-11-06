@@ -347,6 +347,16 @@ pub fn update_script(update: &Update) -> String {
 }
 
 /// The page, loaded once per pane shown in chat mode.
+/// The page's colours switched in place (`theme::restyle_script`): the same
+/// variables as the `:root` rule of `shell`.
+pub fn restyle_script(t: &Theme) -> String {
+    let decls = format!(
+        "--bg:{};--bg2:{};--t1:{};--t2:{};--t3:{};--b2:{};--b3:{};--accent:{};--working:{};--awaiting:{};--err:{};--ok:{};",
+        t.bg, t.bg2, t.t1, t.t2, t.t3, t.b2, t.b3, t.accent, t.working, t.awaiting, t.error, t.ok
+    );
+    crate::theme::restyle_script(!t.dark, &decls)
+}
+
 pub fn shell(theme: &Theme, title: &str, nonce: &str) -> String {
     let t = theme;
     format!(

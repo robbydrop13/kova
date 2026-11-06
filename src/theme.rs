@@ -212,6 +212,16 @@ pub fn apply_light(c: &mut Config) {
     c.bookmarks.bar_bg = LIGHT_SELECTION;
 }
 
+/// The JS that puts a loaded page in another theme without reloading it: the
+/// `:root` rule's variables, overridden on `<html>`'s own style (`decls` is
+/// `--name:value;...`). What the page holds (drafts, scroll, open cards)
+/// stays.
+pub fn restyle_script(light: bool, decls: &str) -> String {
+    let style = format!("color-scheme:{};{}", if light { "light" } else { "dark" }, decls);
+    let style = serde_json::to_string(&style).unwrap_or_else(|_| "\"\"".to_string());
+    format!("document.documentElement.setAttribute('style',{style});")
+}
+
 /// What a terminal's cells are recoloured to on a switch: the theme's default
 /// foreground and background, and its ANSI colours.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -348,6 +358,11 @@ mod tests {
         // `T1` light (#242424) and `BG0` light (#fafafa), not the dark ones.
         assert!(cockpit.contains("--t1:#242424;") && cockpit.contains("--bg0:#fafafa;"), "{cockpit}");
         assert!(!cockpit.contains("--t1:#e9e9e9;"));
+        // A switch on a loaded page sets the same variables in place.
+        let restyle = crate::cockpit::restyle_script(true);
+        assert!(restyle.starts_with("document.documentElement.setAttribute('style',\"color-scheme:light;"), "{restyle}");
+        assert!(restyle.contains("--t1:#242424;") && restyle.contains("--bg0:#fafafa;"));
+        assert!(crate::cockpit::restyle_script(false).contains("--t1:#e9e9e9;"));
     }
 
     #[test]

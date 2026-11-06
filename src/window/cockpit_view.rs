@@ -286,11 +286,18 @@ impl KovaView {
         let web = self.cockpit_web_view(mtm);
         let crashed = slot.delegate.get().is_some_and(|d| d.ivars().crashed.take());
         let theme = crate::theme::generation();
-        if crashed || slot.page.borrow().load.is_empty() || slot.page.borrow().theme != theme {
+        if crashed || slot.page.borrow().load.is_empty() {
             let nonce = crate::ask::new_question_id().replace('-', "");
             *slot.page.borrow_mut() = Page { load: nonce.clone(), theme, ..Default::default() };
             let html = cockpit::shell(tokens::get() == &tokens::LIGHT, &nonce);
             unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
+        }
+        // The theme switched: the colours change in place, the page keeps
+        // what it holds (drafts, instructions, open cards, scroll).
+        if slot.page.borrow().theme != theme {
+            slot.page.borrow_mut().theme = theme;
+            let script = cockpit::restyle_script(tokens::get() == &tokens::LIGHT);
+            unsafe { web.evaluateJavaScript_completionHandler(&NSString::from_str(&script), None) };
         }
         if slot.frame.get() != Some(frame) {
             let (x, y, w, h) = frame;

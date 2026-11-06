@@ -305,7 +305,7 @@ impl KovaView {
             slot.state.replace(None);
         }
         let generation = crate::theme::generation();
-        let fresh = slot.theme.get() != generation || slot.state.borrow().as_ref().is_none_or(|st| st.pane_id != target.pane_id);
+        let fresh = slot.state.borrow().as_ref().is_none_or(|st| st.pane_id != target.pane_id);
         if fresh {
             slot.theme.set(generation);
             let nonce = crate::ask::new_question_id().replace('-', "");
@@ -313,6 +313,12 @@ impl KovaView {
             let title = self.with_pane(target.pane_id, |p| p.display_title("Chat")).unwrap_or_default();
             let html = page::shell(&theme(), &title, &nonce);
             unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
+        }
+        // The theme switched: the colours change in place, the page keeps
+        // its input, its scroll and what it shows.
+        if slot.theme.get() != generation {
+            slot.theme.set(generation);
+            unsafe { web.evaluateJavaScript_completionHandler(&NSString::from_str(&page::restyle_script(&theme())), None) };
         }
         if slot.frame.get() != Some(target.frame) {
             let (x, y, w, h) = target.frame;
@@ -805,10 +811,13 @@ mod tests {
         crate::theme::apply_light(&mut c);
         tokens::set_background(c.colors.background);
         let light = page::shell(&theme(), "t", "n");
+        let restyle = page::restyle_script(&theme());
         tokens::set_background(crate::config::Config::default().colors.background);
         let dark = page::shell(&theme(), "t", "n");
         assert!(light.contains("color-scheme: light"));
         assert!(light.contains("--bg:#fafafa;") && light.contains("--t1:#242424;"), "{light}");
         assert!(dark.contains("color-scheme: dark") && !dark.contains("--t1:#242424;"));
+        // In place: every variable of the `:root` rule, light.
+        assert!(restyle.contains("color-scheme:light;--bg:#fafafa;") && restyle.contains("--t1:#242424;") && restyle.contains("--ok:"), "{restyle}");
     }
 }
