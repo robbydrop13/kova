@@ -421,6 +421,20 @@ fn arms_press(hit: ListHit) -> bool {
     }
 }
 
+/// Whether a click on this target leaves the Cockpit: anything that names a
+/// tab or a session shows it, so the page must give the panes back (with
+/// its chat column open or not, `close_cockpit` drops both).
+fn leaves_cockpit(hit: ListHit) -> bool {
+    matches!(
+        hit,
+        ListHit::Header(_)
+            | ListHit::Panel(_)
+            | ListHit::HeaderAdd(_)
+            | ListHit::Tile(_)
+            | ListHit::Agent(AgentsHit::Pane(_) | AgentsHit::Tab(_) | AgentsHit::Open(_))
+    )
+}
+
 impl ListHit {
     pub fn pane(self) -> Option<PaneId> {
         match self {
@@ -2379,6 +2393,11 @@ impl SidebarListView {
     fn activate(&self, hit: ListHit) {
         let Some(kova) = kova_of(self) else { return };
         let tab_of = |g: usize| self.ivars().shared.borrow().model.groups.get(g).map(|g| g.tab_idx);
+        // Leaving the Cockpit for the active tab shows it, never folds it.
+        let from_cockpit = kova.cockpit_open() && leaves_cockpit(hit);
+        if from_cockpit {
+            kova.close_cockpit();
+        }
         match hit {
             ListHit::Sched(SchedHit::Section(group)) => kova.sidebar_sched_section(group),
             ListHit::Sched(hit) => {
@@ -2419,7 +2438,11 @@ impl SidebarListView {
             }
             ListHit::Header(g) => {
                 if let Some(t) = tab_of(g) {
-                    kova.sidebar_header_clicked(t);
+                    if from_cockpit {
+                        kova.do_switch_tab(t);
+                    } else {
+                        kova.sidebar_header_clicked(t);
+                    }
                 }
             }
             ListHit::Panel(g) => {
@@ -2433,8 +2456,6 @@ impl SidebarListView {
                 }
             }
             ListHit::Tile(pane_id) => {
-                // A pane chosen in the list: the Cockpit gives the panes back.
-                kova.close_cockpit();
                 kova.open_pane_from_sidebar(pane_id);
             }
             ListHit::TileButton(pane_id, button) => {
@@ -3072,6 +3093,33 @@ mod tests {
         assert!(!arms_press(ListHit::Header(0)));
         assert!(!arms_press(ListHit::Tile(1)));
         assert!(!arms_press(ListHit::Empty));
+    }
+
+    #[test]
+    fn a_tab_or_a_session_clicked_leaves_the_cockpit() {
+        for hit in [
+            ListHit::Header(0),
+            ListHit::Panel(0),
+            ListHit::HeaderAdd(0),
+            ListHit::Tile(1),
+            ListHit::Agent(AgentsHit::Pane(1)),
+            ListHit::Agent(AgentsHit::Tab(0)),
+            ListHit::Agent(AgentsHit::Open(sidebar_agents::RosterRef::Manager(0))),
+        ] {
+            assert!(leaves_cockpit(hit), "{hit:?} would leave the Cockpit over the tab it shows");
+        }
+        // The list's own controls keep the page where it is.
+        for hit in [
+            ListHit::Cockpit,
+            ListHit::Chevron(0),
+            ListHit::HeaderDot(0),
+            ListHit::TileButton(1, TileButton::Close),
+            ListHit::Agent(AgentsHit::Filter(sidebar_agents::AgentSection::Working)),
+            ListHit::Agent(AgentsHit::ToggleClosed),
+            ListHit::Empty,
+        ] {
+            assert!(!leaves_cockpit(hit), "{hit:?}");
+        }
     }
 
     #[test]
