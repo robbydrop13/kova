@@ -82,6 +82,10 @@ struct ChatState {
     /// `[attention] perso_dir`: an ask's scope tag.
     perso: Option<std::path::PathBuf>,
     permission: Option<crate::prompt_preview::ParsedPrompt>,
+    /// The menu Claude Code waits on, read off the screen, and an answer
+    /// to it under way: what was written last, for which question, when (ms).
+    menu: Option<crate::prompt_preview::Menu>,
+    menu_job: Option<(cards::MenuAnswer, cards::MenuStage, String, u64)>,
     shown: Option<(u64, bool, usize)>,
     shown_cards: Option<Vec<(String, u64)>>,
     shown_banner: Option<page::BannerWire>,
@@ -139,6 +143,8 @@ impl ChatState {
             linked: HashMap::new(),
             perso: None,
             permission: None,
+            menu: None,
+            menu_job: None,
             shown: None,
             shown_cards: None,
             shown_banner: None,
@@ -558,6 +564,17 @@ impl KovaView {
                     .map(|list| list.iter().filter_map(Value::as_str).filter(|p| st.pasted.iter().any(|q| q == p)).map(str::to_string).collect())
                     .unwrap_or_default();
                 let text = input::with_images(&s("text"), &images);
+                // A menu that takes text waits: the box answers it, at once.
+                if let Some(menu) = &st.menu
+                    && let Some(answer) = cards::box_answer(menu, &text)
+                {
+                    let id = cards::menu_id(menu);
+                    if let Err(e) = start_menu_answer(st, pane, &id, answer) {
+                        st.note = Some(e);
+                        st.restore = Some(text);
+                    }
+                    return Reply::Push;
+                }
                 match input::sanitize(&text) {
                     Err(reason) => {
                         st.note = Some(reason.to_string());
@@ -574,6 +591,19 @@ impl KovaView {
                         }
                         input::Step::Enter | input::Step::Stale | input::Step::Nothing => {}
                     },
+                }
+                Reply::Push
+            }
+            "answer" if s("id").starts_with("menu:") => {
+                let (id, action, text) = (s("id"), s("action"), s("text"));
+                let answer = match st.menu.as_ref().filter(|m| cards::menu_id(m) == id) {
+                    Some(menu) => cards::menu_answer(menu, &action, &text).map_err(str::to_string),
+                    None => Err("Ce menu n'est plus à l'écran".to_string()),
+                };
+                if let Err(e) = answer.and_then(|a| start_menu_answer(st, pane, &id, a)) {
+                    st.note = Some(e);
+                    st.sent_cards.remove(&id);
+                    st.shown_cards = None;
                 }
                 Reply::Push
             }
@@ -903,6 +933,59 @@ fn read_transcript(st: &mut ChatState, pane: &Pane, home: &std::path::Path) {
     }
 }
 
+/// Between two writes of a menu answer: Claude Code's menu reads a digit,
+/// text and Enter written together as one key (measured on 2.1.319).
+const MENU_STEP_MS: u64 = 250;
+
+/// Answer the menu `id` names: the screen is read again, and the option's
+/// digit goes only if it is still that menu. The rest follows in `menu_step`.
+fn start_menu_answer(st: &mut ChatState, pane: &Pane, id: &str, answer: cards::MenuAnswer) -> Result<(), String> {
+    if st.menu_job.is_some() {
+        return Err("Une réponse est déjà en cours".to_string());
+    }
+    let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+    let Some(menu) = crate::prompt_preview::parse_menu(&visible).filter(|m| cards::menu_id(m) == id) else {
+        return Err("Le menu a changé : regarde le terminal".to_string());
+    };
+    log::info!("pane {}: menu answered with option {}", pane.id, answer.number);
+    pane.pty.write(answer.number.to_string().as_bytes());
+    st.menu_job = Some((answer, cards::MenuStage::Digit, menu.question, now_epoch_ms()));
+    Ok(())
+}
+
+/// The next write of a menu answer under way, once `MENU_STEP_MS` passed:
+/// the text, Enter, or nothing (the menu took the digit). A text that goes
+/// after it joins the queue, which sends it once the turn allows.
+fn menu_step(st: &mut ChatState, pane: &Pane, now_ms: u64) {
+    let Some((answer, stage, question, at)) = st.menu_job.clone() else { return };
+    if now_ms < at + MENU_STEP_MS {
+        return;
+    }
+    match cards::menu_next(&answer, stage, &question, st.menu.as_ref()) {
+        Ok(Some(bytes)) if bytes != "\r" => {
+            pane.pty.write(bytes.as_bytes());
+            st.menu_job = Some((answer, cards::MenuStage::Text, question, now_ms));
+            return;
+        }
+        Ok(Some(enter)) => pane.pty.write(enter.as_bytes()),
+        Ok(None) => {}
+        Err(why) => {
+            st.note = Some(why.to_string());
+            st.menu_job = None;
+            return;
+        }
+    }
+    st.menu_job = None;
+    if let Some(text) = answer.after {
+        match input::sanitize(&text) {
+            Ok(text) => {
+                st.outbox.submit(text, input::Verdict::Wait(""), crate::surface::monotonic_ms());
+            }
+            Err(reason) => st.note = Some(reason.to_string()),
+        }
+    }
+}
+
 /// Read the transcript, the cards and the gate again; the update to push,
 /// if the page is ready and something changed. `files`: the kqueue said the
 /// transcript or the turn file changed.
@@ -976,7 +1059,21 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         list.push(cards::question_card(q, handoff));
     }
     st.permission = pane.permission_prompt();
-    if let Some(prompt) = &st.permission {
+    // A menu on screen (permission, AskUserQuestion, plan approval), read
+    // only when something says the session waits.
+    let waits = st.conv.question_pending()
+        || st.hook.is_some_and(|h| h.turn == banner::Turn::Waiting)
+        || st.permission.is_some()
+        || pane.awaiting_since().is_some()
+        || st.menu_job.is_some();
+    st.menu = (!spinner && waits)
+        .then(|| crate::prompt_preview::parse_menu(&pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text))
+        .flatten();
+    menu_step(st, pane, now_ms);
+    if let Some(menu) = &st.menu {
+        html.push(cards::menu_card_html(menu, st.conv.pending_plan(), now));
+        list.push(cards::menu_card(menu));
+    } else if let Some(prompt) = &st.permission {
         let card = cards::permission_card(prompt);
         html.push(page::card_html(&card));
         list.push(card);
@@ -1012,6 +1109,20 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         st.working_since = Some(st.conv.last_user_ts().filter(|t| *t <= now && now - t < 6 * 3600).unwrap_or(now));
     }
     let b = banner::banner(banner::BannerInput { working_since: st.working_since, ..status_input });
+    // Waiting on something no card shows: say so rather than nothing.
+    if b == banner::Banner::Waiting && st.cards.is_empty() {
+        st.cards.push(cards::Card {
+            id: "wait:unread".to_string(),
+            kind: cards::CardKind::Menu,
+            from: String::new(),
+            message: String::new(),
+            detail: None,
+            input: false,
+            buttons: Vec::new(),
+            hint: None,
+        });
+        st.card_html.push(cards::unread_wait_html(now));
+    }
 
     // A text left in the terminal's prompt went (the turn started) or was
     // cleared there: the queue goes on.
@@ -1066,7 +1177,8 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
     if !queued.is_empty() {
         text = format!("{text} · {} en attente, {}", queued.len(), st.queue_reason);
     }
-    let banner = page::BannerWire { state: b.name(), text };
+    let answers = st.menu.as_ref().is_some_and(|m| m.free_text().is_some());
+    let banner = page::BannerWire { state: b.name(), text, answers };
     if st.shown_banner.as_ref() != Some(&banner) {
         st.shown_banner = Some(banner.clone());
         update.banner = Some(banner);

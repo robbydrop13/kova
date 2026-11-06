@@ -467,6 +467,8 @@ pub struct Update {
 pub struct BannerWire {
     pub state: &'static str,
     pub text: String,
+    /// A menu that takes text waits: the box answers it at once.
+    pub answers: bool,
 }
 
 /// A dictation's clean text, and whether the box sends right after
@@ -818,7 +820,8 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     log.querySelectorAll(".streaming").forEach((n) => {{ if (n !== last || !m.working) n.classList.remove("streaming"); }});
     if (last && m.working && last.classList.contains("asst")) last.classList.add("streaming");
     if (m.banner) {{
-      box.placeholder = m.banner.state === "done" ? "Message à Claude" : "Message à Claude, il partira à son tour";
+      box.placeholder = m.banner.answers ? "Ta réponse à Claude, elle part tout de suite"
+        : m.banner.state === "done" ? "Message à Claude" : "Message à Claude, il partira à son tour";
     }}
     if (m.queued) pending(m.queued);
     if (m.attach) {{ images.push(...m.attach); chips(); }}

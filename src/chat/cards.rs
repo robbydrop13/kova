@@ -18,6 +18,8 @@ pub enum CardKind {
     Decision,
     Handoff,
     Permission,
+    /// A menu read on screen (`prompt_preview::parse_menu`).
+    Menu,
 }
 
 /// What a button does.
@@ -224,6 +226,20 @@ pub fn menu_card_html(menu: &Menu, plan: Option<&str>, now: u64) -> String {
         instruction: None,
     };
     cockpit::card_html_with(&item, &[], &[], false, now)
+}
+
+/// A menu's entry in the card list: its id, for the page and the clicks.
+pub fn menu_card(menu: &Menu) -> Card {
+    Card {
+        id: menu_id(menu),
+        kind: CardKind::Menu,
+        from: "Claude".to_string(),
+        message: menu.question.clone(),
+        detail: None,
+        input: true,
+        buttons: Vec::new(),
+        hint: None,
+    }
 }
 
 /// The card shown when the session waits on something Kova cannot read
