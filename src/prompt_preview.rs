@@ -287,6 +287,23 @@ fn continuation_run(lines: &[&str], end: usize) -> usize {
     0
 }
 
+/// The rule Claude Code draws at the bottom of a named session, its name
+/// at the right: `──────── create-test-file ─`.
+fn is_name_rule(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("\u{2500}\u{2500}\u{2500}") && t.ends_with('\u{2500}') && !is_rule(t) && t.chars().filter(|c| *c == '\u{2500}').count() >= 10
+}
+
+/// The last non-empty line of the screen, a named session's bottom rule
+/// left out.
+fn last_line(lines: &[&str]) -> Option<usize> {
+    let last = lines.iter().rposition(|l| !l.trim().is_empty())?;
+    if !is_name_rule(lines[last]) {
+        return Some(last);
+    }
+    lines[..last].iter().rposition(|l| !l.trim().is_empty())
+}
+
 /// The full-width frame rule: a run of at least ten `─`.
 fn is_frame(line: &str) -> bool {
     let t = line.trim();
@@ -337,8 +354,9 @@ pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
     }
     let lines: Vec<&str> = visible.split('\n').map(str::trim_end).collect();
 
-    // 1. The footer is the LAST non-empty line of the screen.
-    let footer_at = lines.iter().rposition(|l| !l.trim().is_empty())?;
+    // 1. The footer is the LAST non-empty line of the screen, the session's
+    //    name rule under it aside.
+    let footer_at = last_line(&lines)?;
     if !is_footer(lines[footer_at]) {
         return None;
     }
@@ -517,7 +535,7 @@ fn is_menu_footer(line: &str) -> bool {
 /// dialog without numbers): nothing is guessed.
 pub fn parse_menu(visible: &str) -> Option<Menu> {
     let lines: Vec<&str> = visible.split('\n').map(str::trim_end).collect();
-    let footer_at = lines.iter().rposition(|l| !l.trim().is_empty())?;
+    let footer_at = last_line(&lines)?;
     if !is_menu_footer(lines[footer_at]) {
         return None;
     }
@@ -742,6 +760,18 @@ mod tests {
 
     const WRITE_WRAPPED: &str = include_str!("../tests/fixtures/prompt/prompt-write-wrapped.txt");
     const ASK: &str = include_str!("../tests/fixtures/prompt/ask-user-question.txt");
+    const NAMED: &str = include_str!("../tests/fixtures/prompt/prompt-write-named.txt");
+
+    #[test]
+    fn a_named_session_s_bottom_rule_does_not_hide_its_prompt() {
+        // `──── create-verify-test-file ─` under the footer.
+        let p = parse_permission_prompt(NAMED).expect("named session prompt");
+        assert_eq!(p.question, "Do you want to create f.txt?");
+        assert_eq!(p.choices().reject, Some(3));
+        let m = parse_menu(NAMED).expect("menu");
+        assert_eq!(m.options.len(), 3);
+        assert_eq!(m.selected, Some(1));
+    }
     const PLAN: &str = include_str!("../tests/fixtures/prompt/plan-approval.txt");
 
     #[test]
