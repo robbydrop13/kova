@@ -382,6 +382,11 @@ impl AppDelegate {
                                         log::warn!("ask: cannot bring {} back: {}", id, e);
                                     }
                                 }
+                                AskAction::Close { id, reason } => {
+                                    if let Err(e) = asks.close(&id, reason) {
+                                        log::warn!("ask: cannot close {}: {}", id, e);
+                                    }
+                                }
                             }
                         }
                         for a in crate::ask_card::take_answers() {

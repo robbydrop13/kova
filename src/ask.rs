@@ -1269,7 +1269,7 @@ impl Board {
                     let ids: Vec<String> = rest.decisions.iter().map(|d| d.id.clone()).collect();
                     let q = Question {
                         id: new_question_id(),
-                        message: rest.card_message(" left"),
+                        message: rest.card_message(" restante"),
                         actions: vec![DECISION_DONE.to_string()],
                         input: false,
                         from: question.from.clone(),
@@ -1327,9 +1327,20 @@ impl Board {
     /// longer matters (`kova ask --drop`). A `kova ask` still waiting on it
     /// exits 3, as on a withdrawal.
     pub fn drop_question(&mut self, id: &str) -> Result<(), String> {
+        self.take_off(id, "dropped by its asker")
+    }
+
+    /// The user closed `id` from its card without answering it: the X
+    /// (`dismissed`) or the check (`done`), logged with that reason. Off the
+    /// Asks like a drop: a `kova ask` still waiting on it exits 3.
+    pub fn close(&mut self, id: &str, reason: &str) -> Result<(), String> {
+        self.take_off(id, &format!("closed by the user, reason {reason}"))
+    }
+
+    fn take_off(&mut self, id: &str, why: &str) -> Result<(), String> {
         let index = self.pending.iter().position(|(q, _)| q.id == id).ok_or_else(|| format!("no question {}", id))?;
         let (question, responder) = self.pending.remove(index);
-        log::info!("ask {}: dropped by its asker", question.id);
+        log::info!("ask {}: {why}", question.id);
         if self.owns_store() {
             self.store.remove_question(&question.id);
         }
@@ -1609,7 +1620,7 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
                 open (its id is in the answer) that no longer matters
   --decisions   a decision sheet Kova shows itself, from a JSON file (the decision-sheet skill's
                 format: title, intro, links, decisions with options, one marked reco). The card
-                says \"New decision\" (the message defaults to \"<title>: <N> decisions\"), Open shows
+                says \"New decision\" (the message defaults to \"<title> : <N> décisions\"), Open shows
                 the sheet in the side panel, answers are saved as they are given, and Done prints
                 them, one line per decision: \"D1: A (label)\", \". Note: ...\", \"D2: other: ...\",
                 \"D3: open\", then \"Note: ...\". A single decision of up to three short options is
@@ -2566,7 +2577,7 @@ mod tests {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let path = sheet_file(TWO);
         let c = parse_cli(&args(&["--decisions", &path])).unwrap();
-        assert!(c.message.starts_with("Plan: 2 decisions\n\u{2022} "), "the message defaults to the title and the decisions");
+        assert!(c.message.starts_with("Plan : 2 décisions\n\u{2022} "), "the message defaults to the title and the decisions");
         assert_eq!((c.actions.clone(), c.input), (vec!["Done".to_string()], false));
         assert!(parse_cli(&args(&["x", "--decisions", &path, "--decision", "https://a.b/c"])).is_err());
         assert!(parse_cli(&args(&["x", "--decisions", "/nonexistent/d.json"])).is_err());
@@ -2623,13 +2634,24 @@ mod tests {
         let rest = board.questions()[0].clone();
         assert!(still.contains(&format!("kova ask --drop {}", rest.id)));
         assert!(rest.follow_up && rest.is_decision());
-        assert_eq!(rest.message, "Plan: 1 decision left\n\u{2022} Who?");
+        assert_eq!(rest.message, "Plan : 1 décision restante\n\u{2022} Who?");
         assert_eq!(rest.sheet.as_ref().unwrap().decisions.len(), 1);
         assert_eq!(rest.sheet.as_ref().unwrap().decisions[0].id, "D2");
         // A message in the conversation does not take it back; its asker can drop it.
         assert_eq!(board.withdraw(rest.from.session_id.as_deref().unwrap_or("s")), 0);
         assert!(board.drop_question(&rest.id).is_ok());
         assert!(board.questions().is_empty());
+    }
+
+    #[test]
+    fn closing_from_a_card_takes_the_question_off_and_frees_its_asker() {
+        let q = sheet_question();
+        let id = q.id.clone();
+        let (mut board, rx) = board_with(q);
+        assert!(board.close(&id, "dismissed").is_ok());
+        assert!(board.questions().is_empty());
+        assert!(matches!(rx.try_recv(), Ok(crate::ipc::IpcResponse::Error { message }) if message == WITHDRAWN));
+        assert!(board.close(&id, "done").is_err(), "already gone");
     }
 
     #[test]

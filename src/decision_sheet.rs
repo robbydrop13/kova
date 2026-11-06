@@ -312,18 +312,21 @@ impl Sheet {
 
     /// The card text when the agent gives none: the title, the count, then
     /// one line per decision so the card says what it is about. `tail` is
-    /// "" or " left" (a follow-up). At most `SHOWN` lines, then "+N more".
+    /// "" or " restante" (a follow-up, plural added). At most `SHOWN` lines, then "+N autres".
     pub fn card_message(&self, tail: &str) -> String {
         const SHOWN: usize = 5;
         let n = self.decisions.len();
         let title = self.title.trim().trim_end_matches([':', ' ', '\u{a0}']);
-        let mut out = format!("{title}: {n} decision{}{tail}", if n == 1 { "" } else { "s" });
+        // French like the Cockpit: `Plan : 3 décisions`, `1 décision restante`.
+        let s = if n == 1 { "" } else { "s" };
+        let tail = if tail.is_empty() { String::new() } else { format!("{tail}{s}") };
+        let mut out = format!("{title} : {n} décision{s}{tail}");
         for d in self.decisions.iter().take(SHOWN) {
             out.push_str("\n\u{2022} ");
             out.push_str(d.title.trim());
         }
         if n > SHOWN {
-            out.push_str(&format!("\n+{} more", n - SHOWN));
+            out.push_str(&format!("\n+{} autres", n - SHOWN));
         }
         out
     }
@@ -694,14 +697,14 @@ mod tests {
     fn the_card_message_names_each_decision() {
         let mut s = sheet();
         s.title = "Plan : ".into();
-        assert_eq!(s.card_message(""), "Plan: 2 decisions\n\u{2022} Ship when?\n\u{2022} Who owns it?");
+        assert_eq!(s.card_message(""), "Plan : 2 décisions\n\u{2022} Ship when?\n\u{2022} Who owns it?");
         for i in 3..=7 {
             s.decisions.push(SheetDecision { id: format!("D{i}"), ..s.decisions[0].clone() });
         }
-        let m = s.card_message(" left");
-        assert!(m.starts_with("Plan: 7 decisions left\n"));
+        let m = s.card_message(" restante");
+        assert!(m.starts_with("Plan : 7 décisions restantes\n"));
         assert_eq!(m.lines().count(), 7, "title, 5 decisions, then the rest counted");
-        assert!(m.ends_with("\n+2 more"));
+        assert!(m.ends_with("\n+2 autres"));
     }
 
     #[test]

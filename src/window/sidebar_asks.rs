@@ -460,6 +460,8 @@ pub enum AskAction {
     Answer { id: String, action: String, text: String },
     Snooze { id: String, until: u64 },
     Unsnooze { id: String },
+    /// Off the Asks without an answer (`Board::close`), with why.
+    Close { id: String, reason: &'static str },
 }
 
 /// The queue between the click and the tick that owns the board.
