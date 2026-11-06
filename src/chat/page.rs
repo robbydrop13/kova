@@ -777,7 +777,8 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     if (!text.trim() && !images.length) return;
     const paths = images.map((im) => im.path);
     box.value = ""; grow(); images = []; chips();
-    if (vBase !== null) {{ vBase = ""; vSkip += vLead + vShown.length; vShown = ""; vLead = 0; }}
+    // Kova starts the heard text again from here.
+    if (vBase !== null) {{ vBase = ""; vSkip = 0; vShown = ""; vLead = 0; }}
     post({{ type: "send", text, images: paths }});
   }}
   box.addEventListener("keydown", (e) => {{

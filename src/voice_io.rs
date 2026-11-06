@@ -98,9 +98,8 @@ fn mint_token(key: &str) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    {
-        let mut stdin = child.stdin.take()?;
-        stdin.write_all(format!("Authorization: {key}\n").as_bytes()).ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(format!("Authorization: {key}\n").as_bytes());
     }
     let out = child.wait_with_output().ok()?;
     voice::token_from(&String::from_utf8_lossy(&out.stdout))
@@ -195,9 +194,12 @@ fn receive(task: Retained<NSURLSessionWebSocketTask>, inbox: Inbox, closed: Arc<
     let next = task.clone();
     let handler = block2::RcBlock::new(move |message: *mut NSURLSessionWebSocketMessage, error: *mut NSError| {
         if !error.is_null() || message.is_null() {
-            if !closed.swap(true, Ordering::Relaxed) && !error.is_null() {
-                let reason = unsafe { &*error }.localizedDescription().to_string();
-                log::info!("voice: socket closed ({reason})");
+            // Not after the server's own end: the socket was lost. The
+            // error's text may hold the URL, and so the token: its code only.
+            if !closed.swap(true, Ordering::Relaxed) {
+                let code = if error.is_null() { 0 } else { unsafe { &*error }.code() };
+                log::info!("voice: socket lost (code {code})");
+                push(&inbox, Note::Failed("Connexion AssemblyAI perdue".into()));
             }
             return;
         }
@@ -340,6 +342,8 @@ impl Drop for Mic {
                 AudioQueueDispose(self.queue, 1);
             }
         }
-        drop(unsafe { Box::from_raw(self.sender) });
+        // The sender is left behind (a few bytes per dictation): Apple does
+        // not promise a callback still running has returned by now.
+        let _ = self.sender;
     }
 }

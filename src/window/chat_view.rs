@@ -319,6 +319,12 @@ impl KovaView {
             // A pane that left chat mode drops its state; one hidden by an
             // overlay keeps it.
             let gone = slot.state.borrow().as_ref().is_some_and(|st| !self.pane_is_chat(st.pane_id));
+            // Out of sight, no one sees what the mic hears: it stops.
+            if let Some(st) = slot.state.borrow_mut().as_mut()
+                && st.listening
+            {
+                st.toggle_voice();
+            }
             if gone {
                 slot.state.replace(None);
                 if let Some(web) = slot.web.get() {
@@ -486,6 +492,10 @@ impl KovaView {
                     .and_then(Value::as_array)
                     .map(|list| list.iter().filter_map(Value::as_str).filter(|p| st.pasted.iter().any(|q| q == p)).map(str::to_string).collect())
                     .unwrap_or_default();
+                // What was dictated went with it: dictation goes on from here.
+                if st.listening {
+                    st.transcript.clear();
+                }
                 let text = input::with_images(&s("text"), &images);
                 match input::sanitize(&text) {
                     Err(reason) => {

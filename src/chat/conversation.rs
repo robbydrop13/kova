@@ -393,7 +393,7 @@ fn behind(text: &str) -> Option<(String, String)> {
     for tag in ["cross-session-message", "teammate-message"] {
         let Some(start) = text.find(&format!("<{tag}")) else { continue };
         let rest = &text[start..];
-        let open_end = rest.find('>')?;
+        let Some(open_end) = rest.find('>') else { continue };
         let head = &rest[..open_end];
         let name = between(head, "from-name=\"", "\"").or_else(|| between(head, "teammate_id=\"", "\"")).unwrap_or("une autre session");
         let body = between(rest, ">", &format!("</{tag}>")).unwrap_or(&rest[open_end + 1..]);

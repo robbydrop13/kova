@@ -111,8 +111,9 @@ fn paths(text: &str, urls: &[Link], exists: &dyn Fn(&str) -> bool) -> Vec<Link> 
                 let candidate = &text[i..end];
                 !candidate.contains(char::is_whitespace) || exists(candidate)
             });
+            // Never across a URL nor another path.
             if let Some(start) = found
-                && !out.iter().any(|l| l.start < end && start < l.end)
+                && !out.iter().chain(urls).any(|l| l.start < end && start < l.end)
             {
                 out.push(Link { start, end, kind: Kind::Path });
             }
@@ -196,6 +197,11 @@ mod tests {
             [("/tmp/report.html".to_string(), Kind::Path), ("~/notes/plan.md".to_string(), Kind::Path)]
         );
         assert_eq!(targets("https://x.io/doc.md", &none), [("https://x.io/doc.md".to_string(), Kind::Url)], "a URL is one link");
+        assert_eq!(
+            targets("see https://x.io/a/b.md?x=1 /c.md", &none),
+            [("https://x.io/a/b.md?x=1".to_string(), Kind::Url), ("/c.md".to_string(), Kind::Path)],
+            "a path inside a URL is not a second link"
+        );
     }
 
     #[test]
