@@ -761,7 +761,7 @@ that pane's card, as the block's row did.
 | Header colour dot (16 pt)  | colour picker (4.3), no tab switch                     |                    | header menu  |
 | Header body                | `do_switch_tab(idx)`; on the active tab: toggle collapse (from the Cockpit: show the tab, no fold) | `start_rename_tab` | header menu |
 | Header `+`                 | add a pane (4.4)                                       |                    | header menu  |
-| Tile body                  | `open_pane_from_sidebar(id)`: `focus_pane_in_window` (switches tab, restores, reveals), then the chat when a live Claude conversation runs there | rename pane  | tile menu    |
+| Tile body                  | `focus_pane_in_window(id)` (switches tab, restores, reveals), terminal; from the Cockpit, leaves it | rename pane  | tile menu    |
 | Tile hover buttons         | the action, without focusing the pane                  |                    | tile menu    |
 | Awaiting `Open`            | `focus_pane_in_window(id)`, terminal                   |                    | tile menu    |
 | Awaiting `Stop`            | interrupt (4.4)                                        |                    | tile menu    |

@@ -33,7 +33,7 @@ it: one `WKWebView` per window over the active tab's panes area
 - Buttons: `Ouvrir` for an entry whose `action` the side panel can show
   (`sidebar_attention::open_target`); `Ouvrir` on a live need opens the card in
   place (see Opened cards); `Ouvrir la fiche` for a decision sheet; `Refuser` / `Autoriser` answer a permission prompt
-  like the chat mode does, only if the screen still shows the prompt the card
+  like the chat does, only if the screen still shows the prompt the card
   was rendered from.
 - Icons (every attention card, top right, Feather, with a tooltip): clock
   `Plus tard`, x `Pas pertinent, retirer` (`close_command ID --reason
@@ -152,12 +152,15 @@ Scheduled icon keeps its red dot.
 
 ## Chat
 
-`Chat` (top right) opens a chief of staff's chat on the left third (the side panel keeps the right): the
-segmented `Claap | Perso` picks the pane of this window whose agent session or
-peer name is `claap-agent` or `perso-agent`. It is the chat mode's own view
-(`chat_view.rs`): `chat_target` returns that pane and the column's frame while
-the Cockpit is open, and counts it as focused, so nothing moves the focus or
-switches tab. No chief pane: the column says so in one line (no launch yet).
+A chief of staff's chat sits on the left third (the side panel keeps the
+right), open by default. `Chat` (top right), the column's X and Cmd+Option+T
+(`toggle_chat`, IPC `dispatch-action` `toggle-chat`) hide or show it; the
+choice holds for the window's life. From outside the Cockpit, Cmd+Option+T
+opens it on its chat. The segmented `Claap | Perso` picks the pane of this
+window whose agent session or peer name is `claap-agent` or `perso-agent`.
+It is the chat's own view (`chat_view.rs`, `docs/chat-mode.md`):
+`cockpit_chat_target` gives that pane and the column's frame while the
+Cockpit is open, and nothing moves the focus or switches tab to it. No chief pane: the column says so in one line (no launch yet).
 The chosen chief is saved per window in the session file (`cockpit_chief`).
 
 ## Une entrée de la file qui renvoie à une fiche

@@ -1,13 +1,13 @@
-//! Chat mode: a pane's Claude conversation shown as a chat instead of its
-//! terminal grid, with an input box and the pane's pending validations as
-//! cards (`docs/chat-mode.md`).
+//! The Cockpit's chat: the chief of staff's Claude conversation shown as a
+//! chat, with an input box and its pane's pending validations as cards
+//! (`docs/chat-mode.md`).
 //!
 //! Everything here is pure and tested: reading the transcript as it grows
 //! (`tail`), turning its lines into messages and tool calls
 //! (`conversation`), the turn's state (`banner`), what the input box may
 //! type and when (`input`), the cards (`cards`), the page (`page`) and the
 //! kqueue that says when the session's files changed (`watch`). The
-//! AppKit side, a web view laid over the pane, is `window::chat_view`.
+//! AppKit side, a web view on the Cockpit's chat column, is `window::chat_view`.
 
 pub mod banner;
 pub mod cards;

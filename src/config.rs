@@ -22,7 +22,7 @@ pub struct Config {
     pub chat: ChatConfig,
 }
 
-/// The chat mode's options.
+/// The Cockpit chat's options.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ChatConfig {

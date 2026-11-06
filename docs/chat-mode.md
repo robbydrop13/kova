@@ -1,40 +1,40 @@
-# Chat mode
+# The Cockpit's chat
 
-A pane running Claude Code can show its conversation as a chat instead of
-its terminal grid, with an input box at the bottom and what waits on the
-user (its `kova ask` questions, a permission prompt) as cards in the thread.
-The terminal keeps running underneath: toggling back shows it as it is.
+The Cockpit shows a chief of staff's Claude conversation as a chat on its
+left third, with an input box at the bottom and what waits on the user (its
+`kova ask` questions, a permission prompt, a menu) as cards in the thread.
+The chief's pane keeps running underneath as a terminal. Panes are
+terminals only: there is no chat over a pane (removed 06/11/2026).
 
 Code: the pure half in `src/chat/` (transcript reader, chat model, banner,
 input gate, cards, page; all unit-tested), the AppKit half in
-`src/window/chat_view.rs` (the web view over the pane, not tested).
+`src/window/chat_view.rs` (the web view on the column, not tested). Which
+pane and where: `docs/cockpit.md`, Chat.
 
-## Toggling
+## Hiding and showing
 
 | From | What |
 |---|---|
-| Cmd+Option+T (`toggle_chat`; not Cmd+Option+C, taken by Alfred's clipboard viewer), Pane > Show as Chat, IPC `dispatch-action` `toggle-chat` | the focused pane as a chat, or its terminal again |
-| A click on a session in the sidebar (pane list or agents view) | the pane as a chat when a Claude conversation runs in it; a shell or another agent stays a terminal |
-| The banner's Terminal button (not on the Cockpit's chat, which has no terminal) | the terminal again |
+| Cmd+Option+T (`toggle_chat`; not Cmd+Option+C, taken by Alfred's clipboard viewer), IPC `dispatch-action` `toggle-chat` | the column hidden or shown; outside the Cockpit, the Cockpit opens on its chat |
+| The Cockpit's `Chat` button, the column's X | the same, from the page |
 
-A pane without a Claude conversation stays a terminal, with a note in the
-status bar. One chat pane per tab: turning one on turns the others of its
-tab off. The choice is saved with the session (`chat` on the saved pane), so
-a restored pane comes back as a chat; until its Claude is resumed the banner
-says `Offline` and the thread shows the transcript as it was.
+The column shows by default; the choice holds for the window's life. Until
+the chief's Claude is resumed the banner says `Offline` and the thread shows
+the transcript as it was.
 
 ## Layout
 
-One `WKWebView` per window, created on first use, laid over the active
-tab's chat pane, the pane's status bar left visible. It hides when the tab
-has no chat pane, when the pane is minimized or too small, and while an
-overlay Kova draws in Metal needs the window (the switcher, the search
-palette, the filter, help, a rename). Its data store is non-persistent.
+One `WKWebView` per window, created on first use, laid on the Cockpit's
+left third under the column's top bar, above the Cockpit's own page. It
+hides when the column or the Cockpit closes (its state dropped) and while
+an overlay Kova draws in Metal needs the window (the switcher, the search
+palette, the filter, help, a rename: its state kept). Its data store is
+non-persistent.
 
-The keyboard follows the focus: a click into the chat focuses its pane, the
-chat pane focused gives the box the keyboard, another pane focused takes it
-back. With the box focused, Cmd+A/C/V/X/Z edit its text; every other Kova
-shortcut stays Kova's.
+The box takes the keyboard when the chat shows, and back from the terminal
+under the page; the chief's pane is never focused for it. With the box
+focused, Cmd+A/C/V/X/Z edit its text; every other Kova shortcut stays
+Kova's.
 
 ## The thread
 
@@ -56,8 +56,7 @@ the transcript holds it, cut.
 
 Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
 
-- the turn's state on the line above the box, with the Terminal button
-  (`src/chat/banner.rs`): `Travaille · 1 min 12 s` (pulsing),
+- the turn's state on the line above the box (`src/chat/banner.rs`): `Travaille · 1 min 12 s` (pulsing),
   `Attend ta réponse`, `Prêt · fini il y a 3 min`, `Hors ligne`, and the
   queue (`2 en attente, part à la fin du tour`). Driven by the session's
   events, never guessed: Claude Code's title spinner (through the PTY), its
@@ -96,7 +95,7 @@ image. A bare http(s) URL, or an absolute or `~/` path to a `.md` / `.html`
 file, is a link too (`src/chat/links.rs`), but not inside code; a path with
 spaces only when the file exists. A click opens it in the side panel
 (`side_panel::target_on_disk`, as `open-panel`), mailto in the mail app. Every message the page posts carries its load's nonce: one from an
-earlier load (another pane) is dropped. The page's content security policy runs
+earlier load is dropped. The page's content security policy runs
 only the script carrying the load's nonce.
 
 ## The input box
@@ -222,9 +221,9 @@ At the bottom of the thread, above the box:
 - Other agents (omp, Codex): terminal only.
 - The page's colours follow the terminal's palette when it is loaded, not a
   switch made while it is shown.
-- The expanded state of tool rows is lost when the page reloads (another
-  pane shown as a chat in the window).
+- The expanded state of tool rows is lost when the page reloads (the
+  column closed, or the other chief picked).
 - The queue lives with the page: messages still queued are dropped when
-  the window shows another pane as a chat.
+  the column closes or the other chief is picked.
 - The first 4 MB are parsed on the main thread, and every change renders the
   shown entries' markdown again.

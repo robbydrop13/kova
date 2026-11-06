@@ -923,9 +923,8 @@ toggle-sidebar                     (switch the layout between the tab bar and th
 toggle-side-panel                  (show or hide the side panel at the right, see side-panel.md)
 panel-history                      (the side panel on what it opened lately, see side-panel.md)
 cycle-theme                        (the next appearance: light, dark, the system's; View menu)
-toggle-chat                        (the focused pane's Claude conversation as a chat, or its terminal again;
-                                    with pane_id that pane is focused first. A pane without a Claude
-                                    conversation stays a terminal. See chat-mode.md)
+toggle-chat                        (hide or show the Cockpit's chat column; from outside the Cockpit, open it
+                                    on its chat. See cockpit.md)
 toggle-voice                       (voice typing in the chat's box: a tap, listening hands-free until the next one; Cmd+Shift+M held is push-to-talk. See chat-mode.md)
 ```
 

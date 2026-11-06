@@ -521,7 +521,7 @@ pub fn update_script(update: &Update) -> String {
     format!("window.kova && window.kova.update({})", serde_json::to_string(update).unwrap_or_else(|_| "{}".into()))
 }
 
-/// The page, loaded once per pane shown in chat mode.
+/// The page, loaded once per pane the Cockpit's chat shows.
 /// The page's colours switched in place (`theme::restyle_script`): the same
 /// variables as the `:root` rule of `shell`.
 pub fn restyle_script(t: &Theme) -> String {
