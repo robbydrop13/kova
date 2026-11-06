@@ -401,7 +401,8 @@ fn tool_group(tools: &[&Tool], working: bool, at: usize) -> Entry {
     }
 }
 
-/// A card's HTML: its message, its detail, its field, its buttons.
+/// A permission card's HTML: its message, its detail, its field, its
+/// buttons. An ask's card is the Cockpit's (`cards::ask_card_html`).
 pub fn card_html(card: &super::cards::Card) -> String {
     use super::cards::Act;
     let detail = card.detail.as_deref().map(|d| format!(r#"<pre class="cdet">{}</pre>"#, escape(d))).unwrap_or_default();
@@ -419,7 +420,7 @@ pub fn card_html(card: &super::cards::Card) -> String {
                     format!(r#" data-choice="{}""#, serde_json::to_value(choice).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()),
                 ),
             };
-            let class = if i == 0 { "btn primary" } else { "btn" };
+            let class = if i == 0 { "cbtn primary" } else { "cbtn" };
             let needs = if b.needs_text { r#" data-needs-text="1""# } else { "" };
             format!(r#"<button class="{class}" data-act="{act}"{extra}{needs}>{}</button>"#, escape(&b.label))
         })
@@ -427,7 +428,7 @@ pub fn card_html(card: &super::cards::Card) -> String {
     let hint = card.hint.as_deref().map(|h| format!(r#"<div class="chint">{}</div>"#, escape(h))).unwrap_or_default();
     let kind = serde_json::to_value(&card.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
     format!(
-        r#"<div class="card {kind}" data-id="{id}"><div class="cfrom">{from}</div><div class="cmsg">{msg}</div>{detail}{field}<div class="cbtns">{buttons}</div>{hint}</div>"#,
+        r#"<div class="pcard {kind}" data-id="{id}"><div class="cfrom">{from}</div><div class="cmsg">{msg}</div>{detail}{field}<div class="cbtns">{buttons}</div>{hint}</div>"#,
         id = escape(&card.id),
         from = escape(&card.from),
         msg = escape(&card.message),
@@ -526,7 +527,12 @@ pub fn restyle_script(t: &Theme) -> String {
         "--bg:{};--bg2:{};--t1:{};--t2:{};--t3:{};--b2:{};--b3:{};--accent:{};--working:{};--awaiting:{};--err:{};--ok:{};",
         t.bg, t.bg2, t.t1, t.t2, t.t3, t.b2, t.b3, t.accent, t.working, t.awaiting, t.error, t.ok
     );
-    crate::theme::restyle_script(!t.dark, &decls)
+    // The ask cards keep the design system's own variables, set on `#asks`.
+    let asks = serde_json::to_string(&crate::cockpit::vars(!t.dark)).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "{}var a=document.getElementById('asks');if(a)a.setAttribute('style',{asks});",
+        crate::theme::restyle_script(!t.dark, &decls)
+    )
 }
 
 pub fn shell(theme: &Theme, title: &str, nonce: &str) -> String {
@@ -595,9 +601,13 @@ body {{ display: flex; flex-direction: column; }}
 .tres {{ margin: 2px 0 6px 6px; max-height: 320px; overflow: auto; background: var(--bg2); border: 1px solid var(--b3);
   border-radius: 6px; padding: 8px 10px; font: 12px/1.45 "SF Mono", Menlo, monospace; color: var(--t2); white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cut {{ margin: 0 0 6px 10px; font-size: 11.5px; color: var(--t3); }}
-#cards {{ flex: none; max-width: 860px; width: 100%; margin: 0 auto; padding: 0 18px; }}
-.card {{ margin: 8px 0; padding: 10px 12px; border: 1px solid var(--b2); border-left: 3px solid var(--awaiting);
-  border-radius: 10px; background: var(--bg2); }}
+#asks {{ flex: none; {ask_vars} line-height: normal; font-family: Inter, "SF Pro Text", -apple-system, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+{card_css}
+}}
+#cards {{ max-width: 860px; width: 100%; margin: 0 auto; padding: 0 18px; }}
+#cards > .card {{ margin: 8px 0; }}
+.pcard {{ margin: 8px 0; padding: 10px 12px; border: 1px solid var(--b2); border-radius: 10px; background: var(--bg2); }}
 .cfrom {{ font-size: 11.5px; color: var(--t3); text-transform: uppercase; letter-spacing: .04em; }}
 .cmsg {{ margin: 2px 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cdet {{ margin: 4px 0 8px; padding: 6px 8px; background: var(--bg); border: 1px solid var(--b3); border-radius: 6px;
@@ -605,10 +615,10 @@ body {{ display: flex; flex-direction: column; }}
 .cfield {{ width: 100%; margin: 2px 0 8px; resize: none; font: inherit; color: var(--t1); background: var(--bg);
   border: 1px solid var(--b3); border-radius: 6px; padding: 5px 8px; }}
 .cbtns {{ display: flex; flex-wrap: wrap; gap: 6px; }}
-.btn {{ font: inherit; font-size: 13px; color: var(--t1); background: var(--bg); border: 1px solid var(--b2);
+.cbtn {{ font: inherit; font-size: 13px; color: var(--t1); background: var(--bg); border: 1px solid var(--b2);
   border-radius: 6px; padding: 3px 12px; cursor: pointer; }}
-.btn.primary {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
-.btn:disabled {{ opacity: .5; cursor: default; }}
+.cbtn.primary {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
+.cbtn:disabled {{ opacity: .5; cursor: default; }}
 .chint {{ margin-top: 6px; font-size: 12px; color: var(--t3); }}
 #foot {{ flex: none; max-width: 860px; width: 100%; margin: 0 auto; padding: 6px 18px 12px; }}
 #pending {{ max-width: 860px; margin: 0 auto; }}
@@ -674,7 +684,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
   font-size: 11px; line-height: 16px; color: #fff; background: rgba(0,0,0,.6); cursor: pointer; }}
 </style></head><body>
 <div id="scroll"><div id="log"><button id="more" data-act="more">Show earlier</button></div><div id="pending"></div></div>
-<div id="cards"></div>
+<div id="asks"><div id="cards"></div>{snooze_html}</div>
 <div id="foot"><div id="chips"></div><div id="banner"><span class="dot"></span><span id="state">…</span><span class="grow"></span><button data-act="terminal">Terminal</button></div>
 <div id="pill"><span class="bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span><span id="pline"></span><button class="pbtn" data-act="vcancel" title="Annuler">✕</button><button class="pbtn ok" data-act="vfinish" title="Terminer">✓</button></div>
 <div id="vhist"></div>
@@ -770,10 +780,18 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
           if (!fresh) continue;
           fresh.dataset.key = e.id; fresh.dataset.h = e.h;
           if (n) {{
-            // A card keeps what was typed in its field.
-            const old = n.querySelector("textarea"), neu = fresh.querySelector("textarea");
-            if (old && neu) neu.value = old.value;
+            // A card keeps what was typed in its fields, and the one typed in.
+            const olds = n.querySelectorAll("textarea"), neus = fresh.querySelectorAll("textarea");
+            const a = document.activeElement;
+            let focus = null;
+            neus.forEach((t, i) => {{
+              const o = olds[i];
+              if (!o || o.className !== t.className) return;
+              t.value = o.value;
+              if (o === a) focus = [t, o.selectionStart, o.selectionEnd];
+            }});
             n.replaceWith(fresh);
+            if (focus) {{ focus[0].focus(); focus[0].setSelectionRange(focus[1], focus[2]); }}
           }}
           n = fresh; reopen(n);
         }}
@@ -887,7 +905,42 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
       post({{ type: "paste-image" }});
     }}
   }});
+  // An ask card's icons, as on the Cockpit: the snooze menu, remove, done.
+  {snooze_js}
+  let snzKey = null;
+  function snzClose() {{ $("snz").hidden = true; $("snzPick").hidden = true; snzKey = null; }}
+  function hideCard(key) {{ const c = cardsEl.querySelector('.card[data-key="' + CSS.escape(key) + '"]'); if (c) c.style.display = "none"; }}
+  function snzClick(e) {{
+    const b = e.target.closest("button");
+    if (!b || !snzKey) return;
+    if (b.dataset.when === "pick") {{ $("snzPick").hidden = false; $("snzAt").focus(); return; }}
+    const d = when(b.dataset.when);
+    if (!d || isNaN(d) || d <= new Date()) return;
+    const id = snzKey;
+    snzClose(); hideCard(id);
+    post({{ type: "ask", id, act: "snooze", text: iso(d) }});
+  }}
+  function snzOpen(b, key) {{
+    snzKey = key;
+    const r = b.getBoundingClientRect(), m = $("snz");
+    m.hidden = false;
+    m.style.top = Math.max(8, r.top - m.offsetHeight - 4) + "px";
+    m.style.left = Math.max(8, Math.min(r.right - m.offsetWidth, window.innerWidth - m.offsetWidth - 8)) + "px";
+    $("snzAt").value = iso(new Date(Date.now() + 3600e3)).slice(0, 16);
+  }}
+  // An instruction on an ask card: Enter sends it, Shift+Enter is a new line.
+  cardsEl.addEventListener("keydown", (e) => {{
+    const t = e.target;
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing || !t.classList.contains("ins")) return;
+    e.preventDefault();
+    if (t.readOnly || !t.value.trim()) return;
+    post({{ type: "ask", id: t.closest(".card").dataset.key, act: "instruct", text: t.value }});
+    t.value = "";
+  }});
+  document.addEventListener("keydown", (e) => {{ if (e.key === "Escape" && !$("snz").hidden) snzClose(); }});
   document.addEventListener("click", (e) => {{
+    if (e.target.closest("#snz")) return snzClick(e);
+    if (!$("snz").hidden) snzClose();
     if (!e.target.closest("#vhist, #hist")) $("vhist").classList.remove("on");
     const a = e.target.closest("a");
     if (a) {{
@@ -907,18 +960,25 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
       if (holder.classList.contains("open")) opened.add(holder.dataset.id); else opened.delete(holder.dataset.id);
       return;
     }}
-    const card = b.closest(".card");
+    const card = b.closest(".card, .pcard");
     if (act === "answer" && card) {{
-      const field = card.querySelector("textarea");
+      const field = card.querySelector("textarea.cfield, textarea.ans");
       const text = field ? field.value : "";
-      if (b.dataset.needsText && !text.trim()) {{ if (field) field.focus(); return; }}
+      if ((b.dataset.needsText || b.dataset.text) && !text.trim()) {{ if (field) field.focus(); return; }}
       card.querySelectorAll("button").forEach((x) => x.disabled = true);
-      post({{ type: "answer", id: card.dataset.id, action: b.dataset.action, text }});
+      post({{ type: "answer", id: card.dataset.key, action: b.dataset.action || b.dataset.arg, text }});
     }} else if (act === "permission" && card) {{
       card.querySelectorAll("button").forEach((x) => x.disabled = true);
-      post({{ type: "permission", id: card.dataset.id, choice: b.dataset.choice }});
+      post({{ type: "permission", id: card.dataset.key, choice: b.dataset.choice }});
     }} else if (act === "open" && card) {{
-      post({{ type: "open", id: card.dataset.id }});
+      post({{ type: "open", id: card.dataset.key }});
+    }} else if (act === "snooze" && card) {{
+      snzOpen(b, card.dataset.key);
+    }} else if (act === "link" && b.dataset.arg) {{
+      post({{ type: "link", href: b.dataset.arg }});
+    }} else if ((act === "dismiss" || act === "done") && card) {{
+      hideCard(card.dataset.key);
+      post({{ type: "ask", id: card.dataset.key, act }});
     }} else if (act === "vcancel" || act === "vfinish") {{
       post({{ type: act === "vcancel" ? "voice-cancel" : "voice-finish" }});
     }} else if (act === "vhist") {{
@@ -939,6 +999,10 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
 </script></body></html>"##,
         nonce = nonce,
         handler = HANDLER,
+        ask_vars = crate::cockpit::vars(!t.dark),
+        card_css = crate::cockpit::CARD_CSS,
+        snooze_html = crate::cockpit::SNOOZE_HTML,
+        snooze_js = crate::cockpit::SNOOZE_JS,
         title = escape(title),
         scheme = if t.dark { "dark" } else { "light" },
         bg = t.bg,
@@ -1141,5 +1205,12 @@ mod tests {
         assert!(page.contains(r#"<script nonce="abc123">"#));
         assert!(!page.contains("onclick"), "no inline handler: the policy would refuse it anyway");
         assert!(page.contains("<title>&lt;x&gt;</title>"));
+        // The ask cards: the Cockpit's look on the design system's dark
+        // tokens, its snooze menu, never the old orange bar.
+        let dark = crate::cockpit::vars(false);
+        assert!(page.contains(&format!("#asks {{ flex: none; {dark}")), "the tokens are scoped to the cards");
+        assert!(page.contains(".card .t{font-size:15px") && page.contains(r#"<div class="snz" id="snz" hidden>"#));
+        assert!(page.contains("function iso(d)") && !page.contains("border-left: 3px solid var(--awaiting)"));
+        assert!(restyle_script(&Theme { dark: false, ..theme }).contains(&crate::cockpit::vars(true)[..20]));
     }
 }

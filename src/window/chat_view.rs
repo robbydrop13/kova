@@ -72,6 +72,13 @@ struct ChatState {
     /// The pane's questions and prompt as last read: what a click answers.
     questions: Vec<crate::ask::Question>,
     cards: Vec<cards::Card>,
+    /// The cards' HTML, in `cards`' order: an ask on the Cockpit's markup.
+    card_html: Vec<String>,
+    /// The attention entry standing for an ask, by ask id: what its icons
+    /// and its instruction act on too.
+    linked: HashMap<String, String>,
+    /// `[attention] perso_dir`: an ask's scope tag.
+    perso: Option<std::path::PathBuf>,
     permission: Option<crate::prompt_preview::ParsedPrompt>,
     shown: Option<(u64, bool, usize)>,
     shown_cards: Option<Vec<(String, u64)>>,
@@ -125,6 +132,9 @@ impl ChatState {
             sent_cards: HashMap::new(),
             questions: Vec::new(),
             cards: Vec::new(),
+            card_html: Vec::new(),
+            linked: HashMap::new(),
+            perso: None,
             permission: None,
             shown: None,
             shown_cards: None,
@@ -414,6 +424,7 @@ impl KovaView {
             let due = st.last_poll.is_none_or(|t| t.elapsed().as_millis() >= POLL_MS);
             if due || force || moved {
                 st.last_poll = Some(std::time::Instant::now());
+                st.perso = self.ivars().config.get().and_then(|c| c.attention.perso_root());
                 update = chat_poll(st, pane, files);
             }
         }
@@ -590,6 +601,10 @@ impl KovaView {
                 }
                 Reply::Push
             }
+            "ask" => {
+                self.chat_ask_act(st, &s("id"), &s("act"), &s("text"));
+                Reply::Push
+            }
             "permission" => {
                 let id = s("id");
                 let choice = serde_json::from_value::<cards::Choice>(msg.get("choice").cloned().unwrap_or(Value::Null)).ok();
@@ -607,6 +622,59 @@ impl KovaView {
             }
             _ => Reply::Nothing,
         }
+    }
+
+    /// An ask card's icon or instruction, as the Cockpit's: snooze puts the
+    /// question off until the date picked, remove (`dismissed`) and done take
+    /// it off the Asks, its asker told it was withdrawn. The attention entry
+    /// standing for it gets the same verb (`attn snooze`, `attn close --reason
+    /// dismissed|done`), and the instruction (`attn act ID instruct`), which
+    /// only such an entry takes. Queued or spawned: nothing here touches the
+    /// window (this runs under the tabs' borrow).
+    fn chat_ask_act(&self, st: &mut ChatState, id: &str, act: &str, text: &str) {
+        use super::sidebar_asks::AskAction;
+        if !st.questions.iter().any(|q| q.id == id) {
+            st.note = Some("Cette question n'attend plus".to_string());
+            return;
+        }
+        let entry = st.linked.get(id).cloned();
+        let mtm = MainThreadMarker::from(self);
+        let queue = |action| crate::app::app_delegate(mtm).ivars().queue_ask_action(action);
+        let attn = |verb, text: Option<&str>| {
+            if let Some(e) = &entry
+                && let Err(why) = crate::attention::perform_with(e, verb, text)
+            {
+                log::warn!("chat: {why}");
+            }
+        };
+        match act {
+            "snooze" => match crate::attention::epoch_of(text) {
+                Some(until) if until > crate::ask::now_epoch() => {
+                    queue(AskAction::Snooze { id: id.to_string(), until });
+                    attn(crate::attention::Verb::Snooze, Some(text));
+                }
+                _ => st.note = Some("Date de rappel invalide".to_string()),
+            },
+            "dismiss" | "done" => {
+                let (reason, verb) =
+                    if act == "done" { ("done", crate::attention::Verb::Resolve) } else { ("dismissed", crate::attention::Verb::Dismiss) };
+                queue(AskAction::Close { id: id.to_string(), reason });
+                attn(verb, None);
+            }
+            "instruct" if !text.trim().is_empty() => match &entry {
+                Some(e) => {
+                    if let Err(why) = crate::attention::perform_with(e, crate::attention::Verb::Instruct, Some(text)) {
+                        log::warn!("chat: {why}");
+                        crate::attention::instruction_refused(e, text, "Kova n'a pas pu la transmettre");
+                    }
+                }
+                None => st.note = Some("Pas de consigne sur cette question".to_string()),
+            },
+            _ => return,
+        }
+        // The card comes back if the click did not take it off.
+        st.sent_cards.remove(id);
+        st.shown_cards = None;
     }
 
     /// `toggle-voice`: the shortcut went down in the chat shown (held,
@@ -845,14 +913,33 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
             }
         });
     }
-    let mut list: Vec<cards::Card> = questions
-        .iter()
-        .map(|q| cards::question_card(q, crate::handoff::detail(q).map(|d| d.card_text())))
-        .collect();
+    let mut list: Vec<cards::Card> = Vec::new();
+    let mut html = Vec::new();
+    st.linked.clear();
+    // An ask is the Cockpit's card: the attention entry standing for it when
+    // there is one, opened (its detail, its instruction field).
+    let entries = crate::attention::snapshot();
+    let (outcomes, instructions) = (crate::attention::outcomes(), crate::attention::instructions());
+    for q in &questions {
+        let handoff = crate::handoff::detail(q).map(|d| d.card_text());
+        let linked = entries.as_deref().and_then(|e| crate::cockpit::entry_for_ask(e, &q.id)).and_then(|e| {
+            let mut item = crate::cockpit::from_attention(e, outcomes.get(&e.id), false)?;
+            item.instruction = instructions.get(&e.id).cloned();
+            item.detail = Some(crate::cockpit::entry_detail(e, crate::attention::explaining(&e.id)));
+            st.linked.insert(q.id.clone(), e.id.clone());
+            Some(item)
+        });
+        let scope = q.from.cwd.as_deref().map_or(crate::attention::Scope::Pro, |cwd| crate::cockpit::scope_of_cwd(cwd, st.perso.as_deref()));
+        html.push(cards::ask_card_html(q, handoff.as_deref(), linked.as_ref(), scope, now));
+        list.push(cards::question_card(q, handoff));
+    }
     st.permission = pane.permission_prompt();
     if let Some(prompt) = &st.permission {
-        list.push(cards::permission_card(prompt));
+        let card = cards::permission_card(prompt);
+        html.push(page::card_html(&card));
+        list.push(card);
     }
+    st.card_html = html;
     st.questions = questions;
     st.cards = list;
 
@@ -952,7 +1039,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         changed = true;
     }
     let card_entries: Vec<page::Entry> =
-        st.cards.iter().map(|c| page::Entry { id: c.id.clone(), html: page::card_html(c) }).collect();
+        st.cards.iter().zip(&st.card_html).map(|(c, h)| page::Entry { id: c.id.clone(), html: h.clone() }).collect();
     let card_key: Vec<(String, u64)> = card_entries.iter().map(|e| (e.id.clone(), e.hash())).collect();
     if st.shown_cards.as_ref() != Some(&card_key) {
         st.shown_cards = Some(card_key);
