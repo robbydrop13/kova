@@ -429,6 +429,9 @@ pub enum Verb {
     Dismiss,
     /// Out of the list until a date: `snooze_command <id> --until=<ISO>`.
     Snooze,
+    /// A free instruction typed on an opened Cockpit card:
+    /// `act_command <id> instruct --text=<text>`.
+    Instruct,
 }
 
 impl Verb {
@@ -443,6 +446,7 @@ impl Verb {
             Verb::Resolve => "C'est fait",
             Verb::Dismiss => "Retirer",
             Verb::Snooze => "Plus tard",
+            Verb::Instruct => "instruct",
         }
     }
 }
@@ -475,6 +479,30 @@ fn set_outcome(id: &str, outcome: Outcome) {
     OUTCOMES.lock().get_or_insert_with(HashMap::new).insert(id.to_string(), outcome);
 }
 
+/// The last instruction typed on an entry's card, and where its command
+/// stands (`Running`, `Sent` or `Failed`). Kept apart from `OUTCOMES`: an
+/// instruction never reads as a sent draft, and never blocks the draft's own
+/// buttons.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Instructed {
+    pub text: String,
+    pub outcome: Outcome,
+}
+
+static INSTRUCTIONS: Mutex<Option<HashMap<String, Instructed>>> = Mutex::new(None);
+
+/// Every entry's last instruction.
+pub fn instructions() -> HashMap<String, Instructed> {
+    INSTRUCTIONS.lock().get_or_insert_with(HashMap::new).clone()
+}
+
+fn set_instructed(id: &str, text: &str, outcome: Outcome) {
+    INSTRUCTIONS
+        .lock()
+        .get_or_insert_with(HashMap::new)
+        .insert(id.to_string(), Instructed { text: text.to_string(), outcome });
+}
+
 /// The argv a click runs: the configured command, the id, then fixed words.
 /// `None` when the command for that verb is not configured or the id is not
 /// one Kova passes on.
@@ -498,7 +526,7 @@ fn verb_argv_with(
     if !valid_id(id) {
         return None;
     }
-    let acts = matches!(verb, Verb::Send | Verb::Validate | Verb::Correct);
+    let acts = matches!(verb, Verb::Send | Verb::Validate | Verb::Correct | Verb::Instruct);
     let base = match verb {
         Verb::Snooze => snooze,
         _ if acts => act,
@@ -510,6 +538,10 @@ fn verb_argv_with(
     match verb {
         Verb::Send | Verb::Validate => args.push(verb.label().to_string()),
         Verb::Correct => {
+            let text = text.filter(|t| !t.trim().is_empty())?;
+            args.extend([verb.label().to_string(), format!("--text={text}")]);
+        }
+        Verb::Instruct => {
             let text = text.filter(|t| !t.trim().is_empty())?;
             args.extend([verb.label().to_string(), format!("--text={text}")]);
         }
@@ -546,6 +578,30 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
         verb_argv_with(&commands.act, &commands.close, &commands.snooze, id, verb, text.as_deref())
     }
     .ok_or_else(|| format!("attention: no command for {}", verb.label()))?;
+    if verb == Verb::Instruct {
+        let text = text.unwrap_or_default();
+        {
+            let mut guard = INSTRUCTIONS.lock();
+            let map = guard.get_or_insert_with(HashMap::new);
+            if map.get(id).is_some_and(|i| i.outcome == Outcome::Running) {
+                return Err(format!("attention: an instruction to {id} already runs"));
+            }
+            map.insert(id.to_string(), Instructed { text: text.clone(), outcome: Outcome::Running });
+        }
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            let outcome = match run_click(&bin, &args) {
+                Ok(()) => Outcome::Sent,
+                Err(words) => {
+                    log::warn!("attention instruct {id}: {words}");
+                    Outcome::Failed { words, until_ms: 0 }
+                }
+            };
+            set_instructed(&id, &text, outcome);
+            refresh();
+        });
+        return Ok(());
+    }
     {
         let mut guard = OUTCOMES.lock();
         let map = guard.get_or_insert_with(HashMap::new);
@@ -556,17 +612,7 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
     }
     let id = id.to_string();
     std::thread::spawn(move || {
-        let result = crate::exec::run_with_deadline(std::process::Command::new(&bin).args(&args), ACT_DEADLINE)
-            .and_then(|out| {
-                if out.status.success() {
-                    Ok(())
-                } else {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    let line: String = err.lines().next().unwrap_or("").trim().chars().take(80).collect();
-                    Err(if line.is_empty() { format!("{bin} exited with {}", out.status) } else { line })
-                }
-            });
-        match result {
+        match run_click(&bin, &args) {
             Ok(()) => set_outcome(
                 &id,
                 if matches!(verb, Verb::Send | Verb::Validate | Verb::Correct) { Outcome::Sent } else { Outcome::Closed },
@@ -579,6 +625,19 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
         refresh();
     });
     Ok(())
+}
+
+/// Run a click's argv: `Err` with the first line of its stderr on a failure.
+fn run_click(bin: &str, args: &[String]) -> Result<(), String> {
+    crate::exec::run_with_deadline(std::process::Command::new(bin).args(args), ACT_DEADLINE).and_then(|out| {
+        if out.status.success() {
+            Ok(())
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let line: String = err.lines().next().unwrap_or("").trim().chars().take(80).collect();
+            Err(if line.is_empty() { format!("{bin} exited with {}", out.status) } else { line })
+        }
+    })
 }
 
 /// How long `attn explain` may take: a model writes the detail.
@@ -644,6 +703,9 @@ pub fn clean_text(text: &str) -> String {
 pub fn prune(entries: &[Entry]) {
     if let Some(map) = OUTCOMES.lock().as_mut() {
         map.retain(|id, o| matches!(o, Outcome::Running) || entries.iter().any(|e| &e.id == id));
+    }
+    if let Some(map) = INSTRUCTIONS.lock().as_mut() {
+        map.retain(|id, i| i.outcome == Outcome::Running || entries.iter().any(|e| &e.id == id));
     }
 }
 
@@ -752,8 +814,25 @@ mod tests {
         // A correction with nothing in it is not one.
         assert_eq!(verb_argv(&act, &[], "a-1", Verb::Correct, Some("  ")), None);
         assert_eq!(verb_argv(&act, &[], "a-1", Verb::Correct, None), None);
-        assert_eq!(clean_text("a\x1b[201~b\u{7}\nc\td"), "a[201~b\nc\td");
+                assert_eq!(clean_text("a\x1b[201~b\u{7}\nc\td"), "a[201~b\nc\td");
         assert_eq!(clean_text(&"é".repeat(MAX_TEXT)).len(), MAX_TEXT);
+    }
+
+    #[test]
+    fn an_instruction_is_act_id_instruct_with_its_text_as_one_argv_element() {
+        let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
+        // Quotes, a newline and an option-like start stay inside `--text=`:
+        // no shell runs it, so nothing needs quoting.
+        let text = "Envoie les relevés \"octobre\" à l'expert\n--by evil; rm -rf ~";
+        assert_eq!(
+            verb_argv(&act, &[], "a-1", Verb::Instruct, Some(text)),
+            Some(("/bin/attn".to_string(), vec!["act".into(), "a-1".into(), "instruct".into(), format!("--text={text}")]))
+        );
+        // Nothing typed, nothing sent.
+        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Instruct, Some(" \n ")), None);
+        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Instruct, None), None);
+        // No act command, no instruction.
+        assert_eq!(verb_argv(&[], &[], "a-1", Verb::Instruct, Some("x")), None);
     }
 
     #[test]

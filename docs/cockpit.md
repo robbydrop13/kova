@@ -89,6 +89,7 @@ is gone is dropped.
   quoi il s'agit…` and Kova runs `explain_command ID` (default: the attn
   program with `explain`, about 40 s) in the background, never twice at once
   for one id; the next read brings the `detail` it saved.
+- Every opened attention card, button or not, ends with a `Consigne` field (`Une consigne pour cette carte`): Enter runs `act_command ID instruct --text=<text>` (one argv element, `attention::clean_text`), which hands it to the chief of the card's scope; Shift+Enter is a new line, nothing typed sends nothing. The field clears and the card shows `Consigne envoyée` with the text sent; on a draft it sits under the draft's actions, apart from the correction, and never marks the draft sent. A typed instruction survives the refresh.
 - Decision sheet: its card's text (the decisions); `Ouvrir la fiche` opens it.
 - Question: its text and its answers as buttons (a free answer brings a
   field), checked with `ask::accepts_external_answer` and queued like the

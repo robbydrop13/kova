@@ -193,13 +193,17 @@ impl KovaView {
         };
         if let Some(entries) = crate::attention::snapshot() {
             let outcomes = crate::attention::outcomes();
+            let instructions = crate::attention::instructions();
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
             for entry in entries.iter() {
                 let openable = entry
                     .action
                     .as_deref()
                     .is_some_and(|a| super::sidebar_attention::open_target(a, home.as_deref(), exists).is_some());
-                items.extend(cockpit::from_attention(entry, outcomes.get(&entry.id), openable));
+                items.extend(cockpit::from_attention(entry, outcomes.get(&entry.id), openable).map(|mut item| {
+                    item.instruction = instructions.get(&entry.id).cloned();
+                    item
+                }));
                 if let Some(a) = &entry.action {
                     actions.push((format!("attention:{}", entry.id), a.clone()));
                 }
@@ -421,6 +425,7 @@ impl KovaView {
                     "routine" => self.cockpit_routine(&key, &s("arg")),
                     "answer" => self.cockpit_answer(&key, &s("arg"), text.as_deref().unwrap_or_default()),
                     "link" => self.cockpit_link(&key, &s("arg")),
+                    "instruct" => self.cockpit_instruct(&key, text.as_deref().unwrap_or_default()),
                     "pane" => {
                         self.close_cockpit();
                         self.sidebar_open_need(&key);
@@ -531,6 +536,20 @@ impl KovaView {
                 }
             }
             _ => {}
+        }
+        self.mark_dirty();
+    }
+
+    /// An instruction typed on an opened attention card: `act_command ID
+    /// instruct --text=<text>`, which hands it to the chief of the card's
+    /// scope. Nothing typed sends nothing.
+    fn cockpit_instruct(&self, key: &str, text: &str) {
+        let Some(id) = key.strip_prefix("attention:") else { return };
+        if text.trim().is_empty() {
+            return;
+        }
+        if let Err(why) = crate::attention::perform_with(id, Verb::Instruct, Some(text)) {
+            log::warn!("cockpit: {why}");
         }
         self.mark_dirty();
     }

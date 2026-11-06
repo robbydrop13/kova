@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 
-use crate::attention::{Draft, Entry, Level, Outcome, Scope};
+use crate::attention::{Draft, Entry, Instructed, Level, Outcome, Scope};
 use crate::window::needs::{NeedItem, NeedKind};
 
 /// What the page's script posts under.
@@ -117,6 +117,8 @@ pub struct Item {
     /// host only for the cards it keeps open.
     pub detail: Option<Detail>,
     pub state: State,
+    /// The last instruction typed on an attention card, filled by the host.
+    pub instruction: Option<Instructed>,
 }
 
 /// What an opened card shows inside it, instead of a jump to another view.
@@ -278,6 +280,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         ask: None,
         detail: None,
         state,
+        instruction: None,
     })
 }
 
@@ -354,6 +357,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         ask: None,
         detail: None,
         state: State::Idle,
+        instruction: None,
     })
 }
 
@@ -640,7 +644,12 @@ pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, 
         .collect();
     let acts = format!("<div class=\"acts\">{acts}</div>");
     let icons = icons_html(&icons(item, can_close, can_snooze), running);
-    let detail = item.detail.as_ref().map(|d| detail_html(d, running)).unwrap_or_default();
+    let mut detail = item.detail.as_ref().map(|d| detail_html(d, running)).unwrap_or_default();
+    // An opened attention card takes an instruction, action or not, under
+    // the draft's actions when it has a draft.
+    if item.kind == Kind::Attention && item.detail.is_some() && can_act {
+        detail.push_str(&instruct_html(item.instruction.as_ref()));
+    }
     let needs = if item.needs.trim().is_empty() {
         String::new()
     } else {
@@ -687,6 +696,33 @@ pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, 
         if item.prio == 1 { " urgent" } else { "" },
         if item.detail.is_some() { " open" } else { "" },
         esc(&item.key),
+    )
+}
+
+/// The placeholder of an opened card's instruction field.
+pub const INSTRUCT_PLACEHOLDER: &str = "Une consigne pour cette carte";
+
+/// The instruction field of an opened attention card, and what the last
+/// instruction became. Enter sends it (`act_command ID instruct`), Shift+Enter
+/// is a new line; distinct from a draft's correction.
+fn instruct_html(last: Option<&Instructed>) -> String {
+    let running = last.is_some_and(|i| i.outcome == Outcome::Running);
+    let note = match last {
+        None => String::new(),
+        Some(Instructed { outcome: Outcome::Running, .. }) => "<div class=\"state\">En cours</div>".to_string(),
+        Some(Instructed { text, outcome: Outcome::Failed { words, .. } }) => format!(
+            "<div class=\"state crit\">Consigne non envoyée : {}</div><p class=\"msg sent\">{}</p>",
+            esc(words),
+            esc(text)
+        ),
+        Some(Instructed { text, .. }) => {
+            format!("<div class=\"state ok\">Consigne envoyée</div><p class=\"msg sent\">{}</p>", esc(text))
+        }
+    };
+    format!(
+        "<div class=\"instr\"><div class=\"lbl\">Consigne</div>\
+         <textarea class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{INSTRUCT_PLACEHOLDER}\"{}></textarea>{note}</div>",
+        if running { " readonly" } else { "" }
     )
 }
 
@@ -1009,6 +1045,10 @@ pre.scroll{margin-top:8px;max-height:240px;overflow:auto;background:var(--bg-inp
 textarea.ans{display:block;width:100%;margin-top:8px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:6px 10px;resize:vertical}
 textarea.ans:focus{border-color:var(--accent);outline:0}
 .state.ok{color:var(--ok-dot)}.state.crit{color:var(--crit)}
+.instr{margin-top:10px;border-top:1px solid var(--b3);padding-top:4px;cursor:auto}
+textarea.ins{display:block;width:100%;margin-top:4px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;line-height:19px;padding:6px 10px;resize:vertical}
+textarea.ins:focus{border-color:var(--accent);outline:0}
+.msg.sent{margin-top:4px;font-size:12px;color:var(--t2)}
 .card{cursor:pointer}.card textarea,.card .detail{cursor:auto}
 .side{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:none}
 .icons{display:flex;gap:2px;flex:none}
@@ -1076,10 +1116,13 @@ function setList(html) {
     inner[card.dataset.key] = {
       open: [...card.querySelectorAll('details')].map(d => d.open),
       scroll: [...card.querySelectorAll('pre.scroll')].map(p => p.scrollTop),
-      ans: (card.querySelector('textarea.ans') || {}).value || ''
+      ans: (card.querySelector('textarea.ans') || {}).value || '',
+      ins: (card.querySelector('textarea.ins') || {}).value || ''
     };
   });
   const ansFocus = a && a.classList && a.classList.contains('ans') ? a.closest('.card').dataset.key : null;
+  const insFocus = a && a.classList && a.classList.contains('ins') ? a.closest('.card').dataset.key : null;
+  const insSel = insFocus ? [a.selectionStart, a.selectionEnd] : null;
   $('list').innerHTML = html;
   document.querySelectorAll('.card').forEach(card => {
     const t = card.querySelector('textarea.bd');
@@ -1097,6 +1140,11 @@ function setList(html) {
     card.querySelectorAll('pre.scroll').forEach((p, i) => { if (k.scroll[i]) p.scrollTop = k.scroll[i]; });
     const ans = card.querySelector('textarea.ans');
     if (ans) { ans.value = k.ans; if (card.dataset.key === ansFocus) ans.focus(); }
+    const ins = card.querySelector('textarea.ins');
+    if (ins) {
+      ins.value = k.ins;
+      if (card.dataset.key === insFocus) { ins.focus(); ins.setSelectionRange(insSel[0], insSel[1]); }
+    }
   });
   document.querySelector('.page').scrollTop = top;
 }
@@ -1146,7 +1194,7 @@ document.addEventListener('click', e => {
   // A click on a card's body, not on a button or a field: it opens or folds.
   if (!b) {
     const card = e.target.closest('.card');
-    if (!card || e.target.closest('textarea, input, a, .detail')) return;
+    if (!card || e.target.closest('textarea, input, a, .detail, .instr')) return;
     if (String(window.getSelection()).trim()) return;
     return post({ type: 'act', key: card.dataset.key, act: 'expand' });
   }
@@ -1192,6 +1240,16 @@ document.addEventListener('input', e => {
   if (t.classList && t.classList.contains('bd')) { grow(t); sync(t.closest('.card')); }
 });
 document.addEventListener('keydown', e => {
+  const t = e.target;
+  // An instruction: Enter sends it, Shift+Enter is a new line, nothing typed
+  // sends nothing.
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && t.classList && t.classList.contains('ins')) {
+    e.preventDefault();
+    if (t.readOnly || !t.value.trim()) return;
+    post({ type: 'act', key: t.closest('.card').dataset.key, act: 'instruct', text: t.value });
+    t.value = '';
+    return;
+  }
   if (e.key !== 'Escape') return;
   e.preventDefault();
   if (!$('snz').hidden) return snzClose();
@@ -1503,6 +1561,54 @@ mod tests {
         assert!(html.contains("Objet <b>S&quot;</b>"));
         // Without act_command, a draft shows as a plain card.
         assert!(!card_html(&item, false, true, true, 10).contains("<textarea"));
+    }
+
+    #[test]
+    fn an_opened_attention_card_takes_an_instruction_even_without_a_button() {
+        // A card with no action, no draft, no button: once opened, a field.
+        let bare = Entry { needs: None, ..entry("a-1", Level::Point, None, 1) };
+        let mut item = from_attention(&bare, None, false).unwrap();
+        assert!(buttons(&item, true).is_empty());
+        let field = format!("<textarea class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{INSTRUCT_PLACEHOLDER}\">");
+        assert!(!card_html(&item, true, true, true, 10).contains("class=\"ins\""), "folded: no field");
+        item.detail = Some(entry_detail(&bare, false));
+        let html = card_html(&item, true, true, true, 10);
+        assert!(html.contains(&field), "{html}");
+        assert!(html.contains("<div class=\"lbl\">Consigne</div>"));
+        // Without act_command there is nowhere to send it.
+        assert!(!card_html(&item, false, true, true, 10).contains("class=\"ins\""));
+
+        // Sent: the card says so with the text that went, escaped.
+        item.instruction = Some(Instructed { text: "Relance <Fidsud> \"vite\"\nmerci".into(), outcome: Outcome::Sent });
+        let html = card_html(&item, true, true, true, 10);
+        assert!(html.contains("Consigne envoyée</div><p class=\"msg sent\">Relance &lt;Fidsud&gt; &quot;vite&quot;\nmerci</p>"), "{html}");
+        assert!(html.contains(&field), "the field stays for the next one");
+        // In flight: the field waits.
+        item.instruction = Some(Instructed { text: "x".into(), outcome: Outcome::Running });
+        let html = card_html(&item, true, true, true, 10);
+        assert!(html.contains("placeholder=\"Une consigne pour cette carte\" readonly>") && html.contains("En cours"));
+        item.instruction = Some(Instructed { text: "x".into(), outcome: Outcome::Failed { words: "boom".into(), until_ms: 0 } });
+        assert!(card_html(&item, true, true, true, 10).contains("Consigne non envoyée : boom"));
+
+        // A draft keeps its own correction field; the instruction comes
+        // under the draft's actions, once.
+        let mut e = entry("a-2", Level::Now, None, 1);
+        e.draft = Some(Draft { to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
+        let mut item = from_attention(&e, None, false).unwrap();
+        item.detail = Some(entry_detail(&e, false));
+        item.instruction = Some(Instructed { text: "Plus court".into(), outcome: Outcome::Sent });
+        let html = card_html(&item, true, true, true, 10);
+        assert_eq!(html.matches("class=\"bd\"").count(), 1);
+        assert_eq!(html.matches("class=\"ins\"").count(), 1);
+        assert!(html.find("data-act=\"validate\"").unwrap() < html.find("class=\"ins\"").unwrap());
+        // An instruction never reads as a sent draft: Valider stays.
+        assert_eq!(buttons(&item, true), [Button::Correct, Button::Validate]);
+        assert!(!html.contains("Transmis"));
+
+        // A live card has no attention id: no field.
+        let mut live = from_need(&need(NeedKind::Error, "pane:1", 5), false).unwrap();
+        live.detail = Some(Detail::Error { words: "w".into(), lines: String::new() });
+        assert!(!card_html(&live, true, true, true, 10).contains("class=\"ins\""));
     }
 
     #[test]
