@@ -87,7 +87,8 @@ struct ChatState {
     /// The title spinner as last seen, and when it last went off (epoch ms).
     spinner: bool,
     spinner_off_at: Option<u64>,
-    status: banner::Banner,
+    /// The turns folder was watched: it did not exist when the watch was made.
+    watching_turns: bool,
     /// The page posted `ready`: updates reach it.
     ready: bool,
     first: bool,
@@ -135,7 +136,7 @@ impl ChatState {
             hook: None,
             spinner: false,
             spinner_off_at: None,
-            status: banner::Banner::Offline,
+            watching_turns: false,
             ready: false,
             first: true,
             focus: false,
@@ -527,9 +528,15 @@ impl KovaView {
                         st.note = Some(reason.to_string());
                         st.restore = Some(text);
                     }
-                    Ok(text) => match st.outbox.submit(text, gate(pane, st.status), crate::surface::monotonic_ms()) {
+                    // Through the queue: the poll this same tick decides on
+                    // the state read now, not the last poll's.
+                    Ok(text) => match st.outbox.submit(text, input::Verdict::Wait(""), crate::surface::monotonic_ms()) {
                         input::Step::Type(text) => type_into(pane, &text),
-                        input::Step::Queued(reason) => st.queue_reason = reason,
+                        input::Step::Queued(reason) => {
+                            if !reason.is_empty() {
+                                st.queue_reason = reason;
+                            }
+                        }
                         input::Step::Enter | input::Step::Stale | input::Step::Nothing => {}
                     },
                 }
@@ -692,7 +699,13 @@ fn gate(pane: &Pane, status: banner::Banner) -> input::Verdict {
         // The session id lags Claude's exit; a fresh probe of the foreground
         // process does not, so a shell's own `❯` never reads as Claude's.
         has_session: pane.claude_session_id().is_some() && pane.pty.foreground_process().is_some(),
-        status: if prompt { banner::Banner::Waiting } else { status },
+        status: if prompt {
+            banner::Banner::Waiting
+        } else if pane.is_working() {
+            banner::Banner::Working { since: None }
+        } else {
+            status
+        },
         composer: input::composer(&visible),
     })
 }
@@ -760,10 +773,14 @@ fn read_transcript(st: &mut ChatState, pane: &Pane, home: &std::path::Path) {
     }
     // Watch what is read: the transcript (or its folder until it exists)
     // and the hooks' turns folder, where a turn file is renamed into place.
+    let turns = home.join(".claude/state/turns");
+    if st.watch.is_some() && !st.watching_turns && turns.is_dir() {
+        st.watch = None;
+    }
     if st.watch.is_none()
         && let (Some(tail), Some(_)) = (&st.tail, &st.session)
     {
-        let turns = home.join(".claude/state/turns");
+        st.watching_turns = turns.is_dir();
         let file = tail.path();
         let target = if tail.waiting() { file.parent().unwrap_or(file) } else { file };
         st.watch = Watch::new(&[target, &turns]);
@@ -854,8 +871,20 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         st.working_since = Some(st.conv.last_user_ts().filter(|t| *t <= now && now - t < 6 * 3600).unwrap_or(now));
     }
     let b = banner::banner(banner::BannerInput { working_since: st.working_since, ..status_input });
-    st.status = b;
 
+    // A text left in the terminal's prompt went (the turn started) or was
+    // cleared there: the queue goes on.
+    if st.outbox.is_stuck()
+        && (working || {
+            let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+            input::composer(&visible) == input::Composer::Empty
+        })
+    {
+        st.outbox.unstick();
+    }
+    if st.outbox.is_stuck() {
+        st.queue_reason = "part quand le texte laissé dans le terminal est envoyé ou effacé";
+    }
     // The queue: its first message once the turn is over.
     let verdict = if st.outbox.queue().is_empty() { input::Verdict::Wait("") } else { gate(pane, b) };
     if let input::Verdict::Wait(reason) = verdict
@@ -874,6 +903,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
                 pane.pty.write(b"\r");
                 pane.clear_awaiting();
             } else {
+                st.outbox.stuck();
                 st.note = Some(NOT_ENTERED.to_string());
             }
         }

@@ -171,6 +171,9 @@ pub struct Outbox {
     enter_due: Option<u64>,
     /// When the last Enter went: the next message waits `SETTLE_MS`.
     entered_at: Option<u64>,
+    /// The last Enter was not written: its text waits in the terminal's
+    /// prompt and the queue holds until it is sent or cleared there.
+    stuck: bool,
 }
 
 /// What the caller does now.
@@ -198,7 +201,22 @@ impl Outbox {
     }
 
     fn busy(&self, now: u64) -> bool {
-        self.enter_due.is_some() || self.entered_at.is_some_and(|t| now < t + SETTLE_MS)
+        self.stuck || self.enter_due.is_some() || self.entered_at.is_some_and(|t| now < t + SETTLE_MS)
+    }
+
+    /// The Enter of the typed text was not written (`Step::Stale`, or the
+    /// screen changed under it): nothing more is typed on top of it.
+    pub fn stuck(&mut self) {
+        self.stuck = true;
+    }
+
+    pub fn is_stuck(&self) -> bool {
+        self.stuck
+    }
+
+    /// The text left the terminal's prompt (sent or cleared there).
+    pub fn unstick(&mut self) {
+        self.stuck = false;
     }
 
     /// The user pressed Enter in the box with `text` (already sanitized). It
@@ -225,7 +243,11 @@ impl Outbox {
             }
             self.enter_due = None;
             self.entered_at = Some(now);
-            return if now - due > ENTER_STALE_MS { Step::Stale } else { Step::Enter };
+            if now - due > ENTER_STALE_MS {
+                self.stuck = true;
+                return Step::Stale;
+            }
+            return Step::Enter;
         }
         if self.queue.is_empty() || self.busy(now) || verdict != Verdict::Send {
             return Step::Nothing;
@@ -323,6 +345,24 @@ mod tests {
         out.submit("hi".into(), Verdict::Send, 0);
         assert_eq!(out.poll(Verdict::Send, ENTER_DELAY_MS + ENTER_STALE_MS + 1), Step::Stale);
         assert_eq!(out.poll(Verdict::Send, 60_000), Step::Nothing);
+    }
+
+    #[test]
+    fn nothing_is_typed_on_top_of_a_text_left_in_the_prompt() {
+        let mut out = Outbox::default();
+        out.submit("one".into(), Verdict::Send, 0);
+        out.submit("two".into(), Verdict::Send, 1);
+        assert_eq!(out.poll(Verdict::Send, ENTER_DELAY_MS + ENTER_STALE_MS + 1), Step::Stale);
+        assert!(out.is_stuck());
+        assert_eq!(out.poll(Verdict::Send, 60_000), Step::Nothing, "two waits while one sits in the prompt");
+        // An Enter refused by the caller (a prompt came up) holds the queue too.
+        out.unstick();
+        assert_eq!(out.poll(Verdict::Send, 60_001), Step::Type("two".into()));
+        assert_eq!(out.poll(Verdict::Send, 60_001 + ENTER_DELAY_MS), Step::Enter);
+        out.stuck();
+        out.submit("three".into(), Verdict::Send, 70_000);
+        assert_eq!(out.poll(Verdict::Send, 90_000), Step::Nothing);
+        assert_eq!(out.queue().len(), 1);
     }
 
     #[test]

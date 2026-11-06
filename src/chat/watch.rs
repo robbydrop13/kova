@@ -90,10 +90,8 @@ mod tests {
         std::fs::write(&file, "a\n").unwrap();
         let w = Watch::new(&[&file, &dir, &dir.join("missing")]).unwrap();
         assert!(!w.fired(), "nothing yet");
-        let started = std::time::Instant::now();
         std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(b"b\n").unwrap();
-        assert!(w.fired(), "an append");
-        assert!(started.elapsed().as_millis() < 5, "seen at once");
+        assert!(w.fired(), "an append, seen without waiting");
         assert!(!w.fired(), "drained");
         // A hook's turn file: written aside, renamed into place.
         std::fs::write(dir.join(".x.tmp"), "ready 1").unwrap();

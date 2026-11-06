@@ -816,7 +816,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
       const u = users[users.length - 1];
       if (u && log.scrollHeight - u.offsetTop > scroll.clientHeight) scroll.scrollTop = u.offsetTop - 12;
       else scroll.scrollTop = scroll.scrollHeight;
-    }} else if (atBottom && (m.entries || m.cards)) {{
+    }} else if (atBottom && (m.entries || m.cards || m.queued)) {{
       scroll.scrollTop = scroll.scrollHeight;
     }}
     if (m.focus) box.focus();
