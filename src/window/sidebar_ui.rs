@@ -296,8 +296,16 @@ impl KovaView {
         let min_w = self.ivars().config.get().map(|c| c.splits.min_width).unwrap_or(300.0);
         let scale = self.backing_scale();
         let wide = (term_w + panel_w.unwrap_or(0.0)) as f32;
-        let mut pins = self.ivars().panel_pins.borrow_mut();
-        let mut tabs = self.ivars().tabs.borrow_mut();
+        // Called from layout, which can run while a caller still holds the tabs (a link
+        // opened from the chat or the Cockpit): skip the pins this time rather than panic,
+        // the next layout sets them.
+        let (Ok(mut pins), Ok(mut tabs)) =
+            (self.ivars().panel_pins.try_borrow_mut(), self.ivars().tabs.try_borrow_mut())
+        else {
+            log::warn!("side_panel_pins: tabs busy, pins left for the next layout");
+            self.mark_dirty();
+            return;
+        };
         let mut next = Vec::new();
         for tab in tabs.iter_mut() {
             let ours = pins.iter().find(|(id, _)| *id == tab.id).map(|(_, v)| *v);

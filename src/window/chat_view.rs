@@ -389,6 +389,7 @@ impl KovaView {
         let messages = slot.delegate.get().map(|d| d.ivars().take()).unwrap_or_default();
         let mut leave = false;
         let mut update = None;
+        let mut open = Vec::new();
         {
             let tabs = self.ivars().tabs.borrow();
             let Some(pane) = tabs.iter().find_map(|t| t.pane(target.pane_id)) else { return };
@@ -399,6 +400,10 @@ impl KovaView {
                 match self.chat_message(st, pane, &raw) {
                     Reply::Leave => leave = true,
                     Reply::Push => force = true,
+                    Reply::Open(target) => {
+                        open.push(target);
+                        force = true;
+                    }
                     Reply::Nothing => {}
                 }
             }
@@ -414,6 +419,10 @@ impl KovaView {
         }
         if let Some(update) = update {
             unsafe { web.evaluateJavaScript_completionHandler(&NSString::from_str(&page::update_script(&update)), None) };
+        }
+        // Outside the borrow of the tabs above (crash of 06/11: RefCell already borrowed in side_panel_pins).
+        for t in open {
+            self.open_in_side_panel(t);
         }
         if leave && target.cockpit {
             self.cockpit_close_chat();
@@ -509,7 +518,7 @@ impl KovaView {
                 } else {
                     let cwd = pane.cached_cwd().map(std::path::PathBuf::from);
                     match super::side_panel::target_on_disk(&href, cwd.as_deref()) {
-                        Some(target) => self.open_in_side_panel(target),
+                        Some(target) => return Reply::Open(target),
                         None if crate::chat::links::is_web(&href) => st.note = Some("Lien non pris en charge".to_string()),
                         None => st.note = Some("Fichier introuvable".to_string()),
                     }
@@ -681,6 +690,9 @@ enum Reply {
     Push,
     /// Back to the terminal.
     Leave,
+    /// Open a link in the side panel, once the tabs are no longer borrowed:
+    /// opening it lays the window out again, which borrows the tabs mutably.
+    Open(super::side_panel::PanelTarget),
 }
 
 /// Paste `text` into the pane, bracketed when the app asked for it.
