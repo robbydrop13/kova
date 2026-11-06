@@ -529,6 +529,9 @@ pub struct View<'a> {
     /// How many cards the list shows; `Voir plus` adds `PAGE_SIZE`.
     pub limit: usize,
     pub now: u64,
+    /// The catch-up band (`crate::catchup::band_html`), between the title
+    /// and the filter; empty when nothing moved.
+    pub band: String,
 }
 
 /// The cards the list shows first, and each `Voir plus` adds.
@@ -857,9 +860,10 @@ pub fn head_html(view: &View) -> String {
     format!(
         "<div class=\"phead\"><div><div class=\"ptitle\">Cockpit</div><div class=\"psub\">{}{tail}</div></div>\
          <button type=\"button\" class=\"btn {}\" data-chat=\"toggle\">{ICON_CHAT}<span>Chat</span></button></div>\
-         <div class=\"bar\"><div class=\"seg\">{}{}{}</div><span class=\"sortlbl\">{ICON_SORT}Par priorité</span></div>",
+         {}<div class=\"bar\"><div class=\"seg\">{}{}{}</div><span class=\"sortlbl\">{ICON_SORT}Par priorité</span></div>",
         esc(&lead),
         if view.chat.is_some() { "on" } else { "sec" },
+        view.band,
         seg(Filter::All, "all", "Tout", count(None)),
         seg(Filter::Only(Scope::Pro), "pro", scope_label(Scope::Pro), count(Some(Scope::Pro))),
         seg(Filter::Only(Scope::Perso), "perso", scope_label(Scope::Perso), count(Some(Scope::Perso))),
@@ -906,11 +910,14 @@ pub struct Update {
     /// Give the keyboard to the page.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub focus: bool,
+    /// Scroll to this card and light it, once the list is in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reveal: Option<String>,
 }
 
 impl Update {
     pub fn is_empty(&self) -> bool {
-        self.head.is_none() && self.list.is_none() && self.chat.is_none() && !self.focus
+        self.head.is_none() && self.list.is_none() && self.chat.is_none() && !self.focus && self.reveal.is_none()
     }
 }
 
@@ -1075,6 +1082,30 @@ body.chat-on .chat{display:flex}
 .chat .x{color:var(--t3);width:26px;height:26px;display:flex;align-items:center;justify-content:center;border-radius:6px}
 .chat .x:hover{background:var(--hover)}
 .cbody{flex:1;padding:20px}
+.cu{margin-top:16px;background:var(--bg1);border:1px solid var(--b3);border-radius:8px;padding:4px 0 6px}
+.cu-h{display:flex;align-items:center;gap:8px;padding:6px 10px 6px 16px;font-size:13px;font-weight:600}
+.cu-h svg{color:var(--info-dot)}
+.cu-h .k{color:var(--t3);font-weight:400;font-size:12px}
+.cu-h .r{margin-left:auto;display:flex;align-items:center;gap:4px}
+.cu .ln{display:grid;grid-template-columns:minmax(0,150px) minmax(0,1fr) auto;gap:4px 12px;align-items:baseline;padding:7px 14px 7px 16px;border-top:1px solid var(--b3);font-size:13px;line-height:18px;cursor:pointer}
+.cu .ln:hover{background:var(--hover)}.cu .ln.open,.cu .ln.open:hover{background:var(--bg2)}
+.cu .p{font-weight:600;display:flex;align-items:center;gap:8px;min-width:0}
+.cu .p span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cu .p i{width:6px;height:6px;border-radius:50%;background:var(--info-dot);display:block;flex:none}
+.cu .m{min-width:0;overflow-wrap:anywhere}
+.cu .w{color:var(--t3);font-size:12px;margin-top:2px}
+.cu .w b{color:var(--warn-dot);font-weight:500}
+.cu .ses{font-size:11px;color:var(--t3);display:flex;align-items:center;gap:4px;white-space:nowrap}
+.cu .det{grid-column:2 / 4;border-top:1px solid var(--b3);padding-top:4px;margin-top:6px;cursor:auto}
+.cu .det .lbl{margin-top:6px}
+.chg{list-style:none;margin:4px 0 0;font-size:12px;color:var(--t2)}
+.chg li{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;padding:2px 0;overflow-wrap:anywhere}
+.chg .tm{color:var(--t3);font-variant-numeric:tabular-nums}
+.chg .dim{color:var(--t3)}
+.chg .lks{display:inline-flex;flex-wrap:wrap;gap:4px 10px}
+.chg .link{font-size:12px}
+.cu-more{padding:6px 16px 2px;border-top:1px solid var(--b3)}
+.card.flash{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 35%,transparent);transition:box-shadow .3s}
 .none{font-size:13px;color:var(--t3)}
 </style></head><body>
 <section class="page"><div class="inner"><div id="head"></div><div id="list"></div></div></section>
@@ -1154,6 +1185,14 @@ window.kova = {
     if (u.list !== undefined) setList(u.list);
     if (u.chat !== undefined) { $('chat').innerHTML = u.chat; document.body.classList.toggle('chat-on', u.chat !== ''); }
     if (u.focus && !(document.activeElement && document.activeElement.tagName === 'TEXTAREA')) window.focus();
+    if (u.reveal) {
+      const c = document.querySelector('.card[data-key="' + CSS.escape(u.reveal) + '"]');
+      if (c) {
+        c.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        c.classList.add('flash');
+        setTimeout(() => c.classList.remove('flash'), 1600);
+      }
+    }
   }
 };
 // The snooze menu lives outside the list, so a push never closes it.
@@ -1191,6 +1230,15 @@ document.addEventListener('click', e => {
   }
   if (!$('snz').hidden) snzClose();
   const b = e.target.closest('button');
+  // The catch-up band: its buttons, its links, a row that opens in place.
+  if (b && b.dataset.band) return post({ type: 'band', what: b.dataset.band });
+  if (b && b.dataset.goto) return post({ type: 'reveal', key: b.dataset.goto });
+  const ln = e.target.closest('.cu .ln');
+  if (b && b.dataset.blink && ln) return post({ type: 'band', what: 'link', proj: ln.dataset.proj, link: b.dataset.blink });
+  if (ln && !b) {
+    if (e.target.closest('.det') || String(window.getSelection()).trim()) return;
+    return post({ type: 'band', what: 'row', proj: ln.dataset.proj });
+  }
   // A click on a card's body, not on a button or a field: it opens or folds.
   if (!b) {
     const card = e.target.closest('.card');
@@ -1407,7 +1455,7 @@ mod tests {
     fn the_list_shows_ten_cards_then_voir_plus() {
         let items: Vec<Item> =
             (0..23).map(|i| from_attention(&entry(&format!("a-{i}"), Level::Now, Some(if i < 4 { 1 } else { 2 }), i), None, false).unwrap()).collect();
-        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100 };
+        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new() };
         let html = list_html(&view(PAGE_SIZE));
         assert_eq!(html.matches("<article").count(), 10);
         assert!(html.contains("data-more=\"1\"><span>Voir plus (13)</span>"));
@@ -1499,7 +1547,7 @@ mod tests {
             from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap(),
             from_attention(&perso, None, false).unwrap(),
         ];
-        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100 };
+        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new() };
         assert!(list_html(&view(Filter::All)).contains("attention:a-1"));
         let only = list_html(&view(Filter::Only(Scope::Perso)));
         assert!(only.contains("attention:a-2") && !only.contains("attention:a-1"));
@@ -1516,13 +1564,13 @@ mod tests {
             from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap(),
             from_attention(&entry("a-1", Level::Point, None, 1), None, false).unwrap(),
         ];
-        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100 });
+        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new() });
         assert!(html.contains("Urgent <span class=\"k\">1</span>"));
         assert!(html.contains("Cette semaine <span class=\"k\">1</span>"));
         assert!(!html.contains("Aujourd'hui"));
         assert_eq!(subtitle(&items), ("2 actions pour toi".to_string(), "1 urgente".to_string()));
         assert_eq!(subtitle(&[]).0, "Aucune action pour toi");
-        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0 }).contains("Rien ne t'attend"));
+        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new() }).contains("Rien ne t'attend"));
     }
 
     #[test]
@@ -1650,5 +1698,20 @@ mod tests {
         let u = Update { list: Some("<p>x</p>".into()), ..Default::default() };
         assert_eq!(update_script(&u), "window.kova && window.kova.update({\"list\":\"<p>x</p>\"})");
         assert!(Update::default().is_empty());
+    }
+
+    #[test]
+    fn the_catch_up_band_sits_between_the_title_and_the_filter() {
+        let items: Vec<Item> = Vec::new();
+        let view = |band: &str| View {
+            items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
+            limit: PAGE_SIZE, now: 0, band: band.to_string(),
+        };
+        let head = head_html(&view("<div class=\"cu\">B</div>"));
+        let (title, band, bar) = (head.find("ptitle").unwrap(), head.find("class=\"cu\"").unwrap(), head.find("class=\"bar\"").unwrap());
+        assert!(title < band && band < bar);
+        assert!(!head_html(&view("")).contains("class=\"cu\""), "no band, nothing between");
+        // A reveal alone is a push.
+        assert!(!Update { reveal: Some("attention:a-1".into()), ..Default::default() }.is_empty());
     }
 }

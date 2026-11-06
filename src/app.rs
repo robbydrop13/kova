@@ -104,6 +104,7 @@ define_class!(
             window::sidebar::tokens::set_background(config.colors.background);
             crate::team::set_command(&config.sidebar.roster_command);
             crate::attention::set_commands(&config.attention.commands());
+            crate::catchup::set_commands(&config.attention.catchup_commands());
             setup_menu(mtm, config);
 
             // Restore session (all windows) or create a single fresh window
@@ -219,6 +220,12 @@ define_class!(
             let mut window_sessions = self.ivars().closed_sessions.borrow().clone();
             window_sessions.extend(collect_window_sessions(&self.ivars().windows.borrow()));
             crate::session::save(&window_sessions);
+            // A Cockpit open at quit is left: its catch-up band is read.
+            for win in self.ivars().windows.borrow().iter() {
+                if let Some(view) = kova_view(win) {
+                    view.cockpit_leave(true);
+                }
+            }
             crate::terminal::pty::shutdown_all();
             crate::ipc::cleanup();
             log::logger().flush();
@@ -474,6 +481,8 @@ impl AppDelegate {
                             // Save session data before the window is deallocated
                             // (skip if killed with Cmd+Shift+Q)
                             if let Some(view) = kova_view(&win) {
+                                // A Cockpit open in a closed window is left.
+                                view.cockpit_leave(false);
                                 if !view.skip_session_save() {
                                     view.append_session_data(&mut closed);
                                 }
@@ -1763,6 +1772,7 @@ fn handle_ipc_reload_config(
     window::sidebar::tokens::set_background(config.colors.background);
     crate::team::set_command(&config.sidebar.roster_command);
     crate::attention::set_commands(&config.attention.commands());
+    crate::catchup::set_commands(&config.attention.catchup_commands());
     let mut applied = 0usize;
     for win in windows.borrow().iter() {
         if let Some(view) = kova_view(win) {

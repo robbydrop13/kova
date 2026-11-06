@@ -62,6 +62,31 @@ from another frame, another URL or an earlier load are dropped. The tick
 gathers the items every 250 ms and pushes only the parts that changed; a draft
 being rewritten keeps its text, caret and focus through a push.
 
+## Catch-up band
+
+`Depuis ton passage de <HHhMM>` and `<n> projets ont bougé`, between the
+title and the filter (`src/catchup.rs`, pure render tested): what moved in
+each project since the user last left the page, from `[attention]
+catchup_command` (default: `command`'s program with `catchup --json`). Read
+off the tick on a thread when the page opens, then at most every 60 s. Nothing
+shows when no project moved or before the first read lands.
+
+- Up to 5 rows (project, headline, `À toi : <first waiting title>` in the warn
+  colour, the session with a terminal icon), then `Voir plus (n)`. The chevron
+  folds the band to its header.
+- A click on a row opens it in place: its changes (time, words, the `action`
+  and `src` links the side panel can show, opening there like a card's links,
+  only links the band holds) and its waiting items. A waiting item that is a
+  card of the list reads `Voir la carte`: the list makes room for it (filter
+  back to `Tout`, `Voir plus` as needed), scrolls to it and lights it; its
+  actions stay on the card.
+- Read marking (Robin, 06/11/2026): leaving the page (closing it, Escape, a
+  tile, Cmd+J, closing its window, quitting Kova) and `Tout lu` run
+  `[attention] seen_command` (default: the program with `seen`, now). Leaving
+  marks read only when a read landed during the visit. The band shows what
+  was there at open plus what the 60 s refresh brings; something that moved in
+  the last minute before leaving is marked read unseen.
+
 ## Opened cards
 
 A click on any card's body (not a button, a field or the open detail) opens

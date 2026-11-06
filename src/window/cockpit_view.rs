@@ -80,6 +80,15 @@ pub struct CockpitSlot {
     /// Entries removed, done or snoozed from here, by key, with when (ms):
     /// hidden until the queue drops them, back if the command failed.
     hidden: RefCell<HashMap<String, u64>>,
+    /// The catch-up band: folded with its chevron, every row shown after
+    /// `Voir plus`, the project rows opened in place.
+    band_folded: Cell<bool>,
+    band_all: Cell<bool>,
+    band_open: RefCell<HashSet<String>>,
+    /// A read of the band landed during this visit: leaving marks it read.
+    band_read: Cell<bool>,
+    /// The card a waiting item of the band points at, for the next push.
+    reveal: RefCell<Option<String>>,
     page: RefCell<Page>,
 }
 
@@ -123,17 +132,33 @@ impl KovaView {
             slot.focus.set(true);
             slot.limit.set(cockpit::PAGE_SIZE);
             crate::attention::refresh();
+            slot.band_all.set(false);
+            slot.band_open.borrow_mut().clear();
+            slot.band_read.set(false);
+            crate::catchup::refresh();
         }
         self.mark_dirty();
     }
 
     pub(super) fn close_cockpit(&self) {
         let slot = &self.ivars().cockpit;
-        if !slot.open.replace(false) {
+        if !slot.open.get() {
             return;
         }
+        self.cockpit_leave(false);
+        slot.open.set(false);
         slot.chat_target.set(None);
         self.hide_cockpit();
+    }
+
+    /// The user leaves the page (it closes, or its window does): the
+    /// catch-up band is marked read, if one was shown. `blocking` waits for
+    /// `attn seen` (the app is quitting).
+    pub fn cockpit_leave(&self, blocking: bool) {
+        let slot = &self.ivars().cockpit;
+        if crate::catchup::seen_on_leave(slot.open.get(), slot.band_read.replace(false)) {
+            crate::catchup::mark_seen(blocking);
+        }
     }
 
     pub(super) fn cockpit_open(&self) -> bool {
@@ -342,6 +367,7 @@ impl KovaView {
             can_snooze: crate::attention::can_snooze(),
             limit: slot.limit.get().max(cockpit::PAGE_SIZE),
             now: now / 1000,
+            band: self.cockpit_band(&items),
         };
         let parts = cockpit::parts(&view);
         page.items = items;
@@ -355,12 +381,93 @@ impl KovaView {
             list: (fresh || shown.1 != parts.1).then(|| parts.1.clone()),
             chat: (fresh || shown.2 != parts.2).then(|| parts.2.clone()),
             focus: false,
+            reveal: slot.reveal.borrow_mut().take(),
         };
         page.shown = Some(parts);
         drop(page);
         if !update.is_empty() {
             unsafe { web.evaluateJavaScript_completionHandler(&NSString::from_str(&cockpit::update_script(&update)), None) };
         }
+    }
+
+    /// The catch-up band as the page shows it: empty when nothing moved or
+    /// the read has not landed.
+    fn cockpit_band(&self, items: &[Item]) -> String {
+        let slot = &self.ivars().cockpit;
+        let Some(data) = crate::catchup::snapshot() else { return String::new() };
+        slot.band_read.set(true);
+        let opened = slot.band_open.borrow();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let exists = |p: &Path| p.is_file();
+        let opens = |l: &str| super::sidebar_attention::open_target(l, home.as_deref(), &exists).is_some();
+        let is_card = |k: &str| items.iter().any(|i| i.key == k);
+        crate::catchup::band_html(&crate::catchup::Band {
+            data: &data,
+            folded: slot.band_folded.get(),
+            opened: &opened,
+            all: slot.band_all.get(),
+            is_card: &is_card,
+            opens: &opens,
+            clock: &crate::catchup::local_clock,
+        })
+    }
+
+    /// A click in the band: `Tout lu`, the chevron, `Voir plus`, a row, a
+    /// link (only one the band shows, in the side panel like the cards').
+    fn cockpit_band_click(&self, what: &str, project: &str, link: &str) {
+        let slot = &self.ivars().cockpit;
+        match what {
+            "seen" => {
+                crate::catchup::mark_seen(false);
+                slot.band_read.set(false);
+                slot.band_open.borrow_mut().clear();
+            }
+            "fold" => slot.band_folded.set(!slot.band_folded.get()),
+            "all" => slot.band_all.set(true),
+            "row" => {
+                let mut open = slot.band_open.borrow_mut();
+                if !open.remove(project) {
+                    open.insert(project.to_string());
+                }
+            }
+            "link" => {
+                if crate::catchup::snapshot().is_some_and(|d| crate::catchup::shows_link(&d, project, link)) {
+                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    let exists = |p: &Path| p.is_file();
+                    if let Some(target) = super::sidebar_attention::open_target(link, home.as_deref(), &exists) {
+                        self.open_in_side_panel(target);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.mark_dirty();
+    }
+
+    /// A waiting item of the band that is a card: the list shows it (the
+    /// filter and `Voir plus` make room) and the page scrolls to it.
+    fn cockpit_reveal(&self, key: &str) {
+        let slot = &self.ivars().cockpit;
+        let page = slot.page.borrow();
+        let Some(item) = page.items.iter().find(|i| i.key == key) else { return };
+        if let Filter::Only(scope) = slot.filter.get()
+            && scope != item.scope
+        {
+            slot.filter.set(Filter::All);
+        }
+        let filter = slot.filter.get();
+        let at = page
+            .items
+            .iter()
+            .filter(|i| filter == Filter::All || matches!(filter, Filter::Only(s) if s == i.scope))
+            .position(|i| i.key == key)
+            .unwrap_or(0);
+        let mut limit = slot.limit.get().max(cockpit::PAGE_SIZE);
+        while limit <= at {
+            limit += cockpit::PAGE_SIZE;
+        }
+        slot.limit.set(limit);
+        *slot.reveal.borrow_mut() = Some(key.to_string());
     }
 
     /// The pane of this window that runs `name`, if any.
@@ -402,6 +509,14 @@ impl KovaView {
                     slot.filter.set(filter);
                     slot.limit.set(cockpit::PAGE_SIZE);
                 }
+                true
+            }
+            "band" => {
+                self.cockpit_band_click(&s("what"), &s("proj"), &s("link"));
+                true
+            }
+            "reveal" => {
+                self.cockpit_reveal(&s("key"));
                 true
             }
             "more" => {

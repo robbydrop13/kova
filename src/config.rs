@@ -263,6 +263,12 @@ pub struct AttentionConfig {
     /// Writes the detail of an entry that says nothing (`attn explain`):
     /// Kova appends the id. Absent: `close_command`'s program with `explain`.
     pub explain_command: Vec<String>,
+    /// Prints the Cockpit's catch-up band as JSON (`attn catchup --json`,
+    /// `crate::catchup`). Absent: `command`'s program with `catchup --json`.
+    pub catchup_command: Vec<String>,
+    /// Marks the band read, now (`attn seen`). Absent: `command`'s program
+    /// with `seen`.
+    pub seen_command: Vec<String>,
     /// The folder whose work is personal (`"~/Perso"`): a failed routine,
     /// a permission or an error whose cwd sits under it is scoped Perso in
     /// the Cockpit, anything else Pro. Empty: everything is Pro.
@@ -278,6 +284,18 @@ impl AttentionConfig {
             snooze: self.snooze_command.clone(),
             explain: self.explain_command.clone(),
         }
+    }
+
+    /// The catch-up band's commands: as given, or the list command's
+    /// program with fixed words, so a working `command` is enough.
+    pub fn catchup_commands(&self) -> crate::catchup::Commands {
+        let or_list = |given: &[String], words: &[&str]| -> Vec<String> {
+            if !given.is_empty() {
+                return given.to_vec();
+            }
+            self.command.first().map(|bin| std::iter::once(bin.clone()).chain(words.iter().map(|w| w.to_string())).collect()).unwrap_or_default()
+        };
+        crate::catchup::Commands { read: or_list(&self.catchup_command, &["catchup", "--json"]), seen: or_list(&self.seen_command, &["seen"]) }
     }
 
     /// `perso_dir` with a leading `~/` expanded, `None` when unset.
@@ -765,6 +783,12 @@ mod tests {
         let none = Config::default();
         assert!(none.attention.command.is_empty() && none.attention.act_command.is_empty());
         assert_eq!(none.attention.perso_root(), None);
+        let catchup = config.attention.catchup_commands();
+        assert_eq!(catchup.read, ["/usr/local/bin/attn", "catchup", "--json"]);
+        assert_eq!(catchup.seen, ["/usr/local/bin/attn", "seen"]);
+        assert_eq!(none.attention.catchup_commands(), crate::catchup::Commands::default());
+        let given: Config = toml::from_str("[attention]\ncommand = [\"/a\"]\ncatchup_command = [\"/b\", \"x\"]\n").unwrap();
+        assert_eq!(given.attention.catchup_commands().read, ["/b", "x"]);
         let perso: Config = toml::from_str("[attention]\nperso_dir = \"~/Perso\"\n").unwrap();
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         assert_eq!(perso.attention.perso_root(), Some(home.join("Perso")));

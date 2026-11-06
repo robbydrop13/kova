@@ -46,6 +46,7 @@ mod terminal;
 mod update_check;
 mod team;
 mod attention;
+mod catchup;
 mod cockpit;
 mod window;
 
