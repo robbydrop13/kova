@@ -247,6 +247,46 @@ fn is_option_line(line: &str) -> bool {
     digits > 0 && s[digits..].starts_with('.')
 }
 
+/// Leading spaces of a screen line, in columns.
+fn indent(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ' || *c == '\u{a0}').count()
+}
+
+/// The column an option's label starts at (`❯ 1. Yes`: the `Y`).
+fn label_col(line: &str) -> usize {
+    let mut col = indent(line);
+    let mut rest = line.trim_start();
+    if let Some(r) = rest.strip_prefix('\u{276f}').or_else(|| rest.strip_prefix('>')) {
+        col += 1 + indent(r);
+        rest = r.trim_start();
+    }
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let after = &rest[digits..];
+    col + digits + 1 + indent(after.strip_prefix('.').unwrap_or(after))
+}
+
+/// How many lines right above `end` continue the option above them: indented
+/// at least to its label, not an option nor a rule, three at most. 0 when the
+/// line above them is not an option.
+fn continuation_run(lines: &[&str], end: usize) -> usize {
+    let mut n = 0;
+    while n < 3 && end > n {
+        let l = lines[end - n - 1];
+        if l.trim().is_empty() || is_option_line(l) || is_rule(l) {
+            break;
+        }
+        n += 1;
+    }
+    while n > 0 {
+        let above = end - n;
+        if above > 0 && is_option_line(lines[above - 1]) && lines[above..end].iter().all(|l| indent(l) >= label_col(lines[above - 1])) {
+            return n;
+        }
+        n -= 1;
+    }
+    0
+}
+
 /// The full-width frame rule: a run of at least ten `─`.
 fn is_frame(line: &str) -> bool {
     let t = line.trim();
@@ -313,12 +353,25 @@ pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
     }
     let mut collected = Vec::new();
     let mut well_formed = true;
-    while i > 0 && is_option_line(lines[i - 1]) {
-        match parse_option(lines[i - 1]) {
-            Some(opt) => collected.push(opt),
+    loop {
+        // An option's label wrapped onto lines of its own (a narrow pane):
+        // part of the label above them.
+        let wrapped = continuation_run(&lines, i);
+        let at = i - wrapped;
+        if at == 0 || !is_option_line(lines[at - 1]) {
+            break;
+        }
+        match parse_option(lines[at - 1]) {
+            Some((n, mut label, marked)) => {
+                for l in &lines[at..i] {
+                    label.push(' ');
+                    label.push_str(l.trim());
+                }
+                collected.push((n, label, marked));
+            }
             None => well_formed = false,
         }
-        i -= 1;
+        i = at - 1;
     }
     collected.reverse();
     let numbered = well_formed
@@ -372,6 +425,166 @@ pub fn parse_permission_prompt(visible: &str) -> Option<ParsedPrompt> {
         detail: body_lines.get(1).cloned(),
         lines: body_lines,
         options,
+    })
+}
+
+// ---------------------------------------------------------------
+// Any numbered menu: permission, AskUserQuestion, plan approval
+// ---------------------------------------------------------------
+
+/// The labels Claude Code gives the option that takes typed text: the digit
+/// focuses its field, the text goes in it, Enter sends (captured on 2.1.319,
+/// `tests/fixtures/prompt/ask-user-question.txt` and `plan-approval.txt`).
+pub const FREE_TEXT_LABELS: [&str; 2] = ["Type something.", "Tell Claude what to change"];
+
+/// One option of a menu, as drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuOption {
+    pub number: u32,
+    pub label: String,
+    /// The lines under it: an AskUserQuestion option's description, the end
+    /// of a label wrapped in a narrow pane, a hint.
+    pub detail: Option<String>,
+    /// Its digit opens a text field rather than answering (`FREE_TEXT_LABELS`).
+    pub free_text: bool,
+}
+
+/// A numbered menu Claude Code waits on: a permission prompt, an
+/// AskUserQuestion, the plan approval. The grammar shared by the three
+/// (fixtures under `tests/fixtures/prompt/`):
+///
+/// ```text
+/// ─────────────────────────────            frame rule
+///  ☐ Color                                 body: header, detail lines
+/// Which color do you prefer?               question, less indented than
+/// ❯ 1. Red                                 the labels; numbered options,
+///      Red                                 each with its lines under it,
+///   4. Type something.                     rules and blank lines between
+/// ─────────────────────────────
+///   5. Chat about this
+///
+/// Enter to select · ↑/↓ to navigate · Esc to cancel   footer, last line
+/// ```
+///
+/// The footer is the last non-empty line and says `Esc to cancel`, `Enter
+/// to select` or starts with `ctrl+g to edit` (the plan approval). A digit
+/// answers an option; the free-text one takes the digit, the text, then
+/// Enter, each in its own write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Menu {
+    /// The frame's lines above the question, rules and tips left out.
+    pub body: Vec<String>,
+    pub question: String,
+    pub options: Vec<MenuOption>,
+}
+
+impl Menu {
+    /// The same screen gives the same number (FNV-1a over the body, the
+    /// question and the options): a click answers only the menu it saw.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h = Fingerprint::new();
+        for line in &self.body {
+            h.text(line);
+        }
+        h.text(&self.question);
+        for o in &self.options {
+            h.number(o.number);
+            h.text(&o.label);
+            h.text(o.detail.as_deref().unwrap_or_default());
+        }
+        h.0
+    }
+
+    pub fn free_text(&self) -> Option<&MenuOption> {
+        self.options.iter().find(|o| o.free_text)
+    }
+
+    /// The option a button names, by its label.
+    pub fn option(&self, label: &str) -> Option<&MenuOption> {
+        self.options.iter().find(|o| o.label == label)
+    }
+}
+
+fn is_menu_footer(line: &str) -> bool {
+    let t = line.trim();
+    t.contains("Esc to cancel") || t.contains("Enter to select") || t.starts_with("ctrl+g to edit")
+}
+
+/// The menu on screen, `None` when the last line is not a menu's footer or
+/// the options do not number 1, 2, 3... (a menu scrolled partway, a trust
+/// dialog without numbers): nothing is guessed.
+pub fn parse_menu(visible: &str) -> Option<Menu> {
+    let lines: Vec<&str> = visible.split('\n').map(str::trim_end).collect();
+    let footer_at = lines.iter().rposition(|l| !l.trim().is_empty())?;
+    if !is_menu_footer(lines[footer_at]) {
+        return None;
+    }
+    // Upward from the footer: options, the lines under them, rules and
+    // blank lines, until a line less indented than every label so far.
+    let mut options: Vec<(u32, String, bool, Vec<String>)> = Vec::new();
+    let mut under: Vec<String> = Vec::new();
+    let mut min_col = usize::MAX;
+    let mut i = footer_at;
+    while i > 0 {
+        let l = lines[i - 1];
+        if l.trim().is_empty() || is_rule(l) {
+            i -= 1;
+            continue;
+        }
+        if is_option_line(l) {
+            let (n, label, marked) = parse_option(l)?;
+            under.reverse();
+            options.push((n, label, marked, std::mem::take(&mut under)));
+            min_col = min_col.min(label_col(l));
+            i -= 1;
+            continue;
+        }
+        if options.is_empty() || indent(l) >= min_col {
+            if under.len() >= 6 {
+                return None;
+            }
+            under.push(l.trim().to_string());
+            i -= 1;
+            continue;
+        }
+        break;
+    }
+    if i == 0 || !under.is_empty() || options.len() < 2 || options.len() > MAX_OPTIONS {
+        return None;
+    }
+    options.reverse();
+    if options.iter().enumerate().any(|(k, (n, ..))| *n != k as u32 + 1) || options.iter().filter(|o| o.2).count() > 1 {
+        return None;
+    }
+    // The question: its line and the ones above it at the same indent (a
+    // wrapped question), three at most.
+    let q_end = i;
+    let q_indent = indent(lines[q_end - 1]);
+    let mut q_start = q_end - 1;
+    while q_start > 0 && q_end - q_start < 3 {
+        let l = lines[q_start - 1];
+        if l.trim().is_empty() || is_rule(l) || indent(l) != q_indent {
+            break;
+        }
+        q_start -= 1;
+    }
+    let question = normalize(&lines[q_start..q_end].join(" "));
+    // The body: what the frame shows above the question.
+    let top = lines[..q_start].iter().rposition(|l| is_frame(l)).map_or(q_start, |t| t + 1);
+    let body: Vec<String> =
+        lines[top..q_start].iter().filter(|l| !l.trim().is_empty() && !is_rule(l) && !is_tip(l)).map(|l| normalize(l)).take(20).collect();
+    Some(Menu {
+        body,
+        question,
+        options: options
+            .into_iter()
+            .map(|(number, label, _, under)| MenuOption {
+                number,
+                free_text: FREE_TEXT_LABELS.contains(&label.as_str()),
+                detail: (!under.is_empty()).then(|| under.join("\n")),
+                label,
+            })
+            .collect(),
     })
 }
 
@@ -522,6 +735,67 @@ mod tests {
     const ERROR_RETRY: &str = include_str!("../tests/fixtures/transcripts/api_error_then_retry.jsonl");
     const ERROR_ANSWER: &str = include_str!("../tests/fixtures/transcripts/api_error_then_answer.jsonl");
     const NO_ERROR: &str = include_str!("../tests/fixtures/transcripts/no_error.jsonl");
+
+    const WRITE_WRAPPED: &str = include_str!("../tests/fixtures/prompt/prompt-write-wrapped.txt");
+    const ASK: &str = include_str!("../tests/fixtures/prompt/ask-user-question.txt");
+    const PLAN: &str = include_str!("../tests/fixtures/prompt/plan-approval.txt");
+
+    #[test]
+    fn a_permission_prompt_with_a_wrapped_option_still_parses() {
+        // A narrow pane: option 2's label runs on a line of its own.
+        let p = parse_permission_prompt(WRITE_WRAPPED).expect("wrapped prompt");
+        assert_eq!(p.question, "Do you want to create note.txt?");
+        assert_eq!(p.options.len(), 3);
+        assert!(p.options[1].1.ends_with("file commands) for this session (shift+tab)"), "{:?}", p.options);
+        assert_eq!(p.choices().reject, Some(3));
+        let m = parse_menu(WRITE_WRAPPED).expect("menu");
+        assert_eq!(m.body, ["Create file", "note.txt", "1 hi"]);
+        assert_eq!(m.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>()[2], "No");
+        assert!(m.free_text().is_none());
+    }
+
+    #[test]
+    fn an_ask_user_question_menu_has_its_options_their_descriptions_and_the_free_text_one() {
+        let m = parse_menu(ASK).expect("ask menu");
+        assert_eq!(m.question, "Which color do you prefer?");
+        assert_eq!(m.body, ["\u{2610} Color"]);
+        let got: Vec<(u32, &str, Option<&str>, bool)> =
+            m.options.iter().map(|o| (o.number, o.label.as_str(), o.detail.as_deref(), o.free_text)).collect();
+        assert_eq!(
+            got,
+            [
+                (1, "Red", Some("Red"), false),
+                (2, "Green", Some("Green"), false),
+                (3, "Blue", Some("Blue"), false),
+                (4, "Type something.", None, true),
+                (5, "Chat about this", None, false),
+            ]
+        );
+        assert_eq!(parse_permission_prompt(ASK), None, "not a permission prompt");
+    }
+
+    #[test]
+    fn the_plan_approval_is_a_menu_whose_third_option_takes_text() {
+        let m = parse_menu(PLAN).expect("plan menu");
+        assert_eq!(m.question, "Claude has written up a plan and is ready to execute. Would you like to proceed?");
+        assert_eq!(m.options.len(), 3);
+        assert_eq!(m.options[0].label, "Yes, and use auto mode");
+        assert!(m.options[2].free_text);
+        assert_eq!(m.options[2].detail.as_deref(), Some("shift+tab to approve with this feedback"));
+        assert!(m.body.is_empty(), "the plan itself sits above the frame: the transcript has it");
+    }
+
+    #[test]
+    fn no_menu_on_an_idle_screen_a_trust_dialog_or_a_scrolled_prompt() {
+        assert_eq!(parse_menu(IDLE), None);
+        assert_eq!(parse_menu(TRUST), None);
+        assert_eq!(parse_menu(SCROLLED), None);
+        assert_eq!(parse_menu(""), None);
+        let m = parse_menu(BASH).expect("a permission prompt is a menu too");
+        assert_eq!(m.options.len(), 4);
+        assert_ne!(m.fingerprint(), parse_menu(WRITE_WRAPPED).unwrap().fingerprint());
+        assert_eq!(m.fingerprint(), parse_menu(BASH).unwrap().fingerprint());
+    }
 
     #[test]
     fn a_bash_prompt_parses_to_its_header_question_and_command() {

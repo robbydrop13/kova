@@ -1,0 +1,32 @@
+▎ Your Ultra plan includes $200 a month in API credits to power your apps and agents. Claim
+▎ them at https://clau.de/api-credits
+
+❯ Use the Write tool to create a file note.txt containing hi. Do nothing else.
+
+⏺ Write(note.txt)
+  ⎿  Wrote 1 line to note.txt
+      1 hi
+
+⏺ I created /private/tmp/kova-fixture/note.txt with the text "hi".
+
+✻ Brewed for 3s · done 15:40
+
+❯ Use the AskUserQuestion tool to ask me which color I prefer, with exactly 3 options:
+  Red, Green, Blue. Nothing else.
+───────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which color do you prefer?
+
+❯ 1. Red
+     Red
+  2. Green
+     Green
+  3. Blue
+     Blue
+  4. Type something.
+───────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
