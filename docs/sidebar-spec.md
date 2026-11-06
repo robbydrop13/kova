@@ -215,7 +215,7 @@ edges like the header:
 
 The awaiting pane is no longer a tall card: same 26 pt row, amber dot and
 the `waiting 4m · Answer` column. Its question is not drawn in the row (the
-`Needs you` block takes it), and neither is the turn-end summary.
+Cockpit lists it), and neither is the turn-end summary.
 
 
 Under the mouse the meta column gives way to the hover actions, right to
@@ -595,8 +595,8 @@ the Asks list is exactly as described above.
 - `À toi maintenant (N)` heads the list: the queue's `now` rows, oldest
   first, then the question cards. N counts both, so it is the number of rows
   under the header. The same `now` entries are need items
-  (`NeedKind::Attention`): they count in the Asks badge and the `Needs you`
-  block, but not in the Next pill nor the Agents `Need you` tile, which count
+  (`NeedKind::Attention`): they count in the Asks badge and the Cockpit
+  entry, but not in the Next pill nor the Agents `Need you` tile, which count
   the panes they lead to (an entry has none). A row sent or closed from here
   stops counting at once.
 - `Au prochain point (N)` sits under the cards and the snoozed section,
@@ -711,43 +711,25 @@ after `OPEN_TIMEOUT_MS` (20 s) if the roster still shows the entry closed.
 `tests/fixtures/team/list.json` holds the made-up roster the parsing and
 matching tests use; no real name is tracked.
 
-### 3.7.5 `Needs you` block (`SidebarList::Panes`)
+### 3.7.5 Cockpit entry (`SidebarList::Panes`)
 
-The first thing in the Panes list, above the groups, scrolls with them, and
-is left out entirely while `model.needs` is empty. A card on the tile ground
-(radius 8, 1 pt `border.subtle`), 4 pt of padding, 6 under the last row and
-10 before the first group. Its header (20 pt, `Style::Sort`) says `Needs you`
-on the left and the counts at the right, right-aligned and cut at the card's
-edge: `2 need you · 1 error · 1 failed`, the waiting count in `warn.text`,
-errors and failed runs in `crit.text`, the ` · ` in tertiary.
+Replaced the `Needs you` block on 05/11/2026 (Robin's decision). The first
+thing in the Panes list, above the groups, scrolls with them: one 40 pt card
+(radius 8, tile ground, 1 pt `border.subtle`), 10 pt before the first group.
+The `inbox` icon at 12 pt, `Cockpit` (`Style::Title`), then at the right the
+count of what waits on the user (`needs::waits_on_you`, the same count as
+before) in a pill, and an 8 pt `error` dot left of it when at least one action
+is urgent (priority 1, `cockpit::any_urgent`). While the page is open the
+entry is selected (`sel.bg` ground, `sel.text` ink, the rail). A click
+(`ListHit::Cockpit`) opens or closes the page (`docs/cockpit.md`). Cmd+J and
+the Next pill are unchanged: they read the tick's need items, never the
+sidebar's rows (frozen by
+`cmd_j_walks_every_need_kind_in_the_same_order_whatever_the_sidebar_shows`).
 
-One 28 pt row per need (`model.needs`, in `needs::need_items` order): a 16 pt
-glyph box at 6 pt from the row's edge (8 pt `awaiting` dot for an ask or a
-permission, `error` dot otherwise, the `x-circle` icon for a failed routine),
-then the title (`Style::Title`, primary, tail-truncated): the asker's name
-for an ask or a permission, the pane's title for an error, the routine's
-name for a failed run; the detail (`Style::Secondary`, tertiary: the
-question, the command a permission wants, the provider's error,
-`Routine failed`) and the age at the right (`Style::Number`,
-`warn.text` for asks and permissions, `crit.text` otherwise). The title keeps
-at most half of the room so the detail always reads; below 280 pt of list
-width the detail column is dropped and the title takes it
-(`NEED_DETAIL_MIN_W`). Rows light to `bg.hover` under the mouse.
-
-Folding (`sidebar_model::need_rows_shown`): every error and failed routine
-always shows, then the asks and permissions fill up to four rows, two of them
-at least. When anything would be folded away a 22 pt ghost button closes the
-card: `Show all N` while folded, `Show less` once every row shows
-(`SidebarState::needs_all`, in the model as `needs_all`).
-
-Clicks: an error row focuses its pane (in any window), a failed routine opens
-the Scheduled list on that routine (`open_routine`), an ask opens the Asks
-list on its card and a permission opens it on its pane's card (2 s, the card
-border in `sel.rail`; `AsksState::highlight` for an ask id,
-`AsksState::highlight_pane` for a permission). A pane holding an open ask or
-a permission prompt drops its meta column and says `waiting 4m · Answer` on
-the subtitle instead: the age in `warn.text`, `Answer` an accent link whose
-hit target (`ListHit::NeedAnswer`) lands where that pane's ask row would.
+A pane holding an open ask or a permission prompt drops its meta column and
+says `waiting 4m · Answer` on the subtitle instead: the age in `warn.text`,
+`Answer` an accent link (`ListHit::NeedAnswer`) that opens the Asks list on
+that pane's card, as the block's row did.
 
 ### 3.8 List extras
 
@@ -784,9 +766,8 @@ hit target (`ListHit::NeedAnswer`) lands where that pane's ask row would.
 | Routine hover/body buttons | `Run now` / `Pause` / `Resume`: `routines::run_action` (background, queued result); `Open log` / `Edit prompt`: argv `open`, path-guarded; `Delete`: the inline confirmation | | |
 | Inline confirmation        | filled `Delete`: `routinectl delete`; `Cancel`: close it |          |              |
 | Escape over the list       | close the inline confirmation, like a lifted tile       |                    |              |
-| `Needs you` row            | error: focus its pane (any window); failed routine: Scheduled, row open (`open_routine`); ask or permission: Asks, `highlight_ask` set | | |
-| `Show all` / `Show less`   | toggle `needs_all`                                     |                    |              |
-| Tile `Answer`              | same as that pane's ask row                            |                    | tile menu    |
+| Cockpit entry              | open or close the Cockpit page                         |                    |              |
+| Tile `Answer`              | Asks list on that pane's card                          |                    | tile menu    |
 | Top area                   | window drag                                            | zoom               |              |
 | Separator +-4 pt           | drag resizes the sidebar                               |                    |              |
 
