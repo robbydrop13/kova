@@ -162,7 +162,10 @@ Each pane carries `id`, `window`, `tab`, `cwd`, `title`, `focused`, `pid`, `chil
   Code derived from the directory even before any `/rename`, which `claude_session_name` does not.
   `null` for Codex, Pi, omp, and for a pane without Claude.
 - `dormant_session_id`: **after a Kova relaunch, a restored agent resumes only once its pane is
-  on screen in the active tab** (or on `wake-pane`). Until then the pane is a bare shell with this
+  on screen in the active tab** (or on `wake-pane`), or when the launch waker reaches it: by
+  default Kova wakes every sleeping pane by itself after a launch, one every 3 s, chiefs first,
+  without switching tab (`[session] wake_on_launch`, `wake_stagger_s`), so the field clears within
+  a few minutes of a relaunch. Until then the pane is a bare shell with this
   field set, and `agent`, the session ids and `peer_name` are `null`: the session is not in
   `ListAgents`, so `SendMessage` cannot reach it. To talk to it, `wake-pane` first, then wait for
   its `peer_name` in `list-panes`. Never `send-keys` into a sleeping pane: it cancels the resume
