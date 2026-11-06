@@ -113,7 +113,87 @@ pub struct Item {
     /// `kova-sheet:<id>` or `kova-ask:<id>`): its button opens that sheet,
     /// and the ask's own card is left out so it shows once.
     pub ask: Option<String>,
+    /// Opened with `Ouvrir`: what the card shows under itself. Filled by the
+    /// host only for the cards it keeps open.
+    pub detail: Option<Detail>,
     pub state: State,
+}
+
+/// What an opened card shows inside it, instead of a jump to another view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Detail {
+    /// A failed routine: the Scheduled row's body, its prompt and its
+    /// actions (`RoutineAct`, the same paths as the sidebar).
+    Routine {
+        /// Label and value, in the Scheduled body's order.
+        rows: Vec<(String, String)>,
+        /// The last run failed: its value reads in the danger colour.
+        failed: bool,
+        prompt: String,
+        acts: Vec<RoutineAct>,
+        /// What the row is doing (`Running now…`) or why an action failed.
+        note: Option<String>,
+    },
+    /// A permission prompt, as the pane shows it.
+    Permission { text: String },
+    /// A turn's error: its words and the last lines of the pane.
+    Error { words: String, lines: String },
+    /// A question: its full text, a button per answer, a field when it takes
+    /// free text (the answer with `needs_text` posts it).
+    Ask { message: String, answers: Vec<(String, bool)>, input: bool },
+}
+
+/// A failed routine's actions inside its card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutineAct {
+    Run,
+    Resume,
+    Log,
+    Pause,
+    Edit,
+}
+
+impl RoutineAct {
+    pub fn word(self) -> &'static str {
+        match self {
+            RoutineAct::Run => "run",
+            RoutineAct::Resume => "resume",
+            RoutineAct::Log => "log",
+            RoutineAct::Pause => "pause",
+            RoutineAct::Edit => "edit",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<RoutineAct> {
+        [RoutineAct::Run, RoutineAct::Resume, RoutineAct::Log, RoutineAct::Pause, RoutineAct::Edit]
+            .into_iter()
+            .find(|a| a.word() == word)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RoutineAct::Run => "Lancer maintenant",
+            RoutineAct::Resume => "Reprendre",
+            RoutineAct::Log => "Voir le log",
+            RoutineAct::Pause => "Mettre en pause",
+            RoutineAct::Edit => "Modifier le prompt",
+        }
+    }
+}
+
+/// Perso when `cwd` is `perso_root` or under it, else Claap (pro). The root
+/// is the config's `[attention] perso_dir`; without one, everything is pro.
+pub fn scope_of_cwd(cwd: &str, perso_root: Option<&std::path::Path>) -> Scope {
+    match perso_root {
+        Some(root) if !root.as_os_str().is_empty() && std::path::Path::new(cwd.trim()).starts_with(root) => Scope::Perso,
+        _ => Scope::Pro,
+    }
+}
+
+/// The last `n` lines of a pane's text that are not blank, trimmed at the end.
+pub fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 /// The default priority of an attention entry by level; `None` for a memo,
@@ -149,6 +229,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         draft: entry.draft.clone(),
         openable,
         ask: None,
+        detail: None,
         state,
     })
 }
@@ -224,6 +305,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         draft: None,
         openable: false,
         ask: None,
+        detail: None,
         state: State::Idle,
     })
 }
@@ -242,6 +324,8 @@ pub fn any_urgent(items: &[Item]) -> bool {
 /// A card's button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
+    /// Open or fold the card's detail in place (`Ouvrir` / `Masquer`).
+    Expand,
     Open,
     OpenSheet,
     Done,
@@ -255,6 +339,7 @@ impl Button {
     /// The word the page posts.
     pub fn act(self) -> &'static str {
         match self {
+            Button::Expand => "expand",
             Button::Open | Button::OpenSheet => "open",
             Button::Done => "done",
             Button::Deny => "deny",
@@ -266,6 +351,7 @@ impl Button {
 
     pub fn parse(word: &str) -> Option<Button> {
         match word {
+            "expand" => Some(Button::Expand),
             "open" => Some(Button::Open),
             "done" => Some(Button::Done),
             "deny" => Some(Button::Deny),
@@ -278,7 +364,7 @@ impl Button {
 
     fn label(self) -> &'static str {
         match self {
-            Button::Open => "Ouvrir",
+            Button::Expand | Button::Open => "Ouvrir",
             Button::OpenSheet => "Ouvrir la fiche",
             Button::Done => "C'est fait",
             Button::Deny => "Refuser",
@@ -317,8 +403,9 @@ pub fn buttons(item: &Item, can_act: bool, can_close: bool) -> Vec<Button> {
             out
         }
         Kind::Sheet => vec![Button::OpenSheet],
-        Kind::Permission => vec![Button::Deny, Button::Allow],
-        Kind::Ask | Kind::Error | Kind::FailedRoutine => vec![Button::Open],
+        // The live kinds open in place: nothing jumps to another view.
+        Kind::Permission => vec![Button::Expand, Button::Deny, Button::Allow],
+        Kind::Ask | Kind::Error | Kind::FailedRoutine => vec![Button::Expand],
     }
 }
 
@@ -400,15 +487,19 @@ const ICON_SORT: &str = r#"<svg class="i" width="11" height="11" viewBox="0 0 24
 const ICON_X: &str = r#"<svg class="i" width="16" height="16" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>"#;
 
 fn button_html(button: Button, disabled: bool) -> String {
+    button_html_as(button, disabled, button.primary(), button.label())
+}
+
+fn button_html_as(button: Button, disabled: bool, primary: bool, label: &str) -> String {
     let icon = if button == Button::Validate { ICON_CHECK } else { "" };
     let tip = if button == Button::Done { " title=\"Retire de ta file\"" } else { "" };
     format!(
         "<button type=\"button\" class=\"btn {}\" data-act=\"{}\"{tip}{}>{}<span>{}</span></button>",
-        if button.primary() { "acc" } else { "sec" },
+        if primary { "acc" } else { "sec" },
         button.act(),
         if disabled { " disabled" } else { "" },
         icon,
-        button.label(),
+        label,
     )
 }
 
@@ -437,7 +528,18 @@ fn state_html(state: &State) -> String {
 /// One card.
 pub fn card_html(item: &Item, can_act: bool, can_close: bool, now: u64) -> String {
     let running = item.state == State::Running;
-    let acts: String = buttons(item, can_act, can_close).into_iter().map(|b| button_html(b, running)).collect();
+    let list = buttons(item, can_act, can_close);
+    let last = list.len().saturating_sub(1);
+    let acts: String = list
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| match b {
+            // `Ouvrir` is the card's main button when it stands alone, and
+            // reads `Masquer` while the detail shows.
+            Button::Expand => button_html_as(b, false, i == last, if item.detail.is_some() { "Masquer" } else { "Ouvrir" }),
+            _ => button_html(b, running),
+        })
+        .collect();
     let acts = format!("<div class=\"acts\">{acts}</div>");
     let needs = if item.needs.trim().is_empty() {
         String::new()
@@ -470,8 +572,9 @@ pub fn card_html(item: &Item, can_act: bool, can_close: bool, now: u64) -> Strin
             )
         }
         _ => format!(
-            "<div class=\"row\"><div class=\"txt\">{head}{src}</div>{acts}</div>{state}",
+            "<div class=\"row\"><div class=\"txt\">{head}{src}</div>{acts}</div>{detail}{state}",
             src = source_html(item, now),
+            detail = item.detail.as_ref().map(|d| detail_html(d, running)).unwrap_or_default(),
             state = state_html(&item.state),
         ),
     };
@@ -480,6 +583,61 @@ pub fn card_html(item: &Item, can_act: bool, can_close: bool, now: u64) -> Strin
         if item.prio == 1 { " urgent" } else { "" },
         esc(&item.key),
     )
+}
+
+/// What an opened card shows under its head.
+pub fn detail_html(detail: &Detail, running: bool) -> String {
+    let dis = if running { " disabled" } else { "" };
+    let inner = match detail {
+        Detail::Routine { rows, failed, prompt, acts, note } => {
+            let kv: String = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (k, v))| {
+                    // The third row is the last run: the one with a verdict.
+                    let crit = if *failed && i == 2 { " class=\"crit\"" } else { "" };
+                    format!("<dt>{}</dt><dd{crit}>{}</dd>", esc(k), esc(v))
+                })
+                .collect();
+            let prompt = if prompt.trim().is_empty() {
+                String::new()
+            } else {
+                format!("<details class=\"fold\"><summary>Voir le prompt</summary><pre class=\"scroll\">{}</pre></details>", esc(prompt))
+            };
+            let buttons: String = acts
+                .iter()
+                .map(|a| format!("<button type=\"button\" class=\"btn sec\" data-act=\"routine\" data-arg=\"{}\"{dis}><span>{}</span></button>", a.word(), a.label()))
+                .collect();
+            let note = note.as_deref().map(|n| format!("<div class=\"state\">{}</div>", esc(n))).unwrap_or_default();
+            format!("<dl class=\"kv\">{kv}</dl>{prompt}<div class=\"dacts\">{buttons}</div>{note}")
+        }
+        Detail::Permission { text } => format!("<pre class=\"scroll\">{}</pre>", esc(text)),
+        Detail::Error { words, lines } => {
+            let words = if words.trim().is_empty() { String::new() } else { format!("<p class=\"words\">{}</p>", esc(words)) };
+            let lines = if lines.trim().is_empty() { String::new() } else { format!("<pre class=\"scroll\">{}</pre>", esc(lines)) };
+            format!("{words}{lines}<div class=\"dacts\"><button type=\"button\" class=\"link\" data-act=\"pane\">Voir le pane</button></div>")
+        }
+        Detail::Ask { message, answers, input } => {
+            let field = if *input || answers.iter().any(|(_, t)| *t) {
+                "<textarea class=\"ans\" rows=\"2\" placeholder=\"Ta réponse\"></textarea>"
+            } else {
+                ""
+            };
+            let buttons: String = answers
+                .iter()
+                .map(|(label, text)| {
+                    format!(
+                        "<button type=\"button\" class=\"btn sec\" data-act=\"answer\" data-arg=\"{}\"{}{dis}><span>{}</span></button>",
+                        esc(label),
+                        if *text { " data-text=\"1\"" } else { "" },
+                        esc(label)
+                    )
+                })
+                .collect();
+            format!("<p class=\"msg\">{}</p>{field}<div class=\"dacts\">{buttons}</div>", esc(message))
+        }
+    };
+    format!("<div class=\"detail\">{inner}</div>")
 }
 
 const SECTIONS: [(u8, &str, &str); 3] = [(1, "Urgent", "crit"), (2, "Aujourd'hui", "warn"), (3, "Cette semaine", "gray")];
@@ -697,6 +855,17 @@ textarea.bd{display:block;width:100%;resize:none;border:0;outline:0;background:t
 .draft-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px}
 .draft-foot .src{margin:0}
 .state{font-size:12px;color:var(--t3);margin-top:6px}
+.detail{margin-top:10px;border-top:1px solid var(--b3);padding-top:10px;font-size:13px;line-height:19px}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}
+.kv dt{color:var(--t3)}.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}.kv dd.crit{color:var(--crit)}
+pre.scroll{margin-top:8px;max-height:240px;overflow:auto;background:var(--bg-input);border:1px solid var(--b3);border-radius:6px;padding:8px 12px;font:12px/17px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.fold{margin-top:8px}.fold summary{cursor:pointer;color:var(--t2);font-size:12px}
+.dacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.link{color:var(--accent);font-size:13px;font-weight:500;padding:0}
+.link:hover{text-decoration:underline}
+.words{color:var(--crit)}.msg{white-space:pre-wrap;overflow-wrap:anywhere}
+textarea.ans{display:block;width:100%;margin-top:8px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:6px 10px;resize:vertical}
+textarea.ans:focus{border-color:var(--accent);outline:0}
 .state.ok{color:var(--ok-dot)}.state.crit{color:var(--crit)}
 .chat{width:33.333%;flex:none;border-left:1px solid var(--b3);background:var(--bg1);display:none;flex-direction:column}
 body.chat-on .chat{display:flex}
@@ -738,9 +907,19 @@ function setList(html) {
     if (edited(t)) keep[t.closest('.card').dataset.key] = { orig: t.dataset.orig, value: t.value };
   });
   const a = document.activeElement;
-  const focusKey = a && a.tagName === 'TEXTAREA' ? a.closest('.card').dataset.key : null;
+  const focusKey = a && a.classList && a.classList.contains('bd') ? a.closest('.card').dataset.key : null;
   const sel = focusKey ? [a.selectionStart, a.selectionEnd] : null;
   const top = document.querySelector('.page').scrollTop;
+  // An opened card's own state: its folds, its scrolled boxes, a typed answer.
+  const inner = {};
+  document.querySelectorAll('.card').forEach(card => {
+    inner[card.dataset.key] = {
+      open: [...card.querySelectorAll('details')].map(d => d.open),
+      scroll: [...card.querySelectorAll('pre.scroll')].map(p => p.scrollTop),
+      ans: (card.querySelector('textarea.ans') || {}).value || ''
+    };
+  });
+  const ansFocus = a && a.classList && a.classList.contains('ans') ? a.closest('.card').dataset.key : null;
   $('list').innerHTML = html;
   document.querySelectorAll('.card').forEach(card => {
     const t = card.querySelector('textarea.bd');
@@ -750,6 +929,14 @@ function setList(html) {
     if (k && k.orig === t.dataset.orig) t.value = k.value;
     grow(t); sync(card);
     if (card.dataset.key === focusKey && !t.readOnly) { t.focus(); t.setSelectionRange(sel[0], sel[1]); }
+  });
+  document.querySelectorAll('.card').forEach(card => {
+    const k = inner[card.dataset.key];
+    if (!k) return;
+    card.querySelectorAll('details').forEach((d, i) => { if (k.open[i]) d.open = true; });
+    card.querySelectorAll('pre.scroll').forEach((p, i) => { if (k.scroll[i]) p.scrollTop = k.scroll[i]; });
+    const ans = card.querySelector('textarea.ans');
+    if (ans) { ans.value = k.ans; if (card.dataset.key === ansFocus) ans.focus(); }
   });
   document.querySelector('.page').scrollTop = top;
 }
@@ -777,8 +964,15 @@ document.addEventListener('click', e => {
     return;
   }
   const msg = { type: 'act', key: card.dataset.key, act };
+  if (b.dataset.arg) msg.arg = b.dataset.arg;
+  if (act === 'answer' && b.dataset.text) {
+    const ans = card.querySelector('textarea.ans');
+    msg.text = ans ? ans.value : '';
+    if (!msg.text.trim()) { if (ans) ans.focus(); return; }
+  }
+  if (act === 'expand' || act === 'pane') return post(msg);
   if (act === 'validate' && t && edited(t)) { msg.act = 'correct'; msg.text = t.value; }
-  card.querySelectorAll('.acts button').forEach(x => x.disabled = true);
+  card.querySelectorAll('.acts button, .dacts button').forEach(x => x.disabled = true);
   post(msg);
 });
 document.addEventListener('input', e => {
@@ -835,6 +1029,66 @@ mod tests {
         let mut items = vec![from_attention(&entry("a-1", Level::Now, None, 10), None, false).expect("item")];
         link_asks(&mut items, &actions, &[]);
         assert_eq!(items[0].ask, None);
+    }
+
+    #[test]
+    fn a_live_card_opens_in_place_and_says_masquer_while_open() {
+        let mut item = from_need(&need(NeedKind::FailedRoutine, "routine:nightly", 5), false).expect("item");
+        let closed = card_html(&item, true, true, 10);
+        assert!(closed.contains("data-act=\"expand\"") && closed.contains("Ouvrir") && !closed.contains("class=\"detail\""));
+        // Alone, `Ouvrir` is the card's main button.
+        assert!(closed.contains("btn acc\" data-act=\"expand\""));
+        item.detail = Some(Detail::Routine {
+            rows: vec![
+                ("Horaire".into(), "daily 21:00".into()),
+                ("Prochain".into(), "21:00".into()),
+                ("Dernier".into(), "Failed · exit 2".into()),
+            ],
+            failed: true,
+            prompt: "Do <this>".into(),
+            acts: vec![RoutineAct::Run, RoutineAct::Log, RoutineAct::Pause, RoutineAct::Edit],
+            note: Some("Running now…".into()),
+        });
+        let open = card_html(&item, true, true, 10);
+        assert!(open.contains("Masquer"));
+        assert!(open.contains("<dd class=\"crit\">Failed · exit 2</dd>"));
+        assert!(open.contains("Do &lt;this&gt;") && open.contains("<details class=\"fold\">"));
+        for word in ["run", "log", "pause", "edit"] {
+            assert!(open.contains(&format!("data-act=\"routine\" data-arg=\"{word}\"")), "{word}");
+            assert_eq!(RoutineAct::parse(word).map(|a| a.word()), Some(word));
+        }
+        // Next to Refuser / Autoriser, `Ouvrir` is a secondary button.
+        let perm = from_need(&need(NeedKind::Permission, "pane:1", 5), false).expect("item");
+        assert!(card_html(&perm, true, true, 10).contains("btn sec\" data-act=\"expand\""));
+    }
+
+    #[test]
+    fn error_permission_and_question_details_are_escaped_and_answerable() {
+        let error = detail_html(&Detail::Error { words: "<limit>".into(), lines: "a\n<b>".into() }, false);
+        assert!(error.contains("&lt;limit&gt;") && error.contains("a\n&lt;b&gt;") && error.contains("data-act=\"pane\""));
+        let perm = detail_html(&Detail::Permission { text: "Bash command\nrm -rf <x>".into() }, false);
+        assert!(perm.contains("rm -rf &lt;x&gt;"));
+        let ask = detail_html(
+            &Detail::Ask { message: "Ship?".into(), answers: vec![("Oui".into(), false), ("Autre \"x\"".into(), true)], input: false },
+            true,
+        );
+        assert!(ask.contains("data-arg=\"Oui\" disabled"));
+        assert!(ask.contains("data-arg=\"Autre &quot;x&quot;\" data-text=\"1\""));
+        assert!(ask.contains("textarea class=\"ans\""), "an answer that needs text brings the field");
+        let plain = detail_html(&Detail::Ask { message: "Ok?".into(), answers: vec![("Oui".into(), false)], input: false }, false);
+        assert!(!plain.contains("textarea"));
+    }
+
+    #[test]
+    fn the_scope_follows_the_cwd_and_the_pane_shows_its_last_lines() {
+        let root = std::path::Path::new("/home/me/Perso");
+        assert_eq!(scope_of_cwd("/home/me/Perso", Some(root)), Scope::Perso);
+        assert_eq!(scope_of_cwd("/home/me/Perso/trail", Some(root)), Scope::Perso);
+        assert_eq!(scope_of_cwd("/home/me/Personal", Some(root)), Scope::Pro, "a component, not a prefix");
+        assert_eq!(scope_of_cwd("/home/me/Work", Some(root)), Scope::Pro);
+        assert_eq!(scope_of_cwd("/home/me/Perso", None), Scope::Pro);
+        assert_eq!(last_lines("a\n\nb  \nc\n\n", 2), "b\nc");
+        assert_eq!(last_lines("", 15), "");
     }
 
     fn need(kind: NeedKind, key: &str, since: u64) -> NeedItem {
@@ -898,11 +1152,11 @@ mod tests {
         // A pending sheet is answered on the sheet, never marked done here.
         assert_eq!(buttons(&sheet, true, true), [Button::OpenSheet]);
         let perm = from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap();
-        assert_eq!(buttons(&perm, true, true), [Button::Deny, Button::Allow]);
+        assert_eq!(buttons(&perm, true, true), [Button::Expand, Button::Deny, Button::Allow]);
         let err = from_need(&need(NeedKind::Error, "pane:1", 1), false).unwrap();
-        assert_eq!(buttons(&err, true, true), [Button::Open]);
+        assert_eq!(buttons(&err, true, true), [Button::Expand]);
         assert!(button_html(Button::Done, false).contains("title=\"Retire de ta file\""));
-        for b in [Button::Done, Button::Deny, Button::Allow, Button::Correct, Button::Validate, Button::Open] {
+        for b in [Button::Expand, Button::Done, Button::Deny, Button::Allow, Button::Correct, Button::Validate, Button::Open] {
             assert_eq!(Button::parse(b.act()), Some(b));
         }
     }
