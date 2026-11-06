@@ -98,7 +98,10 @@ as text, keeps a link only to http(s), mailto or a local `.md` / `.html`
 file (a link to anything else is shown as its text) and never loads an
 image. A bare http(s) URL, or an absolute or `~/` path to a `.md` / `.html`
 file, is a link too (`src/chat/links.rs`), but not inside code; a path with
-spaces only when the file exists. A click opens it in the side panel
+spaces only when the file exists. In an answer, a bare Linear id
+(`CLA-123`, `CLAR-`, `CLAD-`) links to its issue and a bare `#12345` to that
+pull request of the Claap repo, but not inside code, a link, a URL or a
+heading. A click opens it in the side panel
 (`side_panel::target_on_disk`, as `open-panel`), mailto in the mail app. Every message the page posts carries its load's nonce: one from an
 earlier load is dropped. The page's content security policy runs
 only the script carrying the load's nonce.
