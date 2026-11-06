@@ -26,6 +26,11 @@
 # ask_resume_tab = ""               # tab title where a conversation reopened for a late `kova ask` answer
 #                                   # goes, as a new column ("" = a new tab each time)
 
+# [session]
+# wake_on_launch = true             # after a relaunch, wake every restored agent, chiefs first,
+#                                   # without switching tab (false = each waits until its pane is shown)
+# wake_stagger_s = 3                # seconds between two wakes
+
 # [attention]
 # perso_dir = "~/Perso"        # cwd under this folder = Perso in the Cockpit, else Pro
 # snooze_command = []         # default: close_command's program + "snooze"

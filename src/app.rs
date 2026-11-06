@@ -47,6 +47,9 @@ pub struct AppDelegateIvars {
     /// The Asks cards' clicks, queued by the sidebar and served by the same
     /// tick as the floating card's answers: the board lives here.
     sidebar_asks: RefCell<crate::window::sidebar_asks::AskQueue>,
+    /// Wakes the agents a launch restore left asleep, one at a time
+    /// (`[session] wake_on_launch`); `None` once none is left.
+    launch_wake: RefCell<Option<crate::launch_wake::LaunchWaker>>,
 }
 
 impl AppDelegateIvars {
@@ -132,6 +135,10 @@ define_class!(
                         }
                         win.makeKeyAndOrderFront(None);
                         win_vec.push(win);
+                    }
+                    if config.session.wake_on_launch {
+                        let waker = crate::launch_wake::LaunchWaker::new(config.session.wake_stagger_s, std::time::Instant::now());
+                        *self.ivars().launch_wake.borrow_mut() = Some(waker);
                     }
                 }
                 None => {
@@ -285,6 +292,7 @@ impl AppDelegate {
             main_busy: Cell::new(false),
             asks: RefCell::new(crate::ask::Board::new()),
             sidebar_asks: RefCell::new(crate::window::sidebar_asks::AskQueue::default()),
+            launch_wake: RefCell::new(None),
         });
         let retained: Retained<Self> = unsafe { msg_send![super(this), init] };
         retained.ivars().config.set(config).ok();
@@ -361,6 +369,8 @@ impl AppDelegate {
                     // The run-loop source below normally gets there first; this
                     // is the belt-and-braces path for a signal that was missed.
                     drain_ipc(ivars, fps);
+
+                    wake_restored_agents(ivars);
 
                     // Answers given on the question card, then the card itself.
                     {
@@ -1549,6 +1559,36 @@ fn handle_ipc_clear_anchors(
     }
     log::info!("IPC: cleared {} anchor(s)", removed);
     crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "removed": removed })) }
+}
+
+/// The launch waker's turn (`launch_wake`): once its stagger is over, wake
+/// the next agent asleep since the launch, in place like `wake-pane`. It
+/// retires when nothing sleeps and no restored tab is still to spawn.
+fn wake_restored_agents(ivars: &AppDelegateIvars) {
+    let mut slot = ivars.launch_wake.borrow_mut();
+    let Some(waker) = slot.as_mut() else { return };
+    let now = std::time::Instant::now();
+    if !waker.due(now) {
+        return;
+    }
+    let windows = ivars.windows.borrow();
+    let views: Vec<_> = windows.iter().filter_map(|win| kova_view(win)).collect();
+    let mut panes = Vec::new();
+    for view in &views {
+        view.launch_wake_panes(&mut panes);
+    }
+    let Some((pane_id, session)) = waker.pick(&panes) else {
+        if !views.iter().any(|view| view.has_deferred_tabs()) {
+            log::info!("Launch wake: every restored agent is awake");
+            *slot = None;
+        }
+        return;
+    };
+    let woken = views.iter().find_map(|view| view.ipc_wake_pane(pane_id)).unwrap_or(false);
+    if woken {
+        log::info!("Launch wake: pane {} resumes {}", pane_id, session);
+    }
+    waker.record(pane_id, session, now);
 }
 
 /// IPC: resume the agent asleep in `pane_id` where it is, focus untouched.

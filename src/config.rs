@@ -20,6 +20,24 @@ pub struct Config {
     pub sidebar: SidebarConfig,
     pub attention: AttentionConfig,
     pub chat: ChatConfig,
+    pub session: SessionConfig,
+}
+
+/// What a launch does with the agents it restores asleep (`launch_wake`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Wake every restored agent after the launch, as if each tab had been
+    /// clicked. Off: each one waits until its pane is first shown.
+    pub wake_on_launch: bool,
+    /// Seconds between two wakes, so the agents do not all start at once.
+    pub wake_stagger_s: f64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        SessionConfig { wake_on_launch: true, wake_stagger_s: 3.0 }
+    }
 }
 
 /// The Cockpit chat's options.
@@ -443,6 +461,7 @@ impl Default for Config {
             sidebar: SidebarConfig::default(),
             attention: AttentionConfig::default(),
             chat: ChatConfig::default(),
+            session: SessionConfig::default(),
         }
     }
 }
@@ -842,6 +861,16 @@ mod tests {
         assert_eq!(config.layout.mode, LayoutMode::Tabs);
         assert_eq!(config.keys.toggle_sidebar, "cmd+option+s");
         assert_eq!(config.keys.toggle_unread, "cmd+u");
+    }
+
+    #[test]
+    fn launch_wake_is_on_every_3_s_unless_said_otherwise() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.session.wake_on_launch);
+        assert_eq!(config.session.wake_stagger_s, 3.0);
+        let config: Config = toml::from_str("[session]\nwake_on_launch = false\nwake_stagger_s = 5\n").unwrap();
+        assert!(!config.session.wake_on_launch);
+        assert_eq!(config.session.wake_stagger_s, 5.0);
     }
 
     #[test]

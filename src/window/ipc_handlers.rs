@@ -709,6 +709,31 @@ impl KovaView {
         tabs.iter().find_map(|t| t.pane(pane_id)).map(|pane| pane.wake())
     }
 
+    /// The panes of this window for the launch waker (`launch_wake`), in tab
+    /// and pane order, ranked against this window's Cockpit chief.
+    pub fn launch_wake_panes(&self, out: &mut Vec<crate::launch_wake::PaneInfo>) {
+        use crate::attention::Scope;
+        let scope = if self.cockpit_chief().is_some() { Scope::Perso } else { Scope::Pro };
+        let chiefs = [crate::cockpit::chief_session(Scope::Pro), crate::cockpit::chief_session(Scope::Perso)];
+        let cockpit_chief = crate::cockpit::chief_session(scope);
+        for tab in self.ivars().tabs.borrow().iter() {
+            tab.for_each_pane(&mut |pane| {
+                let osc = pane.terminal.read().title.clone();
+                out.push(crate::launch_wake::PaneInfo {
+                    pane_id: pane.id,
+                    dormant: pane.dormant_session_id(),
+                    live: pane.agent_session_id(),
+                    rank: crate::launch_wake::rank(&[osc.as_deref(), pane.custom_title.as_deref()], cockpit_chief, &chiefs),
+                });
+            });
+        }
+    }
+
+    /// Whether tabs of the restored session are still waiting to be spawned.
+    pub fn has_deferred_tabs(&self) -> bool {
+        !self.ivars().deferred_tabs.borrow().is_empty()
+    }
+
     /// IPC: collect all pane IDs in this window (used to expand `panes: "all"`).
     pub fn ipc_collect_pane_ids(&self, out: &mut Vec<PaneId>) {
         collect_pane_ids_in(&self.ivars().tabs.borrow(), out);

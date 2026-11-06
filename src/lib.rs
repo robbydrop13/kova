@@ -27,6 +27,7 @@ mod exec;
 mod input;
 mod ipc;
 mod keybindings;
+mod launch_wake;
 mod launchers;
 mod notification;
 mod omp_session;
