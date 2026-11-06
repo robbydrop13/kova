@@ -17,8 +17,8 @@
 pub const TEXT_MAX: usize = 8 * 1024;
 /// Between the pasted text and its Enter.
 pub const ENTER_DELAY_MS: u64 = 300;
-/// An Enter not written this long after it was due (the pane was not shown
-/// as a chat meanwhile) is dropped: the screen it was meant for is gone.
+/// An Enter not written this long after it was due (the chat was out of
+/// sight meanwhile) is dropped: the screen it was meant for is gone.
 pub const ENTER_STALE_MS: u64 = 2_000;
 
 /// What Claude Code's input line shows, read off the pane's screen.

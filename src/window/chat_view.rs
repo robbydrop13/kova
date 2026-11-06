@@ -252,13 +252,10 @@ impl KovaView {
                 }
                 web.setHidden(true);
             }
-            // A column closed drops its state; one hidden by an overlay keeps it.
-            let gone = !self.metal_overlay_open();
-            // Out of sight, no one sees what the mic hears: it is cancelled.
-            if let Some(st) = slot.state.borrow_mut().as_mut() {
-                st.voice.hide();
-            }
-            if gone {
+            // Out of sight (the column closed, or an overlay over it), the
+            // state goes: the page comes back fresh and takes the keyboard,
+            // and dropping it cancels what the mic hears.
+            if slot.state.borrow().is_some() {
                 slot.state.replace(None);
                 if let Some(web) = slot.web.get() {
                     unsafe { web.loadHTMLString_baseURL(&NSString::from_str(""), None) };
@@ -296,9 +293,8 @@ impl KovaView {
             web.setHidden(false);
         }
 
-        // The box gets the keyboard when the chat shows, and back from the
-        // terminal under the page. The chief's pane is never focused for it:
-        // nothing moves the focus or switches tabs.
+        // The box gets the keyboard when the chat shows. The chief's pane is
+        // never focused for it: nothing moves the focus or switches tabs.
         let on_terminal = window
             .firstResponder()
             .is_some_and(|r| std::ptr::eq(Retained::as_ptr(&r).cast::<()>(), (self as *const Self).cast::<()>()));

@@ -101,15 +101,6 @@ impl Dictation {
         self.run(cmd, crate::surface::monotonic_ms());
     }
 
-    /// The chat went out of sight: listening is cancelled; a text on its
-    /// way still lands when it is back, but Escape is the app's again.
-    pub fn hide(&mut self) {
-        if matches!(self.keys.phase, voice::Phase::Listening { .. }) {
-            self.cancel();
-        }
-        self.watch = None;
-    }
-
     fn run(&mut self, cmd: Cmd, now: u64) {
         match cmd {
             Cmd::Start => {

@@ -26,13 +26,13 @@ the transcript as it was.
 
 One `WKWebView` per window, created on first use, laid on the Cockpit's
 left third under the column's top bar, above the Cockpit's own page. It
-hides when the column or the Cockpit closes (its state dropped) and while
-an overlay Kova draws in Metal needs the window (the switcher, the search
-palette, the filter, help, a rename: its state kept). Its data store is
-non-persistent.
+hides when the column or the Cockpit closes and while an overlay Kova draws
+in Metal needs the window (the switcher, the search palette, the filter,
+help, a rename); hidden, its state is dropped and the page comes back
+fresh. Its data store is non-persistent.
 
-The box takes the keyboard when the chat shows, and back from the terminal
-under the page; the chief's pane is never focused for it. With the box
+The box takes the keyboard when the chat shows; the chief's pane is never
+focused for it. With the box
 focused, Cmd+A/C/V/X/Z edit its text; every other Kova shortcut stays
 Kova's.
 
@@ -172,8 +172,7 @@ read from the Keychain at each dictation (`security find-generic-password
 `Authorization` header; nothing writes or logs it. Less than 300 ms of
 audio sends nothing. The microphone is an AudioQueue input; the first use
 shows macOS's prompt with `NSMicrophoneUsageDescription` (Info.plist).
-The chat going out of sight cancels listening; a text already on its way
-lands when the chat is back. A press long after a hold began (its release
+The chat going out of sight cancels listening and a text on its way. A press long after a hold began (its release
 lost) ends the hold.
 
 ## Cards
