@@ -153,7 +153,9 @@ read from the Keychain at each dictation (`security find-generic-password
 `Authorization` header; nothing writes or logs it. Less than 300 ms of
 audio sends nothing. The microphone is an AudioQueue input; the first use
 shows macOS's prompt with `NSMicrophoneUsageDescription` (Info.plist).
-The chat going out of sight cancels a dictation.
+The chat going out of sight cancels listening; a text already on its way
+lands when the chat is back. A press long after a hold began (its release
+lost) ends the hold.
 
 ## Cards
 

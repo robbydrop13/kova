@@ -157,7 +157,11 @@ pub struct Heard {
 /// The provider's answer; `None` when it is not one.
 pub fn parse_result(body: &str) -> Option<Heard> {
     let v: Value = serde_json::from_str(body).ok()?;
-    let raw = v.get("text")?.as_str()?.trim().to_string();
+    let raw = match v.get("text")? {
+        Value::String(t) => t.trim().to_string(),
+        Value::Null => String::new(),
+        _ => return None,
+    };
     let cleaned = v.get("llm_response").and_then(Value::as_str).map(|t| t.trim().to_string());
     // Silence comes back with no llm_response: nothing to clean, not a failure.
     if raw.is_empty() {
@@ -264,6 +268,9 @@ impl Keys {
                 Command::Start
             }
             Phase::Listening { hands_free: true, .. } => self.finish(),
+            // A press long after a hold began: its release was lost (the app
+            // went to the back, the pointer left), this one ends it.
+            Phase::Listening { since, .. } if now.saturating_sub(since) >= HOLD_MS => self.finish(),
             Phase::Listening { .. } | Phase::Working => Command::Nothing,
         }
     }
@@ -445,6 +452,7 @@ mod tests {
         assert_eq!(parse_result(no_cleanup), Some(Heard { text: "Ship it.".into(), raw: "Ship it.".into(), cleanup_failed: true }));
         let silence = r#"{"text":"","words":[],"audio_duration_ms":100,"llm_response":null,"llm_error":null}"#;
         assert_eq!(parse_result(silence), Some(Heard { text: "".into(), raw: "".into(), cleanup_failed: false }));
+        assert_eq!(parse_result(r#"{"text":null,"llm_response":null}"#).map(|h| h.text), Some(String::new()));
         assert_eq!(parse_result(r#"{"status":401,"title":"Unauthorized","detail":"Invalid API key"}"#), None);
         assert_eq!(parse_result("<html>"), None);
     }
@@ -483,6 +491,9 @@ mod tests {
         assert_eq!(k.release(1_600), Command::Nothing);
         k.done();
         assert_eq!(k.phase, Phase::Idle);
+        // A hold whose release never came: the next press sends it.
+        assert_eq!(k.press(5_000), Command::Start);
+        assert_eq!(k.press(9_000), Command::Finish);
     }
 
     #[test]

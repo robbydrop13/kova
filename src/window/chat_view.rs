@@ -302,10 +302,8 @@ impl KovaView {
             // overlay keeps it.
             let gone = slot.state.borrow().as_ref().is_some_and(|st| !self.pane_is_chat(st.pane_id));
             // Out of sight, no one sees what the mic hears: it is cancelled.
-            if let Some(st) = slot.state.borrow_mut().as_mut()
-                && st.voice.listening()
-            {
-                st.voice.cancel();
+            if let Some(st) = slot.state.borrow_mut().as_mut() {
+                st.voice.hide();
             }
             if gone {
                 slot.state.replace(None);

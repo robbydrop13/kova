@@ -698,7 +698,9 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     if ($("vhist").classList.contains("on")) histList();
   }}
   function insertAt(text) {{
-    const s = box.selectionStart, e = box.selectionEnd;
+    // Never focused, its cursor is at 0: then the text goes at the end.
+    const at = document.activeElement === box;
+    const s = at ? box.selectionStart : box.value.length, e = at ? box.selectionEnd : s;
     const before = box.value.slice(0, s), after = box.value.slice(e);
     const lead = before && !/\s$/.test(before) ? " " : "";
     const tail = after && !/^\s/.test(after) ? " " : "";
@@ -719,8 +721,10 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
     }});
   }}
   // Hold the button to talk, tap it to keep listening: Kova tells them apart.
-  $("mic").addEventListener("pointerdown", (e) => {{ e.preventDefault(); post({{ type: "voice-press" }}); }});
-  $("mic").addEventListener("pointerup", () => post({{ type: "voice-release" }}));
+  const mic = $("mic");
+  mic.addEventListener("pointerdown", (e) => {{ e.preventDefault(); mic.setPointerCapture(e.pointerId); post({{ type: "voice-press" }}); }});
+  mic.addEventListener("pointerup", () => post({{ type: "voice-release" }}));
+  mic.addEventListener("pointercancel", () => post({{ type: "voice-release" }}));
   // Images pasted into the box, sent with the next message: their paths.
   let images = [];
   function chips() {{

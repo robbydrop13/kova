@@ -25,8 +25,9 @@ use objc2_foundation::{
 use crate::voice::{self, Command as Cmd, Failure, Flash, Heard, History, Keys, Pill};
 
 static HISTORY: Mutex<History> = Mutex::new(History::new());
-/// What the keyboard watch saw, with when: drained by the chat's poll.
-static KEYS: Mutex<Vec<KeyInput>> = Mutex::new(Vec::new());
+
+/// What a chat's keyboard watch saw, with when: drained by its poll.
+type KeyInbox = Arc<Mutex<Vec<KeyInput>>>;
 
 #[derive(Clone, Copy, Debug)]
 enum KeyInput {
@@ -45,6 +46,7 @@ pub struct Dictation {
     keys: Keys,
     session: Option<Session>,
     watch: Option<KeyWatch>,
+    keys_in: KeyInbox,
     flash: Option<Flash>,
 }
 
@@ -80,7 +82,7 @@ impl Dictation {
         let cmd = self.keys.press(now);
         self.run(cmd, now);
         if cmd == Cmd::Start {
-            self.watch = KeyWatch::install(key);
+            self.watch = KeyWatch::install(key, self.keys_in.clone());
         }
     }
 
@@ -99,16 +101,20 @@ impl Dictation {
         self.run(cmd, crate::surface::monotonic_ms());
     }
 
-    /// The microphone is on (not once the audio went).
-    pub fn listening(&self) -> bool {
-        matches!(self.keys.phase, voice::Phase::Listening { .. })
+    /// The chat went out of sight: listening is cancelled; a text on its
+    /// way still lands when it is back, but Escape is the app's again.
+    pub fn hide(&mut self) {
+        if matches!(self.keys.phase, voice::Phase::Listening { .. }) {
+            self.cancel();
+        }
+        self.watch = None;
     }
 
     fn run(&mut self, cmd: Cmd, now: u64) {
         match cmd {
             Cmd::Start => {
                 self.flash = None;
-                if let Ok(mut keys) = KEYS.lock() {
+                if let Ok(mut keys) = self.keys_in.lock() {
                     keys.clear();
                 }
                 play("Tink");
@@ -133,7 +139,7 @@ impl Dictation {
 
     pub fn poll(&mut self) -> Polled {
         let now = crate::surface::monotonic_ms();
-        let inputs = KEYS.lock().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default();
+        let inputs = self.keys_in.lock().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default();
         for input in inputs {
             match input {
                 KeyInput::Release(at) => self.release(at),
@@ -188,12 +194,12 @@ struct KeyWatch {
 }
 
 impl KeyWatch {
-    fn install(key: Option<u16>) -> Option<KeyWatch> {
+    fn install(key: Option<u16>, inbox: KeyInbox) -> Option<KeyWatch> {
         let released = std::cell::Cell::new(key.is_none());
         let handler = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
             let e = unsafe { event.as_ref() };
             let push = |input| {
-                if let Ok(mut keys) = KEYS.lock() {
+                if let Ok(mut keys) = inbox.lock() {
                     keys.push(input);
                 }
             };
@@ -323,7 +329,13 @@ fn run(control: &AtomicU8, level: &AtomicU32, inbox: &Inbox) {
     log::info!("voice: listening");
     let max = voice::MAX_AUDIO_MS * voice::BYTES_PER_MS;
     let mut audio: Vec<u8> = Vec::with_capacity(voice::SAMPLE_RATE as usize * 2 * 10);
+    let started = std::time::Instant::now();
     while control.load(Ordering::Relaxed) == RUN {
+        // By the clock too: a microphone that delivers nothing still stops.
+        if started.elapsed() >= Duration::from_millis(voice::MAX_AUDIO_MS as u64) {
+            push(inbox, Note::Full);
+            break;
+        }
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
                 level.store(voice::level(&chunk).to_bits(), Ordering::Relaxed);
