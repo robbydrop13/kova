@@ -1403,6 +1403,13 @@ impl Board {
         }
     }
 
+    /// The user closed `id`'s card with the cross: off the floating card like
+    /// an opened sheet, still waiting, still listed in the Asks. Not saved:
+    /// after a relaunch it shows on the card again.
+    pub fn closed_on_card(&mut self, id: &str) {
+        self.opened_in_panel(id);
+    }
+
     /// The answers given so far on a sheet, kept with its question (on disk
     /// too). False when no such sheet waits.
     pub fn save_draft(&mut self, id: &str, answers: crate::decision_sheet::SheetAnswers) -> bool {
@@ -2590,6 +2597,20 @@ mod tests {
             Ok(crate::ipc::IpcResponse::Ok { data: Some(d) }) => serde_json::from_value(d).unwrap(),
             _ => panic!("no answer"),
         }
+    }
+
+    #[test]
+    fn the_cross_takes_a_question_off_the_card_and_leaves_it_waiting() {
+        let q = sheet_question();
+        let id = q.id.clone();
+        let (mut board, rx) = board_with(q);
+        board.closed_on_card(&id);
+        assert!(board.opened.contains(&id), "off the floating card");
+        assert!(board.dirty, "the card is redrawn");
+        assert!(rx.try_recv().is_err(), "the asker is not answered");
+        assert!(board.sheet(&id).is_some(), "still waiting, still in the Asks");
+        board.closed_on_card("nope");
+        assert_eq!(board.opened.len(), 1, "an unknown id changes nothing");
     }
 
     #[test]

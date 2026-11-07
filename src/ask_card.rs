@@ -120,6 +120,11 @@ static ANSWERS: Mutex<Vec<CardAnswer>> = Mutex::new(Vec::new());
 static SNOOZES: Mutex<Vec<CardSnooze>> = Mutex::new(Vec::new());
 /// Decision sheets the user asked to open, since the last [`take_panel_opens`].
 static PANEL_OPENS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// Questions closed with the card's cross since the last [`take_closes`].
+static CLOSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The cross's glyph and side.
+const CLOSE_GLYPH: &str = "\u{2715}";
+const CLOSE_SIDE: CGFloat = 22.0;
 
 thread_local! {
     /// The card, built on the first `show`. Kept for the life of the process:
@@ -217,6 +222,19 @@ define_class!(
             let view: &NSView = sender.as_ref();
             // Negative y: just under the button, in an unflipped view.
             menu.popUpMenuPositioningItem_atLocation_inView(None, CGPoint::new(0.0, -4.0), Some(view));
+        }
+
+        /// The cross: the card lets the question go, without answering or
+        /// snoozing it. It stays waiting in the Cockpit and the Asks.
+        #[unsafe(method(closeCard:))]
+        fn close_card(&self, _sender: &NSButton) {
+            let Some(card) = card() else { return };
+            let Some(id) = card.current.borrow().as_ref().map(|c| c.id.clone()) else { return };
+            log::info!("Ask card: {} closed, left waiting", id);
+            if let Ok(mut closes) = CLOSES.lock() {
+                closes.push(id);
+            }
+            card.hide();
         }
 
         /// A delay was picked: its tag is its index in `ask::SNOOZE_CHOICES`.
@@ -335,6 +353,7 @@ struct Card {
     field_height: Retained<NSLayoutConstraint>,
     buttons: Retained<NSStackView>,
     snooze_button: Retained<NSButton>,
+    close_button: Retained<NSButton>,
     line_height: CGFloat,
     current: RefCell<Option<Current>>,
     shown: RefCell<Option<Shown>>,
@@ -500,8 +519,18 @@ impl Card {
             NSLayoutConstraintOrientation::Horizontal,
         );
         let spacer = NSView::new(mtm);
+        // Top right: close the card, the question still waits (not "Later").
+        let close_button = unsafe { NSButton::buttonWithTitle_target_action(&ns(CLOSE_GLYPH), Some(&*target), Some(sel!(closeCard:)), mtm) };
+        close_button.setBordered(false);
+        close_button.setAttributedTitle(&small_title(CLOSE_GLYPH));
+        close_button.setToolTip(Some(&ns("Close, keep it in Asks")));
+        close_button.setTranslatesAutoresizingMaskIntoConstraints(false);
+        activate(&[
+            close_button.widthAnchor().constraintEqualToConstant(CLOSE_SIDE),
+            close_button.heightAnchor().constraintEqualToConstant(CLOSE_SIDE),
+        ]);
         let header = NSStackView::stackViewWithViews(
-            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, meta.as_ref()]),
+            &NSArray::from_slice(&[&*badge_holder, who.as_ref(), &*spacer, meta.as_ref(), close_button.as_ref()]),
             mtm,
         );
         header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -599,6 +628,7 @@ impl Card {
             field_height,
             buttons,
             snooze_button,
+            close_button,
             line_height,
             current: RefCell::new(None),
             shown: RefCell::new(None),
@@ -750,6 +780,7 @@ impl Card {
         }
         self.field.setPlaceholderAttributedString(Some(&attributed(PLACEHOLDER, &field_font(), &token(p.text_tertiary))));
         self.snooze_button.setAttributedTitle(&small_title("Later"));
+        self.close_button.setAttributedTitle(&small_title(CLOSE_GLYPH));
 
         for view in self.buttons.arrangedSubviews().iter() {
             view.removeFromSuperview();
@@ -917,6 +948,15 @@ pub fn open_in_panel(id: String, link: String) {
 pub fn take_panel_opens() -> Vec<(String, String)> {
     match PANEL_OPENS.lock() {
         Ok(mut opens) => std::mem::take(&mut *opens),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Questions closed with the cross since the last call: the tick takes them
+/// off the card, still waiting.
+pub fn take_closes() -> Vec<String> {
+    match CLOSES.lock() {
+        Ok(mut closes) => std::mem::take(&mut *closes),
         Err(_) => Vec::new(),
     }
 }

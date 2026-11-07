@@ -454,7 +454,7 @@ running at the same time keeps its own questions in memory only, since
 anything it wrote would be shown and delivered a second time by the holder. Kova.app only: a library host answers `command not
 supported by this host`, which sends `kova ask` on to Kova.app.
 
-Two things on the card do not answer the agent. **Cmd+C** copies what the mouse
+Three things on the card do not answer the agent. **Cmd+C** copies what the mouse
 selected in the message, or the whole message when nothing is selected (the body
 has always been selectable; Kova has no Edit menu, so the panel handles the key
 itself). And **Later** puts the question off for a chosen delay
@@ -463,6 +463,10 @@ snoozed question leaves the card and its queue count, comes back when the delay
 is over as if it were new (sound, Dock badge), and keeps its snooze across a
 restart. The asker is never told: it keeps waiting and times out as it would
 have anyway, so a snooze costs nothing but the late path.
+The **cross** at the top right only closes the card: the question stays waiting,
+listed in the Cockpit and the Asks, with no snooze and nothing sent to the
+asker. The card moves on to the next question. Not saved: after a relaunch the
+question is back on the card.
 
 An answer may carry `text` on any question, a buttons-only one (`--no-input`)
 included: `kova ask` then prints `"<button>: text"` when a button was picked

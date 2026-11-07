@@ -397,6 +397,9 @@ impl AppDelegate {
                         for a in crate::ask_card::take_answers() {
                             asks.answer(&a.id, a.action, a.text);
                         }
+                        for id in crate::ask_card::take_closes() {
+                            asks.closed_on_card(&id);
+                        }
                         for s in crate::ask_card::take_snoozes() {
                             let until = crate::ask::snooze_until(crate::ask::now_epoch(), s.seconds);
                             if let Err(e) = asks.snooze(&s.id, until) {
