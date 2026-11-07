@@ -111,6 +111,8 @@ pub enum PanelTarget {
     /// A decision sheet Kova renders itself (`kova ask --decisions`), by
     /// the id of its question.
     Sheet(String),
+    /// A long `kova ask` question, read and answered in full, by its id.
+    Question(String),
     /// What the panel opened lately (`panel_history`).
     History,
 }
@@ -124,6 +126,7 @@ impl PanelTarget {
                 p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
             }
             PanelTarget::Sheet(_) => "Decision".to_string(),
+            PanelTarget::Question(_) => "Question".to_string(),
             PanelTarget::History => "History".to_string(),
         }
     }
@@ -131,6 +134,9 @@ impl PanelTarget {
     /// What a card's Open link names: `kova-sheet:<id>` for a native sheet,
     /// else an http(s) page.
     pub fn from_link(link: &str) -> PanelTarget {
+        if let Some(id) = link.strip_prefix(crate::ask::QUESTION_LINK) {
+            return PanelTarget::Question(id.to_string());
+        }
         match link.strip_prefix(crate::decision_sheet::LINK_SCHEME) {
             Some(id) => PanelTarget::Sheet(id.to_string()),
             None => PanelTarget::Web(link.to_string()),
@@ -142,7 +148,7 @@ impl PanelTarget {
         match self {
             PanelTarget::Web(url) => url.clone(),
             PanelTarget::Markdown(p) | PanelTarget::Html(p) => p.to_string_lossy().into_owned(),
-            PanelTarget::Sheet(_) | PanelTarget::History => String::new(),
+            PanelTarget::Sheet(_) | PanelTarget::Question(_) | PanelTarget::History => String::new(),
         }
     }
 }
@@ -694,6 +700,7 @@ impl SidePanelView {
                 unsafe { web.loadFileURL_allowingReadAccessToURL(&file, &read) };
             }
             PanelTarget::Sheet(id) => self.render_sheet(mtm, &web, id),
+            PanelTarget::Question(id) => self.render_question(mtm, &web, id),
             PanelTarget::History => {
                 let html = super::panel_history::page();
                 unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
@@ -711,7 +718,7 @@ impl SidePanelView {
     /// The sheet `id` was answered (or is gone): if the panel shows it, it
     /// shows what was sent instead of the form.
     pub fn sheet_closed(&self, id: &str, title: &str, summary: Option<&str>) {
-        if !matches!(self.ivars().current.borrow().as_ref(), Some(PanelTarget::Sheet(s)) if s == id) {
+        if !matches!(self.ivars().current.borrow().as_ref(), Some(PanelTarget::Sheet(s) | PanelTarget::Question(s)) if s == id) {
             return;
         }
         let Some(web) = self.ivars().web.get() else { return };
@@ -729,6 +736,14 @@ impl SidePanelView {
     fn sheet_id(&self) -> Option<String> {
         match self.ivars().current.borrow().as_ref() {
             Some(PanelTarget::Sheet(id)) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    /// The id of the long question the panel shows, if it shows one.
+    fn question_id(&self) -> Option<String> {
+        match self.ivars().current.borrow().as_ref() {
+            Some(PanelTarget::Question(id)) => Some(id.clone()),
             _ => None,
         }
     }
@@ -782,6 +797,7 @@ impl SidePanelView {
             match current {
                 Some(PanelTarget::Markdown(path)) => self.render_markdown_file(web, &path),
                 Some(PanelTarget::Sheet(id)) => self.render_sheet(MainThreadMarker::from(self), web, &id),
+                Some(PanelTarget::Question(id)) => self.render_question(MainThreadMarker::from(self), web, &id),
                 Some(PanelTarget::History) => {
                     let html = super::panel_history::page();
                     unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
@@ -832,6 +848,18 @@ impl SidePanelView {
         };
         // No base URL: the page is `about:blank`, the one origin
         // whose script may post to Kova (`did_receive_script_message`).
+        unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
+    }
+
+    fn render_question(&self, mtm: MainThreadMarker, web: &WKWebView, id: &str) {
+        let html = match crate::app::question_page(mtm, id) {
+            Some(q) => {
+                *self.ivars().title.borrow_mut() = format!("Question from {}", q.from);
+                crate::decision_sheet::render_question(&q.from, &q.message, &q.buttons, q.input, tokens::get())
+            }
+            None => crate::decision_sheet::render_closed("Question", None, tokens::get()),
+        };
+        // `about:blank`, like a sheet: the one origin that may post to Kova.
         unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
     }
 
@@ -930,7 +958,7 @@ impl SidePanelView {
         let url = match (live, current) {
             (Some(url), _) => NSURL::URLWithString(&NSString::from_str(&url)),
             (None, Some(PanelTarget::Web(url))) => NSURL::URLWithString(&NSString::from_str(&url)),
-            (None, Some(PanelTarget::Sheet(_) | PanelTarget::History)) => None,
+            (None, Some(PanelTarget::Sheet(_) | PanelTarget::Question(_) | PanelTarget::History)) => None,
             (None, Some(target)) => Some(NSURL::fileURLWithPath(&NSString::from_str(&target.external()))),
             (None, None) => None,
         };
@@ -1037,7 +1065,7 @@ define_class!(
                 && unsafe { action.targetFrame() }.is_none_or(|f| unsafe { f.isMainFrame() });
             let scheme = url.as_deref().and_then(|u| u.scheme()).map(|s| s.to_string().to_ascii_lowercase());
             let panel = panel_of(web_view);
-            let on_sheet = panel.as_ref().is_some_and(|p| p.sheet_id().is_some());
+            let on_sheet = panel.as_ref().is_some_and(|p| p.sheet_id().is_some() || p.question_id().is_some());
             let on_history = panel.as_ref().is_some_and(|p| matches!(p.ivars().current.borrow().as_ref(), Some(PanelTarget::History)));
             let policy = match (scheme.as_deref(), url.as_deref()) {
                 // An entry of the history page: open it again.
@@ -1102,7 +1130,8 @@ define_class!(
         fn did_receive_script_message(&self, _controller: &WKUserContentController, message: &WKScriptMessage) {
             let Some(web) = (unsafe { message.webView() }) else { return };
             let Some(panel) = panel_of(&web) else { return };
-            let Some(id) = panel.sheet_id() else { return };
+            let question = panel.question_id();
+            let Some(id) = panel.sheet_id().or(question.clone()) else { return };
             let frame = unsafe { message.frameInfo() };
             let frame_url = unsafe { frame.request() }.URL().and_then(|u| u.absoluteString()).map(|s| s.to_string());
             let page_url = unsafe { web.URL() }.and_then(|u| u.absoluteString()).map(|s| s.to_string());
@@ -1117,7 +1146,8 @@ define_class!(
             }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { return };
             let done = value.get("type").and_then(|t| t.as_str()) == Some("done");
-            SHEET_POSTS.with(|p| p.borrow_mut().push(SheetPost { id, done, answers: value }));
+            let question = question.is_some();
+            SHEET_POSTS.with(|p| p.borrow_mut().push(SheetPost { id, done, question, answers: value }));
         }
     }
 
@@ -1162,6 +1192,8 @@ define_class!(
 pub struct SheetPost {
     pub id: String,
     pub done: bool,
+    /// Posted by a long question's page: `{"type":"answer","action","text"}`.
+    pub question: bool,
     pub answers: serde_json::Value,
 }
 

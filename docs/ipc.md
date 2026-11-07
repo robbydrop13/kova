@@ -468,6 +468,13 @@ listed in the Cockpit and the Asks, with no snooze and nothing sent to the
 asker. The card moves on to the next question. Not saved: after a relaunch the
 question is back on the card.
 
+A **long question** (over 320 characters or 6 lines, not a decision or a
+handoff) keeps the card small: its first 3 lines, its buttons, **Open**, Later
+and the cross, no text field. Open shows the whole message in the side panel
+(`kova-question:<id>`, an `about:blank` page like a sheet), with a note field
+when the question takes text and the same buttons. An answer from there is
+checked as one from outside the card (`accepts_external_answer`).
+
 An answer may carry `text` on any question, a buttons-only one (`--no-input`)
 included: `kova ask` then prints `"<button>: text"` when a button was picked
 and `"Other: text"` when none was. `question.input` only decides whether the

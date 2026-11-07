@@ -523,7 +523,7 @@ pub fn render_closed(title: &str, summary: Option<&str>, palette: &tokens::Palet
             "<p class=\"lead\">Answers sent</p><pre>{}</pre>",
             esc(s)
         ),
-        None => "<p class=\"lead\">This sheet is no longer waiting for an answer</p>".to_string(),
+        None => "<p class=\"lead\">This is no longer waiting for an answer</p>".to_string(),
     };
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>{title}</title><style>
@@ -543,6 +543,66 @@ pre {{ white-space: pre-wrap; font: inherit; color: {t2}; background: {tile}; bo
         ok = hex(p.ok_dot),
         body = body,
     )
+}
+
+/// A long `kova ask` question as a page of the side panel: the whole message,
+/// a note when the question takes text, and its buttons. A button posts
+/// `{"type":"answer","action","text"}` to the same handler as a sheet.
+pub fn render_question(from: &str, message: &str, buttons: &[String], input: bool, palette: &tokens::Palette) -> String {
+    let p = palette;
+    let buttons_html: String = buttons
+        .iter()
+        .enumerate()
+        .map(|(i, b)| format!("<button type=\"button\" class=\"{}\" data-action=\"{}\">{}</button>", if i == 0 { "primary" } else { "" }, esc(b), esc(b)))
+        .collect();
+    let note = if input {
+        "<textarea id=\"note\" rows=\"3\" placeholder=\"Add a note to your answer\"></textarea>"
+    } else {
+        ""
+    };
+    let page = r#"<!doctype html><html><head><meta charset="utf-8"><title>Question</title><style>
+:root { color-scheme: {scheme}; }
+* { box-sizing: border-box; }
+html, body { background: {bg}; }
+body { margin: 0; color: {t1}; font: 14px/1.55 "Inter", -apple-system, system-ui, sans-serif; }
+.wrap { max-width: 760px; margin: 0 auto; padding: 22px 20px 40px; display: grid; gap: 14px; }
+.from { color: {t3}; font-size: 12px; margin: 0; }
+.msg { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; background: {tile}; border: 1px solid {b3}; border-radius: 12px; padding: 14px 16px; user-select: text; }
+textarea { width: 100%; font: inherit; font-size: 13px; color: {t1}; background: {bg}; border: 1px solid {b3}; border-radius: 8px; padding: 7px 10px; resize: vertical; }
+textarea:focus { border-color: {accent}; outline: none; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; position: sticky; bottom: 0; background: {bg}; padding: 8px 0; }
+button { font: 500 13px/1 "Inter", -apple-system, system-ui, sans-serif; cursor: pointer; height: 30px; padding: 0 12px; border-radius: 8px; border: 1px solid {b2}; background: {hover}; color: {t1}; }
+button:hover { border-color: {accent}; }
+button.primary { background: {accent}; border-color: {accent}; color: {onfill}; }
+.hint { color: {t3}; font-size: 12px; }
+</style></head><body><div class="wrap">
+<p class="from">From @@FROM@@</p>
+<div class="msg">@@MSG@@</div>
+@@NOTE@@
+<div class="row">@@BUTTONS@@<span class="hint" id="hint"></span></div>
+</div><script>
+document.querySelectorAll('button[data-action]').forEach(b => b.onclick = () => {
+  const n = document.getElementById('note');
+  try { window.webkit.messageHandlers.{handler}.postMessage(JSON.stringify({ type: 'answer', action: b.dataset.action, text: n ? n.value : '' })); } catch (e) {}
+  document.getElementById('hint').textContent = 'Sending';
+});
+</script></body></html>"#
+        .replace("{scheme}", if p == &tokens::LIGHT { "light" } else { "dark" })
+        .replace("{bg}", &hex(p.ground))
+        .replace("{tile}", &hex(p.tile))
+        .replace("{hover}", &hex(p.tile_hover))
+        .replace("{t1}", &hex(p.text_primary))
+        .replace("{t3}", &hex(p.text_tertiary))
+        .replace("{b2}", &hex(p.border_strong))
+        .replace("{b3}", &hex(p.border_subtle))
+        .replace("{accent}", &hex(p.accent))
+        .replace("{onfill}", &hex(p.text_on_fill))
+        .replace("{handler}", HANDLER);
+    // The asker's texts last, so a `{…}` in them is never taken for a slot.
+    page.replacen("@@FROM@@", &esc(from), 1)
+        .replacen("@@NOTE@@", note, 1)
+        .replacen("@@BUTTONS@@", &buttons_html, 1)
+        .replacen("@@MSG@@", &esc(message), 1)
 }
 
 const PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -691,6 +751,16 @@ mod tests {
             ]}"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_long_question_page_escapes_its_texts() {
+        let html = render_question("<a>", "x <script>alert(1)</script> {bg} @@MSG@@", &["OK".into(), "K<O".into()], true, &tokens::DARK);
+        assert!(!html.contains("<script>alert"));
+        assert!(html.contains("{bg}"), "a brace in the message is not a slot");
+        assert!(html.contains("data-action=\"K&lt;O\""));
+        assert!(html.contains("id=\"note\""));
+        assert!(!render_question("a", "b", &["OK".into()], false, &tokens::DARK).contains("id=\"note\""));
     }
 
     #[test]

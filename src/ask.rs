@@ -183,6 +183,44 @@ fn default_true() -> bool {
     true
 }
 
+/// What a long question's Open link starts with, before its id.
+pub const QUESTION_LINK: &str = "kova-question:";
+/// Past either, a message is long: the card shows a preview and Open.
+const LONG_CHARS: usize = 320;
+const LONG_LINES: usize = 6;
+/// The preview of a long message on the card.
+const PREVIEW_LINES: usize = 3;
+const PREVIEW_CHARS: usize = 200;
+
+/// Whether a message is too long for the floating card.
+pub fn is_long_message(message: &str) -> bool {
+    message.chars().count() > LONG_CHARS || message.lines().count() > LONG_LINES
+}
+
+/// The first lines of a long message, blank ones skipped, cut with an
+/// ellipsis: what the card shows of it.
+pub fn card_preview(message: &str) -> String {
+    let lines: Vec<&str> = message.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    let mut out = lines.iter().take(PREVIEW_LINES).copied().collect::<Vec<_>>().join("\n");
+    let mut cut = lines.len() > PREVIEW_LINES;
+    if out.chars().count() > PREVIEW_CHARS {
+        out = out.chars().take(PREVIEW_CHARS).collect::<String>().trim_end().to_string();
+        cut = true;
+    }
+    if cut {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// A long question as the side panel shows it.
+pub struct QuestionView {
+    pub from: String,
+    pub message: String,
+    pub buttons: Vec<String>,
+    pub input: bool,
+}
+
 /// The button always added after the asker's actions when the card has a text field: a typed
 /// answer that is none of the proposed choices must not ride on one of them ("A: stop everything").
 pub const OTHER: &str = "Other";
@@ -207,9 +245,19 @@ impl Question {
         self.kind.as_deref() == Some(KIND_DECISION)
     }
 
+    /// A plain question whose message is too long for the card: the card
+    /// shows its first lines and opens the whole text in the side panel.
+    pub fn is_long(&self) -> bool {
+        !self.is_decision() && !crate::handoff::is_handoff(self) && is_long_message(&self.message)
+    }
+
     /// What the card's Open button shows in the side panel: the sheet's
-    /// artifact, or `kova-sheet:<id>` for a sheet Kova renders itself.
+    /// artifact, `kova-sheet:<id>` for a sheet Kova renders itself, or
+    /// `kova-question:<id>` for a long question.
     pub fn panel_link(&self) -> Option<String> {
+        if self.is_long() {
+            return Some(format!("{}{}", QUESTION_LINK, self.id));
+        }
         if !self.is_decision() {
             return None;
         }
@@ -1431,6 +1479,21 @@ impl Board {
         Some((q.sheet.clone()?, q.draft.clone().unwrap_or_default(), q.from.name.clone()))
     }
 
+    /// A waiting long question, for its page in the side panel.
+    pub fn question_view(&self, id: &str) -> Option<QuestionView> {
+        let (q, _) = self.pending.iter().find(|(q, _)| q.id == id && q.is_long())?;
+        Some(QuestionView { from: q.from.name.clone(), message: q.message.clone(), buttons: q.buttons(), input: q.input })
+    }
+
+    /// An answer given on a long question's page in the side panel, checked
+    /// as one from outside the card (the page is a web view).
+    pub fn answer_from_panel(&mut self, id: &str, action: &str, text: &str) -> Result<(), String> {
+        let (q, _) = self.pending.iter().find(|(q, _)| q.id == id).ok_or("no longer waiting")?;
+        accepts_external_answer(q, action, text)?;
+        self.answer(id, action.to_string(), text.trim().to_string());
+        Ok(())
+    }
+
     /// An answer given somewhere other than the card: KovaLink, from the phone,
     /// so a question does not block the user until he is back at the Mac.
     ///
@@ -2597,6 +2660,35 @@ mod tests {
             Ok(crate::ipc::IpcResponse::Ok { data: Some(d) }) => serde_json::from_value(d).unwrap(),
             _ => panic!("no answer"),
         }
+    }
+
+    #[test]
+    fn a_long_message_shows_as_a_preview_and_opens_in_the_panel() {
+        assert!(!is_long_message("short\nquestion"));
+        assert!(is_long_message(&"x".repeat(LONG_CHARS + 1)));
+        assert!(is_long_message("1\n2\n3\n4\n5\n6\n7"));
+        assert_eq!(card_preview("A\n\nB\nC\nD"), "A\nB\nC\u{2026}", "blank lines skipped, cut after 3");
+        assert_eq!(card_preview("A\nB"), "A\nB", "a short one is whole");
+        let long = card_preview(&"y".repeat(500));
+        assert_eq!(long.chars().count(), PREVIEW_CHARS + 1);
+        let mut q = sheet_question();
+        q.sheet = None;
+        q.kind = None;
+        q.url = None;
+        q.message = "line\n".repeat(10);
+        assert!(q.is_long());
+        assert_eq!(q.panel_link(), Some(format!("{QUESTION_LINK}{}", q.id)));
+        let id = q.id.clone();
+        let (mut board, rx) = board_with(q);
+        let view = board.question_view(&id).unwrap();
+        assert_eq!(view.message, "line\n".repeat(10));
+        assert!(board.answer_from_panel(&id, "not a button", "").is_err());
+        assert!(rx.try_recv().is_err());
+        let button = view.buttons[0].clone();
+        assert!(board.answer_from_panel(&id, &button, " a note ").is_ok());
+        let a = answered(&rx);
+        assert_eq!((a.action.as_str(), a.text.as_str()), (button.as_str(), "a note"));
+        assert!(board.question_view(&id).is_none());
     }
 
     #[test]

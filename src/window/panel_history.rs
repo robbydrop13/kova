@@ -47,7 +47,7 @@ impl Stored {
             PanelTarget::Markdown(p) => Stored::Markdown(p.clone()),
             PanelTarget::Html(p) => Stored::Html(p.clone()),
             PanelTarget::Sheet(id) => Stored::Sheet(id.clone()),
-            PanelTarget::History => return None,
+            PanelTarget::History | PanelTarget::Question(_) => return None,
         })
     }
 

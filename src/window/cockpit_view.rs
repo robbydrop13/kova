@@ -240,7 +240,7 @@ impl KovaView {
         let mut sheets = std::collections::HashSet::new();
         let mut waiting = Vec::new();
         crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|q| {
-            if q.panel_link().is_some() {
+            if q.panel_link().is_some() && !q.is_long() {
                 sheets.insert(format!("ask:{}", q.id));
             }
             waiting.push(q.id.clone());

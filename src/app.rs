@@ -430,6 +430,21 @@ impl AppDelegate {
                         {
                             let mut asks = ivars.asks.borrow_mut();
                             for post in posts {
+                                if post.question {
+                                    let field = |k: &str| post.answers.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let (action, text) = (field("action"), field("text"));
+                                    match asks.answer_from_panel(&post.id, &action, &text) {
+                                        Ok(()) => {
+                                            let sent = if text.trim().is_empty() { action } else { format!("{action}\n{}", text.trim()) };
+                                            closed.push((post.id, "Question".to_string(), Some(sent)));
+                                        }
+                                        Err(e) => {
+                                            log::warn!("ask {}: panel answer refused: {}", post.id, e);
+                                            closed.push((post.id, "Question".to_string(), None));
+                                        }
+                                    }
+                                    continue;
+                                }
                                 match asks.post_sheet(&post.id, &post.answers, post.done) {
                                     Ok(p) if p.done => closed.push((post.id, p.title, Some(p.summary))),
                                     Ok(_) => {}
@@ -1711,6 +1726,12 @@ fn handle_ipc_set_subject_color(
 /// app is in front. Returns whether a window took it.
 /// A decision sheet still waiting, for the side panel to render: the sheet,
 /// its answers so far, who asks. `None` once it is answered or withdrawn.
+pub(crate) fn question_page(mtm: MainThreadMarker, id: &str) -> Option<crate::ask::QuestionView> {
+    let delegate = app_delegate(mtm);
+    let asks = delegate.ivars().asks.try_borrow().ok()?;
+    asks.question_view(id)
+}
+
 pub(crate) fn sheet_page(
     mtm: MainThreadMarker,
     id: &str,

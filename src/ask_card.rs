@@ -744,9 +744,12 @@ impl Card {
             layer.setBorderColor(Some(&token(p.border_subtle).CGColor()));
         }
         let decision = question.decision_url.is_some();
+        // A long question: a preview, Open for the whole text, no field (it is
+        // answered with a note in the panel), the asker's name kept.
+        let long = question.decision_url.is_some_and(|u| u.starts_with(crate::ask::QUESTION_LINK));
         let handoff = question.step.is_some();
         // A decision or a handoff names what it is; the asker moves to the meta line.
-        let header = if handoff { crate::handoff::HEADER } else if decision { "New decision" } else { question.from };
+        let header = if handoff { crate::handoff::HEADER } else if decision && !long { "New decision" } else { question.from };
         self.who.setStringValue(&ns(header));
         self.who.setTextColor(Some(&token(p.text_primary)));
         let (r, g, b) = crate::ask::agent_rgb(question.from);
@@ -756,7 +759,7 @@ impl Card {
             layer.setBackgroundColor(Some(&dot.CGColor()));
         }
         let time = short_time(question.asked_at);
-        let mut meta = if decision || handoff { format!("{} · {}", question.from, time) } else { time };
+        let mut meta = if (decision && !long) || handoff { format!("{} · {}", question.from, time) } else { time };
         if waiting > 0 {
             meta = format!("{} · {} more", meta, waiting);
         }
@@ -764,6 +767,7 @@ impl Card {
         self.meta.setTextColor(Some(&token(p.text_tertiary)));
         let body = match question.detail.filter(|d| !d.is_empty()) {
             Some(detail) => format!("{}\n\n{}", question.message, detail),
+            None if long => crate::ask::card_preview(question.message),
             None => question.message.to_string(),
         };
         self.body.setStringValue(&ns(&body));
@@ -772,7 +776,7 @@ impl Card {
             self.field.setStringValue(&ns(""));
             self.field_height.setConstant(self.line_height);
         }
-        self.field_box.setHidden(!question.input);
+        self.field_box.setHidden(!question.input || long);
         self.field.setTextColor(Some(&token(p.text_primary)));
         if let Some(layer) = self.field_box.layer() {
             layer.setBackgroundColor(Some(&token(p.ground).CGColor()));
