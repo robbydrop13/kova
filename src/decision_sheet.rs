@@ -323,7 +323,7 @@ impl Sheet {
         let mut out = format!("{title} : {n} décision{s}{tail}");
         for d in self.decisions.iter().take(SHOWN) {
             out.push_str("\n\u{2022} ");
-            out.push_str(d.title.trim());
+            out.push_str(&plain(d.title.trim()));
         }
         if n > SHOWN {
             out.push_str(&format!("\n+{} autres", n - SHOWN));
@@ -401,6 +401,23 @@ fn linked_emph(s: &str) -> String {
             crate::text_links::Span::Link { label, url } => format!("<a href=\"{}\">{}</a>", esc(url), esc(label)),
         })
         .collect()
+}
+
+/// A title's simple markdown read as plain text, for the floating card: the
+/// markers go, a link keeps its label.
+fn plain(s: &str) -> String {
+    let html = inline(s);
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&#64;", "@").replace("&amp;", "&")
 }
 
 /// `**bold**`, `*italic*` and `_italic_` in plain text, escaped.
@@ -874,6 +891,14 @@ mod tests {
         assert!(html.contains("<a href=\"https://linear.app/c\">CLA-1</a>"));
         assert!(!html.contains("href=\"javascript"));
         assert_eq!(linked("<b>https://a.b/\"x</b>"), "&lt;b&gt;<a href=\"https://a.b/\">https://a.b/</a>&quot;x&lt;/b&gt;");
+    }
+
+    #[test]
+    fn the_card_lines_drop_the_markdown_markers() {
+        assert_eq!(plain("**Ship** `v2` _now_ or [later](https://x.io) & <b> a_b"), "Ship v2 now or later & <b> a_b");
+        let mut s = sheet();
+        s.decisions[0].title = "**Ship** when?".into();
+        assert!(s.card_message("").contains("\n\u{2022} Ship when?"));
     }
 
     #[test]
