@@ -341,16 +341,103 @@ impl Sheet {
 // The page
 // ---------------------------------------------------------------
 
-/// `s` escaped, its links (`text_links`) made clickable: the panel opens a
-/// web link in itself and an app's link in that app.
-fn linked(s: &str) -> String {
+/// A long text of a sheet or question in simple markdown: `- `, `* ` or `• `
+/// lines as a bulleted list, other lines kept as lines, and inline
+/// `inline`. No headings, tables or raw HTML: everything else is escaped text.
+fn rich(s: &str) -> String {
+    let mut out = String::new();
+    let mut list = false;
+    let mut first = true;
+    for line in s.trim_matches('\n').lines() {
+        let trimmed = line.trim_start();
+        let item = ["- ", "* ", "• "].iter().find_map(|m| trimmed.strip_prefix(m));
+        match item {
+            Some(rest) => {
+                if !list {
+                    out.push_str("<ul>");
+                    list = true;
+                }
+                out.push_str(&format!("<li>{}</li>", inline(rest.trim())));
+            }
+            None => {
+                if list {
+                    out.push_str("</ul>");
+                    list = false;
+                } else if !first {
+                    out.push_str("<br>");
+                }
+                out.push_str(&inline(line));
+            }
+        }
+        first = false;
+    }
+    if list {
+        out.push_str("</ul>");
+    }
+    out
+}
+
+/// One line of simple markdown: `code`, links (`text_links`, clickable),
+/// **bold** and *italic* or _italic_, everything else escaped. A `*` or `_`
+/// inside a word (snake_case, 2*3) stays as it is.
+fn inline(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(open) = rest.find('`') {
+        let Some(len) = rest[open + 1..].find('`').filter(|&l| l > 0) else { break };
+        out.push_str(&linked_emph(&rest[..open]));
+        out.push_str(&format!("<code>{}</code>", esc(&rest[open + 1..open + 1 + len])));
+        rest = &rest[open + 1 + len + 1..];
+    }
+    out.push_str(&linked_emph(rest));
+    out
+}
+
+fn linked_emph(s: &str) -> String {
     crate::text_links::spans(s)
         .iter()
         .map(|span| match span {
-            crate::text_links::Span::Text(t) => esc(t),
+            crate::text_links::Span::Text(t) => emph(t),
             crate::text_links::Span::Link { label, url } => format!("<a href=\"{}\">{}</a>", esc(url), esc(label)),
         })
         .collect()
+}
+
+/// `**bold**`, `*italic*` and `_italic_` in plain text, escaped.
+fn emph(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let at = |j: usize| chars.get(j).copied();
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric());
+    let space = |c: Option<char>| c.is_none_or(|c| c.is_whitespace());
+    while i < chars.len() {
+        let c = chars[i];
+        let bold = c == '*' && at(i + 1) == Some('*');
+        let width = if bold { 2 } else { 1 };
+        if (c == '*' || c == '_') && !word(i.checked_sub(1).and_then(at)) && !space(at(i + width)) {
+            let marker: Vec<char> = chars[i..i + width].to_vec();
+            let close = (i + width + 1..=chars.len().saturating_sub(width)).find(|&j| {
+                chars[j..j + width] == marker[..] && !space(at(j - 1)) && !word(at(j + width)) && !(bold && at(j + width) == Some('*'))
+            });
+            if let Some(j) = close {
+                let inner: String = chars[i + width..j].iter().collect();
+                let tag = if bold { "strong" } else { "em" };
+                out.push_str(&format!("<{tag}>{}</{tag}>", emph(&inner)));
+                i = j + width;
+                continue;
+            }
+        }
+        out.push_str(&esc(&c.to_string()));
+        i += 1;
+    }
+    out
+}
+
+/// `s` escaped, its links (`text_links`) made clickable.
+#[cfg(test)]
+fn linked(s: &str) -> String {
+    linked_emph(s)
 }
 
 fn esc(s: &str) -> String {
@@ -474,7 +561,7 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
         for o in d.options.iter().chain(std::iter::once(&other)) {
             let num = if o.id == OTHER { String::new() } else { format!("<span class=\"oid\">{}</span>", esc(&o.id)) };
             let reco = if o.reco { "<span class=\"badge\">Recommended</span>" } else { "" };
-            let detail = o.detail.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<span class=\"detail\">{}</span>", linked(t))).unwrap_or_default();
+            let detail = o.detail.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<div class=\"detail\">{}</div>", rich(t))).unwrap_or_default();
             let images = images_html(&o.images, home, &mut budget);
             opts.push_str(&format!(
                 "<label class=\"opt\"><input type=\"radio\" name=\"d-{did}\" value=\"{oid}\"{checked}{reco_attr}><span class=\"txt\"><span class=\"label\">{num}{label}</span>{reco}{detail}{images}</span></label>\n",
@@ -485,12 +572,12 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
                 label = esc(&o.label),
             ));
         }
-        let context = d.context.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<p class=\"context\">{}</p>", linked(t))).unwrap_or_default();
+        let context = d.context.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<div class=\"context\">{}</div>", rich(t))).unwrap_or_default();
         cards.push_str(&format!(
             "<article class=\"card{answered}\" data-id=\"{id}\"><div class=\"head\"><span class=\"num\">{id}</span><h3>{title}</h3></div>{context}<div class=\"opts\">{opts}</div><textarea rows=\"1\" placeholder=\"Add to it, change it or propose something else\" aria-label=\"Note on {id}\">{note}</textarea></article>\n",
             answered = if a.is_some() { " answered" } else { "" },
             id = esc(&d.id),
-            title = esc(&d.title),
+            title = inline(&d.title),
             note = esc(a.map(|a| a.note.as_str()).unwrap_or("")),
         ));
     }
@@ -520,7 +607,7 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
     // The sheet's texts last, so a `{…}` in them is never taken for a slot.
     page.replacen("@@TITLE@@", &esc(&sheet.title), 2)
         .replacen("@@FROM@@", &esc(from), 1)
-        .replacen("@@INTRO@@", &linked(&sheet.intro), 1)
+        .replacen("@@INTRO@@", &rich(&sheet.intro), 1)
         .replacen("@@LINKS@@", &links, 1)
         .replacen("@@NOTE@@", &esc(&answers.note), 1)
         .replacen("@@CARDS@@", &cards, 1)
@@ -579,7 +666,9 @@ html, body { background: {bg}; }
 body { margin: 0; color: {t1}; font: 14px/1.55 "Inter", -apple-system, system-ui, sans-serif; }
 .wrap { max-width: 760px; margin: 0 auto; padding: 22px 20px 40px; display: grid; gap: 14px; }
 .from { color: {t3}; font-size: 12px; margin: 0; }
-.msg { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; background: {tile}; border: 1px solid {b3}; border-radius: 12px; padding: 14px 16px; user-select: text; }
+ul { margin: 4px 0; padding-left: 18px; } li { margin: 2px 0; }
+code { font: 12px ui-monospace, "SF Mono", Menlo, monospace; border: 1px solid {b3}; border-radius: 4px; padding: 0 4px; overflow-wrap: anywhere; }
+.msg { overflow-wrap: anywhere; margin: 0; background: {tile}; border: 1px solid {b3}; border-radius: 12px; padding: 14px 16px; user-select: text; }
 textarea { width: 100%; font: inherit; font-size: 13px; color: {t1}; background: {bg}; border: 1px solid {b3}; border-radius: 8px; padding: 7px 10px; resize: vertical; }
 textarea:focus { border-color: {accent}; outline: none; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; position: sticky; bottom: 0; background: {bg}; padding: 8px 0; }
@@ -614,7 +703,7 @@ document.querySelectorAll('button[data-action]').forEach(b => b.onclick = () => 
     page.replacen("@@FROM@@", &esc(from), 1)
         .replacen("@@NOTE@@", note, 1)
         .replacen("@@BUTTONS@@", &buttons_html, 1)
-        .replacen("@@MSG@@", &linked(message), 1)
+        .replacen("@@MSG@@", &rich(message), 1)
 }
 
 const PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -660,6 +749,9 @@ h2.group { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; co
 .oid { color: {t3}; font-weight: 600; margin-right: 6px; }
 .badge { display: inline-block; font-size: 11px; font-weight: 600; color: {ok}; border: 1px solid {ok}; border-radius: 5px; padding: 0 5px; margin-left: 6px; vertical-align: 1px; }
 .detail { color: {t2}; font-size: 13px; display: block; }
+ul { margin: 4px 0; padding-left: 18px; } li { margin: 2px 0; }
+code { font: 12px ui-monospace, "SF Mono", Menlo, monospace; border: 1px solid {b3}; border-radius: 4px; padding: 0 4px; overflow-wrap: anywhere; }
+
 .txt { min-width: 0; }
 .shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 8px; }
 .shot { display: grid; gap: 4px; min-width: 0; }
@@ -678,7 +770,7 @@ textarea:focus { border-color: {accent}; outline: none; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .hint { color: {t3}; font-size: 12px; }
 </style></head><body>
-<div class="wrap"><header><h1>@@TITLE@@</h1><p class="from">From @@FROM@@</p><p class="intro">@@INTRO@@</p><div class="links">@@LINKS@@</div></header></div>
+<div class="wrap"><header><h1>@@TITLE@@</h1><p class="from">From @@FROM@@</p><div class="intro">@@INTRO@@</div><div class="links">@@LINKS@@</div></header></div>
 <div class="bar"><div class="wrap"><span class="count" id="count"></span><div class="track"><div class="fill" id="fill"></div></div><button id="filter" type="button">Open only</button></div></div>
 <div class="wrap">
 <main id="cards">
@@ -782,6 +874,21 @@ mod tests {
         assert!(html.contains("<a href=\"https://linear.app/c\">CLA-1</a>"));
         assert!(!html.contains("href=\"javascript"));
         assert_eq!(linked("<b>https://a.b/\"x</b>"), "&lt;b&gt;<a href=\"https://a.b/\">https://a.b/</a>&quot;x&lt;/b&gt;");
+    }
+
+    #[test]
+    fn sheet_texts_take_simple_markdown() {
+        assert_eq!(
+            rich("Why:\n- **fast** and *safe*\n- see `a_b` [doc](https://x.io)\nThen _done_."),
+            "Why:<ul><li><strong>fast</strong> and <em>safe</em></li><li>see <code>a_b</code> <a href=\"https://x.io\">doc</a></li></ul>Then <em>done</em>."
+        );
+        assert_eq!(rich("one\ntwo"), "one<br>two");
+        // Inside a word or unclosed, the markers are plain text.
+        assert_eq!(inline("snake_case_name 2*3*4 a * b **open"), "snake_case_name 2*3*4 a * b **open");
+        // A URL keeps its underscores and stars.
+        assert_eq!(inline("https://x.io/a_b_c"), "<a href=\"https://x.io/a_b_c\">https://x.io/a_b_c</a>");
+        assert_eq!(inline("**<b>** `<i>`"), "<strong>&lt;b&gt;</strong> <code>&lt;i&gt;</code>");
+        assert_eq!(inline("***both***"), "<strong><em>both</em></strong>");
     }
 
     #[test]

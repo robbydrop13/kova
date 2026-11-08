@@ -118,6 +118,11 @@ sheet's intro, contexts and option details (plus its links block), and the
 long-question page. A web link opens in the side panel (on a sheet or long
 question, Back on that first page renders the sheet again, answers kept as
 drafts); an app's link opens in that app. Other schemes stay plain text.
+The sheet's decision titles (inline only), intro, contexts and option
+details, and the long question's text, take simple markdown: `**bold**`,
+`*italic*` or `_italic_` (not inside a word), `` `code` ``, `- ` / `* ` /
+`• ` lines as a bulleted list, line breaks kept. No headings, tables or raw
+HTML: the rest is escaped text.
 
 Open (on the floating card or in the Cockpit) takes the decision off the
 floating card, which moves on to the next question: it is answered on the
