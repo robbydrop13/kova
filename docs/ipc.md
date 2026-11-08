@@ -428,11 +428,17 @@ the way and Kova delivers it to the conversation itself:
    up, the answer stays on disk, retried at the next launch. Steps 2
    to 4 are skipped then: a resume in a new tab would run the conversation twice
    once the sleeping pane is shown;
-2. typed into the asker's pane, if that pane still runs the asker's
-   conversation (`agent_session_id`, with the matching `agent`; for Claude an
-   older Kova's `claude_session_id` also counts, and the conversation's process
-   descending from the pane's shell);
-3. if the conversation is open in another process, Kova waits for it to end
+2. typed into the pane that runs the asker's conversation (`agent_session_id`,
+   with the matching `agent`; for Claude an older Kova's `claude_session_id`
+   also counts, and the conversation's process descending from the pane's
+   shell). The asker's own pane is checked first, then every pane of the
+   asker's Kova and of the one delivering: after a relaunch the conversation
+   runs in a pane with a new id, on a new socket. An answer whose message is
+   over 600 characters is not typed whole (Claude Code lost the start of a
+   long typed answer): it is written to `~/.config/kova/ask/answers/<id>.txt`
+   and the pane gets one line naming the question and that file;
+3. if the conversation is open in another process outside any Kova pane, Kova
+   posts a notification ("Answer not delivered yet") and waits for it to end
    (Claude only: the other agents keep no per-process registry);
 4. then reopens it in a new tab (or, with `[agent] ask_resume_tab = "<title>"`, as a new column of the tab with that title, created when missing) with the asker agent's resume line:
    `claude --dangerously-skip-permissions --resume <session_id> '<the answer>'`,

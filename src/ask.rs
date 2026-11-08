@@ -370,17 +370,16 @@ pub enum Delivery {
     None,
 }
 
-/// Picks the delivery for an answer nobody waits for. `pane_holds_session`
-/// says whether the asker's pane still runs the asker's conversation;
+/// Picks the delivery for an answer nobody waits for. `holding` is the pane
+/// (socket, id) found running the asker's conversation, wherever it is now:
+/// a Kova relaunch moves a conversation to a new pane id and a new socket.
 /// `live_pid` is the process that still runs it, if any.
 /// Typing into a pane needs a session id to compare: without one, the pane may
 /// run anything by now.
-pub fn delivery(asker: &Asker, pane_holds_session: bool, live_pid: Option<i32>) -> Delivery {
+pub fn delivery(asker: &Asker, holding: Option<(String, u32)>, live_pid: Option<i32>) -> Delivery {
     let Some(session) = asker.session_id.clone() else { return Delivery::None };
-    if pane_holds_session {
-        if let (Some(socket), Some(pane_id)) = (asker.kova_socket.clone(), asker.pane_id) {
-            return Delivery::Pane { socket, pane_id };
-        }
+    if let Some((socket, pane_id)) = holding {
+        return Delivery::Pane { socket, pane_id };
     }
     if let Some(pid) = live_pid {
         return Delivery::OpenElsewhere { pid };
@@ -413,6 +412,21 @@ pub fn late_answer_message(question: &Question, answer: &Answer) -> String {
         "[Kova] The user answered your question \"{}\": {}",
         one_line(&question.message),
         one_line(&answer.line())
+    )
+}
+
+/// Above this, a late answer is not typed into a pane: Claude Code lost the
+/// start of a long typed answer (07/11, a sheet of 20 answers arrived cut).
+/// The answer goes to a file and only its path is typed.
+pub const LATE_TYPED_MAX: usize = 600;
+
+/// The short message pointing at the file holding a long answer.
+pub fn late_answer_pointer(question: &Question, path: &Path) -> String {
+    let title: String = question.message.lines().next().unwrap_or_default().chars().filter(|c| !c.is_control()).take(120).collect();
+    format!(
+        "[Kova] The user answered your question \"{}\". The answer is long: read it in full in {}",
+        title,
+        path.display()
     )
 }
 
@@ -685,7 +699,7 @@ fn reply_ok(reply: &Option<serde_json::Value>) -> bool {
 /// to Kova sockets only — this Kova's own included, answered by the main thread.
 /// The answer leaves `store` only once delivered.
 pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_socket: &str) {
-    let message = late_answer_message(question, answer);
+    let message = late_answer_text(store, question, answer);
     let asker = &question.from;
     let id = &question.id;
     let target = match wake_sleeping_asker(asker, own_socket) {
@@ -707,8 +721,8 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
                         .and_then(|s| live_session_pid(s, &registry))
                 })
                 .flatten();
-            let holds = holding_pane(asker, live);
-            delivery(asker, holds, live)
+            let holding = holding_pane(asker, live, own_socket);
+            delivery(asker, holding, live)
         }
     };
     match target {
@@ -750,6 +764,14 @@ pub fn deliver_late(store: &AskStore, question: &Question, answer: &Answer, own_
                 "ask {}: conversation still open in process {}, outside a pane Kova can type into; resuming once it exits",
                 id,
                 pid
+            );
+            // Said where the user looks, not only in the log: the answer
+            // waits, and the user believes it was sent (08/11).
+            request(
+                own_socket,
+                serde_json::json!({"cmd": "notify", "title": "Answer not delivered yet", "message": format!(
+                    "{} runs outside a Kova pane: your answer reaches it once that process ends", asker.name)}),
+                Duration::from_secs(3),
             );
             let deadline = std::time::Instant::now() + Duration::from_secs(24 * 3600);
             let alive = || unsafe { libc::kill(pid, 0) } == 0;
@@ -901,20 +923,61 @@ fn shows_empty_prompt(text: &str) -> bool {
 
 /// Whether the asker's Kova pane still runs the asker's conversation, read now
 /// from that Kova's `list-panes`. Logs the proof it used.
-fn holding_pane(asker: &Asker, live: Option<i32>) -> bool {
-    let (Some(session), Some(socket), Some(pane_id)) = (asker.session_id.as_deref(), asker.kova_socket.as_deref(), asker.pane_id) else {
-        return false;
-    };
-    let reply = request(socket, serde_json::json!({"cmd": "list-panes"}), Duration::from_secs(3));
-    let Some(panes) = reply.as_ref().and_then(|r| r.get("data")).and_then(|d| d.as_array()) else {
-        return false;
-    };
-    match pane_holds_session(panes, pane_id, asker.agent, session, live, descends) {
-        Some(proof) => {
-            log::info!("ask: pane {} holds session {}: {}", pane_id, session, proof);
-            true
+fn holding_pane(asker: &Asker, live: Option<i32>, own_socket: &str) -> Option<(String, u32)> {
+    let session = asker.session_id.as_deref()?;
+    let sockets = asker.kova_socket.as_deref().into_iter().chain(std::iter::once(own_socket));
+    let mut seen = Vec::new();
+    for socket in sockets {
+        if seen.contains(&socket) {
+            continue;
         }
-        None => false,
+        seen.push(socket);
+        let Some(panes) = list_panes(socket) else { continue };
+        // The asker's own pane id only means something on the asker's socket.
+        let preferred = (Some(socket) == asker.kova_socket.as_deref()).then_some(asker.pane_id).flatten();
+        if let Some((pane_id, proof)) = find_holding_pane(&panes, preferred, asker.agent, session, live, descends) {
+            log::info!("ask: pane {} of {} holds session {}: {}", pane_id, socket, session, proof);
+            return Some((socket.to_string(), pane_id));
+        }
+    }
+    None
+}
+
+/// The pane of `panes` that runs `session_id`, `preferred` checked first. The
+/// asker's pane id is not enough: after a Kova relaunch the conversation
+/// comes back in a pane with another id (08/11, asked from pane 64, running
+/// in pane 42, the answer waited for a process that never ends).
+pub fn find_holding_pane(
+    panes: &[serde_json::Value],
+    preferred: Option<u32>,
+    agent: crate::agent_session::Agent,
+    session_id: &str,
+    live_pid: Option<i32>,
+    descends: impl Fn(i32, i32) -> bool,
+) -> Option<(u32, String)> {
+    let ids = panes.iter().filter_map(|p| p.get("id")?.as_u64()?.try_into().ok());
+    preferred
+        .into_iter()
+        .chain(ids.filter(|id| Some(*id) != preferred))
+        .find_map(|id| pane_holds_session(panes, id, agent, session_id, live_pid, &descends).map(|proof| (id, proof)))
+}
+
+/// What a late answer types: the whole message when short, else a pointer to
+/// a file under the ask directory holding it (`answers/<id>.txt`).
+fn late_answer_text(store: &AskStore, question: &Question, answer: &Answer) -> String {
+    let message = late_answer_message(question, answer);
+    if message.chars().count() <= LATE_TYPED_MAX || !is_safe_question_id(&question.id) {
+        return message;
+    }
+    let dir = store.root.join("answers");
+    let path = dir.join(format!("{}.txt", question.id));
+    let full = format!("Question:\n{}\n\nAnswer:\n{}\n", question.message, answer.line());
+    match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, full)) {
+        Ok(()) => late_answer_pointer(question, &path),
+        Err(e) => {
+            log::warn!("ask {}: could not write the long answer to {}: {}", question.id, path.display(), e);
+            message
+        }
     }
 }
 
@@ -2189,15 +2252,15 @@ mod tests {
 
     #[test]
     fn delivery_prefers_the_live_pane() {
-        assert_eq!(delivery(&asker(), true, None), Delivery::Pane { socket: "/tmp/kova-1.sock".into(), pane_id: 7 });
+        assert_eq!(delivery(&asker(), Some(("/tmp/kova-1.sock".to_string(), 7)), None), Delivery::Pane { socket: "/tmp/kova-1.sock".into(), pane_id: 7 });
         // Open in the pane wins over "open in some process": it is that process.
-        assert_eq!(delivery(&asker(), true, Some(42)), Delivery::Pane { socket: "/tmp/kova-1.sock".into(), pane_id: 7 });
+        assert_eq!(delivery(&asker(), Some(("/tmp/kova-1.sock".to_string(), 7)), Some(42)), Delivery::Pane { socket: "/tmp/kova-1.sock".into(), pane_id: 7 });
     }
 
     #[test]
     fn delivery_resumes_when_the_pane_no_longer_holds_the_conversation() {
         assert_eq!(
-            delivery(&asker(), false, None),
+            delivery(&asker(), None, None),
             Delivery::Resume {
                 agent: crate::agent_session::Agent::Claude,
                 session_id: "abc-123".into(),
@@ -2209,28 +2272,60 @@ mod tests {
             kova_socket: None,
             ..asker()
         };
+        // Found in a pane of the relaunched Kova: typed there, even with no pane on record.
         assert_eq!(
-            delivery(&headless, true, None),
-            Delivery::Resume {
-                agent: crate::agent_session::Agent::Claude,
-                session_id: "abc-123".into(),
-                cwd: Some("/tmp/w".into()),
-            }
+            delivery(&headless, Some(("/tmp/kova-2.sock".to_string(), 42)), None),
+            Delivery::Pane { socket: "/tmp/kova-2.sock".into(), pane_id: 42 }
         );
     }
 
     #[test]
+    fn the_holding_pane_is_found_under_its_new_id_after_a_relaunch() {
+        use crate::agent_session::Agent;
+        let panes = vec![
+            serde_json::json!({"id": 64, "pid": 100, "agent": "claude", "agent_session_id": "other"}),
+            serde_json::json!({"id": 42, "pid": 200, "agent": "claude", "agent_session_id": "abc-123"}),
+        ];
+        let never = |_: i32, _: i32| false;
+        assert_eq!(find_holding_pane(&panes, Some(64), Agent::Claude, "abc-123", None, never).map(|f| f.0), Some(42));
+        // No report yet: the live process descending from a pane's shell is enough.
+        let quiet = vec![serde_json::json!({"id": 5, "pid": 300}), serde_json::json!({"id": 9, "pid": 400})];
+        let under_400 = |pid: i32, shell: i32| pid == 6189 && shell == 400;
+        assert_eq!(find_holding_pane(&quiet, None, Agent::Claude, "abc-123", Some(6189), under_400).map(|f| f.0), Some(9));
+        assert_eq!(find_holding_pane(&quiet, None, Agent::Claude, "abc-123", None, never), None);
+    }
+
+    #[test]
+    fn a_long_late_answer_is_typed_as_a_pointer_to_its_file() {
+        let dir = std::env::temp_dir().join(format!("kova-ask-long-{}", std::process::id()));
+        let store = AskStore::new(dir.clone());
+        let mut q = question("0b0c1d2e-0000-4000-8000-000000000001");
+        q.message = "Plan\nmore".into();
+        let short = Answer { id: q.id.clone(), action: "OK".into(), text: String::new() };
+        assert!(late_answer_text(&store, &q, &short).contains("OK"));
+        let long = Answer { id: q.id.clone(), action: "OK".into(), text: "x".repeat(LATE_TYPED_MAX + 1) };
+        let typed = late_answer_text(&store, &q, &long);
+        let path = dir.join("answers").join(format!("{}.txt", q.id));
+        assert!(typed.chars().count() < LATE_TYPED_MAX, "{}", typed);
+        assert!(typed.contains(&path.display().to_string()) && typed.contains("\"Plan\""), "{}", typed);
+        assert!(!typed.chars().any(|c| c.is_control()));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(&"x".repeat(LATE_TYPED_MAX + 1)) && saved.contains("Plan\nmore"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn delivery_never_forks_a_conversation_open_elsewhere() {
-        assert_eq!(delivery(&asker(), false, Some(42)), Delivery::OpenElsewhere { pid: 42 });
+        assert_eq!(delivery(&asker(), None, Some(42)), Delivery::OpenElsewhere { pid: 42 });
     }
 
     #[test]
     fn delivery_none_without_any_way_back() {
         let script = Asker { name: "script".into(), ..Default::default() };
-        assert_eq!(delivery(&script, false, None), Delivery::None);
+        assert_eq!(delivery(&script, None, None), Delivery::None);
         // A pane without a session to compare is not enough: it may run anything by now.
         let pane_only = Asker { name: "script".into(), pane_id: Some(3), kova_socket: Some("/tmp/k.sock".into()), ..Default::default() };
-        assert_eq!(delivery(&pane_only, true, None), Delivery::None);
+        assert_eq!(delivery(&pane_only, Some(("/tmp/k.sock".to_string(), 3)), None), Delivery::None);
         assert!(!can_deliver_late(&pane_only));
     }
 
