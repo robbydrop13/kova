@@ -170,6 +170,82 @@ define_class!(
 );
 
 define_class!(
+    /// The card's message. A label whose links (`text_links`) are clickable:
+    /// the field editor asks its delegate, this label, what a click on a
+    /// link does. A web link opens in the side panel, an app's link (Slack,
+    /// Linear, Notion) in that app.
+    #[unsafe(super(NSTextField, NSControl, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KovaAskCardBody"]
+    struct CardBody;
+
+    impl CardBody {
+        #[unsafe(method(textView:clickedOnLink:atIndex:))]
+        fn text_view_clicked_on_link(&self, _view: &NSTextView, link: &AnyObject, _index: usize) -> Bool {
+            let url: Option<String> = unsafe {
+                let s: Option<Retained<NSString>> = if msg_send![link, isKindOfClass: objc2::class!(NSString)] {
+                    Some(Retained::retain(link as *const AnyObject as *mut NSString).unwrap())
+                } else if msg_send![link, respondsToSelector: sel!(absoluteString)] {
+                    msg_send![link, absoluteString]
+                } else {
+                    None
+                };
+                s.map(|s| s.to_string())
+            };
+            match url.filter(|u| crate::text_links::allowed(u)) {
+                Some(url) => {
+                    open_link(url);
+                    Bool::YES
+                }
+                None => Bool::NO,
+            }
+        }
+    }
+);
+
+/// A link clicked on the card: a web page for the front window's side panel
+/// (the tick takes it, `take_link_opens`), anything else for its app.
+fn open_link(url: String) {
+    log::info!("Ask card: link clicked: {}", url);
+    if crate::text_links::opens_in_panel(&url) {
+        if let Ok(mut links) = LINK_OPENS.lock() {
+            links.push(url);
+        }
+    } else if let Some(nsurl) = objc2_foundation::NSURL::URLWithString(&ns(&url)) {
+        objc2_app_kit::NSWorkspace::sharedWorkspace().openURL(&nsurl);
+    }
+}
+
+static LINK_OPENS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Web links clicked on the card since the last call.
+pub fn take_link_opens() -> Vec<String> {
+    match LINK_OPENS.lock() {
+        Ok(mut links) => std::mem::take(&mut *links),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `text` in the card's body style, its links carrying `NSLinkAttributeName`.
+fn linked_body(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttributedString> {
+    let out = objc2_foundation::NSMutableAttributedString::new();
+    for span in crate::text_links::spans(text) {
+        let piece = match &span {
+            crate::text_links::Span::Text(t) => attributed(t, font, color),
+            crate::text_links::Span::Link { label, url } => {
+                let keys: [&NSAttributedStringKey; 2] = unsafe { [NSFontAttributeName, objc2_app_kit::NSLinkAttributeName] };
+                let link = ns(url);
+                let values: [&AnyObject; 2] = [font.as_ref(), link.as_ref()];
+                let attrs = NSDictionary::from_slices(&keys, &values);
+                unsafe { NSAttributedString::new_with_attributes(&ns(label), &attrs) }
+            }
+        };
+        out.appendAttributedString(&piece);
+    }
+    Retained::into_super(out)
+}
+
+define_class!(
     /// Target of the buttons and delegate of the answer field. Holds nothing:
     /// the state lives in `CARD`, read when a callback fires.
     #[unsafe(super(NSObject))]
@@ -396,6 +472,10 @@ fn ns(s: &str) -> Retained<NSString> {
     NSString::from_str(s)
 }
 
+fn body_font() -> Retained<NSFont> {
+    crate::window::fonts::inter(crate::window::fonts::Face::Regular, 13.0)
+}
+
 /// An attributed string with a font and a colour.
 fn attributed(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttributedString> {
     let keys: [&NSAttributedStringKey; 2] = unsafe { [NSFontAttributeName, NSForegroundColorAttributeName] };
@@ -537,9 +617,12 @@ impl Card {
         header.setSpacing(8.0);
         header.setAlignment(NSLayoutAttribute::CenterY);
 
-        let body = NSTextField::wrappingLabelWithString(&ns(""), mtm);
-        body.setFont(Some(&crate::window::fonts::inter(crate::window::fonts::Face::Regular, 13.0)));
+        let body: Retained<CardBody> = unsafe { msg_send![<CardBody as objc2::ClassType>::class(), wrappingLabelWithString: &*ns("")] };
+        let body: Retained<NSTextField> = Retained::into_super(body);
+        body.setFont(Some(&body_font()));
         body.setSelectable(true);
+        // Links stay links: without it a selectable label drops its attributes.
+        body.setAllowsEditingTextAttributes(true);
         body.setPreferredMaxLayoutWidth(WIDTH - 2.0 * INSET);
 
         // The answer field: borderless text inside a rounded, lightly tinted box,
@@ -770,8 +853,7 @@ impl Card {
             None if long => crate::ask::card_preview(question.message),
             None => question.message.to_string(),
         };
-        self.body.setStringValue(&ns(&body));
-        self.body.setTextColor(Some(&token(p.text_primary)));
+        self.body.setAttributedStringValue(&linked_body(&body, &body_font(), &token(p.text_primary)));
         if is_new {
             self.field.setStringValue(&ns(""));
             self.field_height.setConstant(self.line_height);

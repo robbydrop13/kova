@@ -111,8 +111,13 @@ page is loaded from a string with no base URL), while the panel shows a sheet;
 the tick keeps it to what the sheet asks (`Sheet::answers_from`). Drafts are
 saved on the question, on disk with it, so closing the panel or quitting Kova
 loses nothing. Done answers the question with the summary and the panel shows
-what was sent. A link in the sheet opens in the default browser: the sheet
-stays the panel's page.
+what was sent. Links in an ask's text are clickable everywhere it is shown:
+bare URLs (`http(s)`, `slack://`, `linear://`, `notion://`) and markdown
+`[label](url)`, found by `src/text_links.rs`, in the card's message, the
+sheet's intro, contexts and option details (plus its links block), and the
+long-question page. A web link opens in the side panel (on a sheet or long
+question, Back on that first page renders the sheet again, answers kept as
+drafts); an app's link opens in that app. Other schemes stay plain text.
 
 Open (on the floating card or in the Cockpit) takes the decision off the
 floating card, which moves on to the next question: it is answered on the

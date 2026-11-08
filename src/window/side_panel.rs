@@ -498,6 +498,9 @@ pub struct SidePanelIvars {
     delegate: OnceCell<Retained<PanelWebDelegate>>,
     /// What the panel shows; `None` until something is opened.
     current: RefCell<Option<PanelTarget>>,
+    /// The sheet or long question a link was opened from: Back on the first
+    /// page shows it again (it is not in the web view's own history).
+    return_to: RefCell<Option<PanelTarget>>,
     /// Whether the user wants the panel on screen (toggle, close button).
     open: Cell<bool>,
     title: RefCell<String>,
@@ -659,6 +662,7 @@ impl SidePanelView {
             web: OnceCell::new(),
             delegate: OnceCell::new(),
             current: RefCell::new(None),
+            return_to: RefCell::new(None),
             open: Cell::new(false),
             title: RefCell::new(String::new()),
             hovered: Cell::new(PanelHit::None),
@@ -681,6 +685,7 @@ impl SidePanelView {
     /// Show `target` in the panel, opening it.
     pub fn open_target(&self, target: PanelTarget) {
         log::info!("side panel: open {:?}", target);
+        self.ivars().return_to.borrow_mut().take();
         let mtm = MainThreadMarker::from(self);
         let web = self.web_view(mtm);
         *self.ivars().title.borrow_mut() = target.fallback_title();
@@ -932,15 +937,40 @@ impl SidePanelView {
         (p.x, p.y)
     }
 
+    /// A link clicked on a sheet or long question: shown here, the sheet
+    /// kept to come back to.
+    pub fn open_from_sheet(&self, url: String) {
+        let from = self.ivars().current.borrow().clone();
+        self.open_target(PanelTarget::Web(url));
+        *self.ivars().return_to.borrow_mut() = from;
+    }
+
+    /// Back to the sheet a link was opened from: its page in the web view's
+    /// history is the `about:blank` it was loaded as.
+    fn back_is_sheet(&self, web: &WKWebView) -> bool {
+        if self.ivars().return_to.borrow().is_none() {
+            return false;
+        }
+        let list = unsafe { web.backForwardList() };
+        let item: Option<Retained<objc2::runtime::AnyObject>> = unsafe { msg_send![&*list, backItem] };
+        let Some(item) = item else { return true };
+        let url: Option<Retained<NSURL>> = unsafe { msg_send![&*item, URL] };
+        is_blank(url.and_then(|u| u.absoluteString()).map(|s| s.to_string()).as_deref())
+    }
+
     fn go_back(&self) {
         let Some(web) = self.ivars().web.get() else { return };
-        if unsafe { web.canGoBack() } {
+        if self.back_is_sheet(web) {
+            if let Some(sheet) = self.ivars().return_to.borrow_mut().take() {
+                self.open_target(sheet);
+            }
+        } else if unsafe { web.canGoBack() } {
             unsafe { web.goBack() };
         }
     }
 
     fn can_go_back(&self) -> bool {
-        self.ivars().web.get().is_some_and(|web| unsafe { web.canGoBack() })
+        self.ivars().web.get().is_some_and(|web| self.back_is_sheet(web) || unsafe { web.canGoBack() })
     }
 
     /// The page in the default browser: the URL the panel is on now (it may
@@ -1079,9 +1109,13 @@ define_class!(
                     }
                     WKNavigationActionPolicy::Cancel
                 }
-                // The sheet stays the panel's page: its links open in the browser.
+                // A sheet's (or long question's) web link opens in the panel,
+                // and Back comes back to the sheet, rendered again from what
+                // Kova keeps (the answers given are drafts there).
                 (Some("http" | "https"), Some(u)) if on_sheet && clicked => {
-                    NSWorkspace::sharedWorkspace().openURL(u);
+                    if let (Some(panel), Some(link)) = (panel.as_ref(), u.absoluteString()) {
+                        panel.open_from_sheet(link.to_string());
+                    }
                     WKNavigationActionPolicy::Cancel
                 }
                 (Some("http" | "https" | "about" | "data" | "blob"), _) => WKNavigationActionPolicy::Allow,

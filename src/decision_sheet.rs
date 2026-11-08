@@ -341,6 +341,18 @@ impl Sheet {
 // The page
 // ---------------------------------------------------------------
 
+/// `s` escaped, its links (`text_links`) made clickable: the panel opens a
+/// web link in itself and an app's link in that app.
+fn linked(s: &str) -> String {
+    crate::text_links::spans(s)
+        .iter()
+        .map(|span| match span {
+            crate::text_links::Span::Text(t) => esc(t),
+            crate::text_links::Span::Link { label, url } => format!("<a href=\"{}\">{}</a>", esc(url), esc(label)),
+        })
+        .collect()
+}
+
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -462,7 +474,7 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
         for o in d.options.iter().chain(std::iter::once(&other)) {
             let num = if o.id == OTHER { String::new() } else { format!("<span class=\"oid\">{}</span>", esc(&o.id)) };
             let reco = if o.reco { "<span class=\"badge\">Recommended</span>" } else { "" };
-            let detail = o.detail.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<span class=\"detail\">{}</span>", esc(t))).unwrap_or_default();
+            let detail = o.detail.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<span class=\"detail\">{}</span>", linked(t))).unwrap_or_default();
             let images = images_html(&o.images, home, &mut budget);
             opts.push_str(&format!(
                 "<label class=\"opt\"><input type=\"radio\" name=\"d-{did}\" value=\"{oid}\"{checked}{reco_attr}><span class=\"txt\"><span class=\"label\">{num}{label}</span>{reco}{detail}{images}</span></label>\n",
@@ -473,7 +485,7 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
                 label = esc(&o.label),
             ));
         }
-        let context = d.context.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<p class=\"context\">{}</p>", esc(t))).unwrap_or_default();
+        let context = d.context.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<p class=\"context\">{}</p>", linked(t))).unwrap_or_default();
         cards.push_str(&format!(
             "<article class=\"card{answered}\" data-id=\"{id}\"><div class=\"head\"><span class=\"num\">{id}</span><h3>{title}</h3></div>{context}<div class=\"opts\">{opts}</div><textarea rows=\"1\" placeholder=\"Add to it, change it or propose something else\" aria-label=\"Note on {id}\">{note}</textarea></article>\n",
             answered = if a.is_some() { " answered" } else { "" },
@@ -508,7 +520,7 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
     // The sheet's texts last, so a `{…}` in them is never taken for a slot.
     page.replacen("@@TITLE@@", &esc(&sheet.title), 2)
         .replacen("@@FROM@@", &esc(from), 1)
-        .replacen("@@INTRO@@", &esc(&sheet.intro), 1)
+        .replacen("@@INTRO@@", &linked(&sheet.intro), 1)
         .replacen("@@LINKS@@", &links, 1)
         .replacen("@@NOTE@@", &esc(&answers.note), 1)
         .replacen("@@CARDS@@", &cards, 1)
@@ -602,7 +614,7 @@ document.querySelectorAll('button[data-action]').forEach(b => b.onclick = () => 
     page.replacen("@@FROM@@", &esc(from), 1)
         .replacen("@@NOTE@@", note, 1)
         .replacen("@@BUTTONS@@", &buttons_html, 1)
-        .replacen("@@MSG@@", &esc(message), 1)
+        .replacen("@@MSG@@", &linked(message), 1)
 }
 
 const PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -761,6 +773,15 @@ mod tests {
         assert!(html.contains("data-action=\"K&lt;O\""));
         assert!(html.contains("id=\"note\""));
         assert!(!render_question("a", "b", &["OK".into()], false, &tokens::DARK).contains("id=\"note\""));
+    }
+
+    #[test]
+    fn links_in_an_asks_text_are_clickable_and_still_escaped() {
+        let html = render_question("a", "Fil https://x.slack.com/p1?a=1&b=2. [CLA-1](https://linear.app/c) [x](javascript:alert(1))", &["OK".into()], false, &tokens::DARK);
+        assert!(html.contains("<a href=\"https://x.slack.com/p1?a=1&amp;b=2\">https://x.slack.com/p1?a=1&amp;b=2</a>."), "{}", html);
+        assert!(html.contains("<a href=\"https://linear.app/c\">CLA-1</a>"));
+        assert!(!html.contains("href=\"javascript"));
+        assert_eq!(linked("<b>https://a.b/\"x</b>"), "&lt;b&gt;<a href=\"https://a.b/\">https://a.b/</a>&quot;x&lt;/b&gt;");
     }
 
     #[test]
