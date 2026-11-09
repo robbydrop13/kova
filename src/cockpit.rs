@@ -651,6 +651,8 @@ pub struct View<'a> {
     /// recording stopped (`crate::record`).
     pub record: String,
     pub record_note: String,
+    /// The theme button (`theme_button`), right of Chat.
+    pub theme: String,
 }
 
 /// The cards the list shows first, and each `Voir plus` adds.
@@ -1040,6 +1042,47 @@ pub fn list_html(view: &View) -> String {
     out
 }
 
+const ICON_SUN: &str = r#"<svg class="i" width="14" height="14" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>"#;
+const ICON_MOON: &str = r#"<svg class="i" width="14" height="14" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>"#;
+const ICON_SYSTEM: &str = r#"<svg class="i" width="14" height="14" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>"#;
+
+/// A shortcut as macOS menus show it: `cmd+option+l` is `⌥⌘L`.
+pub fn shortcut_label(keys: &str) -> String {
+    let parts: Vec<String> = keys.split('+').map(|p| p.trim().to_ascii_lowercase()).collect();
+    let has = |m: &[&str]| parts.iter().any(|p| m.contains(&p.as_str()));
+    let mut out = String::new();
+    for (names, glyph) in [(&["ctrl", "control"][..], "\u{2303}"), (&["option", "alt", "opt"][..], "\u{2325}"), (&["shift"][..], "\u{21e7}"), (&["cmd", "command", "super"][..], "\u{2318}")] {
+        if has(names) {
+            out.push_str(glyph);
+        }
+    }
+    let modifiers = ["ctrl", "control", "option", "alt", "opt", "shift", "cmd", "command", "super"];
+    if let Some(key) = parts.iter().find(|p| !modifiers.contains(&p.as_str())) {
+        out.push_str(&key.to_uppercase());
+    }
+    out
+}
+
+/// The header's theme button: the icon of the current mode, a click goes to
+/// the next one (Clair, Sombre, Système), as View > Theme and the shortcut do.
+pub fn theme_button(mode: crate::theme::ThemeMode, shortcut: &str) -> String {
+    use crate::theme::ThemeMode;
+    let icon = match mode {
+        ThemeMode::Light => ICON_SUN,
+        ThemeMode::Dark => ICON_MOON,
+        ThemeMode::System => ICON_SYSTEM,
+    };
+    let keys = shortcut_label(shortcut);
+    let keys = if keys.is_empty() { String::new() } else { format!(" ({keys})") };
+    format!(
+        "<button type=\"button\" class=\"btn sec ico\" data-theme=\"cycle\" title=\"Thème : {}, clic pour {}{}\" aria-label=\"Thème {}\">{icon}</button>",
+        mode.label(),
+        mode.next().label(),
+        esc(&keys),
+        mode.label()
+    )
+}
+
 /// The title block, the Chat button, the filter.
 pub fn head_html(view: &View) -> String {
     let (lead, tail) = subtitle(view.items);
@@ -1053,11 +1096,12 @@ pub fn head_html(view: &View) -> String {
     };
     format!(
         "<div class=\"phead\"><div><div class=\"ptitle\">Cockpit</div><div class=\"psub\">{}{tail}</div></div>\
-         <div class=\"hbtns\">{}<button type=\"button\" class=\"btn {}\" data-chat=\"toggle\">{ICON_CHAT}<span>Chat</span></button></div></div>\
+         <div class=\"hbtns\">{}<button type=\"button\" class=\"btn {}\" data-chat=\"toggle\">{ICON_CHAT}<span>Chat</span></button>{}</div></div>\
          {}{}<div class=\"bar\"><div class=\"seg\">{}{}{}</div><span class=\"sortlbl\">{ICON_SORT}Par priorité</span></div>",
         esc(&lead),
         view.record,
         if view.chat.is_some() { "on" } else { "sec" },
+        view.theme,
         view.record_note,
         view.band,
         seg(Filter::All, "all", "Tout", count(None)),
@@ -1334,6 +1378,7 @@ body.chat-on .chat{display:flex}
 .chat .x:hover{background:var(--hover)}
 .cbody{flex:1;padding:20px}
 .hbtns{display:flex;gap:8px;flex:none}
+.btn.ico{width:28px;padding:0;justify-content:center}
 .btn.rec.on{background:color-mix(in srgb,var(--crit-dot) 22%,transparent);color:var(--crit)}
 .btn.rec.on svg{fill:currentColor}
 .btn.rec .tm{font-variant-numeric:tabular-nums;font-weight:400}
@@ -1553,6 +1598,7 @@ document.addEventListener('click', e => {
   if (b.dataset.filter) return post({ type: 'filter', scope: b.dataset.filter });
   if (b.dataset.chief) return post({ type: 'chief', scope: b.dataset.chief });
   if (b.dataset.chat) return post({ type: 'chat', what: b.dataset.chat });
+  if (b.dataset.theme) return post({ type: 'theme' });
   const card = b.closest('.card');
   if (!card || !b.dataset.act) return;
   const t = card.querySelector('textarea.bd');
@@ -1821,7 +1867,7 @@ mod tests {
     fn the_list_shows_ten_cards_then_voir_plus() {
         let items: Vec<Item> =
             (0..23).map(|i| from_attention(&entry(&format!("a-{i}"), Level::Now, Some(if i < 4 { 1 } else { 2 }), i), None, false).unwrap()).collect();
-        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new() };
+        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new() };
         let html = list_html(&view(PAGE_SIZE));
         assert_eq!(html.matches("<article").count(), 10);
         assert!(html.contains("data-more=\"1\"><span>Voir plus (13)</span>"));
@@ -2038,7 +2084,7 @@ mod tests {
             from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap(),
             from_attention(&perso, None, false).unwrap(),
         ];
-        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new() };
+        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new() };
         assert!(list_html(&view(Filter::All)).contains("attention:a-1"));
         let only = list_html(&view(Filter::Only(Scope::Perso)));
         assert!(only.contains("attention:a-2") && !only.contains("attention:a-1"));
@@ -2055,13 +2101,13 @@ mod tests {
             from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap(),
             from_attention(&entry("a-1", Level::Point, None, 1), None, false).unwrap(),
         ];
-        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new() });
+        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new() });
         assert!(html.contains("Urgent <span class=\"k\">1</span>"));
         assert!(html.contains("Cette semaine <span class=\"k\">1</span>"));
         assert!(!html.contains("Aujourd'hui"));
         assert_eq!(subtitle(&items), ("2 actions pour toi".to_string(), "1 urgente".to_string()));
         assert_eq!(subtitle(&[]).0, "Aucune action pour toi");
-        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new() }).contains("Rien ne t'attend"));
+        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new() }).contains("Rien ne t'attend"));
     }
 
     #[test]
@@ -2203,12 +2249,25 @@ mod tests {
     }
 
     #[test]
+    fn the_theme_button_shows_the_mode_and_its_shortcut() {
+        use crate::theme::ThemeMode;
+        assert_eq!(shortcut_label("cmd+option+l"), "\u{2325}\u{2318}L");
+        assert_eq!(shortcut_label(""), "");
+        let dark = theme_button(ThemeMode::Dark, "cmd+option+l");
+        assert!(dark.contains("data-theme=\"cycle\"") && dark.contains(ICON_MOON));
+        assert!(dark.contains("title=\"Thème : Sombre, clic pour Système (\u{2325}\u{2318}L)\""), "{}", dark);
+        assert!(theme_button(ThemeMode::Light, "").contains(ICON_SUN));
+        assert!(theme_button(ThemeMode::System, "x").contains(ICON_SYSTEM));
+    }
+
+    #[test]
     fn the_catch_up_band_sits_between_the_title_and_the_filter() {
         let items: Vec<Item> = Vec::new();
         let view = |band: &str| View {
             items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
             limit: PAGE_SIZE, now: 0, band: band.to_string(), record: "<button data-rec=\"start\">R</button>".into(),
             record_note: "<div class=\"recn\">N</div>".into(),
+            theme: theme_button(crate::theme::ThemeMode::Dark, "cmd+option+l"),
         };
         let head = head_html(&view("<div class=\"cu\">B</div>"));
         let (title, band, bar) = (head.find("ptitle").unwrap(), head.find("class=\"cu\"").unwrap(), head.find("class=\"bar\"").unwrap());

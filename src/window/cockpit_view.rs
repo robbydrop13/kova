@@ -409,6 +409,10 @@ impl KovaView {
             band: self.cockpit_band(&items),
             record: crate::record::button_html(&crate::record::phase(), now),
             record_note: crate::record::note_html(&crate::record::phase()),
+            theme: cockpit::theme_button(
+                crate::theme::mode(),
+                self.ivars().config.get().map(|c| c.keys.cycle_theme.as_str()).unwrap_or("cmd+option+l"),
+            ),
         };
         let parts = cockpit::parts(&view);
         page.items = items;
@@ -585,6 +589,11 @@ impl KovaView {
             }
             "chat" => {
                 self.show_cockpit_chat(s("what") == "toggle" && slot.chat_hidden.get());
+                true
+            }
+            // The header's theme button: the same path as View > Theme and the shortcut.
+            "theme" => {
+                crate::app::set_theme(crate::theme::mode().next());
                 true
             }
             "act" => {

@@ -141,6 +141,11 @@ shows when no project moved or before the first read lands.
 
 ## Record
 
+The theme button (header, right of `Chat`) shows the app's appearance (sun
+Clair, moon Sombre, half disc Système) and switches to the next one, through
+the same `app::set_theme` as View > Theme and `cycle-theme`; its tooltip names
+the next mode and the shortcut from `[keys] cycle_theme`.
+
 `Enregistrer` (header, left of `Chat`) records for the montre-une-fois skill
 (`src/record.rs`, phases and commands tested): Kova runs macOS's own
 `/usr/sbin/screencapture -v -g -k -x <file>` (main display, default
