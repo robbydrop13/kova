@@ -126,6 +126,9 @@ pub struct Item {
     pub state: State,
     /// The last instruction typed on an attention card, filled by the host.
     pub instruction: Option<Instructed>,
+    /// Screenshots shown in the card, as (label, absolute path): an entry's
+    /// `before` and `after` (Robin, 09/11/2026).
+    pub shots: Vec<(String, String)>,
 }
 
 /// What an opened card shows inside it, instead of a jump to another view.
@@ -290,6 +293,10 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         detail: None,
         state,
         instruction: None,
+        shots: [("Avant", &entry.before), ("Après", &entry.after)]
+            .into_iter()
+            .filter_map(|(label, path)| path.clone().map(|p| (label.to_string(), p)))
+            .collect(),
     })
 }
 
@@ -405,6 +412,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         detail: None,
         state: State::Idle,
         instruction: None,
+        shots: Vec::new(),
     })
 }
 
@@ -758,6 +766,8 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     let acts = format!("<div class=\"acts\">{acts}</div>");
     let icons = icons_html(icon_list, running);
     let mut detail = item.detail.as_ref().map(|d| detail_html(d, running)).unwrap_or_default();
+    // Before and after, in the card itself: validated without opening anything.
+    detail.insert_str(0, &shots_html(&item.shots, &shot_src));
     // `Refuser` opens this field first: Enter confirms, Escape cancels.
     if list.contains(&Button::Refuse) {
         detail.insert_str(0, &format!("<div class=\"why\" hidden><input type=\"text\" class=\"why\" placeholder=\"{REFUSE_PLACEHOLDER}\" maxlength=\"500\"></div>"));
@@ -814,6 +824,70 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
         if item.detail.is_some() { " open" } else { "" },
         esc(&item.key),
     )
+}
+
+/// A card's screenshots side by side, each with its label; a click shows it
+/// full size. One that cannot be read says so instead. `src` turns a path into
+/// what an `<img>` loads.
+fn shots_html(shots: &[(String, String)], src: &dyn Fn(&str) -> Result<String, String>) -> String {
+    if shots.is_empty() {
+        return String::new();
+    }
+    let figs: String = shots
+        .iter()
+        .map(|(label, path)| match src(path) {
+            Ok(uri) => format!(
+                "<figure class=\"shot\"><figcaption>{l}</figcaption><img src=\"{uri}\" alt=\"{l}\" title=\"Agrandir\" data-zoom=\"{l}\"></figure>",
+                l = esc(label)
+            ),
+            Err(why) => format!("<figure class=\"shot\"><figcaption>{} : {}</figcaption></figure>", esc(label), esc(&why)),
+        })
+        .collect();
+    format!("<div class=\"shots\">{figs}</div>")
+}
+
+/// The largest screenshot a card embeds.
+const MAX_SHOT: u64 = 6 * 1024 * 1024;
+
+/// A screenshot as a `data:` URI, read once per file version: the list is
+/// rendered on every refresh.
+fn shot_src(path: &str) -> Result<String, String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, (std::time::SystemTime, String)>>> = Mutex::new(None);
+    if !path.starts_with('/') || path.chars().any(char::is_control) {
+        return Err("chemin non absolu".into());
+    }
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => return Err("pas une image".into()),
+    };
+    let meta = std::fs::metadata(path).map_err(|_| "fichier introuvable".to_string())?;
+    if !meta.is_file() {
+        return Err("pas un fichier".into());
+    }
+    if meta.len() > MAX_SHOT {
+        return Err("image trop lourde".into());
+    }
+    let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some((at, uri)) = cache.get(path)
+        && *at == modified
+    {
+        return Ok(uri.clone());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "illisible".to_string())?;
+    if bytes.len() as u64 > MAX_SHOT {
+        return Err("image trop lourde".into());
+    }
+    let uri = format!("data:{mime};base64,{}", crate::decision_sheet::base64(&bytes));
+    cache.insert(path.to_string(), (modified, uri.clone()));
+    Ok(uri)
 }
 
 /// The placeholder of the reason field `Refuser` opens.
@@ -1164,6 +1238,14 @@ div.why{margin-top:8px;cursor:auto}div.why[hidden]{display:none}
 input.why{display:block;width:100%;height:28px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:0 10px}
 input.why:focus{border-color:var(--accent);outline:0}
 .card{cursor:pointer}.card textarea,.card .detail{cursor:auto}
+.shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin:10px 0 4px}
+.shot{margin:0;min-width:0}
+.shot figcaption{font-size:11px;color:var(--t3);margin-bottom:4px}
+.shot img{display:block;width:100%;height:auto;border:1px solid var(--b3);border-radius:6px;cursor:zoom-in;background:var(--bg2)}
+#zoom{position:fixed;inset:0;z-index:30;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:24px;background:rgba(0,0,0,.85);cursor:zoom-out}
+#zoom[hidden]{display:none}
+#zoom img{max-width:100%;max-height:calc(100vh - 70px);object-fit:contain;border-radius:6px}
+#zoom span{color:#fff;font-size:13px}
 .side{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:none}
 .icons{display:flex;gap:2px;flex:none}
 .ico{width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--t3)}
@@ -1204,7 +1286,7 @@ function when(word) {
 }"#;
 
 const PAGE: &str = r#"<!doctype html><html lang="fr"><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'nonce-{nonce}'">
 <title>Cockpit</title>
 <style>
 :root{color-scheme:{scheme};{vars}}
@@ -1290,6 +1372,7 @@ body.chat-on .chat{display:flex}
 <section class="chat" id="chat"></section>
 <section class="page"><div class="inner"><div id="head"></div><div id="list"></div></div></section>
 {snooze_html}
+<div id="zoom" hidden><img alt=""><span></span></div>
 <script nonce="{nonce}">
 const $ = id => document.getElementById(id);
 const load = '{nonce}';
@@ -1423,6 +1506,17 @@ let snzKey = null;
 function snzClose() { $('snz').hidden = true; $('snzPick').hidden = true; snzKey = null; }
 function hide(key) { const c = document.querySelector('.card[data-key="' + CSS.escape(key) + '"]'); if (c) c.style.display = 'none'; }
 document.addEventListener('click', e => {
+  // A card's screenshot opens full size over the page; a click closes it.
+  const z = $('zoom');
+  if (!z.hidden) { z.hidden = true; return; }
+  const shot = e.target.closest('img[data-zoom]');
+  if (shot) {
+    e.stopPropagation();
+    z.querySelector('img').src = shot.src;
+    z.querySelector('span').textContent = shot.dataset.zoom;
+    z.hidden = false;
+    return;
+  }
   const s = e.target.closest('#snz');
   if (s) {
     const b = e.target.closest('button');
@@ -1506,6 +1600,7 @@ document.addEventListener('input', e => {
   if (t.classList && t.classList.contains('bd')) { grow(t); sync(t.closest('.card')); }
 });
 document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('zoom').hidden) { $('zoom').hidden = true; return; }
   const t = e.target;
   // An instruction: Enter sends it, Shift+Enter is a new line, nothing typed
   // sends nothing.
@@ -1562,7 +1657,34 @@ mod tests {
             body: None,
             detail: None,
             src: Vec::new(),
+            before: None,
+            after: None,
         }
+    }
+
+    #[test]
+    fn before_and_after_show_in_the_card_and_zoom_on_a_click() {
+        let dir = std::env::temp_dir().join(format!("kova-shots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = dir.join("before.png");
+        std::fs::write(&before, b"png!").unwrap();
+        let e = Entry {
+            before: Some(before.to_string_lossy().into()),
+            after: Some(dir.join("missing.png").to_string_lossy().into()),
+            ..entry("a-1", Level::Now, None, 1)
+        };
+        let item = from_attention(&e, None, false).unwrap();
+        assert_eq!(item.shots.len(), 2);
+        let html = card_html(&item, true, true, true, 10);
+        assert!(html.contains(r#"<figcaption>Avant</figcaption><img src="data:image/png;base64,cG5nIQ==" alt="Avant" title="Agrandir" data-zoom="Avant">"#), "{html}");
+        assert!(html.contains("<figcaption>Après : fichier introuvable</figcaption>"), "{html}");
+        let none = card_html(&from_attention(&entry("a-2", Level::Now, None, 1), None, false).unwrap(), true, true, true, 10);
+        assert!(!none.contains("class=\"shots\""));
+        let page = shell(false, "n");
+        assert!(page.contains(r#"<div id="zoom" hidden>"#) && page.contains("img[data-zoom]"));
+        assert!(page.contains("grid-template-columns:repeat(auto-fit,minmax(300px,1fr))"), "side by side when there is room");
+        assert!(page.contains("img-src data:;"), "the page's policy lets the embedded images load");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2097,5 +2219,25 @@ mod tests {
         assert!(!head_html(&view("")).contains("class=\"cu\""), "no band, nothing between");
         // A reveal alone is a push.
         assert!(!Update { reveal: Some("attention:a-1".into()), ..Default::default() }.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shot_demo {
+    /// `KOVA_SHOT_DEMO=<out.html> cargo test shot_demo`: a page with one card
+    /// showing the two given screenshots, to look at outside Kova.
+    #[test]
+    fn write_demo() {
+        let Ok(out) = std::env::var("KOVA_SHOT_DEMO") else { return };
+        let (b, a) = (std::env::var("KOVA_SHOT_B").unwrap(), std::env::var("KOVA_SHOT_A").unwrap());
+        let e = crate::attention::Entry {
+            id: "a-demo".into(), since: 1, from: "groom-priorisation".into(), level: crate::attention::Level::Now,
+            kind: "test".into(), title: "CLA-10067 (skeleton du desktop) : avant / après".into(),
+            needs: Some("Valider le visuel".into()), action: None, topic: None, scope: crate::attention::Scope::Pro,
+            prio: Some(2), draft: None, body: None, detail: None, src: Vec::new(), before: Some(b), after: Some(a),
+        };
+        let item = super::from_attention(&e, None, false).unwrap();
+        let page = super::shell(false, "n").replace("<div id=\"list\"></div>", &format!("<div id=\"list\">{}</div>", super::card_html(&item, true, true, true, 10)));
+        std::fs::write(out, page).unwrap();
     }
 }

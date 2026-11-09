@@ -101,6 +101,10 @@ pub struct Entry {
     pub detail: Option<String>,
     /// The sources it cites: ids, paths or links.
     pub src: Vec<String>,
+    /// Screenshots before and after a change (`attn add --before/--after`):
+    /// absolute paths, shown in the card (Robin, 09/11/2026).
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +136,10 @@ struct Raw {
     detail: Option<String>,
     #[serde(default)]
     src: Option<serde_json::Value>,
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
 }
 
 /// Parse the CLI's answer. `None` when it is not a JSON array at all; an
@@ -177,6 +185,8 @@ pub fn parse(text: &str) -> Option<Vec<Entry>> {
                         Some(serde_json::Value::String(one)) if !one.trim().is_empty() => vec![one.trim().to_string()],
                         _ => Vec::new(),
                     },
+                    before: nonempty(raw.before),
+                    after: nonempty(raw.after),
                 })
             })
             .collect(),

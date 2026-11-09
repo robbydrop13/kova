@@ -83,6 +83,12 @@ it: one `WKWebView` per window over the active tab's panes area
 - `Voir plus`: the list shows the first 10 cards in the priority order, then
   `Voir plus (N)` (N left) adds 10 more. Section and filter counts cover the
   whole list. Opening the page or changing the filter starts again at 10.
+- Screenshots (Robin, 09/11/2026): an entry's `before` and `after` (absolute
+  paths, `attn add --before --after`) show in the card itself, labelled Avant
+  and Après, side by side when the card is wide enough (300 px each at least),
+  embedded as `data:` URIs (6 MB each at most, read once per file version; the
+  page's policy allows `img-src data:`). A click shows one full size over the
+  page; a click or Escape closes it. A file that cannot be read says why.
 - Drafts: an entry with a `draft` shows it in an editable field under
   `À <to>  <channel>  Objet <subject>`. `Valider` runs `act_command ID
   Valider`; once the text is rewritten it reads `Valider la correction` and
