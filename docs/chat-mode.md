@@ -25,7 +25,10 @@ the transcript as it was.
 ## Layout
 
 One `WKWebView` per window, created on first use, laid on the Cockpit's
-left third under the column's top bar, above the Cockpit's own page. It
+left third under the column's top bar, above the Cockpit's own page. The
+column floats over the page (`position:fixed`, a shadow on its right edge):
+the action list keeps the page's full width under it instead of being
+pushed right (Robin, 09/11). It
 hides when the column or the Cockpit closes and while an overlay Kova draws
 in Metal needs the window (the switcher, the search palette, the filter,
 help, a rename); hidden, its state is dropped and the page comes back
