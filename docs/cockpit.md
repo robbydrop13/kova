@@ -74,7 +74,12 @@ it: one `WKWebView` per window over the active tab's panes area
   --until=<ISO 8601 with offset>` (default: `close_command`'s program with
   `snooze`). The card leaves the page at once and stays hidden until the queue
   drops it (60 s at most); a failed command brings it back with its words.
-  Live needs keep their own buttons, no icons.
+  A waiting `kova ask` (sheet or question) has the same three icons (Robin,
+  09/11/2026), acted on the board itself: the clock snoozes it, the x closes it
+  `dismissed` (its `kova ask` exits 3 with `ask::DISMISSED`, and the same
+  question from the same asker is refused until Kova restarts), the check
+  closes it `done` (`ask::DONE`). The other live needs keep their own buttons,
+  no icons.
 - `Voir plus`: the list shows the first 10 cards in the priority order, then
   `Voir plus (N)` (N left) adds 10 more. Section and filter counts cover the
   whole list. Opening the page or changing the filter starts again at 10.

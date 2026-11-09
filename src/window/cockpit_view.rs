@@ -633,6 +633,24 @@ impl KovaView {
         let Some(item) = slot.page.borrow().items.iter().find(|i| i.key == key).cloned() else { return };
         let attention_id = key.strip_prefix("attention:");
         match (item.kind, button) {
+            // A waiting ask: snooze, X (not relevant) or done act on the board.
+            // The asker learns which (`ask::DISMISSED`, `ask::DONE`).
+            (Kind::Sheet | Kind::Ask, Button::Snooze | Button::Dismiss | Button::Done) => {
+                use super::ask_actions::AskAction;
+                let Some(id) = key.strip_prefix("ask:") else { return };
+                let action = match button {
+                    Button::Snooze => match text.and_then(crate::attention::epoch_of) {
+                        Some(until) if until > crate::ask::now_epoch() => AskAction::Snooze { id: id.to_string(), until },
+                        _ => return log::warn!("cockpit: invalid snooze time for {id}"),
+                    },
+                    Button::Done => AskAction::Close { id: id.to_string(), reason: "done" },
+                    _ => AskAction::Close { id: id.to_string(), reason: "dismissed" },
+                };
+                let mtm = MainThreadMarker::from(self);
+                crate::app::app_delegate(mtm).ivars().queue_ask_action(action);
+                slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
+                self.mark_dirty();
+            }
             (Kind::Attention, Button::Open | Button::OpenSheet) if item.ask.is_some() => {
                 self.cockpit_open_ask(item.ask.as_deref().unwrap_or_default());
             }

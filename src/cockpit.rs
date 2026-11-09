@@ -563,11 +563,16 @@ pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
     links.into_iter().chain(primary(item, can_act)).collect()
 }
 
-/// An attention card's icons, top right: snooze, remove, done. A verb whose
-/// command is not configured is left out; the live kinds have none.
+/// A card's icons, top right: snooze, remove, done. On an attention card a
+/// verb whose command is not configured is left out; a waiting ask has all
+/// three; the other live kinds have none.
 pub fn icons(item: &Item, can_close: bool, can_snooze: bool) -> Vec<Button> {
-    if item.kind != Kind::Attention {
-        return Vec::new();
+    match item.kind {
+        // A waiting `kova ask` (sheet or question) closes and snoozes on the
+        // board itself, no attention command needed (Robin, 09/11/2026).
+        Kind::Sheet | Kind::Ask => return vec![Button::Snooze, Button::Dismiss, Button::Done],
+        Kind::Attention => {}
+        _ => return Vec::new(),
     }
     let mut out = Vec::new();
     if can_snooze {
@@ -1860,6 +1865,8 @@ mod tests {
         let err = from_need(&need(NeedKind::Error, "pane:1", 1), false).unwrap();
         assert_eq!(buttons(&err, true), [Button::Pane]);
         assert!(icons(&perm, true, true).is_empty(), "a live need keeps its own buttons");
+        let ask = from_need(&need(NeedKind::Ask, "ask:q1", 5), false).unwrap();
+        assert_eq!(icons(&ask, false, false), [Button::Snooze, Button::Dismiss, Button::Done], "an ask closes on its board");
         for b in [Button::Snooze, Button::Dismiss, Button::Expand, Button::Done, Button::Deny, Button::Allow, Button::Correct, Button::Validate, Button::Refuse, Button::Open] {
             assert_eq!(Button::parse(b.act()), Some(b));
         }

@@ -1215,6 +1215,9 @@ pub struct Board {
     steps: Vec<crate::handoff::Step>,
     /// The last step pressed and when: a double click runs it once.
     last_step: Option<(String, std::time::Instant)>,
+    /// (asker, message) of the questions the user removed as not relevant:
+    /// asked again, refused at once with [`DISMISSED`]. Not kept across a restart.
+    dismissed: std::collections::HashSet<(String, String)>,
 }
 
 impl Board {
@@ -1231,7 +1234,7 @@ impl Board {
             );
         }
         OWNS_STORE.store(owner.is_some(), std::sync::atomic::Ordering::Relaxed);
-        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new(), last_step: None }
+        Board { store, pending: Vec::new(), _owner: owner, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new(), last_step: None, dismissed: Default::default() }
     }
 
     /// A Kova that started while another held the lock takes it over once that
@@ -1280,6 +1283,24 @@ impl Board {
             if self.pending.iter().any(|(q, _)| q.id == question.id) {
                 continue;
             }
+            // Two copies of one question on disk (asked twice before dedup):
+            // the newer one stays, one card.
+            if let Some(i) = self.pending.iter().position(|(q, _)| {
+                q.from.name == question.from.name && q.message == question.message && q.sheet.is_some() == question.sheet.is_some()
+            }) {
+                let pending_is_older = self.pending[i].0.asked_at <= question.asked_at;
+                let gone = if pending_is_older {
+                    std::mem::replace(&mut self.pending[i], (question, None)).0
+                } else {
+                    question
+                };
+                log::info!("ask {}: a copy of {}, dropped", gone.id, self.pending[i].0.id);
+                if self.owns_store() {
+                    self.store.remove_question(&gone.id);
+                }
+                self.dirty = true;
+                continue;
+            }
             log::info!("ask {}: restored from disk ({})", question.id, question.from.name);
             self.pending.push((question, None));
             self.dirty = true;
@@ -1300,10 +1321,35 @@ impl Board {
             question.from.pane_id.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
             question.message
         );
+        let same = (question.from.name.clone(), question.message.clone());
+        if self.dismissed.contains(&same) {
+            log::info!("ask {}: refused, the user removed the same question as not relevant", question.id);
+            let _ = responder.send(crate::ipc::IpcResponse::Error { message: DISMISSED.to_string() });
+            return;
+        }
         if self.owns_store() {
             self.store.save_question(&question);
         }
-        self.pending.push((question, Some(responder)));
+        // The same question from the same asker, still waiting (a `kova ask`
+        // cut by its caller's timeout, then run again): the new one takes its
+        // place, one card (Robin, 09/11/2026).
+        let twin = self.pending.iter().position(|(q, _)| {
+            q.from.name == question.from.name && q.message == question.message && q.sheet.is_some() == question.sheet.is_some()
+        });
+        match twin {
+            Some(i) => {
+                let (old, old_tx) = std::mem::replace(&mut self.pending[i], (question, Some(responder)));
+                log::info!("ask {}: replaced by {}, same question from {}", old.id, self.pending[i].0.id, old.from.name);
+                if self.owns_store() {
+                    self.store.remove_question(&old.id);
+                }
+                self.opened.remove(&old.id);
+                if let Some(tx) = old_tx {
+                    let _ = tx.send(crate::ipc::IpcResponse::Error { message: REPLACED.to_string() });
+                }
+            }
+            None => self.pending.push((question, Some(responder))),
+        }
         self.dirty = true;
     }
 
@@ -1437,17 +1483,27 @@ impl Board {
     /// longer matters (`kova ask --drop`). A `kova ask` still waiting on it
     /// exits 3, as on a withdrawal.
     pub fn drop_question(&mut self, id: &str) -> Result<(), String> {
-        self.take_off(id, "dropped by its asker")
+        self.take_off(id, "dropped by its asker", WITHDRAWN)
     }
 
     /// The user closed `id` from its card without answering it: the X
     /// (`dismissed`) or the check (`done`), logged with that reason. Off the
     /// Cockpit like a drop: a `kova ask` still waiting on it exits 3.
     pub fn close(&mut self, id: &str, reason: &str) -> Result<(), String> {
-        self.take_off(id, &format!("closed by the user, reason {reason}"))
+        if reason == "dismissed"
+            && let Some((q, _)) = self.pending.iter().find(|(q, _)| q.id == id)
+        {
+            self.dismissed.insert((q.from.name.clone(), q.message.clone()));
+        }
+        let reply = match reason {
+            "dismissed" => DISMISSED,
+            "done" => DONE,
+            _ => WITHDRAWN,
+        };
+        self.take_off(id, &format!("closed by the user, reason {reason}"), reply)
     }
 
-    fn take_off(&mut self, id: &str, why: &str) -> Result<(), String> {
+    fn take_off(&mut self, id: &str, why: &str, reply: &str) -> Result<(), String> {
         let index = self.pending.iter().position(|(q, _)| q.id == id).ok_or_else(|| format!("no question {}", id))?;
         let (question, responder) = self.pending.remove(index);
         log::info!("ask {}: {why}", question.id);
@@ -1455,7 +1511,7 @@ impl Board {
             self.store.remove_question(&question.id);
         }
         if let Some(tx) = responder {
-            let _ = tx.send(crate::ipc::IpcResponse::Error { message: WITHDRAWN.to_string() });
+            let _ = tx.send(crate::ipc::IpcResponse::Error { message: reply.to_string() });
         }
         self.opened.remove(id);
         self.dirty = true;
@@ -1691,6 +1747,13 @@ impl Board {
 
 /// What a `kova ask` still waiting receives when its question is withdrawn.
 pub const WITHDRAWN: &str = "withdrawn: the user answered in the conversation instead of on the card";
+/// The user removed the question from its Cockpit card (the X): not relevant.
+/// The same question from the same asker is refused while this Kova runs.
+pub const DISMISSED: &str = "dismissed: the user removed this question from the Cockpit as not relevant";
+/// The user checked the question done from its Cockpit card, without an answer.
+pub const DONE: &str = "done: the user marked this question done from the Cockpit";
+/// The same asker asked the same question again: the newer ask waits instead.
+pub const REPLACED: &str = "replaced: the same question was asked again, the newer ask waits for the answer";
 
 /// Whether `question` was asked from the conversation `session_id`.
 pub fn asked_from(question: &Question, session_id: &str) -> bool {
@@ -2145,6 +2208,19 @@ pub fn run_cli(args: &[String]) -> i32 {
                 "kova ask: the Kova on {} predates `ask` ({}). It answers from its next launch.",
                 socket, err
             ), 1);
+        }
+        if err == DISMISSED {
+            return fail(
+                "kova ask: the user removed this question from the Cockpit as not relevant. Do not ask it again; \
+                 drop what it was for, or carry on without it.",
+                3,
+            );
+        }
+        if err == DONE {
+            return fail("kova ask: the user marked this question done from the Cockpit, without an answer. Carry on.", 3);
+        }
+        if err == REPLACED {
+            return fail("kova ask: the same question was asked again; the newer ask waits for the answer. Stop waiting here.", 3);
         }
         if err == WITHDRAWN {
             return fail(
@@ -2746,7 +2822,7 @@ mod tests {
     fn board_with(q: Question) -> (Board, std::sync::mpsc::Receiver<crate::ipc::IpcResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = std::env::temp_dir().join(format!("kova-board-test-{}", new_question_id()));
-        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new(), last_step: None };
+        let board = Board { store: AskStore::new(root), pending: vec![(q, Some(tx))], _owner: None, owner_tried: std::time::Instant::now(), dirty: false, opened: Default::default(), steps: Vec::new(), last_step: None, dismissed: Default::default() };
         (board, rx)
     }
 
@@ -2839,8 +2915,45 @@ mod tests {
         let (mut board, rx) = board_with(q);
         assert!(board.close(&id, "dismissed").is_ok());
         assert!(board.questions().is_empty());
-        assert!(matches!(rx.try_recv(), Ok(crate::ipc::IpcResponse::Error { message }) if message == WITHDRAWN));
+        assert!(matches!(rx.try_recv(), Ok(crate::ipc::IpcResponse::Error { message }) if message == DISMISSED));
         assert!(board.close(&id, "done").is_err(), "already gone");
+    }
+
+    #[test]
+    fn a_dismissed_question_asked_again_is_refused_and_done_tells_its_asker() {
+        let q = sheet_question();
+        let again = Question { id: "00000000-0000-4000-8000-0000000000aa".into(), ..q.clone() };
+        let id = q.id.clone();
+        let (mut board, _rx) = board_with(q);
+        board.close(&id, "dismissed").unwrap();
+        let (tx, rx2) = std::sync::mpsc::channel();
+        board.add(again, tx);
+        assert!(board.questions().is_empty(), "not back on the Cockpit");
+        assert!(matches!(rx2.try_recv(), Ok(crate::ipc::IpcResponse::Error { message }) if message == DISMISSED));
+
+        let q = question("00000000-0000-4000-8000-0000000000bb");
+        let id = q.id.clone();
+        let (mut board, rx) = board_with(q);
+        board.close(&id, "done").unwrap();
+        assert!(matches!(rx.try_recv(), Ok(crate::ipc::IpcResponse::Error { message }) if message == DONE));
+    }
+
+    #[test]
+    fn the_same_question_asked_twice_is_one_card_the_newer_waits() {
+        let q = question("00000000-0000-4000-8000-0000000000cc");
+        let twin = Question { id: "00000000-0000-4000-8000-0000000000dd".into(), ..q.clone() };
+        let (mut board, rx_old) = board_with(q);
+        let (tx, rx_new) = std::sync::mpsc::channel();
+        board.add(twin, tx);
+        let ids: Vec<&str> = board.questions().iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, ["00000000-0000-4000-8000-0000000000dd"]);
+        assert!(matches!(rx_old.try_recv(), Ok(crate::ipc::IpcResponse::Error { message }) if message == REPLACED));
+        assert!(rx_new.try_recv().is_err(), "the newer one waits");
+        let mut other = question("00000000-0000-4000-8000-0000000000ee");
+        other.message = "something else".into();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        board.add(other, tx);
+        assert_eq!(board.questions().len(), 2);
     }
 
     #[test]

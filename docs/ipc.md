@@ -355,6 +355,12 @@ by `withdraw-asks`), answered late; the summary ends with
 `Still open in the user's Kova Cockpit: D3 (question <id>) …`.
 `drop-ask` with `id` takes a question off unanswered (`kova ask --drop <id>`); a
 `kova ask` still waiting on it exits 3.
+Closed from its Cockpit card, it exits 3 too, with what Robin did: the x
+(`dismissed`: not relevant, do not ask again; the same question from the same
+asker is refused at once until Kova restarts) or the check (`done`). The same
+asker asking the same question again while it waits (a `kova ask` cut by its
+caller's timeout, then rerun) gets one card: the newer ask takes the place of the
+older, which exits 3 (`replaced`).
 
 For a remote client (KovaLink) a native sheet is read and answered over the
 socket, with the same semantics as the panel:
