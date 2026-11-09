@@ -247,6 +247,12 @@ impl KovaView {
                     if !rect_eq(panel.frame(), frame) {
                         panel.setFrame(frame);
                     }
+                    // Above everything in the container: the Cockpit and the
+                    // chat put their web views over the Metal view later on.
+                    let on_top = container.subviews().lastObject().is_some_and(|v| std::ptr::eq(&*v, panel.as_ref() as &objc2_app_kit::NSView));
+                    if !on_top {
+                        container.addSubview_positioned_relativeTo(panel, objc2_app_kit::NSWindowOrderingMode::Above, None);
+                    }
                     if panel.isHidden() {
                         panel.setHidden(false);
                     }
@@ -267,7 +273,8 @@ impl KovaView {
         let resized = !rect_eq(self.frame(), my_frame);
         if resized {
             // Before the frame changes: the resize reads the pinned widths.
-            self.side_panel_pins(panel_frame.map(|f| f.size.width), my_frame.size.width);
+            // The panel floats over the panes: no width to keep, Kova's old pins come off.
+            self.side_panel_pins(None, my_frame.size.width);
             self.setFrame(my_frame);
             let screen_w = self.drawable_viewport().width;
             let mut tabs = self.ivars().tabs.borrow_mut();
@@ -1264,8 +1271,12 @@ fn split_layout(bounds: CGRect, width: f64, min_split: f64, wanted: bool) -> (bo
 }
 
 /// `split_layout` with the side panel at the right: the frames of the
-/// sidebar, the Metal view and the panel (when shown), from
-/// `side_panel::split`. Without a panel it is the sidebar's split exactly.
+/// sidebar, the Metal view and the panel (when shown). The panel floats over
+/// the right of the Metal view (and the Cockpit or chat laid on it) instead
+/// of taking its width: Robin, 09/11, "the panel should appear above the
+/// main central part of the screen, not push content to the left". The
+/// sidebar and the Metal view are laid out as without a panel; the panel's
+/// width is `side_panel::split`'s, kept inside the room right of the sidebar.
 fn split_frames(
     bounds: CGRect,
     width: f64,
@@ -1275,11 +1286,15 @@ fn split_frames(
     fraction: f32,
 ) -> (bool, CGRect, CGRect, Option<CGRect>) {
     let h = bounds.size.height;
-    let s = super::side_panel::split(bounds.size.width, width, wanted, panel_wanted, fraction, min_split);
+    let base = super::side_panel::split(bounds.size.width, width, wanted, false, fraction, min_split);
     let rect = |x: f64, w: f64| CGRect { origin: CGPoint { x, y: 0.0 }, size: CGSize { width: w, height: h } };
     let sidebar_frame = rect(0.0, width);
-    let my_frame = if s.sidebar || s.panel.is_some() { rect(s.term_x, s.term_w) } else { bounds };
-    (s.sidebar, sidebar_frame, my_frame, s.panel.map(|(x, w)| rect(x, w)))
+    let my_frame = if base.sidebar { rect(base.term_x, base.term_w) } else { bounds };
+    let panel = super::side_panel::split(bounds.size.width, width, wanted, panel_wanted, fraction, min_split)
+        .panel
+        .map(|(_, w)| w.min(base.term_w))
+        .map(|w| rect(bounds.size.width - w, w));
+    (base.sidebar, sidebar_frame, my_frame, panel)
 }
 
 /// One tab's width override as the side panel opens, resizes or closes:
@@ -1458,6 +1473,18 @@ mod tests {
         assert!(matches!(&rows[7], MenuRow::Swatch(n, 7, Some(_), true) if n == "Coral"));
         assert!(matches!(&rows[12], MenuRow::Swatch(n, TAG_NO_COLOR, None, false) if n == "No colour"));
         assert!(matches!(&color_rows(None)[12], MenuRow::Swatch(_, _, None, true)));
+    }
+
+    #[test]
+    fn the_panel_floats_over_the_terminal_without_narrowing_it() {
+        let bounds = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 1600.0, height: 900.0 } };
+        let (_, _, alone, none) = split_frames(bounds, 300.0, 300.0, true, false, 0.4);
+        let (shown, _, kova, panel) = split_frames(bounds, 300.0, 300.0, true, true, 0.4);
+        assert!(shown && none.is_none());
+        assert!(rect_eq(kova, alone), "the terminal keeps its frame under the panel");
+        let panel = panel.expect("panel shown");
+        assert_eq!((panel.origin.x + panel.size.width, panel.size.width), (1600.0, 520.0));
+        assert!(panel.origin.x >= kova.origin.x, "never over the sidebar");
     }
 
     #[test]

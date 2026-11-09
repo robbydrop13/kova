@@ -36,16 +36,17 @@ window, a drag moves it. A 1 pt `b3` separator down the left edge, a 5 pt
 resize zone over it.
 
 Width: a share of the room right of the sidebar, 0.5 by default, 0.2..0.8,
-at least 320 pt, the terminal keeping `splits.min_width`. When the three do
-not fit, the sidebar yields first, then the panel. Dragging the edge sets the
+at least 320 pt, never wider than the room minus `splits.min_width`, and
+never over the sidebar. Dragging the edge sets the
 share live; it is saved on mouse up as `panel_fraction` in
 `~/.config/kova/prefs.json`. Closing keeps the page: the toggle brings it back.
 
-The panel never squashes the panes: while it is open, each tab keeps the
-width it has without it (`virtual_width_override` pinned, `panel_pin` in
-`sidebar_ui.rs`) and scrolls horizontally; the focused pane is scrolled into
-view. A width the user set themselves is left alone, and Kova's pins come off
-when the panel closes.
+The panel floats over the right of the panes, the Cockpit and the chat
+(`split_frames`, `sidebar_ui.rs`): they keep their full width under it, and
+it is kept the top subview of the window's container. Before 09/11 it took
+its width from the terminal and the Cockpit reflowed narrower; Robin wanted
+it above the central area instead. Kova's old width pins (`panel_pin`) come
+off at the next layout.
 
 ## Web content
 
