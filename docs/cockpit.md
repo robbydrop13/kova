@@ -106,6 +106,17 @@ it: one `WKWebView` per window over the active tab's panes area
   holds that (`only_a_click_on_a_page_can_carry_the_key`). No file, or one
   that does not read: the click goes without a key, as before. Who clicked
   (`--by <name>`) is given in `act_command` and `close_command` themselves.
+- The draft the user saw (10/11/2026). The queue gives each draft a
+  fingerprint (`draft.seen`); a `Valider` or a correction sends back the one
+  of the version the page shows (`--seen=<fingerprint>`,
+  `attention::with_seen`). When the draft changed since, the command fails
+  and the card says so (`Non transmis : …`), then shows the new draft at the
+  next read. A second click on a version already sent answers `déjà parti
+  …`, shown as it is, not as a failure. The target reads in words when the
+  queue gives them (`draft.target_label`, the raw id in the tooltip; amber
+  for `target_kind` `external`). A card back with `uncertain` (nobody knows
+  whether the message left) says `Peut-être parti, vérifie le fil : why` at
+  its head, and its `Valider` is a link, not the blue button.
 - `No go` (10/11/2026), on an action plan only: a `decision` posted by
   `veille-actions` with its plan in the body (`attention::PLAN_FROM`). It
   runs `close_command ID --reason nogo`: the plan's agent learns a no go,

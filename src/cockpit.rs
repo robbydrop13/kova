@@ -148,6 +148,9 @@ pub struct Item {
     pub validates: bool,
     /// The card came back after its action failed: why. Shown at its head.
     pub failed: Option<String>,
+    /// Nobody knows whether its message left: why. Shown at its head, and
+    /// `Valider` is no longer the card's blue button.
+    pub uncertain: Option<String>,
     /// The proof that its action took place, shown as a link when it is one.
     pub proof: Option<String>,
     /// An action plan: its card carries `No go`, distinct from the x.
@@ -353,6 +356,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         ask: None,
         validates: expects_validation(entry),
         failed: entry.failed.clone(),
+        uncertain: entry.uncertain.clone(),
         proof: entry.proof.clone(),
         plan: entry.plan,
         entry_kind: entry.kind.clone(),
@@ -476,6 +480,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         ask: None,
         validates: false,
         failed: None,
+        uncertain: None,
         proof: None,
         plan: false,
         entry_kind: String::new(),
@@ -610,6 +615,10 @@ impl Button {
 /// Buttons). `None` for a card that only informs (its check icon is the
 /// action) and once a go went through.
 pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
+    // Maybe sent already: validating again is not what the card puts first.
+    if item.uncertain.is_some() && (item.draft.is_some() || item.validates) {
+        return None;
+    }
     let sent = matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted);
     match item.kind {
         Kind::Attention if item.draft.is_some() && can_act => (!sent).then_some(Button::Validate),
@@ -651,7 +660,10 @@ pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
         Kind::Permission => vec![Button::Deny],
         Kind::Sheet | Kind::Ask | Kind::Error | Kind::FailedRoutine => Vec::new(),
     };
-    links.into_iter().chain(primary(item, can_act)).collect()
+    // An uncertain card keeps `Valider`, last and as a link, not in blue.
+    let again = (item.uncertain.is_some() && !sent && can_act && item.kind == Kind::Attention && (item.draft.is_some() || item.validates))
+        .then_some(Button::Validate);
+    links.into_iter().chain(primary(item, can_act)).chain(again).collect()
 }
 
 /// A card's icons, top right: snooze, remove, done. On an attention card a
@@ -914,6 +926,12 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     };
     // Back after its action failed: the reason first, the card as it was.
     let failed = item.failed.as_deref().map(|why| format!("<div class=\"state crit top\">Échec : {}</div>", linked(why))).unwrap_or_default();
+    let unsure = item
+        .uncertain
+        .as_deref()
+        .map(|why| format!("<div class=\"state warn top\">Peut-être parti, vérifie le fil : {}</div>", linked(why)))
+        .unwrap_or_default();
+    let failed = format!("{failed}{unsure}");
     let proof = item.proof.as_deref().map(|p| format!("<div class=\"state ok\">Preuve : {}</div>", linked(p))).unwrap_or_default();
     let head = format!("{failed}<div class=\"t\">{}</div>{needs}{proof}", linked(&item.title));
     let body = match (&item.draft, item.kind == Kind::Attention && can_act) {
@@ -926,13 +944,19 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
                 .unwrap_or_default();
             let channel = if draft.channel.trim().is_empty() { String::new() } else { format!("<span>{}</span>", esc(&draft.channel)) };
             // The name a person reads, then where the message really goes.
-            let target = draft
-                .target
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(|t| format!(" <code class=\"tg\" title=\"Cible de l'envoi\">{}</code>", esc(t)))
-                .unwrap_or_default();
+            // In words when the queue gives them (`DM Sacha`), the raw id
+            // then in the tooltip; else the raw id.
+            let clean = |s: &Option<String>| s.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+            let target = match (clean(&draft.target_label), clean(&draft.target)) {
+                (Some(label), raw) => format!(
+                    " <span class=\"tg{}\" title=\"Cible de l'envoi{}\">{}</span>",
+                    if draft.target_kind.as_deref() == Some("external") { " ext" } else { "" },
+                    raw.map(|r| format!(" : {}", esc(&r))).unwrap_or_default(),
+                    esc(&label)
+                ),
+                (None, Some(raw)) => format!(" <code class=\"tg\" title=\"Cible de l'envoi\">{}</code>", esc(&raw)),
+                (None, None) => String::new(),
+            };
             let to = if draft.to.trim().is_empty() && target.is_empty() {
                 String::new()
             } else {
@@ -1552,7 +1576,8 @@ pre.scroll{margin-top:8px;max-height:240px;overflow:auto;background:var(--bg-inp
 .words{color:var(--crit)}.msg{white-space:pre-wrap;overflow-wrap:anywhere}
 textarea.ans{display:block;width:100%;margin-top:8px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:6px 10px;resize:vertical}
 textarea.ans:focus{border-color:var(--accent);outline:0}
-.draft .hd .tg{font:11.5px "SF Mono",Menlo,monospace;color:var(--t3);background:none;border:0;padding:0}
+.draft .hd code.tg{font:11.5px "SF Mono",Menlo,monospace;color:var(--t3);background:none;border:0;padding:0}
+.draft .hd span.tg{color:var(--t3)}.draft .hd span.tg.ext{color:var(--warn-dot)}
 .state.top{margin:0 0 6px}.jr{margin:18px 0 6px;font-size:12px;color:var(--t3)}.jr a{color:var(--t3);text-decoration:underline}
 .state.ok{color:var(--ok-dot)}.state.warn{color:var(--warn-dot)}.state.crit{color:var(--crit)}
 .instr{margin-top:10px;border-top:1px solid var(--b3);padding-top:4px;cursor:auto}
@@ -2067,6 +2092,7 @@ mod tests {
             after: None,
             label: None,
             failed: None,
+            uncertain: None,
             proof: None,
             plan: false,
         }
@@ -2300,7 +2326,7 @@ mod tests {
     #[test]
     fn a_draft_shows_where_it_really_goes_and_a_send_by_code_says_so() {
         let mut e = Entry { kind: "would".into(), ..entry("a-1", Level::Now, None, 1) };
-        e.draft = Some(Draft { target: Some("U0BJ301TJNM/<17.5>".into()), to: "Sacha".into(), channel: "slack".into(), subject: None, text: "Hi".into() });
+        e.draft = Some(Draft { target_label: None, target_kind: None, seen: None, target: Some("U0BJ301TJNM/<17.5>".into()), to: "Sacha".into(), channel: "slack".into(), subject: None, text: "Hi".into() });
         let html = card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10);
         assert!(html.contains("<span>À <b>Sacha</b> <code class=\"tg\" title=\"Cible de l'envoi\">U0BJ301TJNM/&lt;17.5&gt;</code></span>"), "{html}");
         // No target: the name alone, as before.
@@ -2311,6 +2337,36 @@ mod tests {
         let sent = card_html(&from_attention(&e, Some(&Outcome::SentByCode("envoi par le code (slack à <U1>)".into())), false).unwrap(), true, true, true, 10);
         assert!(sent.contains("<div class=\"state ok\">envoi par le code (slack à &lt;U1&gt;)</div>") && !sent.contains("Transmis à l'agent"), "{sent}");
         assert!(sent.contains("readonly") && !sent.contains("data-act=\"validate\""), "not offered again");
+    }
+
+    #[test]
+    fn a_draft_names_its_target_in_words_and_an_uncertain_card_does_not_put_valider_first() {
+        let mut e = Entry { kind: "would".into(), ..entry("a-1", Level::Now, None, 1) };
+        e.draft = Some(Draft {
+            target: Some("C0123/17.5".into()),
+            target_label: Some("#it (canal privé, 4 membres), dans un fil".into()),
+            target_kind: Some("private".into()),
+            seen: Some("3fe43fde4beeba99".into()),
+            to: "Sacha".into(),
+            channel: "slack".into(),
+            subject: None,
+            text: "Hi".into(),
+        });
+        let item = from_attention(&e, None, false).unwrap();
+        let html = card_html(&item, true, true, true, 10);
+        assert!(html.contains("<span>À <b>Sacha</b> <span class=\"tg\" title=\"Cible de l'envoi : C0123/17.5\">#it (canal privé, 4 membres), dans un fil</span></span>"), "{html}");
+        assert_eq!(item.draft.as_ref().and_then(|d| d.seen.as_deref()), Some("3fe43fde4beeba99"), "the version shown keeps its fingerprint");
+        // Outside the workspace: said in amber.
+        e.draft.as_mut().unwrap().target_kind = Some("external".into());
+        assert!(card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10).contains("class=\"tg ext\""));
+        // Maybe sent: said at the head, and Valider is there but not in blue.
+        e.uncertain = Some("Slack n'a pas répondu <30 s>".into());
+        let item = from_attention(&e, None, false).unwrap();
+        assert_eq!(primary(&item, true), None);
+        assert_eq!(buttons(&item, true), [Button::Correct, Button::Validate]);
+        let html = card_html(&item, true, true, true, 10);
+        assert!(html.contains("<div class=\"state warn top\">Peut-être parti, vérifie le fil : Slack n&#39;a pas répondu &lt;30 s&gt;</div>"), "{html}");
+        assert!(html.contains("data-act=\"validate\"") && !html.contains("class=\"btn acc\" data-act=\"validate\""), "a link, not the blue button: {html}");
     }
 
     #[test]
@@ -2332,7 +2388,7 @@ mod tests {
         assert!(buttons(&item, true).contains(&Button::NoGo));
         let html = card_html(&item, true, true, true, 10);
         assert!(html.contains("data-act=\"nogo\"") && html.contains(">No go<") && html.contains("data-act=\"dismiss\""), "both: {html}");
-        let drafted = Entry { draft: Some(Draft { target: None, to: "A".into(), channel: "slack".into(), subject: None, text: "x".into() }), ..plan };
+        let drafted = Entry { draft: Some(Draft { target: None, target_label: None, target_kind: None, seen: None, to: "A".into(), channel: "slack".into(), subject: None, text: "x".into() }), ..plan };
         assert_eq!(buttons(&from_attention(&drafted, None, false).unwrap(), true), [Button::NoGo, Button::Correct, Button::Validate]);
         assert!(!buttons(&from_attention(&entry("a-3", Level::Now, None, 1), None, false).unwrap(), true).contains(&Button::NoGo), "not on another card");
         assert_eq!(Button::parse("nogo"), Some(Button::NoGo));
@@ -2441,7 +2497,7 @@ mod tests {
             from_attention(&e, None, openable).unwrap()
         };
         let draft = {
-            let e = Entry { kind: "would".into(), draft: Some(Draft { target: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
+            let e = Entry { kind: "would".into(), draft: Some(Draft { target: None, target_label: None, target_kind: None, seen: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
             from_attention(&e, None, false).unwrap()
         };
         let mut sheet_entry = with("decision", Some("kova-sheet:430b8a55"), false);
@@ -2489,7 +2545,7 @@ mod tests {
         assert!(q.contains("data-act=\"expand\" data-focus=\"ans\""), "{q}");
         // A draft's Corriger is a link next to its blue Valider; it opens the
         // card on its consigne field.
-        let e = Entry { kind: "would".into(), draft: Some(Draft { target: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
+        let e = Entry { kind: "would".into(), draft: Some(Draft { target: None, target_label: None, target_kind: None, seen: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
         let d = card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10);
         assert!(d.contains("<button type=\"button\" class=\"link\" data-act=\"correct\" data-focus=\"ins\">Corriger</button>"), "{d}");
     }
@@ -2518,7 +2574,7 @@ mod tests {
         assert_eq!(icons(&item, false, false), []);
         item.openable = false;
         assert_eq!(buttons(&item, true), []);
-        item.draft = Some(Draft { target: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
+        item.draft = Some(Draft { target: None, target_label: None, target_kind: None, seen: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
         assert_eq!(buttons(&item, true), [Button::Correct, Button::Validate]);
         item.state = State::Sent;
         assert_eq!(buttons(&item, true), []);
@@ -2556,7 +2612,7 @@ mod tests {
         assert!(!expects_validation(&with("decision", None)), "a decision with nothing prepared");
         assert!(!expects_validation(&with("decision", Some("kova-sheet:430b8a55"))), "a sheet takes its own answers");
         assert!(!expects_validation(&with("test", Some("/tmp/x.md"))));
-        let drafted = Entry { draft: Some(Draft { target: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..with("would", None) };
+        let drafted = Entry { draft: Some(Draft { target: None, target_label: None, target_kind: None, seen: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..with("would", None) };
         assert!(!expects_validation(&drafted), "a draft keeps its own Valider");
         let mut item = from_attention(&with("would", Some("/tmp/prep.md")), None, true).unwrap();
         assert_eq!(buttons(&item, true), [Button::Open, Button::Refuse, Button::Validate]);
@@ -2682,6 +2738,9 @@ mod tests {
         e.needs = Some("</textarea><script>".into());
         e.draft = Some(Draft {
             target: None,
+            target_label: None,
+            target_kind: None,
+            seen: None,
             to: "<b>x</b>".into(),
             channel: "Email".into(),
             subject: Some("S\"".into()),
@@ -2738,7 +2797,7 @@ mod tests {
         // A draft keeps its own correction field; the instruction comes
         // under the draft's actions, once.
         let mut e = entry("a-2", Level::Now, None, 1);
-        e.draft = Some(Draft { target: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
+        e.draft = Some(Draft { target: None, target_label: None, target_kind: None, seen: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
         let mut item = from_attention(&e, None, false).unwrap();
         item.detail = Some(entry_detail(&e, false));
         item.instruction = Some(Instructed { text: "Plus court".into(), outcome: Outcome::Sent });
@@ -2759,7 +2818,7 @@ mod tests {
     #[test]
     fn a_sent_draft_says_so_and_a_running_click_disables_the_buttons() {
         let mut e = entry("a-1", Level::Now, None, 1);
-        e.draft = Some(Draft { target: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
+        e.draft = Some(Draft { target: None, target_label: None, target_kind: None, seen: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
         let sent = from_attention(&e, Some(&Outcome::Sent), false).unwrap();
         let html = card_html(&sent, true, true, true, 10);
         assert!(html.contains("Transmis à l'agent") && html.contains("readonly") && !html.contains("data-act=\"validate\""));
@@ -2862,7 +2921,7 @@ mod shot_demo {
             kind: "test".into(), title: "CLA-10067 (skeleton du desktop) : avant / après".into(),
             needs: Some("Valider le visuel".into()), action: None, topic: None, scope: crate::attention::Scope::Pro,
             prio: Some(2), draft: None, body: None, detail: None, src: Vec::new(), before: Some(b), after: Some(a), label: None,
-            failed: None, proof: None, plan: false,
+            failed: None, uncertain: None, proof: None, plan: false,
         };
         let item = super::from_attention(&e, None, false).unwrap();
         let page = super::shell(false, "n").replace("<div id=\"list\"></div>", &format!("<div id=\"list\">{}</div>", super::card_html(&item, true, true, true, 10)));

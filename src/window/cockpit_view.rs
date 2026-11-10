@@ -756,7 +756,9 @@ impl KovaView {
                     Button::Validate => (Verb::Validate, None),
                     _ => (Verb::Correct, text),
                 };
-                match crate::attention::perform_with(id, verb, text) {
+                // The draft as the page shows it: its fingerprint goes with the go.
+                let seen = item.draft.as_ref().and_then(|d| d.seen.clone());
+                match crate::attention::perform_with(id, verb, text, seen.as_deref()) {
                     // Gone from the page at once; the next read drops it.
                     Ok(()) if matches!(verb, Verb::Resolve | Verb::Dismiss | Verb::NoGo | Verb::Snooze) => {
                         slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
@@ -822,7 +824,7 @@ impl KovaView {
         if text.trim().is_empty() {
             return;
         }
-        if let Err(why) = crate::attention::perform_with(id, Verb::Instruct, Some(text)) {
+        if let Err(why) = crate::attention::perform_with(id, Verb::Instruct, Some(text), None) {
             log::warn!("cockpit: {why}");
             crate::attention::instruction_refused(id, text, "Kova n'a pas pu la transmettre");
         }

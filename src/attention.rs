@@ -77,6 +77,35 @@ pub struct Draft {
     /// shown next to `to`, the name a person reads.
     #[serde(default)]
     pub target: Option<String>,
+    /// `target` in words a person reads (`DM Sacha`, `#it (private channel,
+    /// 4 members), in a thread`): shown instead of the raw id.
+    #[serde(default)]
+    pub target_label: Option<String>,
+    /// `dm`, `group`, `private`, `public` or `external`.
+    #[serde(default)]
+    pub target_kind: Option<String>,
+    /// The fingerprint of this version of the draft (channel, target,
+    /// text), given by the queue: a click sends back the one of the version
+    /// shown (`--seen`), so a draft changed since is never validated blind.
+    #[serde(default)]
+    pub seen: Option<String>,
+}
+
+/// A go's argv with the fingerprint of the draft the user saw: `Valider`
+/// and a correction only, and only a fingerprint that reads as one.
+pub fn with_seen(mut args: Vec<String>, verb: Verb, seen: Option<&str>) -> Vec<String> {
+    if matches!(verb, Verb::Validate | Verb::Correct)
+        && let Some(seen) = seen.filter(|s| valid_seen(s))
+    {
+        args.push(format!("--seen={seen}"));
+    }
+    args
+}
+
+/// A draft's fingerprint as the queue gives it: 8 to 64 hex digits. Anything
+/// else is not passed on.
+pub fn valid_seen(seen: &str) -> bool {
+    (8..=64).contains(&seen.len()) && seen.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// One open entry, as the CLI prints it. Fields Kova does not show are
@@ -114,6 +143,9 @@ pub struct Entry {
     pub label: Option<Label>,
     /// The card came back after its action failed (`attn fail`): why.
     pub failed: Option<String>,
+    /// The card came back and nobody knows whether its message left (a send
+    /// that timed out): why. To check before validating again.
+    pub uncertain: Option<String>,
     /// The proof that its action took place (a message id, a link, a
     /// commit, a file).
     pub proof: Option<String>,
@@ -178,6 +210,8 @@ struct Raw {
     #[serde(default)]
     failed: Option<String>,
     #[serde(default)]
+    uncertain: Option<String>,
+    #[serde(default)]
     proof: Option<String>,
 }
 
@@ -198,6 +232,7 @@ pub fn parse(text: &str) -> Option<Vec<Entry>> {
                 Some(Entry {
                     plan,
                     failed: nonempty(raw.failed.clone()),
+                    uncertain: nonempty(raw.uncertain.clone()),
                     proof: nonempty(raw.proof.clone()),
                     level: Level::parse(&raw.level)?,
                     since: epoch_of(&raw.ts).unwrap_or(0),
@@ -658,7 +693,12 @@ fn verb_argv_with(
 /// keeps its buttons. The text is the user's own, typed on the Cockpit's
 /// card: control characters but tab and newline are dropped, and it is
 /// capped at `MAX_TEXT`.
-pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), String> {
+///
+/// `seen` is the fingerprint of the draft the page showed when the user
+/// clicked (`Draft::seen`): it goes with `Valider` and a correction as
+/// `--seen=<fingerprint>`, and the CLI refuses the click when the draft
+/// changed since.
+pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>) -> Result<(), String> {
     let text = text.map(clean_text);
     let known = CACHE.read().as_ref().is_some_and(|entries| entries.iter().any(|e| e.id == id));
     if !known {
@@ -669,6 +709,7 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
         verb_argv_with(&commands.act, &commands.close, &commands.snooze, id, verb, text.as_deref())
     }
     .ok_or_else(|| format!("attention: no command for {}", verb.label()))?;
+    let args = with_seen(args, verb, seen);
     if verb == Verb::Instruct {
         let text = text.unwrap_or_default();
         {
@@ -746,12 +787,15 @@ pub enum Delivery {
 /// itself instead of handing it to an agent (`envoi par le code (slack à
 /// U123)`).
 pub const CODE_SEND: &str = "envoi par le code";
+/// Its first line for a second click on a version already sent or on its
+/// way: not an error, shown as it is.
+pub const ALREADY_SENT: &str = "déjà parti";
 
 /// The line a command that exited 0 printed, when it says it sends the
 /// message itself: one line, 120 chars at most.
 pub fn code_send_line(stdout: &str) -> Option<String> {
     let line = stdout.lines().next()?.trim();
-    line.starts_with(CODE_SEND).then(|| line.chars().filter(|c| !c.is_control()).take(120).collect())
+    (line.starts_with(CODE_SEND) || line.starts_with(ALREADY_SENT)).then(|| line.chars().filter(|c| !c.is_control()).take(120).collect())
 }
 
 /// What a click's exit says: `code` is `None` when a signal ended it.
@@ -827,7 +871,7 @@ fn run_click_with(bin: &str, args: &[String], key: Option<&str>) -> Result<Deliv
             })
         } else {
             let err = String::from_utf8_lossy(&out.stderr);
-            let line: String = err.lines().next().unwrap_or("").trim().chars().take(80).collect();
+            let line: String = err.lines().next().unwrap_or("").trim().chars().take(140).collect();
             Err(if line.is_empty() { format!("{bin} exited with {}", out.status) } else { line })
         }
     })
@@ -1117,6 +1161,14 @@ mod tests {
         // The command sends the message itself and says so: its line, as it is.
         assert_eq!(code_send_line("envoi par le code (slack à U0BJ301TJNM)\nmore\n").as_deref(), Some("envoi par le code (slack à U0BJ301TJNM)"));
         assert_eq!(code_send_line("remis à claap-agent\n"), None);
+        assert_eq!(code_send_line("déjà parti ou en cours pour cette version du brouillon\n").as_deref(), Some("déjà parti ou en cours pour cette version du brouillon"), "a second click: not an error");
+        let argv = |verb, seen| with_seen(vec!["act".to_string(), "a-1".to_string()], verb, seen).join(" ");
+        assert_eq!(argv(Verb::Validate, Some("3fe43fde4beeba99")), "act a-1 --seen=3fe43fde4beeba99");
+        assert_eq!(argv(Verb::Correct, Some("3fe43fde4beeba99")), "act a-1 --seen=3fe43fde4beeba99");
+        assert_eq!(argv(Verb::Instruct, Some("3fe43fde4beeba99")), "act a-1", "a go only");
+        assert_eq!(argv(Verb::Validate, Some("--by=evil")), "act a-1", "not a fingerprint: not passed on");
+        assert_eq!(argv(Verb::Validate, None), "act a-1");
+        assert!(valid_seen("3fe43fde4beeba99") && !valid_seen("3fe4") && !valid_seen("--by=robin0000000") && !valid_seen("zzzzzzzzzzzzzzzz"));
         assert_eq!(code_send_line(""), None);
         assert_eq!(delivery_of(Some(3), false), None, "a command not asked for exit codes: 3 is a failure");
         // Only a click on an agent's card asks for them; a close does not.
@@ -1213,7 +1265,7 @@ mod tests {
         set_commands(&Commands::default());
         assert!(!configured());
         assert!(snapshot().is_none());
-        assert!(perform_with("a-100001", Verb::Resolve, None).is_err());
+        assert!(perform_with("a-100001", Verb::Resolve, None, None).is_err());
     }
 
     #[test]
