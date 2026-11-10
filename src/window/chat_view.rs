@@ -190,7 +190,11 @@ fn css_hex(c: [f32; 3]) -> String {
 
 /// The page's colours: the design system's, light or dark as the terminal is.
 fn theme() -> page::Theme {
-    let p = tokens::get();
+    theme_of(tokens::get())
+}
+
+/// The chat page's colours for a palette.
+pub(crate) fn theme_of(p: &tokens::Palette) -> page::Theme {
     page::Theme {
         dark: p != &tokens::LIGHT,
         bg: css_hex(p.ground),

@@ -24,7 +24,7 @@ mod sidebar_ui;
 pub(super) mod sidebar_sched;
 mod sidebar_view;
 pub(crate) mod side_panel;
-mod chat_view;
+pub(crate) mod chat_view;
 mod cockpit_view;
 pub(crate) mod panel_history;
 use sidebar_ui::SidebarState;

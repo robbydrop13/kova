@@ -261,12 +261,10 @@ At the bottom of the thread, above the box:
 
 ## Looking at a rendering without Kova
 
-`KOVA_CHAT_TRANSCRIPT=<jsonl> KOVA_CHAT_OUT=<html> [KOVA_CHAT_MARKERS="a|b"]
-[KOVA_CHAT_BASE=<pane folder>] [KOVA_CHAT_UNFOLD=1] cargo test --release
-render_a_transcript -- --ignored --nocapture` writes the thread of a
-transcript as one HTML file, read as the chat reads it, prints what it read
-and fails if a text the assistant wrote in the exchanges shown is not on the
-page. A headless browser turns the file into a screenshot.
+`kova render chat --transcript <jsonl> --out <file.html>` writes the thread
+of a transcript as one HTML file, read as the chat reads it, and fails if a
+text the assistant wrote in the exchanges shown is not on the page
+(`docs/render.md`, with the screenshot script).
 
 ## Not done yet
 

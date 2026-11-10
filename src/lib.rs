@@ -55,11 +55,17 @@ mod catchup;
 mod inflight;
 mod cockpit;
 mod record;
+mod render_cli;
 mod window;
 
 /// `kova ask …` (see `ask::USAGE`): returns the exit code.
 pub fn ask_cli(args: &[String]) -> i32 {
     ask::run_cli(args)
+}
+
+/// `kova render …` (see `render_cli::USAGE`): returns the exit code.
+pub fn render_cli(args: &[String]) -> i32 {
+    render_cli::run(args)
 }
 
 /// Process RSS (Resident Set Size) in MB via mach API.

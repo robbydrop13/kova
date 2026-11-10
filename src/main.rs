@@ -213,6 +213,9 @@ fn main() {
 
     // `kova ask "<question>"`: the one subcommand. A client of a running Kova
     // (it asks the user something through the question card), never the app.
+    if args.get(1).map(String::as_str) == Some("render") {
+        std::process::exit(kova::render_cli(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("ask") {
         std::process::exit(kova::ask_cli(&args[2..]));
     }
@@ -234,6 +237,7 @@ fn main() {
         println!("  --session N        restore session.N.json instead of session.json");
         println!();
         println!("  kova ask \"<question>\"  ask the user through the running Kova (kova ask --help)");
+        println!("  kova render <page>     write the Cockpit, the chat or a sheet as HTML, no window (kova render --help)");
         return;
     }
 
@@ -241,7 +245,7 @@ fn main() {
     // for an IPC CLI, and each call opened a second Kova window over the user's
     // work. Refuse any positional word instead of launching the app.
     if let Some(word) = stray_subcommand(&args) {
-        eprintln!("kova: '{}' is not a command. This binary is the Kova app; its only subcommand is `kova ask`.", word);
+        eprintln!("kova: '{}' is not a command. This binary is the Kova app; its only subcommands are `kova ask` and `kova render`.", word);
         eprintln!("Talk to a running Kova through its socket:");
         eprintln!("  printf '%s' '{{\"cmd\":\"list-panes\"}}' | nc -U \"$KOVA_SOCKET\"");
         std::process::exit(2);
