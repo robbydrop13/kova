@@ -1647,6 +1647,7 @@ body{font-family:Inter,"SF Pro Text",-apple-system,system-ui,sans-serif;color:va
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .page{flex:1;min-width:0;overflow-y:auto}
 .inner{max-width:880px;margin:0 auto;padding:26px 24px 40px}
+body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
 .phead{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
 .ptitle{font-size:28px;line-height:34px;font-weight:600;letter-spacing:-.2px}
 .psub{font-size:13px;color:var(--t3);margin-top:4px}
@@ -1717,7 +1718,7 @@ textarea.bd{display:block;width:100%;resize:none;border:0;outline:0;background:t
 .draft-foot .src{margin:0}
 .fold{margin-top:8px}.fold summary{cursor:pointer;color:var(--t2);font-size:12px}
 .more{margin:8px 0 0}
-.chat{width:33.333%;flex:none;border-right:1px solid var(--b3);background:var(--bg1);display:none;flex-direction:column;position:fixed;left:0;top:0;bottom:0;z-index:5;box-shadow:4px 0 16px rgba(0,0,0,.18)}
+.chat{width:33.333%;flex:none;border-right:1px solid var(--b3);background:var(--bg1);display:none;flex-direction:column}
 body.chat-on .chat{display:flex}
 .chat .top{height:56px;flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 14px 0 16px;border-bottom:1px solid var(--b3)}
 .chat .who{font-size:11px;color:var(--t3);display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden}
@@ -2859,14 +2860,13 @@ mod tests {
     }
 
     #[test]
-    fn the_chat_column_floats_left_over_the_action_list() {
+    fn the_chat_column_sits_left_of_the_action_list() {
         let page = shell(false, "n");
         let (chat, list) = (page.find(r#"<section class="chat""#).unwrap(), page.find(r#"<section class="page""#).unwrap());
         assert!(chat < list, "the chat comes first in the flex row");
         assert!(page.contains(".chat{width:33.333%;flex:none;border-right:"));
-        // It floats over the list, which keeps its own layout under it (k-181aa1, 09/11).
-        assert!(page.contains("position:fixed;left:0;top:0;bottom:0;z-index:5"));
-        assert!(!page.contains("body.chat-on .inner"), "the list does not move when the chat opens");
+        // It takes its width; only the side panel floats (Robin, 09/11).
+        assert!(!page.contains("position:fixed;left:0;top:0;bottom:0;z-index:5"));
         assert_eq!(chat_frame((200.0, 10.0, 900.0, 600.0), 56.0), (200.0, 10.0, 299.0, 544.0), "the left third, under its bar");
         assert!(!PAGE.contains('\u{2014}'), "no em dash in the UI");
         let u = Update { list: Some("<p>x</p>".into()), ..Default::default() };
