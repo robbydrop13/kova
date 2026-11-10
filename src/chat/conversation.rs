@@ -35,11 +35,9 @@ pub enum Item {
     /// What the user wrote.
     User { id: String, text: String, ts: Option<u64> },
     /// One API request of the assistant: its blocks in `apiBlockIndex` order.
-    /// `ends_turn`: the request stopped on `end_turn`, its text is what the
-    /// agent said to the user, whatever comes after it.
-    Assistant { id: String, blocks: Vec<Block>, ts: Option<u64>, ends_turn: bool },
+    Assistant { id: String, blocks: Vec<Block>, ts: Option<u64> },
     /// A short line from the harness worth seeing: a slash command, an
-    /// interruption, a compaction.
+    /// interruption, a compaction, a Stop hook that sent the agent back.
     Note { id: String, text: String },
     /// What reached the agent from elsewhere than the user: another
     /// session's message, a finished background task. Never shown as the
@@ -152,17 +150,14 @@ impl Conversation {
         let index = match self.by_request.get(&key) {
             Some(&i) => i,
             None => {
-                self.items.push(Item::Assistant { id: key.clone(), blocks: Vec::new(), ts, ends_turn: false });
+                self.items.push(Item::Assistant { id: key.clone(), blocks: Vec::new(), ts });
                 self.by_request.insert(key, self.items.len() - 1);
                 self.items.len() - 1
             }
         };
-        let Item::Assistant { blocks, ts: item_ts, ends_turn, .. } = &mut self.items[index] else { return false };
+        let Item::Assistant { blocks, ts: item_ts, .. } = &mut self.items[index] else { return false };
         if ts.is_some() {
             *item_ts = ts;
-        }
-        if matches!(v.pointer("/message/stop_reason").and_then(Value::as_str), Some("end_turn" | "stop_sequence")) {
-            *ends_turn = true;
         }
         let api = v.get("apiBlockIndex").and_then(Value::as_i64);
         let mut added = Vec::new();
@@ -399,6 +394,11 @@ fn classify_user(v: &Value, text: &str) -> UserLine {
     }
     if trimmed.starts_with("[Request interrupted") {
         return UserLine::Note("Interrupted".to_string());
+    }
+    // A Stop hook that blocked the end of the turn: why the agent goes on
+    // (and often writes its answer again).
+    if let Some(why) = trimmed.strip_prefix("Stop hook feedback:") {
+        return UserLine::Note(format!("Stop hook: {}", one_line(why, TARGET_MAX)));
     }
     // A slash command the user typed: the harness wraps it, the name is worth a line.
     if let Some(name) = between(trimmed, "<command-name>", "</command-name>") {

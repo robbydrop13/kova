@@ -158,158 +158,89 @@ pub fn markdown(source: &str) -> String {
     out
 }
 
-/// One thing of the thread, before it is shown or kept behind the scenes.
-enum Unit<'a> {
-    User { id: &'a str, text: &'a str },
-    Text { key: String, text: &'a str, ends: bool },
-    Tool(&'a Tool),
-    Thinking { key: String, text: &'a str },
-    Note { key: String, text: &'a str },
-    Image { key: String },
-    Behind { key: String, label: &'a str, text: &'a str },
-}
-
 /// The entries of the last `exchanges` exchanges, and whether earlier ones
 /// exist. `working` says whether a tool call without its result is running
 /// (or was stopped).
 ///
-/// Only the user's messages and the assistant's final text (no tool call
-/// after it in its turn) are shown. Everything between two of them (tool
-/// calls, the text that goes with them, notes, other sessions' messages,
-/// finished tasks) folds into one `N actions en coulisse` line. While the
-/// agent works with no call running, a `Réflexion` line ends the thread.
+/// KovaLink's way: everything the transcript holds, in its order, nothing
+/// hidden and nothing guessed. Every text the assistant wrote shows in
+/// full, once; consecutive tool calls make one group (folded past five);
+/// notes, another session's message, a finished task and a reasoning with
+/// its text are one-line rows. While the agent works with no call running,
+/// a `Réflexion` line ends the thread.
 pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Entry>, bool) {
     let users: Vec<usize> = conv.items.iter().enumerate().filter(|(_, i)| matches!(i, Item::User { .. })).map(|(n, _)| n).collect();
     let start = if users.len() > exchanges { users[users.len() - exchanges] } else { 0 };
-    let mut units: Vec<Unit> = Vec::new();
-    for item in conv.items.iter().skip(start) {
-        match item {
-            Item::User { id, text, .. } => units.push(Unit::User { id, text }),
-            Item::Note { id, text } => units.push(Unit::Note { key: format!("n:{id}"), text }),
-            Item::Behind { id, label, text } => units.push(Unit::Behind { key: format!("b:{id}"), label, text }),
-            Item::Assistant { id, blocks, ends_turn, .. } => {
-                for (k, block) in blocks.iter().enumerate() {
-                    units.push(match &block.kind {
-                        BlockKind::Text(text) => Unit::Text { key: format!("t:{id}:{k}"), text, ends: *ends_turn },
-                        BlockKind::Tool(tool) => Unit::Tool(tool),
-                        BlockKind::Image => Unit::Image { key: format!("i:{id}:{k}") },
-                        BlockKind::Thinking(text) => Unit::Thinking { key: format!("k:{id}:{k}"), text },
-                    });
-                }
-            }
-        }
-    }
-    // A text is final when no tool call follows it before the next user message,
-    // or when it ended the agent's turn: another session's message can start
-    // a new turn with calls before the user writes again (06/11).
-    let mut visible = vec![false; units.len()];
-    let mut tool_after = false;
-    for (n, unit) in units.iter().enumerate().rev() {
-        match unit {
-            Unit::User { .. } => {
-                visible[n] = true;
-                tool_after = false;
-            }
-            Unit::Tool(_) => tool_after = true,
-            Unit::Text { ends, .. } => visible[n] = !tool_after || *ends,
-            _ => {}
-        }
-    }
+    let shown = &conv.items[start..];
     // Only the current turn's calls can be running: one from an earlier turn
     // that never got its result was stopped.
-    let last_user = units.iter().rposition(|u| matches!(u, Unit::User { .. }));
+    let last_user = shown.iter().rposition(|i| matches!(i, Item::User { .. }));
     let mut out = Vec::new();
-    let mut run: Vec<&Unit> = Vec::new();
-    for (n, unit) in units.iter().enumerate() {
-        if !visible[n] {
-            // A thinking block without its text is nothing to show.
-            if !matches!(unit, Unit::Thinking { text, .. } if text.is_empty()) {
-                run.push(unit);
+    let mut tools: Vec<&Tool> = Vec::new();
+    // The reasoning that came last, while nothing followed it yet.
+    let mut thought: Option<(String, &str)> = None;
+    let flush = |tools: &mut Vec<&Tool>, out: &mut Vec<Entry>, current: bool| {
+        if !tools.is_empty() {
+            out.push(tool_group(tools, working && current, out.len()));
+            tools.clear();
+        }
+    };
+    for (n, item) in shown.iter().enumerate() {
+        let current = last_user.is_none_or(|u| n > u);
+        let Item::Assistant { id, blocks, .. } = item else {
+            flush(&mut tools, &mut out, current);
+            if let Some((key, text)) = thought.take() {
+                out.push(fold_entry(&key, "Réflexion", text));
             }
+            out.push(match item {
+                Item::User { id, text, .. } => Entry {
+                    id: format!("u:{id}"),
+                    html: format!(r#"<div class="user"><div class="bubble">{}</div></div>"#, linkify(text)),
+                },
+                Item::Note { id, text } => Entry { id: format!("n:{id}"), html: format!(r#"<div class="note">{}</div>"#, escape(text)) },
+                Item::Behind { id, label, text } => fold_entry(&format!("b:{id}"), label, text),
+                Item::Assistant { .. } => unreachable!(),
+            });
             continue;
+        };
+        for (k, block) in blocks.iter().enumerate() {
+            if let BlockKind::Tool(t) = &block.kind {
+                tools.push(t);
+                continue;
+            }
+            // A thinking block without its text is nothing to show.
+            if matches!(&block.kind, BlockKind::Thinking(t) if t.is_empty()) {
+                continue;
+            }
+            flush(&mut tools, &mut out, current);
+            if let Some((key, text)) = thought.take() {
+                out.push(fold_entry(&key, "Réflexion", text));
+            }
+            match &block.kind {
+                BlockKind::Text(text) => out.push(Entry { id: format!("t:{id}:{k}"), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) }),
+                BlockKind::Image => out.push(Entry { id: format!("i:{id}:{k}"), html: r#"<div class="note">image</div>"#.to_string() }),
+                BlockKind::Thinking(text) => thought = Some((format!("k:{id}:{k}"), text)),
+                BlockKind::Tool(_) => {}
+            }
         }
-        if !run.is_empty() {
-            out.push(behind_entry(&run, working && last_user.is_none_or(|u| n > u)));
-            run.clear();
-        }
-        out.push(match unit {
-            Unit::User { id, text } => Entry {
-                id: format!("u:{id}"),
-                html: format!(r#"<div class="user"><div class="bubble">{}</div></div>"#, linkify(text)),
-            },
-            Unit::Text { key, text, .. } => Entry { id: key.clone(), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) },
-            _ => unreachable!("only messages are visible"),
-        });
     }
-    let running = working && run.iter().any(|u| matches!(u, Unit::Tool(t) if t.result.is_none()));
-    // The reasoning going on, when the transcript has its text and nothing
-    // came after it: shown on the Réflexion line, not behind the scenes.
-    let mut thought = "";
-    if working && !running && let Some(Unit::Thinking { text, .. }) = run.last() {
-        thought = text;
-        run.pop();
-    }
-    if !run.is_empty() {
-        out.push(behind_entry(&run, working));
+    let running = working && tools.iter().any(|t| t.result.is_none());
+    flush(&mut tools, &mut out, true);
+    // The reasoning going on is on the Réflexion line, not a row of its own.
+    let live = if working && !running { thought.take().map_or("", |(_, text)| text) } else { "" };
+    if let Some((key, text)) = thought {
+        out.push(fold_entry(&key, "Réflexion", text));
     }
     if working && !running {
-        out.push(thinking_entry(thought));
+        out.push(thinking_entry(live));
     }
     (out, start > 0)
 }
 
-/// `N actions en coulisse`: the hidden things between two messages, folded,
-/// compact once unfolded.
-fn behind_entry(run: &[&Unit], working: bool) -> Entry {
-    let key = |u: &Unit| match u {
-        Unit::Tool(t) if !t.id.is_empty() => format!("g:{}", t.id),
-        Unit::Tool(_) => "g:@".to_string(),
-        Unit::Text { key, .. } | Unit::Thinking { key, .. } | Unit::Note { key, .. } | Unit::Image { key } | Unit::Behind { key, .. } => key.clone(),
-        Unit::User { id, .. } => format!("u:{id}"),
-    };
-    let id = format!("c:{}", key(run[0]));
-    let mut inner = String::new();
-    let mut tools: Vec<&Tool> = Vec::new();
-    let flush = |tools: &mut Vec<&Tool>, inner: &mut String| {
-        if !tools.is_empty() {
-            inner.push_str(&tool_group(tools, working, inner.len()).html);
-            tools.clear();
-        }
-    };
-    let mut states = Vec::new();
-    for unit in run {
-        if let Unit::Tool(t) = unit {
-            states.push(state_of(t, working));
-            tools.push(t);
-            continue;
-        }
-        flush(&mut tools, &mut inner);
-        match unit {
-            Unit::Text { text, .. } => inner.push_str(&format!(r#"<div class="asst bt">{}</div>"#, markdown(text))),
-            Unit::Note { text, .. } => inner.push_str(&format!(r#"<div class="note">{}</div>"#, escape(text))),
-            Unit::Image { .. } => inner.push_str(r#"<div class="note">image</div>"#),
-            Unit::Thinking { key, text } => inner.push_str(&fold_row(key, "Réflexion", text)),
-            Unit::Behind { key, label, text } => inner.push_str(&fold_row(key, label, text)),
-            Unit::Tool(_) | Unit::User { .. } => {}
-        }
-    }
-    flush(&mut tools, &mut inner);
-    let st = if states.contains(&State::Running) {
-        r#"<span class="st run"></span>"#
-    } else if states.contains(&State::Error) {
-        r#"<span class="st err"></span>"#
-    } else {
-        ""
-    };
-    let n = run.len();
-    let label = if n == 1 { "1 action en coulisse".to_string() } else { format!("{n} actions en coulisse") };
-    Entry {
-        html: format!(
-            r#"<div class="behind" data-id="{eid}"><button class="trow bhead" data-act="fold"><span class="verb">{label}</span>{st}</button><div class="fold">{inner}</div></div>"#,
-            eid = escape(&id),
-        ),
-        id,
-    }
+/// A one-line row of its own (a reasoning, another session's message, a
+/// finished task): its label, its text unfolded on a click.
+fn fold_entry(key: &str, label: &str, text: &str) -> Entry {
+    Entry { id: key.to_string(), html: format!(r#"<div class="tools">{}</div>"#, fold_row(key, label, text)) }
 }
 
 /// A folded row: its label, its text unfolded.
@@ -672,11 +603,6 @@ body {{ display: flex; flex-direction: column; }}
   border: 1px solid var(--b2); border-radius: 10px; padding: 8px 12px; outline: none; }}
 #box:focus {{ border-color: var(--accent); }}
 #note {{ min-height: 16px; margin-top: 4px; font-size: 12px; color: var(--t3); }}
-.behind {{ margin: 2px 0; }}
-.bhead {{ height: 24px; font-size: 12.5px; }} .bhead .verb {{ color: var(--t3); font-weight: 400; }}
-.behind > .fold {{ padding-left: 10px; border-left: 1px solid var(--b3); margin: 0 0 6px 9px; font-size: 13px; }}
-.asst.bt {{ margin: 4px 6px; font-size: 13px; color: var(--t2); }}
-.behind .note {{ text-align: left; margin: 4px 6px; }}
 .think {{ margin: 6px 0; font-size: 13px; }} .think > .shimmer {{ padding: 0 6px; }}
 .shimmer {{ color: var(--t3); background: linear-gradient(90deg, var(--t3) 35%, var(--t1) 50%, var(--t3) 65%);
   background-size: 250% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
@@ -1068,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_user_s_messages_and_the_final_text_show_the_rest_folds() {
+    fn every_text_shows_in_order_and_consecutive_calls_group() {
         let c = conv(vec![
             user("u1", "go"),
             text("r0", 0, "Let me look."),
@@ -1084,40 +1010,90 @@ mod tests {
         ]);
         let (e, more) = entries(&c, EXCHANGES_STEP, false);
         assert!(!more);
-        assert_eq!(ids(&e), ["u:u1", "c:t:r0:0", "t:r3:0", "c:b:q", "u:u3", "c:n:n"]);
-        assert!(e[1].html.contains("3 actions en coulisse"), "a text before a call, two calls; an empty thinking is nothing: {}", e[1].html);
-        assert_eq!(e[1].html.matches(r#"class="tool""#).count(), 2);
-        assert!(e[1].html.contains(r#"<div class="fold">"#), "folded by default, unfolded on a click");
-        assert!(e[3].html.contains("1 action en coulisse") && e[3].html.contains("Message de pm"));
-        assert!(e[5].html.contains("Interrupted"));
+        assert_eq!(ids(&e), ["u:u1", "t:r0:0", "g:a", "t:r3:0", "b:q", "u:u3", "n:n"]);
+        assert_eq!(e[2].html.matches(r#"class="tool""#).count(), 2, "two calls, an empty thinking between them is nothing");
+        assert!(!e.iter().any(|x| x.html.contains("coulisse")), "nothing is folded away");
+        assert!(e[4].html.contains("Message de pm"));
+        assert!(e[6].html.contains("Interrupted"));
     }
 
     #[test]
-    fn a_turn_s_final_text_stays_when_another_session_starts_a_turn_with_calls() {
-        let mut end = text("r1", 0, "Here is the full answer.");
-        end["message"]["stop_reason"] = json!("end_turn");
-        let c = conv(vec![
-            user("u1", "explain"),
-            tool("r0", 0, "a"),
-            end,
-            json!({"type": "attachment", "uuid": "q", "attachment": {"type": "queued_command", "commandMode": "prompt", "origin": {"kind": "peer"},
-                   "prompt": "<cross-session-message from-name=\"pm\">done</cross-session-message>"}}),
-            tool("r2", 0, "b"),
-            text("r3", 0, "Noted."),
-        ]);
-        let (e, _) = entries(&c, EXCHANGES_STEP, false);
-        assert_eq!(ids(&e), ["u:u1", "c:g:a", "t:r1:0", "c:b:q", "t:r3:0"]);
-    }
-
-    #[test]
-    fn the_last_text_shows_while_the_turn_goes_on_and_folds_once_a_call_follows() {
+    fn a_text_stays_when_a_call_follows_it() {
         let mut lines = vec![user("u1", "go"), text("r1", 0, "Looking.")];
         let (e, _) = entries(&conv(lines.clone()), EXCHANGES_STEP, true);
         assert_eq!(ids(&e), ["u:u1", "t:r1:0", "r:live"], "the model thinks: the Réflexion line ends the thread");
         lines.push(tool("r2", 0, "a"));
         let (e, _) = entries(&conv(lines), EXCHANGES_STEP, true);
-        assert_eq!(ids(&e), ["u:u1", "c:t:r1:0"], "a call runs: no Réflexion line");
-        assert!(e[1].html.contains(r#"class="st run""#), "the running call shows on the folded line");
+        assert_eq!(ids(&e), ["u:u1", "t:r1:0", "g:a"], "a call runs: no Réflexion line");
+        assert!(e[2].html.contains(r#"class="st run""#));
+    }
+
+    /// The assistant's text blocks of `lines`, in order, each once.
+    fn texts_of(lines: &[serde_json::Value]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|v| v["type"] == "assistant")
+            .flat_map(|v| v["message"]["content"].as_array().cloned().unwrap_or_default())
+            .filter(|b| b["type"] == "text")
+            .map(|b| b["text"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Each text block's markdown appears exactly once in the page, in the
+    /// order of the transcript.
+    fn assert_each_text_once(e: &[Entry], texts: &[String]) {
+        let page: String = e.iter().map(|x| x.html.as_str()).collect();
+        let mut at = 0;
+        for t in texts {
+            let m = markdown(t);
+            assert_eq!(page.matches(m.as_str()).count(), 1, "{t:?} once");
+            let found = page[at..].find(m.as_str()).unwrap_or_else(|| panic!("{t:?} out of order"));
+            at += found + m.len();
+        }
+    }
+
+    /// A Stop hook that blocks the end of a turn makes the agent answer again:
+    /// both answers are in the transcript, both show, each once, with the
+    /// hook's line between them.
+    #[test]
+    fn a_stop_hook_rewrite_shows_every_text_once() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/transcripts/stop_hook_rewrite.jsonl");
+        let lines: Vec<serde_json::Value> = FIXTURE.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let texts = texts_of(&lines);
+        assert_eq!(texts.len(), 3);
+        let (e, _) = entries(&conv(lines), EXCHANGES_STEP, false);
+        assert_each_text_once(&e, &texts);
+        assert_eq!(ids(&e), ["u:u1", "t:req_1:1", "g:t1", "t:req_2:0", "n:h1", "g:t2", "t:req_4:0"]);
+        assert!(e[4].html.contains("Stop hook: [hook] An instruction is waiting on card a-1"), "{}", e[4].html);
+    }
+
+    /// The incremental reader can hand a line again (the window read at open
+    /// overlapping what is appended, a watcher firing twice): its block shows once.
+    #[test]
+    fn a_block_read_twice_by_the_tail_shows_once() {
+        use crate::chat::tail::Tail;
+        use std::io::Write as _;
+        const FIXTURE: &str = include_str!("../../tests/fixtures/transcripts/stop_hook_rewrite.jsonl");
+        let path = std::env::temp_dir().join(format!("kova-chat-twice-{}.jsonl", crate::ask::new_question_id()));
+        let (head, rest) = FIXTURE.split_at(FIXTURE.find("\n").unwrap() + 1);
+        std::fs::write(&path, head).unwrap();
+        let (mut tail, first) = Tail::open(&path);
+        let mut c = Conversation::new();
+        c.apply_all(&first);
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for l in rest.lines() {
+            file.write_all(format!("{l}\n").as_bytes()).unwrap();
+            let read = tail.read_more();
+            c.apply_all(&read.lines);
+            c.apply_all(&read.lines);
+        }
+        // The whole file read again from scratch on top: nothing new.
+        c.apply_all(&Tail::open(&path).1);
+        std::fs::remove_file(&path).ok();
+        let lines: Vec<serde_json::Value> = FIXTURE.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let (e, _) = entries(&c, EXCHANGES_STEP, false);
+        assert_each_text_once(&e, &texts_of(&lines));
+        assert_eq!(e.len(), 7);
     }
 
     #[test]
@@ -1129,7 +1105,7 @@ mod tests {
         let (e, _) = entries(&conv(vec![user("u1", "go"), think("weigh <both>")]), EXCHANGES_STEP, true);
         let last = e.last().unwrap();
         assert!(last.html.contains(r#"data-act="fold""#) && last.html.contains("weigh &lt;both&gt;"));
-        assert_eq!(ids(&e), ["u:u1", "r:live"], "the reasoning going on is not also behind the scenes");
+        assert_eq!(ids(&e), ["u:u1", "r:live"], "the reasoning going on is not also a row of its own");
         let (e, _) = entries(&conv(vec![user("u1", "go"), think("x")]), EXCHANGES_STEP, false);
         assert!(!e.iter().any(|x| x.id == "r:live"), "idle: no Réflexion");
     }

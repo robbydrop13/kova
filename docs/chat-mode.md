@@ -77,17 +77,23 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
   finish`, the prompt takes a message);
 - the assistant's text full width, rendered markdown, no bubble; the user's
   message in a quiet bubble on the right;
-- only the user's messages and the assistant's final text (no tool call
-  after it in its turn) show. Everything between two of them folds into
-  one `N actions en coulisse` line, a click unfolds it, compact: tool calls
-  as one-line rows (`Read  …/src/boot.ts`, `Run  npm test`), state at the
-  right (running, ✓, ✕), a click unfolds the result, a run past five folded
-  again into `N actions`; the text that went with the calls; notes
-  (`Interrupted`, a slash command); another session's message
-  (`Message de <name>`) and a finished background task, never shown as the
-  user's (a peer's message is queued as a `prompt` too: its origin decides).
-  System reminders are dropped. What was unfolded stays unfolded while the
-  page lives. The cards (questions, permission prompt) are never folded;
+- everything the transcript holds, in its order, like KovaLink's mobile
+  thread: no rule hides or shows a message, nothing is guessed or
+  deduplicated by content. Every text the assistant wrote shows in full,
+  once (a line read twice is known by its `uuid`). Consecutive tool calls
+  make one group of one-line rows (`Read  …/src/boot.ts`, `Run  npm test`),
+  state at the right (running, ✓, ✕), a click unfolds the result, a run
+  past five folded into `N actions`. Notes (`Interrupted`, a slash command,
+  `Stop hook: …` when a Stop hook sends the agent back, so its second
+  answer follows its first), another session's message (`Message de
+  <name>`), a finished background task and a reasoning with its text are
+  one-line rows, never shown as the user's (a peer's message is queued as a
+  `prompt` too: its origin decides). System reminders are dropped. What was
+  unfolded stays unfolded while the page lives. The cards (questions,
+  permission prompt) are never folded. Until 10/11 only the user's messages
+  and the assistant's final text showed and the rest folded into `N actions
+  en coulisse`: a text followed by a call disappeared, and a Stop hook's
+  rewrite showed both answers as finals back to back;
 - while Claude works with no call running, a `Réflexion` line ends the
   thread, a light sweeping across it (still under `prefers-reduced-motion`);
   a click unfolds the reasoning when the transcript holds it (it often keeps
