@@ -325,6 +325,14 @@ pub struct AttentionConfig {
     /// Writes the detail of an entry that says nothing (`attn explain`):
     /// Kova appends the id. Absent: `close_command`'s program with `explain`.
     pub explain_command: Vec<String>,
+    /// A file holding the key that tells the queue's CLI a click really
+    /// comes from this app, on the user's own click: one line, read at each
+    /// click and handed to `act_command`, `close_command` and the snooze
+    /// command in their environment (`attention::CLICK_KEY_ENV`, with
+    /// `attention::CLICK_FROM_ENV` set to `kova`), never as an argument,
+    /// never logged, never kept. A leading `~/` is the home folder. Empty
+    /// (the default), absent or unreadable: no key, the click goes as before.
+    pub click_key_file: String,
     /// The day's journal, where routines write what they did instead of
     /// posting cards: a path with `{date}` for the day (`YYYY-MM-DD`), a
     /// leading `~/` the home folder
@@ -382,6 +390,18 @@ impl AttentionConfig {
     /// program with `add`.
     pub fn add_command(&self) -> Vec<String> {
         self.command.first().map(|bin| vec![bin.clone(), "add".to_string()]).unwrap_or_default()
+    }
+
+    /// `click_key_file` with a leading `~/` expanded, `None` when unset.
+    pub fn click_key_path(&self) -> Option<std::path::PathBuf> {
+        let file = self.click_key_file.trim();
+        if file.is_empty() {
+            return None;
+        }
+        Some(match file.strip_prefix("~/") {
+            Some(rest) => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+            None => std::path::PathBuf::from(file),
+        })
     }
 
     /// Today's journal (`journal_file`), when the file exists.

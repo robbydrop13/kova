@@ -765,11 +765,61 @@ pub fn delivery_of(code: Option<i32>, exit_codes: bool) -> Option<Delivery> {
     }
 }
 
+/// The environment variable that carries the click key to the CLI, and the
+/// one that names who clicked.
+pub const CLICK_KEY_ENV: &str = "ATTN_CLICK_KEY";
+pub const CLICK_FROM_ENV: &str = "ATTN_CLICK_FROM";
+/// This app, for `CLICK_FROM_ENV`.
+pub const CLICK_FROM: &str = "kova";
+
+static CLICK_KEY_FILE: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
+
+/// `[attention] click_key_file`, set at load and on a config reload: the
+/// path only. The key itself is read at each click and never kept.
+pub fn set_click_key_file(path: Option<std::path::PathBuf>) {
+    *CLICK_KEY_FILE.write() = path;
+}
+
+/// The click key in `path`: its one line, trimmed. `None` when the file is
+/// not there, cannot be read, or does not hold one printable word of 16 to
+/// 256 chars: the click then goes without a key, as before. Kova never
+/// writes this file, and never logs the key: only that it could not be read.
+pub fn click_key(path: &std::path::Path) -> Option<String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            log::warn!("attention: the click key file cannot be read ({})", e.kind());
+            return None;
+        }
+    };
+    let key = raw.trim();
+    let sound = (16..=256).contains(&key.len()) && key.chars().all(|c| c.is_ascii_graphic());
+    if !sound {
+        log::warn!("attention: the click key file does not hold a key");
+    }
+    sound.then(|| key.to_string())
+}
+
 /// Run a click's argv: how far it went, or `Err` with the first line of its
-/// stderr on a failure.
+/// stderr on a failure. Only the user's own clicks come here
+/// (`perform_with`, called by the Cockpit's and the chat's pages, never by
+/// the IPC nor the command line): the command gets the click key in its
+/// environment, never in its argv, which any process can read.
 fn run_click(bin: &str, args: &[String]) -> Result<Delivery, String> {
+    let key = CLICK_KEY_FILE.read().clone().and_then(|path| click_key(&path));
+    run_click_with(bin, args, key.as_deref())
+}
+
+fn run_click_with(bin: &str, args: &[String], key: Option<&str>) -> Result<Delivery, String> {
     let exit_codes = args.iter().any(|a| a == EXIT_CODES);
-    crate::exec::run_with_deadline(std::process::Command::new(bin).args(args), ACT_DEADLINE).and_then(|out| {
+    let mut command = std::process::Command::new(bin);
+    command.args(args);
+    // Never inherited from Kova's own environment: only a key read now.
+    command.env_remove(CLICK_KEY_ENV).env_remove(CLICK_FROM_ENV);
+    if let Some(key) = key {
+        command.env(CLICK_KEY_ENV, key).env(CLICK_FROM_ENV, CLICK_FROM);
+    }
+    crate::exec::run_with_deadline(&mut command, ACT_DEADLINE).and_then(|out| {
         if let Some(delivery) = delivery_of(out.status.code(), exit_codes) {
             Ok(match (delivery, code_send_line(&String::from_utf8_lossy(&out.stdout))) {
                 (Delivery::Delivered, Some(line)) => Delivery::ByCode(line),
@@ -968,6 +1018,93 @@ mod tests {
         // No go closes with its own reason, through the close command.
         let close: Vec<String> = ["/bin/attn", "close", "--by", "robin"].iter().map(|s| s.to_string()).collect();
         assert_eq!(verb_argv(&[], &close, "a-1", Verb::NoGo, None).map(|(_, a)| a), Some(vec!["close".into(), "--by".into(), "robin".into(), "a-1".into(), "--reason".into(), "nogo".into()]));
+    }
+
+    #[test]
+    fn a_click_carries_its_key_in_the_environment_never_in_the_argv() {
+        let dir = std::env::temp_dir().join(format!("kova-click-key-{}", crate::ask::new_question_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("key");
+        let key = "0123456789abcdef0123456789abcdef";
+        std::fs::write(&file, format!("{key}\n")).unwrap();
+        assert_eq!(click_key(&file).as_deref(), Some(key), "one line, trimmed");
+        std::fs::write(&file, "short\n").unwrap();
+        assert_eq!(click_key(&file), None);
+        std::fs::write(&file, "two words that are long enough\n").unwrap();
+        assert_eq!(click_key(&file), None, "not one word");
+        assert_eq!(click_key(&dir.join("none")), None, "no file, no key, and none is made");
+        assert!(!dir.join("none").exists());
+        // The command sees the key and who clicked in its environment; its
+        // argv is what it was. (The script writes what it got to a file.)
+        let seen = dir.join("seen");
+        let script = dir.join("act.sh");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s|%s|%s' \"${}\" \"${}\" \"$*\" > '{}'\necho 'refused by the queue' >&2\nexit \"$1\"\n",
+            CLICK_KEY_ENV,
+            CLICK_FROM_ENV,
+            seen.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = script.to_string_lossy().into_owned();
+        let args = |code: &str| vec![code.to_string(), "a-1".to_string(), "Valider".to_string()];
+        assert_eq!(run_click_with(&bin, &args("0"), Some(key)), Ok(Delivery::Delivered));
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), format!("{key}|kova|0 a-1 Valider"), "in the environment, not in the argv");
+        // A failure's words never hold the key.
+        let failed = run_click_with(&bin, &args("1"), Some(key)).unwrap_err();
+        assert_eq!(failed, "refused by the queue");
+        // Without a key (no file, or one that does not read): the click goes
+        // as before, and a key or an origin in Kova's own environment is not
+        // passed on.
+        assert_eq!(run_click_with(&bin, &args("0"), None), Ok(Delivery::Delivered));
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "||0 a-1 Valider");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The key goes with the user's own click only: `perform_with` is called
+    /// by the Cockpit's and the chat's pages and by nothing else (no IPC
+    /// command, no `kova` subcommand, no rendering), `run_click` by
+    /// `perform_with` only, and no test runs with a key file set.
+    #[test]
+    fn only_a_click_on_a_page_can_carry_the_key() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        let rel = |p: &std::path::Path| p.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+        // The code before the tests module, comments dropped.
+        let code = |p: &std::path::Path| -> String {
+            let text = std::fs::read_to_string(p).unwrap();
+            let body = text.split("\n#[cfg(test)]\nmod tests").next().unwrap_or("").to_string();
+            body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+        };
+        let mut calling: Vec<String> = files.iter().filter(|p| code(p).contains("perform_with(")).map(|p| rel(p)).collect();
+        calling.sort();
+        assert_eq!(calling, ["attention.rs", "window/chat_view.rs", "window/cockpit_view.rs"], "who can run a click");
+        for p in &files {
+            let (name, body) = (rel(p), code(p));
+            if name != "attention.rs" {
+                assert!(!body.contains("run_click") && !body.contains("click_key(") && !body.contains("CLICK_KEY_ENV"), "{name} must not touch the click key");
+            }
+        }
+        // In this file: the key is read in one place, used in one place.
+        let own = code(&root.join("attention.rs"));
+        assert_eq!(own.matches("click_key(&path)").count(), 1);
+        assert_eq!(own.matches("run_click(&bin, &args)").count(), 2, "the instruction and the other verbs, both inside perform_with");
+        let perform = own.split("pub fn perform_with(").nth(1).unwrap().split("\nfn run_click(").next().unwrap();
+        assert_eq!(perform.matches("run_click(&bin, &args)").count(), 2);
+        // No test runs with a key file: the path is only set from the config.
+        assert!(CLICK_KEY_FILE.read().is_none());
     }
 
     #[test]

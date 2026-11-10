@@ -94,6 +94,18 @@ it: one `WKWebView` per window over the active tab's panes area
   `act_command` sends a validated draft itself and says so on its first
   line (`envoi par le code (slack à U123)`, `attention::CODE_SEND`), the
   card shows that line as it is, where it would say `Transmis à l'agent`.
+- Whose click it is (10/11/2026). The queue's CLI takes a click for the
+  user's when the process that runs it carries the click key. With
+  `[attention] click_key_file` set, Kova reads that file at each click (one
+  line; never kept, never logged, never written by Kova) and hands the key
+  to `act_command`, `close_command` and the snooze command in their
+  environment (`attention::CLICK_KEY_ENV`, and `CLICK_FROM_ENV` = `kova`),
+  never as an argument, which any process can read. Only a click on the
+  Cockpit's or the chat's page runs these commands (`attention::perform_with`):
+  no IPC command, no `kova` subcommand, no `kova render` does, and a test
+  holds that (`only_a_click_on_a_page_can_carry_the_key`). No file, or one
+  that does not read: the click goes without a key, as before. Who clicked
+  (`--by <name>`) is given in `act_command` and `close_command` themselves.
 - `No go` (10/11/2026), on an action plan only: a `decision` posted by
   `veille-actions` with its plan in the body (`attention::PLAN_FROM`). It
   runs `close_command ID --reason nogo`: the plan's agent learns a no go,

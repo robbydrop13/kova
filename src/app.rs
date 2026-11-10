@@ -110,6 +110,7 @@ define_class!(
             crate::chat::conversation::configure(&config.chat.rewrite_markers);
             crate::refs::set_file(config.links.refs_path().as_deref());
             crate::attention::set_commands(&config.attention.commands());
+    crate::attention::set_click_key_file(config.attention.click_key_path());
             crate::catchup::set_commands(&config.attention.catchup_commands());
             crate::inflight::set_command(&config.attention.inflight_command());
             setup_menu(mtm, config);
@@ -1853,6 +1854,7 @@ fn handle_ipc_reload_config(
     crate::chat::conversation::configure(&config.chat.rewrite_markers);
     crate::refs::set_file(config.links.refs_path().as_deref());
     crate::attention::set_commands(&config.attention.commands());
+    crate::attention::set_click_key_file(config.attention.click_key_path());
     crate::catchup::set_commands(&config.attention.catchup_commands());
     crate::inflight::set_command(&config.attention.inflight_command());
     let mut applied = 0usize;
