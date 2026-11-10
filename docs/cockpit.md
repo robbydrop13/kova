@@ -82,6 +82,13 @@ it: one `WKWebView` per window over the active tab's panes area
   instruction that is a go reads `Go`. A card back in the list after a
   failure (`failed` in the queue's JSON) says `Échec : why` at its head, with
   its buttons; one that carries a `proof` shows it under its needs.
+- Where a draft really goes (10/11/2026): when the draft carries a
+  `target` (what the sender's tool takes: a Slack id, a `#channel`, `/<ts>`
+  for a thread), it shows in small type next to the `to` name, so the user
+  sees the destination and not only a name. No `target`, nothing more. When
+  `act_command` sends a validated draft itself and says so on its first
+  line (`envoi par le code (slack à U123)`, `attention::CODE_SEND`), the
+  card shows that line as it is, where it would say `Transmis à l'agent`.
 - `No go` (10/11/2026), on an action plan only: a `decision` posted by
   `veille-actions` with its plan in the body (`attention::PLAN_FROM`). It
   runs `close_command ID --reason nogo`: the plan's agent learns a no go,

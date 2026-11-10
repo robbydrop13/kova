@@ -111,6 +111,8 @@ pub enum State {
     Running,
     /// The click went through: the receiver has it.
     Sent,
+    /// The go is sent by the command itself, not an agent: its own line.
+    SentByCode(String),
     /// The click is recorded, the receiver does not have it yet.
     Noted,
     Failed(String),
@@ -332,6 +334,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         Some(Outcome::Closed) => return None,
         Some(Outcome::Running) => State::Running,
         Some(Outcome::Sent) => State::Sent,
+        Some(Outcome::SentByCode(line)) => State::SentByCode(line.clone()),
         Some(Outcome::Noted) => State::Noted,
         Some(Outcome::Failed { words, .. }) => State::Failed(words.clone()),
         None => State::Idle,
@@ -607,7 +610,7 @@ impl Button {
 /// Buttons). `None` for a card that only informs (its check icon is the
 /// action) and once a go went through.
 pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
-    let sent = matches!(item.state, State::Sent | State::Noted);
+    let sent = matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted);
     match item.kind {
         Kind::Attention if item.draft.is_some() && can_act => (!sent).then_some(Button::Validate),
         Kind::Attention if item.ask.is_some() => Some(Button::OpenSheet),
@@ -630,7 +633,7 @@ pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
 /// (`primary`). A draft's verbs need `act_command`; a sent draft has none
 /// left. `Refuser` needs the close command (`card_html`).
 pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
-    let sent = matches!(item.state, State::Sent | State::Noted);
+    let sent = matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted);
     let links: Vec<Button> = match item.kind {
         Kind::Attention if item.draft.is_some() && can_act => match (sent, item.plan) {
             (true, _) => Vec::new(),
@@ -680,7 +683,7 @@ pub fn icons(item: &Item, can_close: bool, can_snooze: bool) -> Vec<Button> {
 /// The user already acted on the card: a go went through, or a consigne
 /// was sent or is on its way.
 pub fn acted(item: &Item) -> bool {
-    matches!(item.state, State::Sent | State::Noted)
+    matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted)
         || matches!(&item.instruction, Some(Instructed { outcome: Outcome::Sent | Outcome::Noted | Outcome::Running, .. }))
 }
 
@@ -870,6 +873,7 @@ fn state_html(state: &State) -> String {
         State::Idle => String::new(),
         State::Running => "<div class=\"state\">En cours</div>".to_string(),
         State::Sent => "<div class=\"state ok\">Transmis à l'agent</div>".to_string(),
+        State::SentByCode(line) => format!("<div class=\"state ok\">{}</div>", esc(line)),
         State::Noted => "<div class=\"state warn\">Noté, pas encore remis à l'agent</div>".to_string(),
         State::Failed(words) => format!("<div class=\"state crit\">Non transmis : {}</div>", esc(words)),
     }
@@ -921,7 +925,19 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
                 .map(|s| format!("<span>Objet <b>{}</b></span>", esc(s)))
                 .unwrap_or_default();
             let channel = if draft.channel.trim().is_empty() { String::new() } else { format!("<span>{}</span>", esc(&draft.channel)) };
-            let to = if draft.to.trim().is_empty() { String::new() } else { format!("<span>À <b>{}</b></span>", esc(&draft.to)) };
+            // The name a person reads, then where the message really goes.
+            let target = draft
+                .target
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| format!(" <code class=\"tg\" title=\"Cible de l'envoi\">{}</code>", esc(t)))
+                .unwrap_or_default();
+            let to = if draft.to.trim().is_empty() && target.is_empty() {
+                String::new()
+            } else {
+                format!("<span>À <b>{}</b>{target}</span>", esc(&draft.to))
+            };
             // The newline after `<textarea>` is the one the parser drops, so
             // a text that starts with a newline keeps it.
             format!(
@@ -931,7 +947,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
                  <div class=\"draft-foot\">{src}{acts}</div>{detail}{state}",
                 orig = esc(&draft.text),
                 text = esc(&draft.text),
-                ro = if matches!(item.state, State::Sent | State::Noted) || running { " readonly" } else { "" },
+                ro = if matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted) || running { " readonly" } else { "" },
                 src = source_html(item, now),
                 state = state_html(&item.state),
             )
@@ -1536,6 +1552,7 @@ pre.scroll{margin-top:8px;max-height:240px;overflow:auto;background:var(--bg-inp
 .words{color:var(--crit)}.msg{white-space:pre-wrap;overflow-wrap:anywhere}
 textarea.ans{display:block;width:100%;margin-top:8px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:6px 10px;resize:vertical}
 textarea.ans:focus{border-color:var(--accent);outline:0}
+.draft .hd .tg{font:11.5px "SF Mono",Menlo,monospace;color:var(--t3);background:none;border:0;padding:0}
 .state.top{margin:0 0 6px}.jr{margin:18px 0 6px;font-size:12px;color:var(--t3)}.jr a{color:var(--t3);text-decoration:underline}
 .state.ok{color:var(--ok-dot)}.state.warn{color:var(--warn-dot)}.state.crit{color:var(--crit)}
 .instr{margin-top:10px;border-top:1px solid var(--b3);padding-top:4px;cursor:auto}
@@ -2281,6 +2298,22 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_shows_where_it_really_goes_and_a_send_by_code_says_so() {
+        let mut e = Entry { kind: "would".into(), ..entry("a-1", Level::Now, None, 1) };
+        e.draft = Some(Draft { target: Some("U0BJ301TJNM/<17.5>".into()), to: "Sacha".into(), channel: "slack".into(), subject: None, text: "Hi".into() });
+        let html = card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10);
+        assert!(html.contains("<span>À <b>Sacha</b> <code class=\"tg\" title=\"Cible de l'envoi\">U0BJ301TJNM/&lt;17.5&gt;</code></span>"), "{html}");
+        // No target: the name alone, as before.
+        e.draft.as_mut().unwrap().target = None;
+        let html = card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10);
+        assert!(html.contains("<span>À <b>Sacha</b></span>") && !html.contains("class=\"tg\""), "{html}");
+        // Sent by the command itself: its line, not "handed to the agent".
+        let sent = card_html(&from_attention(&e, Some(&Outcome::SentByCode("envoi par le code (slack à <U1>)".into())), false).unwrap(), true, true, true, 10);
+        assert!(sent.contains("<div class=\"state ok\">envoi par le code (slack à &lt;U1&gt;)</div>") && !sent.contains("Transmis à l'agent"), "{sent}");
+        assert!(sent.contains("readonly") && !sent.contains("data-act=\"validate\""), "not offered again");
+    }
+
+    #[test]
     fn a_card_back_after_a_failure_says_why_and_a_plan_takes_a_no_go() {
         // Back after its action failed: the reason first, the buttons as before.
         let mut e = Entry { kind: "would".into(), ..entry("a-1", Level::Now, None, 1) };
@@ -2299,7 +2332,7 @@ mod tests {
         assert!(buttons(&item, true).contains(&Button::NoGo));
         let html = card_html(&item, true, true, true, 10);
         assert!(html.contains("data-act=\"nogo\"") && html.contains(">No go<") && html.contains("data-act=\"dismiss\""), "both: {html}");
-        let drafted = Entry { draft: Some(Draft { to: "A".into(), channel: "slack".into(), subject: None, text: "x".into() }), ..plan };
+        let drafted = Entry { draft: Some(Draft { target: None, to: "A".into(), channel: "slack".into(), subject: None, text: "x".into() }), ..plan };
         assert_eq!(buttons(&from_attention(&drafted, None, false).unwrap(), true), [Button::NoGo, Button::Correct, Button::Validate]);
         assert!(!buttons(&from_attention(&entry("a-3", Level::Now, None, 1), None, false).unwrap(), true).contains(&Button::NoGo), "not on another card");
         assert_eq!(Button::parse("nogo"), Some(Button::NoGo));
@@ -2408,7 +2441,7 @@ mod tests {
             from_attention(&e, None, openable).unwrap()
         };
         let draft = {
-            let e = Entry { kind: "would".into(), draft: Some(Draft { to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
+            let e = Entry { kind: "would".into(), draft: Some(Draft { target: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
             from_attention(&e, None, false).unwrap()
         };
         let mut sheet_entry = with("decision", Some("kova-sheet:430b8a55"), false);
@@ -2456,7 +2489,7 @@ mod tests {
         assert!(q.contains("data-act=\"expand\" data-focus=\"ans\""), "{q}");
         // A draft's Corriger is a link next to its blue Valider; it opens the
         // card on its consigne field.
-        let e = Entry { kind: "would".into(), draft: Some(Draft { to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
+        let e = Entry { kind: "would".into(), draft: Some(Draft { target: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..entry("a-1", Level::Now, None, 1) };
         let d = card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10);
         assert!(d.contains("<button type=\"button\" class=\"link\" data-act=\"correct\" data-focus=\"ins\">Corriger</button>"), "{d}");
     }
@@ -2485,7 +2518,7 @@ mod tests {
         assert_eq!(icons(&item, false, false), []);
         item.openable = false;
         assert_eq!(buttons(&item, true), []);
-        item.draft = Some(Draft { to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
+        item.draft = Some(Draft { target: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
         assert_eq!(buttons(&item, true), [Button::Correct, Button::Validate]);
         item.state = State::Sent;
         assert_eq!(buttons(&item, true), []);
@@ -2523,7 +2556,7 @@ mod tests {
         assert!(!expects_validation(&with("decision", None)), "a decision with nothing prepared");
         assert!(!expects_validation(&with("decision", Some("kova-sheet:430b8a55"))), "a sheet takes its own answers");
         assert!(!expects_validation(&with("test", Some("/tmp/x.md"))));
-        let drafted = Entry { draft: Some(Draft { to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..with("would", None) };
+        let drafted = Entry { draft: Some(Draft { target: None, to: "A".into(), channel: "email".into(), subject: None, text: "Hi".into() }), ..with("would", None) };
         assert!(!expects_validation(&drafted), "a draft keeps its own Valider");
         let mut item = from_attention(&with("would", Some("/tmp/prep.md")), None, true).unwrap();
         assert_eq!(buttons(&item, true), [Button::Open, Button::Refuse, Button::Validate]);
@@ -2648,6 +2681,7 @@ mod tests {
         e.from = "\"a\" & 'b'".into();
         e.needs = Some("</textarea><script>".into());
         e.draft = Some(Draft {
+            target: None,
             to: "<b>x</b>".into(),
             channel: "Email".into(),
             subject: Some("S\"".into()),
@@ -2704,7 +2738,7 @@ mod tests {
         // A draft keeps its own correction field; the instruction comes
         // under the draft's actions, once.
         let mut e = entry("a-2", Level::Now, None, 1);
-        e.draft = Some(Draft { to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
+        e.draft = Some(Draft { target: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
         let mut item = from_attention(&e, None, false).unwrap();
         item.detail = Some(entry_detail(&e, false));
         item.instruction = Some(Instructed { text: "Plus court".into(), outcome: Outcome::Sent });
@@ -2725,7 +2759,7 @@ mod tests {
     #[test]
     fn a_sent_draft_says_so_and_a_running_click_disables_the_buttons() {
         let mut e = entry("a-1", Level::Now, None, 1);
-        e.draft = Some(Draft { to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
+        e.draft = Some(Draft { target: None, to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
         let sent = from_attention(&e, Some(&Outcome::Sent), false).unwrap();
         let html = card_html(&sent, true, true, true, 10);
         assert!(html.contains("Transmis à l'agent") && html.contains("readonly") && !html.contains("data-act=\"validate\""));

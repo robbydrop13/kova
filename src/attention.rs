@@ -72,6 +72,11 @@ pub struct Draft {
     #[serde(default)]
     pub subject: Option<String>,
     pub text: String,
+    /// Where the message really goes, as the sender's tool takes it (a
+    /// Slack id `U…`, `C…`, `D…`, `G…`, a `#channel`, `/<ts>` for a thread):
+    /// shown next to `to`, the name a person reads.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 /// One open entry, as the CLI prints it. Fields Kova does not show are
@@ -510,6 +515,9 @@ pub enum Outcome {
     /// (`act_command … --exit-codes` exited 0): the card says so instead of
     /// offering it again.
     Sent,
+    /// The go did not go to an agent: the command sends the message itself
+    /// and says so on its first line (`CODE_SEND`), shown as it is.
+    SentByCode(String),
     /// The click is recorded but its agent does not have it yet (exit 3): it
     /// will be handed over later. Not a failure; the card says so.
     Noted,
@@ -674,7 +682,7 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
         let id = id.to_string();
         std::thread::spawn(move || {
             let outcome = match run_click(&bin, &args) {
-                Ok(Delivery::Delivered) => Outcome::Sent,
+                Ok(Delivery::Delivered | Delivery::ByCode(_)) => Outcome::Sent,
                 Ok(Delivery::Noted) => Outcome::Noted,
                 Err(words) => {
                     log::warn!("attention instruct {id}: {words}");
@@ -703,6 +711,7 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
                 &id,
                 match (verb, delivery) {
                     (Verb::Validate | Verb::Correct, Delivery::Delivered) => Outcome::Sent,
+                    (Verb::Validate | Verb::Correct, Delivery::ByCode(line)) => Outcome::SentByCode(line),
                     (Verb::Validate | Verb::Correct, Delivery::Noted) => Outcome::Noted,
                     _ => Outcome::Closed,
                 },
@@ -725,10 +734,24 @@ pub const EXIT_CODES: &str = "--exit-codes";
 const EXIT_NOTED: i32 = 3;
 
 /// How far a click that did not fail went.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delivery {
     Delivered,
     Noted,
+    /// The command sends the message itself: its own words.
+    ByCode(String),
+}
+
+/// How `act_command` starts its first line when it sends a validated draft
+/// itself instead of handing it to an agent (`envoi par le code (slack à
+/// U123)`).
+pub const CODE_SEND: &str = "envoi par le code";
+
+/// The line a command that exited 0 printed, when it says it sends the
+/// message itself: one line, 120 chars at most.
+pub fn code_send_line(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next()?.trim();
+    line.starts_with(CODE_SEND).then(|| line.chars().filter(|c| !c.is_control()).take(120).collect())
 }
 
 /// What a click's exit says: `code` is `None` when a signal ended it.
@@ -748,7 +771,10 @@ fn run_click(bin: &str, args: &[String]) -> Result<Delivery, String> {
     let exit_codes = args.iter().any(|a| a == EXIT_CODES);
     crate::exec::run_with_deadline(std::process::Command::new(bin).args(args), ACT_DEADLINE).and_then(|out| {
         if let Some(delivery) = delivery_of(out.status.code(), exit_codes) {
-            Ok(delivery)
+            Ok(match (delivery, code_send_line(&String::from_utf8_lossy(&out.stdout))) {
+                (Delivery::Delivered, Some(line)) => Delivery::ByCode(line),
+                (delivery, _) => delivery,
+            })
         } else {
             let err = String::from_utf8_lossy(&out.stderr);
             let line: String = err.lines().next().unwrap_or("").trim().chars().take(80).collect();
@@ -951,6 +977,10 @@ mod tests {
         assert_eq!(delivery_of(Some(1), true), None);
         assert_eq!(delivery_of(Some(2), true), None);
         assert_eq!(delivery_of(None, true), None, "killed by a signal");
+        // The command sends the message itself and says so: its line, as it is.
+        assert_eq!(code_send_line("envoi par le code (slack à U0BJ301TJNM)\nmore\n").as_deref(), Some("envoi par le code (slack à U0BJ301TJNM)"));
+        assert_eq!(code_send_line("remis à claap-agent\n"), None);
+        assert_eq!(code_send_line(""), None);
         assert_eq!(delivery_of(Some(3), false), None, "a command not asked for exit codes: 3 is a failure");
         // Only a click on an agent's card asks for them; a close does not.
         let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();

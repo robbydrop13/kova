@@ -558,7 +558,7 @@ impl KovaView {
                     .filter(|entry| {
                         !matches!(
                             outcomes.get(&entry.id),
-                            Some(crate::attention::Outcome::Sent | crate::attention::Outcome::Closed)
+                            Some(crate::attention::Outcome::Sent | crate::attention::Outcome::SentByCode(_) | crate::attention::Outcome::Closed)
                         )
                     })
                     .map(|entry| AttentionNeed {
