@@ -342,7 +342,7 @@ listed by `list-asks` as they were asked, absent on a plain question.
 A **native sheet** is a decision with `"sheet"` in place of `url`: the
 decision-sheet JSON (`title`, `intro`, `links`, `decisions` with `options`, one
 `reco` at most), checked on arrival (`"question.sheet": …` on a refusal: plain
-ids, bounded texts, http(s) links). Kova renders it in the side panel, keeps the
+ids, bounded texts, links to an http(s) URL or to a local file the side panel shows, by an absolute or `~/` path). Kova renders it in the side panel, keeps the
 answers given so far in `draft` (Kova's field: one sent with the question is
 dropped), and answers `Done` with their summary as `text`, one line per decision
 (`D1: A (label)`, `. Note: …`, `D2: other: …`, `D3: open`, then `Note: …`). A

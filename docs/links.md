@@ -48,6 +48,7 @@ path to a file of another type (`.rs`, `.zip`), an API route
 | En cours, Fait | a click's title, instruction and result, an agent's line and its first instruction | `inflight.rs` |
 | Catch-up band | a project's headline, a change, a waiting item's title and needs | `catchup.rs` |
 | Decision sheet, long question | every text (`rich`, `inline`), a whole code span included; a file opens in the panel, Back returns to the sheet | `decision_sheet.rs`, `side_panel.rs` (navigation policy) |
+| Decision sheet, its `links` field | each link's `url`: an http(s) URL, or an absolute or `~/` path to a file the panel shows. `kova ask --decisions` refuses any other with the reason (missing, another type, relative) | `decision_sheet::link_ok`, `link_href` |
 | Floating `kova ask` card | its message | `ask_card.rs` |
 
 Not linked: an editable field (a draft, a note), a notification, a sidebar

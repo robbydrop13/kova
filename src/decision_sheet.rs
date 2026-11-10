@@ -123,6 +123,39 @@ impl SheetAnswers {
     }
 }
 
+/// A sheet's link goes to an http(s) URL, or to a local file the side panel
+/// shows: an absolute or `~/` path that `opens` (the panel's own rule,
+/// `links::open`: the file exists and has one of its extensions).
+fn link_ok(link: &SheetLink, opens: &dyn Fn(&str) -> bool) -> Result<(), String> {
+    let url = link.url.trim();
+    if crate::ask::is_panel_url(url) {
+        return Ok(());
+    }
+    if url.contains("://") || url.chars().any(char::is_control) {
+        return Err(format!("link '{}' is not an http(s) URL nor a local file", link.label));
+    }
+    if !(url.starts_with('/') || url.starts_with("~/")) {
+        return Err(format!("link '{}': a local file is given by an absolute or ~/ path, not '{}'", link.label, url));
+    }
+    if !opens(url) {
+        return Err(format!(
+            "link '{}': '{}' is not a file the side panel shows (missing, or not one of: {})",
+            link.label,
+            url,
+            crate::window::side_panel::FILE_EXTENSIONS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// A sheet link's `href`: the URL, or the local file as a `file:` URL the
+/// panel opens (`links::file_url`). `None` when the file is gone since the
+/// sheet was checked: its label stays, as text.
+fn link_href(url: &str) -> Option<String> {
+    let url = url.trim();
+    if crate::ask::is_panel_url(url) { Some(url.to_string()) } else { crate::links::file_url(url, None) }
+}
+
 fn safe_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 24 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
@@ -143,8 +176,9 @@ impl Sheet {
     }
 
     /// The limits a sheet must keep to be shown: ids that are plain words,
-    /// unique, texts of bounded length, http(s) links, one recommendation at
-    /// most per decision.
+    /// unique, texts of bounded length, links to an http(s) URL or to a
+    /// local file the side panel shows, one recommendation at most per
+    /// decision.
     pub fn validate(&self) -> Result<(), String> {
         if self.title.trim().is_empty() {
             return Err("the sheet has no title".into());
@@ -156,9 +190,7 @@ impl Sheet {
         }
         for link in &self.links {
             text_ok("a link label", &link.label)?;
-            if !crate::ask::is_panel_url(&link.url) {
-                return Err(format!("link '{}' is not an http(s) URL", link.label));
-            }
+            link_ok(link, &|p| crate::links::open(p, None).is_some())?;
         }
         if self.decisions.is_empty() || self.decisions.len() > MAX_DECISIONS {
             return Err(format!("a sheet holds 1 to {} decisions", MAX_DECISIONS));
@@ -615,7 +647,10 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
     let links: String = sheet
         .links
         .iter()
-        .map(|l| format!("<a href=\"{}\">{}</a>", esc(&l.url), esc(&l.label)))
+        .map(|l| match link_href(&l.url) {
+            Some(href) => format!("<a href=\"{}\">{}</a>", esc(&href), esc(&l.label)),
+            None => format!("<span>{}</span>", esc(&l.label)),
+        })
         .collect::<Vec<_>>()
         .join("");
     let p = palette;
@@ -896,6 +931,39 @@ mod tests {
         assert!(html.contains("data-action=\"K&lt;O\""));
         assert!(html.contains("id=\"note\""));
         assert!(!render_question("a", "b", &["OK".into()], false, &tokens::DARK).contains("id=\"note\""));
+    }
+
+    #[test]
+    fn a_sheet_s_link_goes_to_a_url_or_to_a_local_file_the_panel_shows() {
+        let link = |url: &str| SheetLink { label: "Plan".into(), url: url.into() };
+        let opens = |p: &str| p == "/tmp/x/plan.md" || p == "~/AI directory/x/shot.png";
+        assert_eq!(link_ok(&link("https://linear.app/x"), &opens), Ok(()));
+        assert_eq!(link_ok(&link("/tmp/x/plan.md"), &opens), Ok(()));
+        assert_eq!(link_ok(&link("~/AI directory/x/shot.png"), &opens), Ok(()), "a path with spaces");
+        let why = |url: &str| link_ok(&link(url), &opens).unwrap_err();
+        assert!(why("/tmp/x/none.md").contains("is not a file the side panel shows (missing, or not one of: md, markdown, html"), "{}", why("/tmp/x/none.md"));
+        assert!(why("/tmp/x/main.rs").contains("not a file the side panel shows"));
+        assert!(why("docs/plan.md").contains("absolute or ~/ path"), "{}", why("docs/plan.md"));
+        assert!(why("javascript:alert(1)").contains("absolute or ~/ path"));
+        assert!(why("file:///tmp/x/plan.md").contains("not an http(s) URL nor a local file"));
+        assert!(why("slack://x").contains("not an http(s) URL nor a local file"));
+        // On the page: the file as a `file:` URL the panel opens; one gone since stays a label.
+        let dir = std::env::temp_dir().join(format!("kova sheet link {}", crate::ask::new_question_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plan.md");
+        std::fs::write(&file, "x").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let raw = format!(
+            r#"{{"title":"t","links":[{{"label":"Le plan","url":{}}},{{"label":"Site","url":"https://x.io"}}],"decisions":[{{"id":"D1","title":"x","options":[{{"id":"A","label":"a"}}]}}]}}"#,
+            serde_json::to_string(&path).unwrap()
+        );
+        let sheet = Sheet::from_json(&raw).expect("a local file is a link");
+        let html = render(&sheet, &SheetAnswers::default(), "pm", &tokens::DARK, None);
+        let url = crate::links::file_url(&path, None).unwrap();
+        assert!(html.contains(&format!("<a href=\"{url}\">Le plan</a><a href=\"https://x.io\">Site</a>")), "{html}");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(Sheet::from_json(&raw).unwrap_err().contains("is not a file the side panel shows"), "refused once the file is gone");
+        assert!(render(&sheet, &SheetAnswers::default(), "pm", &tokens::DARK, None).contains("<span>Le plan</span>"));
     }
 
     #[test]
