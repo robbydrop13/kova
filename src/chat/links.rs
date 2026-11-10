@@ -1,7 +1,12 @@
-//! Links in the chat's text: http(s) URLs, and absolute or `~/` paths to
-//! local `.md` and `.html` files, the targets the side panel shows
-//! (`window::side_panel::target_for`). A click opens them there. Any other
-//! path stays text.
+//! Links in the chat's text: http(s) URLs, and paths to the local files the
+//! side panel shows (`window::side_panel::FILE_EXTENSIONS`: markdown, HTML,
+//! images, PDF, text, JSON). A click opens them there. Any other path stays
+//! text.
+//!
+//! An absolute or `~/` path to a `.md` or `.html` file is a link as written.
+//! Every other one only when the file exists: another extension, a path
+//! with spaces, a path relative to the pane's folder or one of its parents
+//! (`artifacts/plan.md`), a whole code span (`` `~/notes/plan.md` ``).
 //!
 //! In an agent's answer, a bare Linear id (`CLA-123`, `CLAR-`, `CLAD-`) links
 //! to its issue and a bare `#12345` to that pull request of the Claap repo.
@@ -10,7 +15,23 @@
 //! the file exists, so a sentence that happens to start with `/` is never
 //! taken for one.
 
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+
 use super::page::escape;
+use crate::window::side_panel::{self, FILE_EXTENSIONS as PANEL_EXTENSIONS, PanelTarget};
+
+thread_local! {
+    /// The folder of the pane whose chat is rendered: what a relative path
+    /// is read against (`on_disk`).
+    static BASE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Set the folder relative paths are read against, before rendering a
+/// pane's chat (the main thread renders every chat).
+pub fn set_base(cwd: Option<&Path>) {
+    BASE.with(|b| *b.borrow_mut() = cwd.map(Path::to_path_buf));
+}
 
 /// A link found in a text: its bytes in the text, and what it opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +62,25 @@ const SPACED_PATH_MAX: usize = 240;
 pub fn is_panel_path(raw: &str) -> bool {
     (raw.starts_with('/') || raw.starts_with("~/")) && (raw.ends_with(".md") || raw.ends_with(".html"))
 }
+
+/// `raw` ends with an extension the panel shows.
+fn has_panel_extension(raw: &str) -> bool {
+    raw.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && PANEL_EXTENSIONS.contains(&ext))
+}
+
+/// Whether the whole of `raw` (a code span, a markdown link's destination)
+/// names a file the panel shows: a path, absolute, `~/` or relative, to a
+/// file that exists.
+pub fn is_file_path(raw: &str, exists: &dyn Fn(&str) -> bool) -> bool {
+    !raw.is_empty()
+        && raw.len() <= SPACED_PATH_MAX
+        && raw.contains('/')
+        && !raw.contains("://")
+        && !raw.contains(char::is_control)
+        && has_panel_extension(raw)
+        && exists(raw)
+}
+
 
 /// Whether `raw` is an http(s) URL.
 pub fn is_web(raw: &str) -> bool {
@@ -143,9 +183,12 @@ fn urls(text: &str) -> Vec<Link> {
 
 fn paths(text: &str, urls: &[Link], exists: &dyn Fn(&str) -> bool) -> Vec<Link> {
     let mut out: Vec<Link> = Vec::new();
-    for ext in [".md", ".html"] {
+    for ext in PANEL_EXTENSIONS {
+        let ext = &format!(".{ext}");
+        // As written for these two; the file must be there for the others.
+        let as_written = ext == ".md" || ext == ".html";
         let mut from = 0;
-        while let Some(rel) = text[from..].find(ext) {
+        while let Some(rel) = text[from..].find(ext.as_str()) {
             let end = from + rel + ext.len();
             from = end;
             let boundary = text[end..].chars().next().is_none_or(|c| c.is_whitespace() || ".,;:!?)]}>\"'`*_".contains(c));
@@ -163,7 +206,16 @@ fn paths(text: &str, urls: &[Link], exists: &dyn Fn(&str) -> bool) -> Vec<Link> 
                 .filter(|&i| (text[i..].starts_with('/') || text[i..].starts_with("~/")) && starts_token(text, i));
             let found = starts.collect::<Vec<_>>().into_iter().rev().find(|&i| {
                 let candidate = &text[i..end];
-                !candidate.contains(char::is_whitespace) || exists(candidate)
+                (as_written && !candidate.contains(char::is_whitespace)) || exists(candidate)
+            });
+            // A path relative to the pane's folder (`docs/plan.md`): the
+            // word it ends, when it names a file.
+            let found = found.or_else(|| {
+                let word = text[low..end].rfind(|c: char| c.is_whitespace() || "([{<\"'`*".contains(c)).map_or(low, |i| low + i + 1);
+                let candidate = &text[word..end];
+                (word == low || starts_token(text, word)).then_some(word).filter(|_| {
+                    candidate.contains('/') && !candidate.starts_with('/') && !candidate.starts_with('~') && !candidate.contains("://") && exists(candidate)
+                })
             });
             // Never across a URL nor another path.
             if let Some(start) = found
@@ -225,12 +277,11 @@ pub fn linkify_refs(text: &str) -> String {
     linkify_refs_with(text, &on_disk)
 }
 
-fn on_disk(path: &str) -> bool {
-    let expanded = match path.strip_prefix("~/") {
-        Some(rest) => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
-        None => std::path::PathBuf::from(path),
-    };
-    expanded.is_file()
+/// `path` names a file the panel would open on a click: the same rule as
+/// the click itself (`side_panel::target_on_disk`), so a link is never dead.
+/// A relative path is read against the pane's folder and its parents.
+pub fn on_disk(path: &str) -> bool {
+    BASE.with(|b| matches!(side_panel::target_on_disk(path, b.borrow().as_deref()), Some(t) if !matches!(t, PanelTarget::Web(_))))
 }
 
 #[cfg(test)]
@@ -283,6 +334,28 @@ mod tests {
         assert!(targets("I edited /a/b and c/d.md", &none).is_empty(), "not a path made of a sentence");
         let long = format!("{} /tmp/x.md", "é".repeat(200));
         assert_eq!(targets(&long, &none), [("/tmp/x.md".to_string(), Kind::Path)], "a long accented line: no cut inside a char");
+    }
+
+    #[test]
+    fn every_file_the_panel_shows_is_linked_when_it_exists() {
+        let there = ["/tmp/shot.png", "~/out/run.log", "docs/plan.md", "a b/report.pdf", "~/AI directory/x/data.json"];
+        let exists = |p: &str| there.contains(&p);
+        let text = "Saved /tmp/shot.png and ~/out/run.log, see docs/plan.md (and ~/AI directory/x/data.json). Not /v1/list.json nor lib/x.txt nor a.md";
+        assert_eq!(
+            targets(text, &exists),
+            [
+                ("/tmp/shot.png".to_string(), Kind::Path),
+                ("~/out/run.log".to_string(), Kind::Path),
+                ("docs/plan.md".to_string(), Kind::Path),
+                ("~/AI directory/x/data.json".to_string(), Kind::Path),
+            ],
+            "an API route, a relative path to nothing and a bare file name stay text"
+        );
+        assert!(targets("Saved /tmp/shot.png and docs/plan.md", &none).is_empty(), "only when the file is there");
+        assert_eq!(targets("https://x.io/docs/plan.md", &exists).len(), 1, "inside a URL: the URL only");
+        assert!(is_file_path("docs/plan.md", &exists) && is_file_path("~/AI directory/x/data.json", &exists) && is_file_path("a b/report.pdf", &exists));
+        assert!(!is_file_path("docs/plan.md", &none) && !is_file_path("plan.md", &|_| true) && !is_file_path("https://x.io/a.md", &|_| true));
+        assert!(!is_file_path("src/main.rs", &|_| true), "not a file the panel shows");
     }
 
     #[test]

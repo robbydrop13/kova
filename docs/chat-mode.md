@@ -43,7 +43,12 @@ Kova's.
 Read from `~/.claude/projects/<slug>/<sessionId>.jsonl` (under the
 session's `CLAUDE_CONFIG_DIR` when it has one; found in another project
 folder when the session started elsewhere), the last 4 MB at open, then
-only what is appended, as soon as it is: a kqueue on the file
+only what is appended, as soon as it is. Those 4 MB are bytes, not
+exchanges: a pasted image or long tool results fill them with a few minutes
+of conversation (6 to 17 exchanges measured on a chief's day). So the window
+grows four times at a time (`Tail::widen`, 64 MB at most) until it holds the
+20 exchanges shown, and again on `Show earlier`, which stays offered while
+the file has lines before what was read. A kqueue on the file
 (`src/chat/watch.rs`) is asked once per frame without waiting, so a line
 reaches the chat one frame after Claude Code wrote it (a read every second
 anyway, for a file replaced or not written yet). A line still missing its `\n` waits for
@@ -89,11 +94,27 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
   <name>`), a finished background task and a reasoning with its text are
   one-line rows, never shown as the user's (a peer's message is queued as a
   `prompt` too: its origin decides). System reminders are dropped. What was
-  unfolded stays unfolded while the page lives. The cards (questions,
+  unfolded stays unfolded while the page lives. The lines Claude Code
+  wraps a paste in (`<pasted_content id="…">`) are not shown, what was
+  pasted is. The cards (questions,
   permission prompt) are never folded. Until 10/11 only the user's messages
   and the assistant's final text showed and the rest folded into `N actions
   en coulisse`: a text followed by a call disappeared, and a Stop hook's
   rewrite showed both answers as finals back to back;
+- one answer per rewrite. When a Stop hook sends an answer back to be
+  written again, the transcript holds both; once the second is written the
+  first becomes a quiet `Version précédente` row (a click unfolds the
+  hook's reason and the answer as it was) and the hook's line goes inside
+  it. Read off the transcript's structure, nothing compared or guessed
+  (`page::superseded`): the hook's feedback holds one of `[chat]
+  rewrite_markers` (the hook's own wording, e.g. `rewrite_markers =
+  ["Rewrite it in full"]`; none by default, so nothing folds); the draft is
+  the text that ended the answer right before the hook's line; the rewrite
+  is the next text the assistant writes, with only its own calls and
+  reasoning in between. Until that text is there the draft shows in full,
+  and it stays so when a message (the user's, another session's) comes
+  first. Any other Stop hook feedback (a card to post, an instruction to
+  apply) leaves both answers and its line;
 - while Claude works with no call running, a `Réflexion` line ends the
   thread, a light sweeping across it (still under `prefers-reduced-motion`);
   a click unfolds the reasoning when the transcript holds it (it often keeps
@@ -104,9 +125,15 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
 Every text from the transcript is escaped by Rust. Markdown shows raw HTML
 as text, keeps a link only to http(s), mailto or a local `.md` / `.html`
 file (a link to anything else is shown as its text) and never loads an
-image. A bare http(s) URL, or an absolute or `~/` path to a `.md` / `.html`
-file, is a link too (`src/chat/links.rs`), but not inside code; a path with
-spaces only when the file exists. In an answer, a bare Linear id
+image. A bare http(s) URL is a link, and so is the path of a file the side
+panel shows (`side_panel::FILE_EXTENSIONS`: markdown, HTML, images, PDF,
+text, log, JSON; `src/chat/links.rs`): an absolute or `~/` path to a `.md` /
+`.html` file as written, every other one when the file exists (another
+extension, a path with spaces, a path relative to the pane's folder or one
+of its parents such as `artifacts/plan.md`, a markdown link to it). A code
+span that is, whole, such a path links too; a code block never does.
+Existence is the click's own test (`side_panel::target_on_disk`), so a
+link is never dead when drawn. In an answer, a bare Linear id
 (`CLA-123`, `CLAR-`, `CLAD-`) links to its issue and a bare `#12345` to that
 pull request of the Claap repo, but not inside code, a link, a URL or a
 heading. A click opens it in the side panel
@@ -231,6 +258,15 @@ At the bottom of the thread, above the box:
 - the permission prompt read on the pane's screen, when no menu was read: Yes, the option that
   always allows, No; the digit is typed only while the screen still shows
   that prompt (`Pane::answer_permission`).
+
+## Looking at a rendering without Kova
+
+`KOVA_CHAT_TRANSCRIPT=<jsonl> KOVA_CHAT_OUT=<html> [KOVA_CHAT_MARKERS="a|b"]
+[KOVA_CHAT_BASE=<pane folder>] [KOVA_CHAT_UNFOLD=1] cargo test --release
+render_a_transcript -- --ignored --nocapture` writes the thread of a
+transcript as one HTML file, read as the chat reads it, prints what it read
+and fails if a text the assistant wrote in the exchanges shown is not on the
+page. A headless browser turns the file into a screenshot.
 
 ## Not done yet
 

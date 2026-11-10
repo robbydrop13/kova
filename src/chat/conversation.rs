@@ -19,6 +19,7 @@
 //! not reference: what the line holds is all there is, shown truncated.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use serde_json::Value;
 
@@ -30,6 +31,21 @@ pub const RESULT_MAX: usize = 4000;
 /// Longest target shown on a tool line, in chars.
 const TARGET_MAX: usize = 120;
 
+static REWRITE_MARKERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// `[chat] rewrite_markers`, set at load and on a config reload: what a Stop
+/// hook's feedback holds when it asks the agent to write its answer again.
+pub fn configure(rewrite_markers: &[String]) {
+    if let Ok(mut m) = REWRITE_MARKERS.lock() {
+        *m = clean_markers(rewrite_markers);
+    }
+}
+
+/// An empty marker would match every feedback: dropped.
+fn clean_markers(markers: &[String]) -> Vec<String> {
+    markers.iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     /// What the user wrote.
@@ -38,7 +54,9 @@ pub enum Item {
     Assistant { id: String, blocks: Vec<Block>, ts: Option<u64> },
     /// A short line from the harness worth seeing: a slash command, an
     /// interruption, a compaction, a Stop hook that sent the agent back.
-    Note { id: String, text: String },
+    /// `rewrite`: a Stop hook that asked for the answer to be written again
+    /// (its feedback holds one of `[chat] rewrite_markers`).
+    Note { id: String, text: String, rewrite: bool },
     /// What reached the agent from elsewhere than the user: another
     /// session's message, a finished background task. Never shown as the
     /// user's, kept behind the scenes.
@@ -91,6 +109,8 @@ pub struct Conversation {
     /// Results that came before their call (never seen, but cheap to allow).
     early_results: HashMap<String, ToolResult>,
     seen: HashSet<String>,
+    /// What marks a Stop hook's feedback as a request to rewrite the answer.
+    rewrite_markers: Vec<String>,
     /// The behind-the-scenes texts already kept: one message can reach the
     /// transcript twice (queued mid-turn, then as a line).
     behind_seen: HashSet<String>,
@@ -103,6 +123,16 @@ pub struct Conversation {
 impl Conversation {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A conversation read with the config's `[chat] rewrite_markers`.
+    pub fn configured() -> Self {
+        let markers = REWRITE_MARKERS.lock().map(|m| m.clone()).unwrap_or_default();
+        Self::with_rewrite_markers(&markers)
+    }
+
+    pub fn with_rewrite_markers(markers: &[String]) -> Self {
+        Self { rewrite_markers: clean_markers(markers), ..Self::default() }
     }
 
     pub fn apply_all(&mut self, lines: &[RawLine]) {
@@ -218,9 +248,9 @@ impl Conversation {
             return changed;
         }
         let id = v.get("uuid").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("u{}", line.offset));
-        match classify_user(v, &text) {
+        match classify_user(v, &text, &self.rewrite_markers) {
             UserLine::Human => {
-                let mut text = text.trim().to_string();
+                let mut text = without_paste_tags(&text);
                 for _ in 0..images {
                     if !text.is_empty() {
                         text.push('\n');
@@ -229,7 +259,8 @@ impl Conversation {
                 }
                 self.items.push(Item::User { id, text, ts });
             }
-            UserLine::Note(note) => self.items.push(Item::Note { id, text: note }),
+            UserLine::Note(note) => self.items.push(Item::Note { id, text: note, rewrite: false }),
+            UserLine::Rewrite(note) => self.items.push(Item::Note { id, text: note, rewrite: true }),
             UserLine::Harness => match behind(&text) {
                 Some((label, body)) => return self.push_behind(id, label, body) || changed,
                 None => return changed,
@@ -310,6 +341,11 @@ impl Conversation {
         }
     }
 
+    /// How many messages the user wrote: the exchanges the chat can show.
+    pub fn user_count(&self) -> usize {
+        self.items.iter().filter(|i| matches!(i, Item::User { .. })).count()
+    }
+
     /// When the user last wrote, epoch seconds.
     pub fn last_user_ts(&self) -> Option<u64> {
         self.items.iter().rev().find_map(|i| match i {
@@ -384,10 +420,12 @@ const HARNESS_TAGS: &[&str] = &[
 enum UserLine {
     Human,
     Note(String),
+    /// A Stop hook that asked for the answer to be written again.
+    Rewrite(String),
     Harness,
 }
 
-fn classify_user(v: &Value, text: &str) -> UserLine {
+fn classify_user(v: &Value, text: &str, rewrite_markers: &[String]) -> UserLine {
     let trimmed = text.trim_start();
     if v.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
         return UserLine::Note("Conversation compacted".to_string());
@@ -398,7 +436,9 @@ fn classify_user(v: &Value, text: &str) -> UserLine {
     // A Stop hook that blocked the end of the turn: why the agent goes on
     // (and often writes its answer again).
     if let Some(why) = trimmed.strip_prefix("Stop hook feedback:") {
-        return UserLine::Note(format!("Stop hook: {}", one_line(why, TARGET_MAX)));
+        let note = format!("Stop hook: {}", one_line(why, TARGET_MAX));
+        // Said by the hook itself, never guessed from the two answers.
+        return if rewrite_markers.iter().any(|m| why.contains(m.as_str())) { UserLine::Rewrite(note) } else { UserLine::Note(note) };
     }
     // A slash command the user typed: the harness wraps it, the name is worth a line.
     if let Some(name) = between(trimmed, "<command-name>", "</command-name>") {
@@ -435,6 +475,13 @@ fn behind(text: &str) -> Option<(String, String)> {
         return Some((one_line(summary, TARGET_MAX), result.trim().to_string()));
     }
     None
+}
+
+/// The user's text without the lines Claude Code wraps a paste in
+/// (`<pasted_content id="…">`, `</pasted_content id="…">`): what was pasted stays.
+fn without_paste_tags(text: &str) -> String {
+    let tag = |l: &str| (l.starts_with("<pasted_content") || l.starts_with("</pasted_content")) && l.ends_with('>') && l.matches('<').count() == 1;
+    text.lines().filter(|l| !tag(l.trim())).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
 fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -684,9 +731,30 @@ mod tests {
             json!({"type": "user", "uuid": "f", "message": {"content": "[Request interrupted by user]"}}),
         ]);
         assert_eq!(c.items.len(), 3);
-        assert_eq!(c.items[0], Item::Note { id: "d".into(), text: "/clear".into() });
+        assert_eq!(c.items[0], Item::Note { id: "d".into(), text: "/clear".into(), rewrite: false });
         assert!(matches!(&c.items[1], Item::User { text, .. } if text == "fix the bug"));
         assert!(matches!(&c.items[2], Item::Note { text, .. } if text == "Interrupted"));
+    }
+
+    #[test]
+    fn a_stop_hook_asks_for_a_rewrite_only_when_its_feedback_says_so() {
+        let hook = |uuid: &str, why: &str| json!({"type": "user", "uuid": uuid, "isMeta": true, "message": {"content": format!("Stop hook feedback:\n{why}")}});
+        let lines = vec![hook("a", "[hook] Your answer fails the form check. Write it again in full:\n- a dash"), hook("b", "[hook] A card waits for you.")];
+        let mut c = Conversation::with_rewrite_markers(&["Write it again in full".to_string(), "  ".to_string()]);
+        for (i, v) in lines.iter().enumerate() {
+            c.apply(&line(i as u64, v.clone()));
+        }
+        let rewrites: Vec<bool> = c.items.iter().map(|i| matches!(i, Item::Note { rewrite: true, .. })).collect();
+        assert_eq!(rewrites, [true, false], "an empty marker matches nothing");
+        assert!(matches!(&c.items[0], Item::Note { text, .. } if text == "Stop hook: [hook] Your answer fails the form check. Write it again in full:"));
+        let plain = conv(lines);
+        assert!(plain.items.iter().all(|i| matches!(i, Item::Note { rewrite: false, .. })), "no marker configured: never a rewrite");
+    }
+
+    #[test]
+    fn a_paste_shows_without_its_wrapping_tags() {
+        let c = conv(vec![json!({"type": "user", "uuid": "p", "message": {"content": "<pasted_content id=\"e46a\">\nmy list:\n- a <b> c\n</pasted_content id=\"e46a\">\nand this"}})]);
+        assert!(matches!(&c.items[0], Item::User { text, .. } if text == "my list:\n- a <b> c\nand this"), "{:?}", c.items);
     }
 
     #[test]

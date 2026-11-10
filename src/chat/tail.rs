@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 /// long session several hundred MB: the window is capped, the rest stays
 /// in the terminal's scrollback.
 pub const MAX_INITIAL_BYTES: u64 = 4 * 1024 * 1024;
+/// How far back `widen` goes at most. The lines of a few exchanges can fill
+/// the first window (a pasted image, tool results): the chat asks for more
+/// until it has its exchanges, and on `Show earlier`.
+pub const MAX_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
 /// The fingerprint that tells a file rewritten in place from one that grew.
 const HEAD_BYTES: usize = 64;
 
@@ -44,13 +48,17 @@ pub struct Tail {
     /// A line still missing its `\n`, and where it starts in the file.
     carry: Vec<u8>,
     carry_start: u64,
+    /// How many bytes from the end a (re)read takes.
+    window: u64,
+    /// Where the last window read started in the file.
+    start: u64,
 }
 
 impl Tail {
     /// Open `path` and read its last `MAX_INITIAL_BYTES`. A missing file is an
     /// empty conversation, not an error: it is opened once it exists.
     pub fn open(path: &Path) -> (Tail, Vec<RawLine>) {
-        let mut tail = Tail { path: path.to_path_buf(), offset: 0, inode: 0, head: Vec::new(), carry: Vec::new(), carry_start: 0 };
+        let mut tail = Tail { path: path.to_path_buf(), offset: 0, inode: 0, head: Vec::new(), carry: Vec::new(), carry_start: 0, window: MAX_INITIAL_BYTES, start: 0 };
         let lines = tail.read_window();
         (tail, lines)
     }
@@ -62,6 +70,18 @@ impl Tail {
     /// The file has not been seen yet (`inode` still 0).
     pub fn waiting(&self) -> bool {
         self.inode == 0
+    }
+
+    /// The file holds lines before the window read, and the window can grow.
+    pub fn can_widen(&self) -> bool {
+        self.start > 0 && self.window < MAX_WINDOW_BYTES
+    }
+
+    /// Read again from four times further back: every line of the new
+    /// window, replacing all that was read before.
+    pub fn widen(&mut self) -> Vec<RawLine> {
+        self.window = (self.window * 4).min(MAX_WINDOW_BYTES);
+        self.read_window()
     }
 
     /// The lines added since the last read.
@@ -100,6 +120,7 @@ impl Tail {
         let Ok(meta) = std::fs::metadata(&self.path) else {
             self.inode = 0;
             self.offset = 0;
+            self.start = 0;
             self.carry_start = 0;
             self.head.clear();
             return Vec::new();
@@ -107,7 +128,8 @@ impl Tail {
         let size = meta.len();
         self.inode = meta.ino();
         self.head = read_range(&self.path, 0, HEAD_BYTES as u64).unwrap_or_default();
-        let start = size.saturating_sub(MAX_INITIAL_BYTES);
+        let start = size.saturating_sub(self.window);
+        self.start = start;
         let bytes = read_range(&self.path, start, size).unwrap_or_default();
         self.offset = start + bytes.len() as u64;
         // A window that starts mid-line drops that first piece.
@@ -227,6 +249,22 @@ mod tests {
         let path = dir().join("s.jsonl");
         append(&path, &(line_of("user", 100) + &line_of("assistant", max - 10) + &line_of("system", 40)));
         assert_eq!(types(&Tail::open(&path).1), ["system"], "the cut line is dropped");
+    }
+
+    #[test]
+    fn a_window_too_short_is_widened_then_the_tail_goes_on() {
+        let max = MAX_INITIAL_BYTES as usize;
+        let path = dir().join("s.jsonl");
+        append(&path, &(line_of("user", 100) + &line_of("assistant", max) + &line_of("system", 40)));
+        let (mut tail, lines) = Tail::open(&path);
+        assert_eq!(types(&lines), ["system"]);
+        assert!(tail.can_widen());
+        assert_eq!(types(&tail.widen()), ["user", "assistant", "system"], "everything again, from further back");
+        assert!(!tail.can_widen(), "the whole file is read");
+        append(&path, "{\"type\":\"user\"}\n");
+        let read = tail.read_more();
+        assert!(!read.reopened);
+        assert_eq!(types(&read.lines), ["user"], "only what was appended");
     }
 
     #[test]

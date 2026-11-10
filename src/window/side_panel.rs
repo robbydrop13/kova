@@ -156,6 +156,10 @@ impl PanelTarget {
     }
 }
 
+/// The extensions `file_kind` knows, lower case: what the chat looks for to
+/// link a file's path (`chat::links`).
+pub const FILE_EXTENSIONS: &[&str] = &["md", "markdown", "html", "htm", "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "txt", "log", "json"];
+
 /// Whether a local file is one the panel shows, by its extension.
 fn file_kind(path: &Path) -> Option<fn(PathBuf) -> PanelTarget> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
@@ -1360,6 +1364,9 @@ mod tests {
         // An image, a PDF, text or JSON a card points at opens too (Robin, 10/11/2026).
         for f in ["/tmp/x/a.pdf", "/tmp/x/shot.PNG", "/tmp/x/out.json", "/tmp/x/run.log"] {
             assert_eq!(open_target(f, None, &yes), Some(PanelTarget::File(PathBuf::from(f))), "{f}");
+        }
+        for ext in FILE_EXTENSIONS {
+            assert!(open_target(&format!("/tmp/x/a.{ext}"), None, &yes).is_some(), "{ext} is listed, so it opens");
         }
         assert_eq!(open_target("call the bank", None, &yes), None);
         assert_eq!(open_target("https://example.com/a b", None, &yes), None);

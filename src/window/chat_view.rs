@@ -130,7 +130,7 @@ impl ChatState {
             pane_id,
             session: None,
             tail: None,
-            conv: Conversation::new(),
+            conv: Conversation::configured(),
             exchanges: page::EXCHANGES_STEP,
             sent_entries: HashMap::new(),
             sent_cards: HashMap::new(),
@@ -373,6 +373,7 @@ impl KovaView {
             }
             "more" => {
                 st.exchanges += page::EXCHANGES_STEP;
+                read_enough(st);
                 Reply::Push
             }
             "cancel" => {
@@ -746,18 +747,38 @@ fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// The window read from the transcript's end holds bytes, not exchanges: a
+/// pasted image or long tool results fill it with a few minutes of
+/// conversation. Read from further back until the chat has the exchanges it
+/// shows, or the file (or `tail::MAX_WINDOW_BYTES`) is exhausted.
+fn read_enough(st: &mut ChatState) {
+    let Some(tail) = st.tail.as_mut() else { return };
+    while st.conv.user_count() < st.exchanges && tail.can_widen() {
+        let lines = tail.widen();
+        let mut conv = Conversation::configured();
+        conv.apply_all(&lines);
+        log::info!("chat reads further back: {} lines, {} exchanges", lines.len(), conv.user_count());
+        st.conv = conv;
+        st.shown = None;
+    }
+}
+
 /// The transcript: what was appended since the last read, or the file
 /// looked for (and watched) once it exists.
 fn read_transcript(st: &mut ChatState, pane: &Pane, home: &std::path::Path) {
+    // A window just read from the end may hold too few exchanges.
+    let mut enough = true;
     match (&mut st.tail, &st.session) {
         (Some(tail), _) => {
             let read = tail.read_more();
-            if read.reopened {
-                st.conv = Conversation::new();
+            let reopened = read.reopened;
+            if reopened {
+                st.conv = Conversation::configured();
                 st.first = true;
                 st.watch = None;
             }
             st.conv.apply_all(&read.lines);
+            enough = !reopened;
             // Not there yet: the next read looks for it again, in case it
             // appears under another project folder than the guessed one.
             if tail.waiting() {
@@ -776,9 +797,13 @@ fn read_transcript(st: &mut ChatState, pane: &Pane, home: &std::path::Path) {
                 st.conv.apply_all(&lines);
                 st.tail = Some(tail);
                 st.watch = None;
+                enough = false;
             }
         }
         (None, None) => {}
+    }
+    if !enough {
+        read_enough(st);
     }
     // Watch what is read: the transcript (or its folder until it exists)
     // and the hooks' turns folder, where a turn file is renamed into place.
@@ -867,7 +892,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         st.tail = None;
         st.watch = None;
         st.hook = None;
-        st.conv = Conversation::new();
+        st.conv = Conversation::configured();
         st.first = true;
     }
     let read_files = files || st.files_read.is_none_or(|t| t.elapsed().as_millis() >= FILES_FALLBACK_MS);
@@ -1061,9 +1086,11 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
     let key = (st.conv.revision, working, st.exchanges);
     if st.shown != Some(key) || st.first {
         st.shown = Some(key);
+        crate::chat::links::set_base(pane.cached_cwd().as_deref().map(std::path::Path::new));
         let (entries, more) = page::entries(&st.conv, st.exchanges, working);
         update.entries = Some(page::wire(&entries, &mut st.sent_entries));
-        update.more = more;
+        // Earlier exchanges may also be in the file, before what was read.
+        update.more = more || st.tail.as_ref().is_some_and(|t| t.can_widen());
         changed = true;
     }
     let card_entries: Vec<page::Entry> =

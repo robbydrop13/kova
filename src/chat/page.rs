@@ -15,6 +15,8 @@
 //! and folded past five, the last exchanges first, nothing folding by
 //! itself.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::Serialize;
 
 use super::conversation::{BlockKind, Conversation, Item, Tool};
@@ -121,7 +123,7 @@ pub fn markdown(source: &str) -> String {
         Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
             let dest = dest_url.trim();
             let lower = dest.to_ascii_lowercase();
-            if super::links::is_panel_path(dest) {
+            if super::links::is_panel_path(dest) || super::links::is_file_path(dest, &super::links::on_disk) {
                 path_link = true;
                 in_link += 1;
                 return Event::InlineHtml(CowStr::from(super::links::anchor(dest, super::links::Kind::Path)));
@@ -148,6 +150,11 @@ pub fn markdown(source: &str) -> String {
             in_link = in_link.saturating_sub(1);
             Event::End(TagEnd::Link)
         }
+        // A code span that is, whole, the path of a file the panel shows.
+        Event::Code(code) if in_link == 0 && super::links::is_file_path(code.trim(), &super::links::on_disk) => {
+            let path = code.trim();
+            Event::InlineHtml(CowStr::from(format!("<code>{}{}</a></code>", super::links::anchor(path, super::links::Kind::Path), escape(path))))
+        }
         Event::Start(Tag::Image { link_type, title, id, .. }) => {
             Event::Start(Tag::Image { link_type, dest_url: "".into(), title, id })
         }
@@ -168,6 +175,10 @@ pub fn markdown(source: &str) -> String {
 /// notes, another session's message, a finished task and a reasoning with
 /// its text are one-line rows. While the agent works with no call running,
 /// a `Réflexion` line ends the thread.
+///
+/// One exception, read off the transcript's structure (`superseded`): an
+/// answer a Stop hook sent back for a rewrite, once rewritten, is a
+/// `Version précédente` row, unfolded on a click; its rewrite shows.
 pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Entry>, bool) {
     let users: Vec<usize> = conv.items.iter().enumerate().filter(|(_, i)| matches!(i, Item::User { .. })).map(|(n, _)| n).collect();
     let start = if users.len() > exchanges { users[users.len() - exchanges] } else { 0 };
@@ -175,6 +186,7 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
     // Only the current turn's calls can be running: one from an earlier turn
     // that never got its result was stopped.
     let last_user = shown.iter().rposition(|i| matches!(i, Item::User { .. }));
+    let (drafts, absorbed) = superseded(shown);
     let mut out = Vec::new();
     let mut tools: Vec<&Tool> = Vec::new();
     // The reasoning that came last, while nothing followed it yet.
@@ -192,12 +204,16 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
             if let Some((key, text)) = thought.take() {
                 out.push(fold_entry(&key, "Réflexion", text));
             }
+            // The hook's line is inside its draft's `Version précédente` row.
+            if absorbed.contains(&n) {
+                continue;
+            }
             out.push(match item {
                 Item::User { id, text, .. } => Entry {
                     id: format!("u:{id}"),
                     html: format!(r#"<div class="user"><div class="bubble">{}</div></div>"#, linkify(text)),
                 },
-                Item::Note { id, text } => Entry { id: format!("n:{id}"), html: format!(r#"<div class="note">{}</div>"#, escape(text)) },
+                Item::Note { id, text, .. } => Entry { id: format!("n:{id}"), html: format!(r#"<div class="note">{}</div>"#, escape(text)) },
                 Item::Behind { id, label, text } => fold_entry(&format!("b:{id}"), label, text),
                 Item::Assistant { .. } => unreachable!(),
             });
@@ -217,6 +233,13 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
                 out.push(fold_entry(&key, "Réflexion", text));
             }
             match &block.kind {
+                BlockKind::Text(text) if drafts.contains_key(&(n, k)) => {
+                    let why = match &shown[drafts[&(n, k)]] {
+                        Item::Note { text, .. } => text.as_str(),
+                        _ => "",
+                    };
+                    out.push(previous_entry(&format!("v:{id}:{k}"), why, text));
+                }
                 BlockKind::Text(text) => out.push(Entry { id: format!("t:{id}:{k}"), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) }),
                 BlockKind::Image => out.push(Entry { id: format!("i:{id}:{k}"), html: r#"<div class="note">image</div>"#.to_string() }),
                 BlockKind::Thinking(text) => thought = Some((format!("k:{id}:{k}"), text)),
@@ -235,6 +258,61 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
         out.push(thinking_entry(live));
     }
     (out, start > 0)
+}
+
+/// The answers a Stop hook sent back for a rewrite and that were rewritten:
+/// (item, block) of each draft to the hook's note, and the notes shown inside
+/// their draft's row.
+///
+/// Only what the transcript says, nothing compared or guessed:
+/// - the hook asked for a rewrite (`Item::Note { rewrite: true }`, the hook's
+///   own wording matched by `[chat] rewrite_markers`): any other Stop hook
+///   feedback (a card to post, an instruction to apply) leaves both answers;
+/// - the draft is the text that ended the assistant's answer right before
+///   the hook's line;
+/// - the assistant wrote a text again after it, with nothing but its own
+///   calls and reasoning in between. Until then, or when a message (the
+///   user's, another session's) came first, the draft stays shown in full.
+fn superseded(shown: &[Item]) -> (HashMap<(usize, usize), usize>, HashSet<usize>) {
+    let mut drafts = HashMap::new();
+    let mut absorbed = HashSet::new();
+    for (h, item) in shown.iter().enumerate() {
+        if !matches!(item, Item::Note { rewrite: true, .. }) {
+            continue;
+        }
+        let Some(Item::Assistant { blocks, .. }) = h.checked_sub(1).and_then(|p| shown.get(p)) else { continue };
+        let Some(k) = blocks.iter().rposition(|b| !matches!(b.kind, BlockKind::Thinking(_))) else { continue };
+        if !matches!(blocks[k].kind, BlockKind::Text(_)) {
+            continue;
+        }
+        let rewritten = shown[h + 1..]
+            .iter()
+            .map_while(|i| match i {
+                Item::Assistant { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .flatten()
+            .any(|b| matches!(b.kind, BlockKind::Text(_)));
+        if rewritten {
+            drafts.insert((h - 1, k), h);
+            absorbed.insert(h);
+        }
+    }
+    (drafts, absorbed)
+}
+
+/// `Version précédente`: an answer its rewrite replaced, one quiet row. A
+/// click unfolds why the hook sent it back and the answer as it was written.
+fn previous_entry(key: &str, why: &str, text: &str) -> Entry {
+    let why = if why.is_empty() { String::new() } else { format!(r#"<div class="note">{}</div>"#, escape(why)) };
+    Entry {
+        id: key.to_string(),
+        html: format!(
+            r#"<div class="tools"><div class="tool prev" data-id="{key}"><button class="trow" data-act="fold"><span class="verb">Version précédente</span></button><div class="fold">{why}<div class="asst">{body}</div></div></div></div>"#,
+            key = escape(key),
+            body = markdown(text),
+        ),
+    }
 }
 
 /// A one-line row of its own (a reasoning, another session's message, a
@@ -539,7 +617,10 @@ body {{ display: flex; flex-direction: column; }}
   animation: pulse 1.2s ease-in-out infinite; }}
 .fold {{ display: none; }}
 .open > .fold {{ display: block; }}
-.group > .fold {{ padding-left: 14px; border-left: 1px solid var(--b3); margin-left: 9px; }}
+.group > .fold, .prev > .fold {{ padding-left: 14px; border-left: 1px solid var(--b3); margin-left: 9px; }}
+.prev > .trow .verb {{ color: var(--t3); font-weight: 400; }}
+.prev .note {{ text-align: left; margin: 6px 0 0; }}
+.prev .asst {{ color: var(--t2); }}
 .tres {{ margin: 2px 0 6px 6px; max-height: 320px; overflow: auto; background: var(--bg2); border: 1px solid var(--b3);
   border-radius: 6px; padding: 8px 10px; font: 12px/1.45 "SF Mono", Menlo, monospace; color: var(--t2); white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cut {{ margin: 0 0 6px 10px; font-size: 11.5px; color: var(--t3); }}
@@ -1067,6 +1148,141 @@ mod tests {
         assert!(e[4].html.contains("Stop hook: [hook] An instruction is waiting on card a-1"), "{}", e[4].html);
     }
 
+    /// Real lines (Claude Code 2.1.322, texts made generic): an answer the
+    /// Stop hook sends back for its form, rewritten at once; a second block
+    /// that asks for something else; then a rewrite asked but a message from
+    /// the user comes before the next text.
+    #[test]
+    fn a_rewritten_answer_folds_into_version_precedente() {
+        const FIXTURE: &str = include_str!("../../tests/fixtures/transcripts/stop_hook_form_rewrite.jsonl");
+        let lines: Vec<serde_json::Value> = FIXTURE.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let texts = texts_of(&lines);
+        assert_eq!(texts.len(), 5);
+        let mut c = Conversation::with_rewrite_markers(&["Rewrite it in full".to_string()]);
+        for (i, value) in lines.iter().enumerate() {
+            c.apply(&RawLine { offset: i as u64, value: value.clone() });
+        }
+        let (e, _) = entries(&c, EXCHANGES_STEP, false);
+        assert_each_text_once(&e, &texts);
+        assert_eq!(
+            ids(&e),
+            ["u:u1", "g:t1", "v:req_2:0", "t:req_3:0", "n:h2", "g:t2", "t:req_5:0", "u:u2", "t:req_6:1", "n:h3", "g:t3", "b:q1", "u:q2", "t:req_8:0"]
+        );
+        // The draft: one row, its text and the hook's reason inside the fold.
+        let fold = e[2].html.split_once(r#"<div class="fold">"#).expect("a fold").1;
+        assert!(e[2].html.contains(r#"<span class="verb">Version précédente</span>"#) && e[2].html.contains(r#"data-act="fold""#));
+        assert!(fold.contains("say go and I merge #41.") && fold.contains("Stop hook: [hook] Your answer fails the form check."), "{fold}");
+        // Its rewrite shows in full; the block that asked for a card hides nothing.
+        assert!(e[3].html.starts_with(r#"<div class="asst">"#) && e[3].html.contains("(login fix)"));
+        assert!(e[4].html.contains("Stop hook: [hook] The user has not answered"));
+        assert!(e[6].html.starts_with(r#"<div class="asst">"#));
+        // The user wrote before the next text: that text is not a rewrite, the first answer stays.
+        assert!(e[8].html.starts_with(r#"<div class="asst">"#) && e[8].html.contains("The tests of #43 go first"));
+        // Without the marker (the default), every answer shows as written.
+        let (plain, _) = entries(&conv(lines), EXCHANGES_STEP, false);
+        assert!(plain.iter().all(|x| !x.html.contains("Version précédente")));
+        assert_eq!(plain.len(), e.len() + 1, "the first hook's line is back in the thread");
+    }
+
+    /// The draft stays in full until its rewrite is written: nothing is ever
+    /// hidden on a promise.
+    #[test]
+    fn a_draft_stays_shown_until_its_rewrite_is_there() {
+        let hook = json!({"type": "user", "uuid": "h", "isMeta": true, "message": {"content": "Stop hook feedback:\nREDO: a dash"}});
+        let build = |lines: Vec<serde_json::Value>| {
+            let mut c = Conversation::with_rewrite_markers(&["REDO".to_string()]);
+            for (i, value) in lines.into_iter().enumerate() {
+                c.apply(&RawLine { offset: i as u64, value });
+            }
+            c
+        };
+        let mut lines = vec![user("u1", "go"), text("r1", 0, "Done - all good."), hook];
+        let (e, _) = entries(&build(lines.clone()), EXCHANGES_STEP, true);
+        assert_eq!(ids(&e), ["u:u1", "t:r1:0", "n:h", "r:live"], "asked, not rewritten yet");
+        lines.push(tool("r2", 0, "a"));
+        let (e, _) = entries(&build(lines.clone()), EXCHANGES_STEP, true);
+        assert_eq!(ids(&e), ["u:u1", "t:r1:0", "n:h", "g:a"], "a call is not a rewrite");
+        lines.push(text("r3", 0, "Done, all good."));
+        let (e, _) = entries(&build(lines.clone()), EXCHANGES_STEP, false);
+        assert_eq!(ids(&e), ["u:u1", "v:r1:0", "g:a", "t:r3:0"]);
+        // A turn that ended on a call (no answer to rewrite) folds nothing.
+        let (e, _) = entries(&build(vec![user("u1", "go"), tool("r1", 0, "a"), lines[2].clone(), text("r3", 0, "Ok.")]), EXCHANGES_STEP, false);
+        assert_eq!(ids(&e), ["u:u1", "g:a", "n:h", "t:r3:0"]);
+    }
+
+    /// Not a test: the thread of a transcript written as one HTML file, to
+    /// look at a rendering without launching Kova (`docs/chat-mode.md`).
+    /// `KOVA_CHAT_TRANSCRIPT=<jsonl> KOVA_CHAT_OUT=<html> [KOVA_CHAT_MARKERS="a|b"]
+    /// [KOVA_CHAT_BASE=<the pane's folder>] [KOVA_CHAT_UNFOLD=1]
+    /// cargo test --release render_a_transcript -- --ignored --nocapture`
+    /// Read as the chat reads it (the window widened until it holds the
+    /// exchanges shown); prints what it read and checks that every text the
+    /// assistant wrote in those exchanges is on the page once.
+    #[test]
+    #[ignore]
+    fn render_a_transcript_to_a_file() {
+        let (Ok(from), Ok(to)) = (std::env::var("KOVA_CHAT_TRANSCRIPT"), std::env::var("KOVA_CHAT_OUT")) else { return };
+        let markers: Vec<String> = std::env::var("KOVA_CHAT_MARKERS").unwrap_or_default().split('|').map(str::to_string).collect();
+        let began = std::time::Instant::now();
+        let (mut tail, mut lines) = crate::chat::tail::Tail::open(std::path::Path::new(&from));
+        let mut c = Conversation::with_rewrite_markers(&markers);
+        c.apply_all(&lines);
+        while c.user_count() < EXCHANGES_STEP && tail.can_widen() {
+            lines = tail.widen();
+            c = Conversation::with_rewrite_markers(&markers);
+            c.apply_all(&lines);
+        }
+        let read_ms = began.elapsed().as_millis();
+        let base = std::env::var("KOVA_CHAT_BASE").ok().map(std::path::PathBuf::from);
+        crate::chat::links::set_base(base.as_deref());
+        let began = std::time::Instant::now();
+        let (e, more) = entries(&c, EXCHANGES_STEP, false);
+        let page: String = e.iter().map(|x| x.html.as_str()).collect();
+        // Every text of the exchanges shown, once.
+        let users: Vec<usize> = c.items.iter().enumerate().filter(|(_, i)| matches!(i, Item::User { .. })).map(|(n, _)| n).collect();
+        let start = if users.len() > EXCHANGES_STEP { users[users.len() - EXCHANGES_STEP] } else { 0 };
+        let mut texts = 0;
+        for item in &c.items[start..] {
+            let Item::Assistant { blocks, .. } = item else { continue };
+            for b in blocks {
+                if let BlockKind::Text(t) = &b.kind {
+                    texts += 1;
+                    let m = markdown(t);
+                    assert!(page.matches(m.as_str()).count() >= 1, "a text is missing from the page: {t:?}");
+                }
+            }
+        }
+        println!(
+            "read {} lines in {read_ms} ms, {} exchanges in the window, {} shown; rendered in {} ms: {} entries, {texts} texts all on the page, {} file links, {} folded drafts",
+            lines.len(),
+            c.user_count(),
+            users.len().min(EXCHANGES_STEP),
+            began.elapsed().as_millis(),
+            e.len(),
+            page.matches("data-path").count(),
+            page.matches("Version précédente").count(),
+        );
+        let update = Update { entries: Some(wire(&e, &mut std::collections::HashMap::new())), more, first: true, ..Default::default() };
+        let theme = Theme {
+            dark: true,
+            bg: "#1b1b1f".into(),
+            bg2: "#26262b".into(),
+            t1: "#f2f2f4".into(),
+            t2: "#c9c9d1".into(),
+            t3: "#8e8e99".into(),
+            b2: "#4a4a55".into(),
+            b3: "#34343c".into(),
+            accent: "#6f9bff".into(),
+            working: "#3ecf8e".into(),
+            awaiting: "#f5a623".into(),
+            error: "#ff5c5c".into(),
+            ok: "#3ecf8e".into(),
+        };
+        let unfold = if std::env::var("KOVA_CHAT_UNFOLD").is_ok() { r#";document.querySelectorAll(".prev > .trow").forEach((b) => b.click())"# } else { "" };
+        let script = format!(r#"<script nonce="dump">{}{unfold}</script></body>"#, update_script(&update).replace("</", "<\\/"));
+        std::fs::write(&to, shell(&theme, "chat", "dump").replace("</body>", &script)).unwrap();
+    }
+
     /// The incremental reader can hand a line again (the window read at open
     /// overlapping what is appended, a watcher firing twice): its block shows once.
     #[test]
@@ -1119,6 +1335,28 @@ mod tests {
         assert!(html.contains("<code>CLA-2</code>"));
         assert!(html.contains(r#"<a href="https://x.io/3">CLA-3</a>"#));
         assert!(!html.contains("issue/CLA-4") && !html.contains("pull/13545") && !html.contains("pull/1234"));
+    }
+
+    #[test]
+    fn a_file_s_path_links_in_code_relative_or_with_spaces_when_it_exists() {
+        let dir = std::env::temp_dir().join(format!("kova chat links {}", crate::ask::new_question_id()));
+        std::fs::create_dir_all(dir.join("docs/night qa")).unwrap();
+        for f in ["docs/plan.md", "docs/night qa/shot.png", "docs/run.log"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let abs = dir.join("docs/night qa/shot.png").to_string_lossy().into_owned();
+        crate::chat::links::set_base(Some(&dir));
+        let html = markdown(&format!(
+            "Plan in `docs/plan.md`, capture `{abs}`, log docs/run.log and [the plan](docs/plan.md).\n\nNot `docs/none.md`, `cargo test docs/plan.md` nor `src/main.rs`.\n\n```\ndocs/plan.md\n```"
+        ));
+        crate::chat::links::set_base(None);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(html.contains(r##"<code><a href="#" class="path" data-path="docs/plan.md">docs/plan.md</a></code>"##), "relative to the pane's folder: {html}");
+        assert!(html.contains(&format!(r#"data-path="{abs}">{abs}</a></code>"#)), "absolute, with spaces: {html}");
+        assert!(html.contains(r#"data-path="docs/run.log">docs/run.log</a>"#), "outside code too: {html}");
+        assert!(html.contains("<code>docs/none.md</code>") && html.contains("<code>cargo test docs/plan.md</code>") && html.contains("<code>src/main.rs</code>"));
+        assert!(html.contains(r#"data-path="docs/plan.md">the plan</a>"#), "a markdown link to it: {html}");
+        assert_eq!(html.matches("data-path").count(), 4, "a missing file, a command, another type and a code block stay text: {html}");
     }
 
     #[test]

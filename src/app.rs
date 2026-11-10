@@ -107,6 +107,7 @@ define_class!(
             init_theme(mtm, config);
             crate::team::set_command(&config.sidebar.roster_command);
             crate::voice::configure(config.chat.voice_auto_send, &config.chat.voice_vocabulary);
+            crate::chat::conversation::configure(&config.chat.rewrite_markers);
             crate::attention::set_commands(&config.attention.commands());
             crate::catchup::set_commands(&config.attention.catchup_commands());
             crate::inflight::set_command(&config.attention.inflight_command());
@@ -1847,6 +1848,7 @@ fn handle_ipc_reload_config(
     window::sidebar::tokens::set_background(config.colors.background);
     crate::team::set_command(&config.sidebar.roster_command);
     crate::voice::configure(config.chat.voice_auto_send, &config.chat.voice_vocabulary);
+    crate::chat::conversation::configure(&config.chat.rewrite_markers);
     crate::attention::set_commands(&config.attention.commands());
     crate::catchup::set_commands(&config.attention.catchup_commands());
     crate::inflight::set_command(&config.attention.inflight_command());

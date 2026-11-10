@@ -50,6 +50,11 @@ pub struct ChatConfig {
     /// Words voice typing should spell right (names, jargon), sent as the
     /// provider's vocabulary; Claap's back takes them from the workspace.
     pub voice_vocabulary: Vec<String>,
+    /// What a Stop hook's feedback holds when it asks the agent to write its
+    /// answer again (the hook's own wording, e.g. `"Rewrite it in full"`).
+    /// The chat then folds the answer it replaced under `Version précédente`.
+    /// Empty (the default): every answer shows, as written.
+    pub rewrite_markers: Vec<String>,
 }
 
 /// How Kova rebuilds an agent's command line when it puts a conversation back.
