@@ -1462,7 +1462,8 @@ pub fn shell(light: bool, nonce: &str) -> String {
 
 /// The card's look, shared by the Cockpit and the chat's ask cards: the
 /// design system's variables (`vars`) must be in scope where it applies.
-pub const CARD_CSS: &str = r#".card a,.clk a,.ag a,.cu a{color:var(--accent);text-decoration:none;overflow-wrap:anywhere}.card a:hover,.clk a:hover,.ag a:hover,.cu a:hover{text-decoration:underline}
+pub const CARD_CSS: &str = r#".rt{color:var(--t3);font-weight:400}
+.card a,.clk a,.ag a,.cu a{color:var(--accent);text-decoration:none;overflow-wrap:anywhere}.card a:hover,.clk a:hover,.ag a:hover,.cu a:hover{text-decoration:underline}
 svg.i{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
 button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 button:disabled{opacity:.5;cursor:default}

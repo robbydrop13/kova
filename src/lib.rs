@@ -56,6 +56,7 @@ mod catchup;
 mod inflight;
 mod cockpit;
 mod record;
+mod refs;
 mod render_cli;
 mod window;
 

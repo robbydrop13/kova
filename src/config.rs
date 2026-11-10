@@ -20,6 +20,7 @@ pub struct Config {
     pub sidebar: SidebarConfig,
     pub attention: AttentionConfig,
     pub chat: ChatConfig,
+    pub links: LinksConfig,
     pub session: SessionConfig,
 }
 
@@ -37,6 +38,31 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         SessionConfig { wake_on_launch: true, wake_stagger_s: 3.0 }
+    }
+}
+
+/// What the links of every page read (`docs/links.md`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LinksConfig {
+    /// A JSON file of ticket and pull request titles, written by an outside
+    /// tool: `{"CLA-123": {"title": "…", "url": "…"}, "#12345": {…}}`. An id
+    /// of a text that the text does not tell gets its title drawn after it.
+    /// A leading `~/` is the home folder. Empty (the default): no title.
+    pub refs_file: String,
+}
+
+impl LinksConfig {
+    /// `refs_file` with a leading `~/` expanded, `None` when unset.
+    pub fn refs_path(&self) -> Option<std::path::PathBuf> {
+        let file = self.refs_file.trim();
+        if file.is_empty() {
+            return None;
+        }
+        Some(match file.strip_prefix("~/") {
+            Some(rest) => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+            None => std::path::PathBuf::from(file),
+        })
     }
 }
 
@@ -478,6 +504,7 @@ impl Default for Config {
             sidebar: SidebarConfig::default(),
             attention: AttentionConfig::default(),
             chat: ChatConfig::default(),
+            links: LinksConfig::default(),
             session: SessionConfig::default(),
         }
     }

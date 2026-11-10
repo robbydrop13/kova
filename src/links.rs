@@ -22,6 +22,9 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
+use std::collections::HashSet;
+
+use crate::refs::Ref;
 use crate::window::side_panel::{self, FILE_EXTENSIONS as PANEL_EXTENSIONS, PanelTarget};
 
 /// `s` as HTML text.
@@ -249,8 +252,7 @@ pub fn pieces(text: &str) -> Vec<(String, Option<String>)> {
         let url = match link.kind {
             Kind::Url => Some(target.to_string()),
             Kind::Path => file_url(target, None),
-            Kind::Issue => Some(format!("{LINEAR_ISSUE}{target}")),
-            Kind::Pull => Some(format!("{GITHUB_PULL}{}", target.trim_start_matches('#'))),
+            Kind::Issue | Kind::Pull => Some(ref_url(target, link.kind, &crate::refs::lookup)),
         };
         let Some(url) = url else { continue };
         if link.start > at {
@@ -274,46 +276,39 @@ pub fn open(href: &str, cwd: Option<&Path>) -> Option<PanelTarget> {
 
 /// `find`, plus the bare issue ids and pull request numbers (`refs`).
 pub fn find_with_refs(text: &str, exists: &dyn Fn(&str) -> bool) -> Vec<Link> {
+    find_with_refs_using(text, exists, &crate::refs::lookup)
+}
+
+fn find_with_refs_using(text: &str, exists: &dyn Fn(&str) -> bool, lookup: &dyn Fn(&str) -> Option<Ref>) -> Vec<Link> {
     let mut links = find(text, exists);
-    let found = refs(text, &links);
+    let found = refs(text, &links, lookup);
     links.extend(found);
     links.sort_by_key(|l| l.start);
     links
 }
 
-/// `CLA-123`, `CLAR-123`, `CLAD-123` and `#12345` standing alone: not glued
-/// to a word, a path or a URL, nor inside a link already found.
-fn refs(text: &str, taken: &[Link]) -> Vec<Link> {
-    let bytes = text.as_bytes();
-    let word = |i: usize| bytes[i].is_ascii_alphanumeric() || b"_/-#".contains(&bytes[i]);
-    let digits = |from: usize| bytes[from..].iter().take_while(|b| b.is_ascii_digit()).count();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let free = i == 0 || !word(i - 1);
-        let found = if !free {
-            None
-        } else if bytes[i] == b'#' {
-            let n = digits(i + 1);
-            (n == 5).then(|| (i + 1 + n, Kind::Pull))
-        } else {
-            ["CLA-", "CLAR-", "CLAD-"].iter().find(|p| bytes[i..].starts_with(p.as_bytes())).and_then(|p| {
-                let n = digits(i + p.len());
-                (n > 0).then(|| (i + p.len() + n, Kind::Issue))
-            })
-        };
-        match found {
-            Some((end, kind))
-                if (end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_')
-                    && !taken.iter().any(|l| l.start < end && i < l.end) =>
-            {
-                out.push(Link { start: i, end, kind, md: None });
-                i = end;
-            }
-            _ => i += 1,
-        }
-    }
-    out
+/// The ticket and pull request ids standing alone (`refs::mentions`), not
+/// inside a link already found: a Linear id and a five-digit `#12345`
+/// always, any other form (`#1234`, `PR 13937`) when the cache knows it.
+fn refs(text: &str, taken: &[Link], lookup: &dyn Fn(&str) -> Option<Ref>) -> Vec<Link> {
+    crate::refs::mentions(text)
+        .into_iter()
+        .filter(|m| !taken.iter().any(|l| l.start < m.end && m.start < l.end))
+        // Not the tail of a path or of another id (`issue/CLA-1`, `x-CLA-1`).
+        .filter(|m| !text[..m.start].ends_with(['/', '-', '#']))
+        .filter_map(|m| {
+            let kind = if m.key.starts_with('#') { Kind::Pull } else { Kind::Issue };
+            // `PR #13937`: the link is the number, as before.
+            let start = text[m.start..m.end].find('#').map_or(m.start, |at| m.start + at);
+            let plain = kind == Kind::Issue || (start > m.start || text[m.start..].starts_with('#')) && m.end - start == 6;
+            (plain || lookup(&m.key).is_some()).then_some(Link { start, end: m.end, kind, md: None })
+        })
+        .collect()
+}
+
+/// The cache key of an id as written: `PR 13937` and `#13937` are `#13937`.
+fn ref_key(target: &str) -> String {
+    crate::refs::mentions(target).into_iter().next().map_or_else(|| target.to_string(), |m| m.key)
 }
 
 fn starts_token(text: &str, at: usize) -> bool {
@@ -407,9 +402,66 @@ pub fn linkify_with(text: &str, exists: &dyn Fn(&str) -> bool) -> String {
     render(text, find(text, exists))
 }
 
-/// `linkify_with`, the bare issue ids and pull request numbers linked too.
+/// `linkify_with`, the bare issue ids and pull request numbers linked too,
+/// and the title of each one the text does not tell drawn after its first
+/// mention (`refs::untold`), from the cache.
 pub fn linkify_refs_with(text: &str, exists: &dyn Fn(&str) -> bool) -> String {
-    render(text, find_with_refs(text, exists))
+    linkify_refs_using(text, exists, &crate::refs::lookup)
+}
+
+/// `linkify_refs_with` with the ids' cache given.
+pub fn linkify_refs_using(text: &str, exists: &dyn Fn(&str) -> bool, lookup: &dyn Fn(&str) -> Option<Ref>) -> String {
+    let pending = RefCell::new(crate::refs::untold(text, lookup));
+    linkify_refs_pending(text, exists, lookup, &pending)
+}
+
+/// One piece of a longer text (a markdown document's text run): `pending`
+/// holds the ids of the whole text still waiting for their title, each
+/// drawn once, at its first mention shown.
+pub fn linkify_refs_pending(text: &str, exists: &dyn Fn(&str) -> bool, lookup: &dyn Fn(&str) -> Option<Ref>, pending: &RefCell<HashSet<String>>) -> String {
+    let links = find_with_refs_using(text, exists, lookup);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for link in links {
+        if link.start < at {
+            continue;
+        }
+        out.push_str(&escape(&text[at..link.start]));
+        let target = link.target(text);
+        match link.kind {
+            Kind::Issue | Kind::Pull if link.md.is_none() => out.push_str(&format!(r#"<a href="{}">"#, escape(&ref_url(target, link.kind, lookup)))),
+            kind => out.push_str(&anchor(target, kind)),
+        }
+        out.push_str(&escape(link.label(text)));
+        out.push_str("</a>");
+        if matches!(link.kind, Kind::Issue | Kind::Pull) && link.md.is_none() {
+            out.push_str(&title_after(&ref_key(target), lookup, pending));
+        }
+        at = link.end;
+    }
+    out.push_str(&escape(&text[at..]));
+    out
+}
+
+/// Where an id goes: the cache's URL, else its Linear issue or its pull
+/// request of the Claap repo.
+fn ref_url(target: &str, kind: Kind, lookup: &dyn Fn(&str) -> Option<Ref>) -> String {
+    let key = ref_key(target);
+    lookup(&key).and_then(|r| r.url).unwrap_or_else(|| match kind {
+        Kind::Pull => format!("{GITHUB_PULL}{}", key.trim_start_matches('#')),
+        _ => format!("{LINEAR_ISSUE}{key}"),
+    })
+}
+
+/// ` (title)` after an id still waiting for it, greyed (`.rt`): Kova's
+/// words, not the author's. Nothing once drawn, or for an id not waiting.
+pub fn title_after(key: &str, lookup: &dyn Fn(&str) -> Option<Ref>, pending: &RefCell<HashSet<String>>) -> String {
+    if !pending.borrow().contains(key) {
+        return String::new();
+    }
+    let Some(found) = lookup(key) else { return String::new() };
+    pending.borrow_mut().remove(key);
+    format!(r#"<span class="rt"> ({})</span>"#, escape(&crate::refs::short_title(&found.title)))
 }
 
 fn render(text: &str, links: Vec<Link>) -> String {
@@ -565,6 +617,40 @@ mod tests {
         assert_eq!(got[5].1.as_deref(), Some("https://github.com/claap-app/claap/pull/12345"));
         assert_eq!(got.iter().map(|(t, _)| t.as_str()).collect::<String>(), text, "the pieces give the text back");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The chief's real answer of 10/11 16:33, refused then by the form
+    /// check for two ids without their subject: Kova draws them.
+    #[test]
+    fn an_id_the_text_does_not_tell_gets_its_title_once_greyed() {
+        let cache = |k: &str| match k {
+            "CLA-9914" => Some(Ref { title: "Live upload".into(), url: None }),
+            "CLA-10040" => Some(Ref { title: "Send the video <during> the call".into(), url: Some("https://linear.app/claap/issue/CLA-10040/send".into()) }),
+            "CLA-9905" => Some(Ref { title: "Film the meeting in front".into(), url: None }),
+            "#1394" => Some(Ref { title: "fix: sign out".into(), url: Some("https://github.com/claap-app/claap/pull/1394".into()) }),
+            _ => None,
+        };
+        let real = "Les 4 sous-tickets de CLA-9914 (vidéo de réunion envoyée pendant l'appel) sont prêts. CLA-10040 et CLA-9905 attendent ta relecture.";
+        assert_eq!(
+            linkify_refs_using(real, &none, &cache),
+            concat!(
+                r#"Les 4 sous-tickets de <a href="https://linear.app/claap/issue/CLA-9914">CLA-9914</a> (vidéo de réunion envoyée pendant l&#39;appel) sont prêts. "#,
+                r#"<a href="https://linear.app/claap/issue/CLA-10040/send">CLA-10040</a><span class="rt"> (Send the video &lt;during&gt; the call)</span> et "#,
+                r#"<a href="https://linear.app/claap/issue/CLA-9905">CLA-9905</a><span class="rt"> (Film the meeting in front)</span> attendent ta relecture."#
+            ),
+            "told by the text: nothing added; the cache's url when it has one"
+        );
+        // Once per id; an id the cache does not know gets nothing and links as before.
+        let twice = linkify_refs_using("CLA-9905 now, CLA-9905 later, CLA-77 and #1394 and #12345.", &none, &cache);
+        assert_eq!(twice.matches("Film the meeting in front").count(), 1, "{twice}");
+        assert!(twice.contains(r#"<a href="https://linear.app/claap/issue/CLA-77">CLA-77</a> and"#), "{twice}");
+        assert!(twice.contains(r#"<a href="https://github.com/claap-app/claap/pull/1394">#1394</a><span class="rt"> (fix: sign out)</span>"#), "a four-digit number the cache knows: {twice}");
+        assert!(twice.contains(r#"<a href="https://github.com/claap-app/claap/pull/12345">#12345</a>."#));
+        // A subject given at another mention of the same text: nothing.
+        assert!(!linkify_refs_using("CLA-9905 again. Earlier: CLA-9905 (front mode).", &none, &cache).contains("class=\"rt\""));
+        // Without a cache, nothing changes.
+        assert_eq!(linkify_refs_using(real, &none, &|_| None).matches("rt").count(), 0);
+        assert_eq!(linkify_refs_using("#1234 PR 139", &none, &|_| None), "#1234 PR 139", "not links without the cache");
     }
 
     #[test]

@@ -20,7 +20,7 @@ kova render: write Kova's pages as HTML files, without a window
 
   kova render cockpit --list <json> --out <dir>
         [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
-        [--state <card id>=delivered|noted|running|failed:<why>]...
+        [--state <card id>=delivered|noted|running|failed:<why>]... [--refs <json>]
       <json> files hold what the `[attention]` commands print: `attn list --open --json`,
       `attn inflight --json`, `attn catchup --json`; panes: [[\"session\", working], ...].
       Writes default.html, menu.html, chips.html, en-cours.html, fait.html, and
@@ -28,6 +28,7 @@ kova render: write Kova's pages as HTML files, without a window
 
   kova render chat --transcript <jsonl> --out <file.html>
         [--markers \"a|b\"] [--base <the pane's folder>] [--exchanges N] [--unfold] [--light]
+        [--refs <json>]
       The thread as the chat reads it. Exit 1 when a text the assistant wrote
       in the exchanges shown is not on the page.
 
@@ -116,7 +117,12 @@ pub fn run(args: &[String]) -> i32 {
         println!("{USAGE}");
         return 0;
     }
-    let done = Args::parse(&args[1..]).and_then(|a| match what {
+    let done = Args::parse(&args[1..]).and_then(|a| {
+        // The ids' titles (`[links] refs_file`), for the pages that draw them.
+        crate::refs::set_file(a.get("--refs").map(Path::new));
+        Ok(a)
+    });
+    let done = done.and_then(|a| match what {
         "cockpit" => render_cockpit(&a),
         "chat" => render_chat(&a),
         "sheet" => render_sheet(&a),

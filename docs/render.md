@@ -15,13 +15,17 @@ to the work, without asking the user to launch anything. Code:
 ```
 kova render cockpit --list <json> --out <dir>
       [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
-      [--state <card id>=delivered|noted|running|failed:<why>]...
+      [--state <card id>=delivered|noted|running|failed:<why>]... [--refs <json>]
 kova render chat --transcript <jsonl> --out <file.html>
       [--markers "a|b"] [--base <the pane's folder>] [--exchanges N] [--unfold] [--light]
+      [--refs <json>]
 kova render sheet --sheet <json> --out <file.html> [--from <who>] [--light]
 kova render question --message <text or @file> --out <file.html>
       [--from <who>] [--button <label>]... [--input] [--light]
 ```
+
+`--refs` is `[links] refs_file`: the titles drawn after the ticket and pull
+request ids a text does not tell (`docs/links.md`).
 
 Each prints the files it wrote. Exit 0 when written, 2 on a bad call (the
 reason on stderr, nothing written).

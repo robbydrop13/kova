@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use super::conversation::{BlockKind, Conversation, Item, Tool};
-use crate::links::{self, linkify, linkify_refs};
+use crate::links::{self, linkify};
 
 /// How many exchanges (a user message and what follows it) the page opens
 /// on; `Show earlier` adds as many again.
@@ -75,9 +75,23 @@ fn fnv(s: &str) -> u64 {
 
 /// Markdown as an HTML fragment: raw HTML as text, a link only to http(s),
 /// mailto or a local `.md` / `.html` file, no image source. A URL or such a
-/// path in the text is a link too, but not inside code.
+/// path in the text is a link too, but not inside code. A ticket or pull
+/// request id the text does not tell gets its title from the cache, drawn
+/// greyed after its first mention (`refs::untold`): the text is not changed.
 pub fn markdown(source: &str) -> String {
+    markdown_using(source, &crate::refs::lookup)
+}
+
+/// `markdown` with the ids' cache given.
+pub fn markdown_using(source: &str, lookup: &dyn Fn(&str) -> Option<crate::refs::Ref>) -> String {
     use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd, TextMergeStream};
+    // The ids of the whole message still waiting for their title.
+    let pending = std::cell::RefCell::new(crate::refs::untold(source, lookup));
+    // What a link reads as, while inside it: `[CLA-1](url)` gets its title too.
+    let mut link_text = String::new();
+    let titles_of = |text: &str| -> String {
+        crate::refs::mentions(text).iter().map(|m| links::title_after(&m.key, lookup, &pending)).collect()
+    };
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     // Inside a link to another scheme: its text stays, the link goes.
     let mut unsafe_link = false;
@@ -90,7 +104,13 @@ pub fn markdown(source: &str) -> String {
     let parser = TextMergeStream::new(Parser::new_ext(source, options)).map(|event| match event {
         Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
         Event::Text(text) if in_link == 0 && !in_code && in_heading => Event::InlineHtml(CowStr::from(linkify(&text))),
-        Event::Text(text) if in_link == 0 && !in_code => Event::InlineHtml(CowStr::from(linkify_refs(&text))),
+        Event::Text(text) if in_link == 0 && !in_code => {
+            Event::InlineHtml(CowStr::from(links::linkify_refs_pending(&text, &links::on_disk, lookup, &pending)))
+        }
+        Event::Text(text) if in_link > 0 && !in_code => {
+            link_text.push_str(&text);
+            Event::Text(text)
+        }
         Event::Start(Tag::Heading { level, id, classes, attrs }) => {
             in_heading = true;
             Event::Start(Tag::Heading { level, id, classes, attrs })
@@ -126,16 +146,19 @@ pub fn markdown(source: &str) -> String {
         Event::End(TagEnd::Link) if unsafe_link => {
             unsafe_link = false;
             in_link = in_link.saturating_sub(1);
+            link_text.clear();
             Event::Text("".into())
         }
         Event::End(TagEnd::Link) if path_link => {
             path_link = false;
             in_link = in_link.saturating_sub(1);
+            link_text.clear();
             Event::InlineHtml("</a>".into())
         }
         Event::End(TagEnd::Link) => {
             in_link = in_link.saturating_sub(1);
-            Event::End(TagEnd::Link)
+            let titles = titles_of(&std::mem::take(&mut link_text));
+            Event::InlineHtml(CowStr::from(format!("</a>{titles}")))
         }
         // A code span that is, whole, the path of a file the panel shows.
         Event::Code(code) if in_link == 0 && links::is_file_path(code.trim(), &links::on_disk) => {
@@ -578,6 +601,7 @@ body {{ display: flex; flex-direction: column; }}
 .asst {{ margin: 8px 0; color: var(--t1); overflow-wrap: anywhere; }}
 .asst p {{ margin: .5em 0; }} .asst ul, .asst ol {{ margin: .4em 0; padding-left: 1.4em; }}
 .asst h1, .asst h2, .asst h3 {{ font-size: 15px; margin: 1em 0 .4em; }}
+.rt {{ color: var(--t3); }}
 .asst a {{ color: var(--accent); text-decoration: none; }} .asst a:hover {{ text-decoration: underline; }}
 .asst code {{ font: 12.5px/1.5 "SF Mono", Menlo, monospace; background: var(--bg2); border: 1px solid var(--b3);
   border-radius: 4px; padding: 0 4px; }}
@@ -1238,6 +1262,31 @@ mod tests {
         assert_eq!(ids(&e), ["u:u1", "r:live"], "the reasoning going on is not also a row of its own");
         let (e, _) = entries(&conv(vec![user("u1", "go"), think("x")]), EXCHANGES_STEP, false);
         assert!(!e.iter().any(|x| x.id == "r:live"), "idle: no Réflexion");
+    }
+
+    #[test]
+    fn an_answer_s_untold_ids_get_their_title_and_told_ones_none() {
+        use crate::refs::Ref;
+        let cache = |k: &str| match k {
+            "CLA-10040" => Some(Ref { title: "Send the video during the call".into(), url: None }),
+            "CLA-9905" => Some(Ref { title: "Film the meeting in front".into(), url: None }),
+            "CLA-9914" => Some(Ref { title: "Live upload".into(), url: None }),
+            "#13937" => Some(Ref { title: "fix: sign out".into(), url: None }),
+            _ => None,
+        };
+        // The chief's real answer of 10/11 16:33.
+        let html = markdown_using("Les 4 sous-tickets de CLA-9914 (vidéo de réunion envoyée pendant l'appel) sont prêts. CLA-10040 et CLA-9905 attendent ta relecture.", &cache);
+        assert!(html.contains(r#">CLA-10040</a><span class="rt"> (Send the video during the call)</span> et <a "#), "{html}");
+        assert!(html.contains(r#">CLA-9905</a><span class="rt"> (Film the meeting in front)</span> attendent"#), "{html}");
+        assert!(html.contains(">CLA-9914</a> (vidéo de réunion") && !html.contains("Live upload"), "already told: {html}");
+        // Across the message's paragraphs and lists: once per id, a subject anywhere is enough.
+        let html = markdown_using("**CLA-10040** is ready.\n\n- CLA-10040 again\n- [CLA-9905](https://linear.app/x/CLA-9905) too\n- #13937 (sign out fix)\n\n`CLA-9914` in code, #13937 again.", &cache);
+        assert_eq!(html.matches("Send the video during the call").count(), 1, "{html}");
+        assert!(html.contains(r#"<strong><a href="https://linear.app/claap/issue/CLA-10040">CLA-10040</a><span class="rt"> (Send the video during the call)</span></strong>"#), "{html}");
+        assert!(html.contains(r#"<a href="https://linear.app/x/CLA-9905">CLA-9905</a><span class="rt"> (Film the meeting in front)</span> too"#), "a markdown link to it: {html}");
+        assert!(!html.contains("fix: sign out") && !html.contains("Live upload"), "told, or only in code: {html}");
+        // No cache: the answer as written.
+        assert!(!markdown_using("CLA-10040 et CLA-9905", &|_| None).contains("rt"));
     }
 
     #[test]

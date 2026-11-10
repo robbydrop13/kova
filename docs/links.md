@@ -22,6 +22,34 @@ and its parents up to `$HOME`: the pane's folder in the chat
 path to a file of another type (`.rs`, `.zip`), an API route
 (`/v1/list.json` with no such file), a bare file name stay text.
 
+## What an id is about
+
+An agent writes `CLA-10040` and the reader does not know what it is. Kova
+says it: with `[links] refs_file` set to a JSON file of titles (`{"CLA-123":
+{"title": "…", "url": "…" or null}, "#12345": {…}}`, written by an outside
+tool, read again when it changes), an id of a text that the text does not
+tell gets its title drawn after its first mention, in parentheses and
+greyed (`.rt`): Kova's words, visibly not the author's. Once per id and per
+text (a chat answer, a card's title, a line of En cours). The text itself,
+and the transcript, are never changed. `src/refs.rs`.
+
+| In the text | Drawn |
+|---|---|
+| An id the cache knows, with no subject in the text | `CLA-10040` then ` (its title)` greyed, 90 chars at most; the link goes to the cache's `url` when it has one |
+| An id the text tells, at this mention or another: `CLA-1 (subject)`, `subject (CLA-1)`, `CLA-1 : subject`, `#13573, which keeps the screen on`, `\| #13908 \| subject \|`, after a markdown link to it, a run `CLA-1, CLA-2 et #3 (subject)` | nothing added |
+| An id the cache does not know | nothing added; it links as before |
+| An id in code, in a URL, in a heading | nothing added |
+| `#1234`, `PR 13937` (not the five-digit `#12345`) | a link only when the cache knows it |
+
+The forms that tell a subject are the ones the harness's form check
+accepted (`claude-config/bin/formcheck`, `check_subject`), read on the id's
+own line, with one difference: a comma followed by a conjunction (`#13900,
+et son ticket …`) goes on with the sentence and tells nothing. In the chat,
+the whole answer is one text (`chat::page::markdown`); a decision sheet and
+the floating ask card do not draw titles.
+
+`kova render chat|cockpit --refs <json>` draws them from a given file.
+
 ## The functions
 
 - `find` / `find_with_refs`: the links of a text, in order.
