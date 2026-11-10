@@ -154,6 +154,8 @@ pub struct Item {
     /// Screenshots shown in the card, as (label, absolute path): an entry's
     /// `before` and `after` (Robin, 09/11/2026).
     pub shots: Vec<(String, String)>,
+    /// Its label, a colored tag next to its space (`attn labels`).
+    pub label: Option<crate::attention::Label>,
 }
 
 /// What an opened card shows inside it, instead of a jump to another view.
@@ -370,6 +372,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
             .into_iter()
             .filter_map(|(label, path)| path.clone().map(|p| (label.to_string(), p)))
             .collect(),
+        label: entry.label.clone(),
     })
 }
 
@@ -486,6 +489,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         state: State::Idle,
         instruction: None,
         shots: Vec::new(),
+        label: None,
     })
 }
 
@@ -746,6 +750,8 @@ pub struct View<'a> {
     pub inflight_n: usize,
     /// What `Fait (24 h)` counts.
     pub done_n: usize,
+    /// The label the list keeps, `None` for every card.
+    pub label: Option<String>,
 }
 
 /// The cards the list shows first, and each `Voir plus` adds.
@@ -822,6 +828,24 @@ fn button_html(button: Button, disabled: bool, primary: bool) -> String {
     format!("<button type=\"button\" class=\"btn acc\" {data}{dis}>{icon}<span>{}</span></button>", button.label())
 }
 
+/// A label's dot in the filter menu, of its color.
+fn label_dot(view: &View, name: &str) -> String {
+    let color = view.items.iter().filter_map(|i| i.label.as_ref()).find(|l| l.name == name).map(|l| l.color.as_str()).unwrap_or("#94A3B8");
+    format!("<i class=\"ld\" style=\"background:{}\"></i>", esc(color))
+}
+
+/// A card's label: a tag tinted with its color.
+fn label_html(label: &Option<crate::attention::Label>) -> String {
+    match label {
+        Some(l) if crate::attention::hex_color(&l.color) => format!(
+            "<span class=\"tag lb\" style=\"color:{0};background:{0}22\">{1}</span>",
+            l.color,
+            esc(&l.name)
+        ),
+        _ => String::new(),
+    }
+}
+
 fn tag_html(scope: Scope) -> String {
     format!(
         "<span class=\"tag\"><i class=\"{}\"></i>{}</span>",
@@ -832,7 +856,7 @@ fn tag_html(scope: Scope) -> String {
 
 fn source_html(item: &Item, now: u64) -> String {
     let words: Vec<String> = [item.from.trim().to_string(), age(item.since, now)].into_iter().filter(|w| !w.is_empty()).collect();
-    format!("<div class=\"src\">{}<span>{}</span></div>", tag_html(item.scope), esc(&words.join(" \u{b7} ")))
+    format!("<div class=\"src\">{}{}<span>{}</span></div>", tag_html(item.scope), label_html(&item.label), esc(&words.join(" \u{b7} ")))
 }
 
 fn state_html(state: &State) -> String {
@@ -1121,12 +1145,19 @@ pub fn detail_html(detail: &Detail, running: bool) -> String {
 
 const SECTIONS: [(u8, &str, &str); 3] = [(1, "Urgent", "crit"), (2, "Aujourd'hui", "warn"), (3, "Cette semaine", "gray")];
 
+impl View<'_> {
+    /// A card the space and the label filters both keep.
+    fn keeps(&self, item: &Item) -> bool {
+        self.filter.keeps(item) && self.label.as_ref().is_none_or(|l| item.label.as_ref().is_some_and(|x| &x.name == l))
+    }
+}
+
 /// The cards the filter keeps, under their section headers.
 pub fn list_html(view: &View) -> String {
     if view.show != Show::Mine {
         return if view.inflight.is_empty() { "<p class=\"empty\">Lecture en cours\u{2026}</p>".to_string() } else { view.inflight.clone() };
     }
-    let kept: Vec<&Item> = view.items.iter().filter(|i| view.filter.keeps(i)).collect();
+    let kept: Vec<&Item> = view.items.iter().filter(|i| view.keeps(i)).collect();
     if kept.is_empty() {
         return "<p class=\"empty\">Rien ne t'attend ici</p>".to_string();
     }
@@ -1225,9 +1256,9 @@ const ICON_FILTER: &str = r#"<svg class="i" width="11" height="11" viewBox="0 0 
 const ICON_PLUS: &str = r#"<svg class="i" width="11" height="11" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>"#;
 
 /// One option of the filter menu: (word, label, count, chosen).
-struct FilterOption {
+struct FilterOption<'a> {
     attr: &'static str,
-    word: &'static str,
+    word: &'a str,
     label: String,
     n: usize,
     on: bool,
@@ -1255,19 +1286,41 @@ pub fn filters_html(view: &View) -> String {
             word,
             label: label.to_string(),
             n: match show {
-                Show::Mine => view.items.iter().filter(|i| view.filter.keeps(i)).count(),
+                Show::Mine => view.items.iter().filter(|i| view.keeps(i)).count(),
                 Show::InFlight => view.inflight_n,
                 Show::Done => view.done_n,
             },
             on: view.show == *show,
         })
         .collect();
+    // The labels the cards carry, the most used first; a dot of its color.
+    let mut names: Vec<(&str, usize)> = Vec::new();
+    for l in view.items.iter().filter(|i| view.filter.keeps(i)).filter_map(|i| i.label.as_ref()) {
+        match names.iter_mut().find(|(n, _)| *n == l.name) {
+            Some((_, c)) => *c += 1,
+            None => names.push((&l.name, 1)),
+        }
+    }
+    names.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    if let Some(on) = view.label.as_deref()
+        && !names.iter().any(|(n, _)| *n == on)
+    {
+        // The chosen label stays removable when no card carries it any more.
+        names.push((on, 0));
+    }
+    let labels: Vec<FilterOption> = names
+        .iter()
+        .map(|(l, n)| FilterOption { attr: "label", word: l, label: l.to_string(), n: *n, on: view.label.as_deref() == Some(*l) })
+        .collect();
     // The default of each dimension: what removing its chip puts back.
-    let groups: [(&str, &str, &str, &[FilterOption]); 2] =
-        [("Espace", "filter", "all", &space[..]), ("Vue", "show", "mine", &shows[..])];
+    let groups: [(&str, &str, &str, &[FilterOption]); 3] =
+        [("Espace", "filter", "all", &space[..]), ("Vue", "show", "mine", &shows[..]), ("Label", "label", "all", &labels[..])];
     let mut chips = String::new();
     let mut menu = String::new();
     for (name, attr, default, options) in groups {
+        if options.is_empty() {
+            continue;
+        }
         menu.push_str(&format!("<div class=\"fm-h\">{name}</div>"));
         for o in options {
             // A chosen value: picked again, it goes back to the default.
@@ -1276,7 +1329,7 @@ pub fn filters_html(view: &View) -> String {
                 "<button type=\"button\" class=\"fm-o{}\" data-{}=\"{word}\"><span class=\"ok\">{ICON_CHECK}</span><span>{}</span><span class=\"c\">{}</span></button>",
                 if o.on { " on" } else { "" },
                 o.attr,
-                esc(&o.label),
+                if o.attr == "label" { label_dot(view, &o.label) + &esc(&o.label) } else { esc(&o.label) },
                 o.n
             ));
             if o.on && o.word != default {
@@ -1446,7 +1499,7 @@ button:disabled{opacity:.5;cursor:default}
 .src span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tag{height:18px;border-radius:4px;padding:0 6px;font-size:11px;font-weight:500;display:inline-flex;align-items:center;gap:5px;background:var(--bg-elev);color:var(--t2);flex:none}
 .tag i{width:6px;height:6px;border-radius:50%;display:block;background:var(--tag-blue)}
-.tag i.perso{background:var(--tag-green)}
+.tag i.perso{background:var(--tag-green)}.tag.lb{font-weight:600}.fm-o i.ld{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
 .acts{display:flex;align-items:center;gap:14px;flex:none}
 .state{font-size:12px;color:var(--t3);margin-top:6px}
 .detail{margin-top:10px;border-top:1px solid var(--b3);padding-top:10px;font-size:13px;line-height:19px}
@@ -1824,6 +1877,7 @@ document.addEventListener('click', e => {
     fm.hidden = true;
     if (b.dataset.filter) return post({ type: 'filter', scope: b.dataset.filter });
     if (b.dataset.show) return post({ type: 'show', show: b.dataset.show });
+    if (b.dataset.label) return post({ type: 'label', label: b.dataset.label });
     return;
   }
   // The catch-up band: its buttons, its links, a row that opens in place.
@@ -1847,6 +1901,7 @@ document.addEventListener('click', e => {
   if (b.dataset.more) return post({ type: 'more' });
   if (b.dataset.filter) return post({ type: 'filter', scope: b.dataset.filter });
   if (b.dataset.show) return post({ type: 'show', show: b.dataset.show });
+  if (b.dataset.label) return post({ type: 'label', label: b.dataset.label });
   if (b.dataset.chief) return post({ type: 'chief', scope: b.dataset.chief });
   if (b.dataset.chat) return post({ type: 'chat', what: b.dataset.chat });
   if (b.dataset.theme) return post({ type: 'theme' });
@@ -1957,6 +2012,7 @@ mod tests {
             src: Vec::new(),
             before: None,
             after: None,
+            label: None,
         }
     }
 
@@ -2106,6 +2162,43 @@ mod tests {
     }
 
     #[test]
+    fn a_label_is_a_tinted_tag_on_the_card_and_a_dimension_of_the_filter() {
+        let lab = |n: &str, c: &str| Some(crate::attention::Label { name: n.into(), color: c.into() });
+        let mut a = from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap();
+        a.label = lab("QA", "#F59E0B");
+        let mut b = from_attention(&entry("a-2", Level::Now, None, 2), None, false).unwrap();
+        b.label = lab("Dev", "#3B82F6");
+        let mut c = from_attention(&entry("a-3", Level::Now, None, 3), None, false).unwrap();
+        c.label = lab("QA", "#F59E0B");
+        let bare = from_attention(&entry("a-4", Level::Now, None, 4), None, false).unwrap();
+        let items = vec![a, b, c, bare];
+        let view = |label: Option<&str>| View {
+            items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
+            limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(),
+            theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0,
+            label: label.map(str::to_string),
+        };
+        let all = list_html(&view(None));
+        assert!(all.contains("<span class=\"tag lb\" style=\"color:#F59E0B;background:#F59E0B22\">QA</span>"), "{all}");
+        // The menu: a Label group, the most used first, each with its dot.
+        let head = head_html(&view(None));
+        let src = head.split("<div id=\"fmsrc\" hidden>").nth(1).unwrap();
+        let (qa, dev) = (src.find("data-label=\"QA\"").unwrap(), src.find("data-label=\"Dev\"").unwrap());
+        assert!(src.contains("<div class=\"fm-h\">Label</div>") && qa < dev, "{src}");
+        assert!(src.contains("<i class=\"ld\" style=\"background:#F59E0B\"></i>QA</span><span class=\"c\">2</span>"));
+        // Chosen: only its cards, a chip that removes it.
+        let qa_only = list_html(&view(Some("QA")));
+        assert!(qa_only.contains("attention:a-1") && qa_only.contains("attention:a-3") && !qa_only.contains("attention:a-2") && !qa_only.contains("attention:a-4"));
+        let head = head_html(&view(Some("QA")));
+        assert!(head.contains("<span class=\"ck\">Label :</span> QA</button>") && head.contains("class=\"cx\" data-label=\"all\""), "{head}");
+        // No card carries a label: no Label group at all.
+        let none = vec![from_attention(&entry("a-9", Level::Now, None, 1), None, false).unwrap()];
+        let v = View { items: &none, ..view(None) };
+        assert!(!head_html(&v).contains("fm-h\">Label"));
+        assert!(!crate::attention::hex_color("red;x") && crate::attention::hex_color("#a1B2c3"));
+    }
+
+    #[test]
     fn a_local_file_source_is_a_link_to_the_panel_never_a_dead_path() {
         let opens = |p: &str| ["/Users/me/AI directory/Claap/qa list.md", "/tmp/shot.png"].contains(&p);
         let mut e = entry("a-1", Level::Point, None, 1);
@@ -2146,7 +2239,7 @@ mod tests {
     fn the_list_shows_ten_cards_then_voir_plus() {
         let items: Vec<Item> =
             (0..23).map(|i| from_attention(&entry(&format!("a-{i}"), Level::Now, Some(if i < 4 { 1 } else { 2 }), i), None, false).unwrap()).collect();
-        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0 };
+        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None };
         let html = list_html(&view(PAGE_SIZE));
         assert_eq!(html.matches("<article").count(), 10);
         assert!(html.contains("data-more=\"1\"><span>Voir plus (13)</span>"));
@@ -2373,7 +2466,7 @@ mod tests {
             from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap(),
             from_attention(&perso, None, false).unwrap(),
         ];
-        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0 };
+        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None };
         assert!(list_html(&view(Filter::All)).contains("attention:a-1"));
         let only = list_html(&view(Filter::Only(Scope::Perso)));
         assert!(only.contains("attention:a-2") && !only.contains("attention:a-1"));
@@ -2394,7 +2487,7 @@ mod tests {
         let view = |filter, show, inflight: &str| View {
             items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true,
             limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(),
-            theme: String::new(), show, inflight: inflight.to_string(), inflight_n: 4, done_n: 7,
+            theme: String::new(), show, inflight: inflight.to_string(), inflight_n: 4, done_n: 7, label: None,
         };
         // Default: no chip, one `Filtrer` control, the sort label on the right.
         let head = head_html(&view(Filter::All, Show::Mine, ""));
@@ -2437,13 +2530,13 @@ mod tests {
             from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap(),
             from_attention(&entry("a-1", Level::Point, None, 1), None, false).unwrap(),
         ];
-        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0 });
+        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None });
         assert!(html.contains("Urgent <span class=\"k\">1</span>"));
         assert!(html.contains("Cette semaine <span class=\"k\">1</span>"));
         assert!(!html.contains("Aujourd'hui"));
         assert_eq!(subtitle(&items), ("2 actions pour toi".to_string(), "1 urgente".to_string()));
         assert_eq!(subtitle(&[]).0, "Aucune action pour toi");
-        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0 }).contains("Rien ne t'attend"));
+        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None }).contains("Rien ne t'attend"));
     }
 
     #[test]
@@ -2604,7 +2697,7 @@ mod tests {
             limit: PAGE_SIZE, now: 0, band: band.to_string(), record: "<button data-rec=\"start\">R</button>".into(),
             record_note: "<div class=\"recn\">N</div>".into(),
             theme: theme_button(crate::theme::ThemeMode::Dark, "cmd+option+l"),
-            show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0,
+            show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None,
         };
         let head = head_html(&view("<div class=\"cu\">B</div>"));
         let (title, band, bar) = (head.find("ptitle").unwrap(), head.find("class=\"cu\"").unwrap(), head.find("class=\"bar\"").unwrap());
@@ -2630,7 +2723,7 @@ mod shot_demo {
             id: "a-demo".into(), since: 1, from: "groom-priorisation".into(), level: crate::attention::Level::Now,
             kind: "test".into(), title: "CLA-10067 (skeleton du desktop) : avant / après".into(),
             needs: Some("Valider le visuel".into()), action: None, topic: None, scope: crate::attention::Scope::Pro,
-            prio: Some(2), draft: None, body: None, detail: None, src: Vec::new(), before: Some(b), after: Some(a),
+            prio: Some(2), draft: None, body: None, detail: None, src: Vec::new(), before: Some(b), after: Some(a), label: None,
         };
         let item = super::from_attention(&e, None, false).unwrap();
         let page = super::shell(false, "n").replace("<div id=\"list\"></div>", &format!("<div id=\"list\">{}</div>", super::card_html(&item, true, true, true, 10)));

@@ -116,13 +116,17 @@ being rewritten keeps its text, caret and focus through a push.
 
 ## Filtres
 
-Filters work like Linear's (Robin, 10/11/2026; `cockpit::filters_html`). The bar under the title holds one `Filtrer` control (funnel icon, styled like `Par priorité` on the right). It opens a menu of every dimension with its values and their counts, a check on the chosen one: `Espace` (Claap, Perso, the scope) and `Vue` (`À moi`, `En cours`, `Fait (24 h)`, `cockpit::Show`). A chosen value shows as a chip `Espace : Claap` with its cross, and the control turns into a `+`; the cross, or picking the chosen value again, removes it. No chip is the whole list: every space, `À moi`. The menu lives outside the head (`#fm`, like the snooze menu), filled from the head's hidden `#fmsrc`, so a push refills it open instead of closing it; Escape or a click elsewhere closes it. A new dimension is one more group in `filters_html` (and a value of `Show` is a line in `SHOWS`).
+Filters work like Linear's (Robin, 10/11/2026; `cockpit::filters_html`). The bar under the title holds one `Filtrer` control (funnel icon, styled like `Par priorité` on the right). It opens a menu of every dimension with its values and their counts, a check on the chosen one: `Espace` (Claap, Perso, the scope) and `Vue` (`À moi`, `En cours`, `Fait (24 h)`, `cockpit::Show`) and `Label` (the labels the cards carry, the most used first, a dot of its color; no group when no card has one). A chosen value shows as a chip `Espace : Claap` with its cross, and the control turns into a `+`; the cross, or picking the chosen value again, removes it. No chip is the whole list: every space, `À moi`. The menu lives outside the head (`#fm`, like the snooze menu), filled from the head's hidden `#fmsrc`, so a push refills it open instead of closing it; Escape or a click elsewhere closes it. A new dimension is one more group in `filters_html` (and a value of `Show` is a line in `SHOWS`).
 
 - `À moi` (default): the list as above, what waits on the user. Its menu item counts the cards the scope keeps.
 - `En cours`: only what still moves, read from `attn inflight --json` (`[attention] inflight_command`, default `command`'s program with `inflight --json`), cached and refreshed on a thread every 15 s (`crate::inflight`). Its menu item counts what it lists; the sort label reads `En direct`.
   - `Tes clics`: the clicks of the last 24 h not over yet (Valider, Corriger, Consigne), newest first, with a tracker `Envoyé`, `Reçu`, `Fait` and their times. `Reçu` is the `delivered` op of the click; `Fait` is the agent closing the card (`close`, or `settled` when the user had already cleared it) or updating it (`update`). A click done, or a removal (`Retiré`), leaves at once for `Fait (24 h)`. Not received after 3 min: orange, `Pas encore reçu <n> min`. The scope keeps one side's clicks.
   - `Agents au travail pour toi`: liveness is read, not self-reported. A session a Kova pane holds is listed while its pane works, whatever its last status says; a session with no pane, while its `working` status is under 30 min old. Its status text shows only while that status says `working`; its open consignes show under it. Consignes held by sessions at rest are one count line; holding a consigne never lists a session.
 - `Fait (24 h)`: the clicks over in the last 24 h (done or `Retiré`), newest first, with their result.
+
+A card's label (`attn add|update --label`, a closed registry of ten in `claude-config/labels.json`; `attn list --json` adds `label_color`) shows as a tag tinted with its color next to the space tag. Only a `#RRGGBB` color reaches the page; another reads gray.
+
+The Cockpit page runs down over the global status bar: its shortcuts and counters belong to the terminal.
 
 ## Catch-up band
 

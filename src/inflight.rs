@@ -636,7 +636,7 @@ mod preview {
                 items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true,
                 limit: crate::cockpit::PAGE_SIZE, now, band: String::new(), record: String::new(), record_note: String::new(),
                 theme: String::new(), show, inflight, inflight_n: super::count(&data, scope, &working, now),
-                done_n: super::done_count(&data, scope, now),
+                done_n: super::done_count(&data, scope, now), label: None,
             };
             let (head, body, chat) = crate::cockpit::parts(&view);
             let update = crate::cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };
@@ -671,7 +671,7 @@ mod preview {
         let view = View {
             items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
             limit: crate::cockpit::PAGE_SIZE, now, band: String::new(), record: String::new(), record_note: String::new(),
-            theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0,
+            theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None,
         };
         let (head, body, chat) = crate::cockpit::parts(&view);
         let update = crate::cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };

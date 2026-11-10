@@ -71,6 +71,8 @@ pub struct CockpitSlot {
     filter: Cell<Filter>,
     /// The second filter: `À moi` (default) or `En cours`.
     show: Cell<Show>,
+    /// The label the list keeps (`Label` in the filter menu), none for all.
+    label: RefCell<Option<String>>,
     frame: Cell<Option<Frame>>,
     /// The chat's place this tick, read by `chat_view`.
     chat_target: Cell<Option<(PaneId, Frame)>>,
@@ -284,7 +286,9 @@ impl KovaView {
         let scale = self.backing_scale().max(1.0) as f64;
         let view = self.frame();
         let top = (vp.y as f64 / scale).max(0.0);
-        let h = (vp.height as f64 / scale).min(view.size.height - top).max(0.0);
+        // The page runs down over the global status bar: its shortcuts and
+        // counters are the terminal's, not the Cockpit's (Robin, 10/11/2026).
+        let h = ((vp.height + self.global_bar_height()) as f64 / scale).min(view.size.height - top).max(0.0);
         let w = view.size.width;
         if w < 80.0 || h < 80.0 {
             return None;
@@ -420,6 +424,7 @@ impl KovaView {
             inflight,
             inflight_n,
             done_n,
+            label: slot.label.borrow().clone(),
             items: &items,
             filter: slot.filter.get(),
             chat: (!slot.chat_hidden.get()).then_some(ChatColumn { chief, found: chief_pane.is_some() }),
@@ -591,6 +596,12 @@ impl KovaView {
                     slot.filter.set(filter);
                     slot.limit.set(cockpit::PAGE_SIZE);
                 }
+                true
+            }
+            "label" => {
+                let word = s("label");
+                *slot.label.borrow_mut() = (word != "all" && !word.is_empty()).then_some(word);
+                slot.limit.set(cockpit::PAGE_SIZE);
                 true
             }
             "show" => {

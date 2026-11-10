@@ -179,6 +179,7 @@ pub fn ask_card_html(
         state: cockpit::State::Idle,
         instruction: None,
         shots: Vec::new(),
+        label: None,
         validates: false,
         entry_kind: String::new(),
     };
@@ -228,6 +229,7 @@ pub fn menu_card_html(menu: &Menu, plan: Option<&str>, now: u64) -> String {
         state: cockpit::State::Idle,
         instruction: None,
         shots: Vec::new(),
+        label: None,
         validates: false,
         entry_kind: String::new(),
     };
@@ -267,6 +269,7 @@ pub fn unread_wait_html(now: u64) -> String {
         state: cockpit::State::Idle,
         instruction: None,
         shots: Vec::new(),
+        label: None,
         validates: false,
         entry_kind: String::new(),
     };
@@ -511,6 +514,7 @@ mod tests {
             state: crate::cockpit::State::Idle,
             instruction: None,
             shots: Vec::new(),
+            label: None,
             validates: false,
             entry_kind: String::new(),
         };

@@ -105,6 +105,21 @@ pub struct Entry {
     /// absolute paths, shown in the card (Robin, 09/11/2026).
     pub before: Option<String>,
     pub after: Option<String>,
+    /// Its label from the closed registry (`attn labels`), with its color.
+    pub label: Option<Label>,
+}
+
+/// A card's label: a name from `attn`'s registry of ten at most and its
+/// `#RRGGBB` color (Robin, 10/11/2026).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Label {
+    pub name: String,
+    pub color: String,
+}
+
+/// A `#RRGGBB` color, the only form a label's color takes into the page.
+pub fn hex_color(c: &str) -> bool {
+    c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 #[derive(Deserialize)]
@@ -140,6 +155,10 @@ struct Raw {
     before: Option<String>,
     #[serde(default)]
     after: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    label_color: Option<String>,
 }
 
 /// Parse the CLI's answer. `None` when it is not a JSON array at all; an
@@ -187,6 +206,11 @@ pub fn parse(text: &str) -> Option<Vec<Entry>> {
                     },
                     before: nonempty(raw.before),
                     after: nonempty(raw.after),
+                    // A label without a color that reads is shown gray.
+                    label: nonempty(raw.label).map(|name| Label {
+                        name,
+                        color: raw.label_color.filter(|c| hex_color(c)).unwrap_or_else(|| "#94A3B8".to_string()),
+                    }),
                 })
             })
             .collect(),
@@ -729,6 +753,16 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("../tests/fixtures/attention/list.json");
+
+    #[test]
+    fn a_label_reads_with_its_color_and_a_color_that_does_not_read_is_gray() {
+        let list = parse(r##"[{"id":"a-1","level":"now","title":"t","label":"QA","label_color":"#F59E0B"},
+            {"id":"a-2","level":"now","title":"t","label":"Dev","label_color":"red;x"},{"id":"a-3","level":"now","title":"t","label":" "}]"##)
+        .unwrap();
+        assert_eq!(list[0].label, Some(Label { name: "QA".into(), color: "#F59E0B".into() }));
+        assert_eq!(list[1].label.as_ref().unwrap().color, "#94A3B8");
+        assert_eq!(list[2].label, None);
+    }
 
     #[test]
     fn the_fixture_parses_and_a_bad_entry_is_skipped_alone() {
