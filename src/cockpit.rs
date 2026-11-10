@@ -586,10 +586,22 @@ pub fn icons(item: &Item, can_close: bool, can_snooze: bool) -> Vec<Button> {
     if can_snooze {
         out.push(Button::Snooze);
     }
-    if can_close {
+    if can_close && acted(item) {
+        // Robin already gave a go or a consigne on it: clearing the card is
+        // "done", never "not relevant", which would tell its agent to drop
+        // the very thing he just asked for (10/11/2026).
+        out.push(Button::Done);
+    } else if can_close {
         out.extend([Button::Dismiss, Button::Done]);
     }
     out
+}
+
+/// The user already acted on the card: a go went through, or a consigne
+/// was sent or is on its way.
+pub fn acted(item: &Item) -> bool {
+    item.state == State::Sent
+        || matches!(&item.instruction, Some(Instructed { outcome: Outcome::Sent | Outcome::Running, .. }))
 }
 
 /// `il y a 4 min`, `il y a 2 h`, `hier`, `il y a 3 j`; empty when unknown.
@@ -2033,6 +2045,16 @@ mod tests {
         let err = from_need(&need(NeedKind::Error, "pane:1", 1), false).unwrap();
         assert_eq!(buttons(&err, true), [Button::Pane]);
         assert!(icons(&perm, true, true).is_empty(), "a live need keeps its own buttons");
+        // Once a go went through, or a consigne, the card is cleared as done,
+        // never removed as not relevant.
+        item.state = State::Sent;
+        assert_eq!(icons(&item, true, true), [Button::Snooze, Button::Done]);
+        item.state = State::Idle;
+        item.instruction = Some(Instructed { text: "il a répondu, mets à jour".into(), outcome: Outcome::Sent });
+        assert_eq!(icons(&item, true, false), [Button::Done]);
+        item.instruction = Some(Instructed { text: "x".into(), outcome: Outcome::Failed { words: "boom".into(), until_ms: 0 } });
+        assert_eq!(icons(&item, true, false), [Button::Dismiss, Button::Done], "a consigne that failed is no act");
+        item.instruction = None;
         let ask = from_need(&need(NeedKind::Ask, "ask:q1", 5), false).unwrap();
         assert_eq!(icons(&ask, false, false), [Button::Snooze, Button::Dismiss, Button::Done], "an ask closes on its board");
         for b in [Button::Snooze, Button::Dismiss, Button::Expand, Button::Done, Button::Deny, Button::Allow, Button::Correct, Button::Validate, Button::Refuse, Button::Open] {
