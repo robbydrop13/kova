@@ -424,6 +424,7 @@ impl KovaView {
             inflight,
             inflight_n,
             done_n,
+            journal: self.ivars().config.get().and_then(|c| c.attention.journal_today()),
             label: slot.label.borrow().clone(),
             items: &items,
             filter: slot.filter.get(),
@@ -741,12 +742,14 @@ impl KovaView {
             }
             (
                 Kind::Attention,
-                Button::Done | Button::Dismiss | Button::Refuse | Button::Snooze | Button::Validate | Button::Correct,
+                Button::Done | Button::Dismiss | Button::Refuse | Button::NoGo | Button::Snooze | Button::Validate | Button::Correct,
             ) => {
                 let Some(id) = attention_id else { return };
                 let (verb, text) = match button {
                     Button::Done => (Verb::Resolve, None),
                     Button::Dismiss => (Verb::Dismiss, None),
+                    // A plan turned down: its agent learns a no go, not "not relevant".
+                    Button::NoGo => (Verb::NoGo, None),
                     // Closed as dismissed, with the reason typed, if any.
                     Button::Refuse => (Verb::Dismiss, text),
                     Button::Snooze => (Verb::Snooze, text),
@@ -755,7 +758,7 @@ impl KovaView {
                 };
                 match crate::attention::perform_with(id, verb, text) {
                     // Gone from the page at once; the next read drops it.
-                    Ok(()) if matches!(verb, Verb::Resolve | Verb::Dismiss | Verb::Snooze) => {
+                    Ok(()) if matches!(verb, Verb::Resolve | Verb::Dismiss | Verb::NoGo | Verb::Snooze) => {
                         slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
                     }
                     Ok(()) => {}

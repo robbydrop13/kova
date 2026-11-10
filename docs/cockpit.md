@@ -73,6 +73,23 @@ it: one `WKWebView` per window over the active tab's panes area
   (red, a minute; an instruction's stays until the next one), the card in
   place with its buttons. A click refused before the command ran (the entry
   gone from the queue, no command) says so the same way.
+- A go, its proof, its failure (10/11/2026). The queue says what became of a
+  click (`inflight_command`: `go`, `done` only with a proof, `result`), and
+  `En cours` and `Fait` show it (`inflight::fate`): `preuve : X`, `Preuve :`
+  and X as a link when it is one (`links`), in `Fait`; `échec : why`, `Échec`
+  in red, still in `En cours`; `carte fermée sans preuve`, `Sans preuve` in
+  amber, still in `En cours` (nothing proves the action took place). An
+  instruction that is a go reads `Go`. A card back in the list after a
+  failure (`failed` in the queue's JSON) says `Échec : why` at its head, with
+  its buttons; one that carries a `proof` shows it under its needs.
+- `No go` (10/11/2026), on an action plan only: a `decision` posted by
+  `veille-actions` with its plan in the body (`attention::PLAN_FROM`). It
+  runs `close_command ID --reason nogo`: the plan's agent learns a no go,
+  where the x says the card was not relevant. The card leaves at once.
+- The day's journal: with `[attention] journal_file` (a path with
+  `{date}`), a quiet `Journal du jour` link under the list opens today's
+  file in the side panel, when it exists. Routines write there what they
+  did instead of posting cards.
 - Icons (every attention card, top right, Feather, with a tooltip): clock
   `Plus tard`, x `Pas pertinent, retirer` (`close_command ID --reason
   dismissed`), check `C'est fait` (`close_command ID --reason done`). The clock

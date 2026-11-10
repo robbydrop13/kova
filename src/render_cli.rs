@@ -21,6 +21,7 @@ kova render: write Kova's pages as HTML files, without a window
   kova render cockpit --list <json> --out <dir>
         [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
         [--state <card id>=delivered|noted|running|failed:<why>]... [--refs <json>]
+        [--journal <file.md>]
       <json> files hold what the `[attention]` commands print: `attn list --open --json`,
       `attn inflight --json`, `attn catchup --json`; panes: [[\"session\", working], ...].
       Writes default.html, menu.html, chips.html, en-cours.html, fait.html, and
@@ -232,6 +233,7 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
             inflight,
             inflight_n: crate::inflight::count(&data, scope, &panes, now),
             done_n: crate::inflight::done_count(&data, scope, now),
+            journal: a.get("--journal").map(str::to_string),
             label: None,
         };
         let (head, body, chat) = cockpit::parts(&view);

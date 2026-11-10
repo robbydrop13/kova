@@ -166,6 +166,14 @@ pub fn local_clock(epoch: u64) -> String {
     clock(epoch, tm.tm_gmtoff)
 }
 
+/// `2026-11-10`, the day of `epoch` in this Mac's zone.
+pub fn local_date(epoch: u64) -> String {
+    let t = epoch as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+}
+
 /// Whether leaving the page marks the band read: only when a read landed
 /// during the visit, so a CLI that failed never hides what the user did not
 /// see.

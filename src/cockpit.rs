@@ -144,6 +144,12 @@ pub struct Item {
     /// `would`, a `review`, or a `decision` with a prepared action. Its card
     /// carries `Refuser` and `Valider`.
     pub validates: bool,
+    /// The card came back after its action failed: why. Shown at its head.
+    pub failed: Option<String>,
+    /// The proof that its action took place, shown as a link when it is one.
+    pub proof: Option<String>,
+    /// An action plan: its card carries `No go`, distinct from the x.
+    pub plan: bool,
     /// An attention entry's kind (`decision`, `test`, `blocked`…), which
     /// names its main button (`primary`); empty for a live need.
     pub entry_kind: String,
@@ -343,6 +349,9 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         openable,
         ask: None,
         validates: expects_validation(entry),
+        failed: entry.failed.clone(),
+        proof: entry.proof.clone(),
+        plan: entry.plan,
         entry_kind: entry.kind.clone(),
         detail: None,
         state,
@@ -463,6 +472,9 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         openable: false,
         ask: None,
         validates: false,
+        failed: None,
+        proof: None,
+        plan: false,
         entry_kind: String::new(),
         detail: None,
         state: State::Idle,
@@ -516,6 +528,9 @@ pub enum Button {
     /// The attention card's icons: out until a date, not relevant.
     Snooze,
     Dismiss,
+    /// No go on an action plan: closed as `nogo`, which its agent learns as
+    /// a plan turned down, not as a card that was not relevant.
+    NoGo,
 }
 
 impl Button {
@@ -534,11 +549,13 @@ impl Button {
             Button::Refuse => "refuse",
             Button::Snooze => "snooze",
             Button::Dismiss => "dismiss",
+            Button::NoGo => "nogo",
         }
     }
 
     pub fn parse(word: &str) -> Option<Button> {
         match word {
+            "nogo" => Some(Button::NoGo),
             "expand" => Some(Button::Expand),
             "open" => Some(Button::Open),
             "done" => Some(Button::Done),
@@ -570,6 +587,7 @@ impl Button {
             Button::Validate => "Valider",
             Button::Snooze => "Plus tard",
             Button::Dismiss => "Pas pertinent, retirer",
+            Button::NoGo => "No go",
         }
     }
 
@@ -614,12 +632,18 @@ pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
 pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
     let sent = matches!(item.state, State::Sent | State::Noted);
     let links: Vec<Button> = match item.kind {
-        Kind::Attention if item.draft.is_some() && can_act => if sent { Vec::new() } else { vec![Button::Correct] },
+        Kind::Attention if item.draft.is_some() && can_act => match (sent, item.plan) {
+            (true, _) => Vec::new(),
+            (false, true) => vec![Button::NoGo, Button::Correct],
+            (false, false) => vec![Button::Correct],
+        },
         Kind::Attention if item.ask.is_some() => Vec::new(),
         Kind::Attention => {
             let open = item.openable.then_some(Button::Open);
             let refuse = (item.validates && !sent).then_some(Button::Refuse);
-            open.into_iter().chain(refuse).collect()
+            // A plan is said no go to, not refused nor crossed out.
+            let nogo = (item.plan && !sent).then_some(Button::NoGo);
+            open.into_iter().chain(refuse).chain(nogo).collect()
         }
         Kind::Permission => vec![Button::Deny],
         Kind::Sheet | Kind::Ask | Kind::Error | Kind::FailedRoutine => Vec::new(),
@@ -731,6 +755,9 @@ pub struct View<'a> {
     pub done_n: usize,
     /// The label the list keeps, `None` for every card.
     pub label: Option<String>,
+    /// The day's journal (what the routines did, written to a file instead
+    /// of cards), when it exists: a quiet link under the list.
+    pub journal: Option<String>,
 }
 
 /// The cards the list shows first, and each `Voir plus` adds.
@@ -881,7 +908,10 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     } else {
         format!("<div class=\"need\">{ICON_CHEVRON}<span>{}</span></div>", linked(&item.needs))
     };
-    let head = format!("<div class=\"t\">{}</div>{needs}", linked(&item.title));
+    // Back after its action failed: the reason first, the card as it was.
+    let failed = item.failed.as_deref().map(|why| format!("<div class=\"state crit top\">Échec : {}</div>", linked(why))).unwrap_or_default();
+    let proof = item.proof.as_deref().map(|p| format!("<div class=\"state ok\">Preuve : {}</div>", linked(p))).unwrap_or_default();
+    let head = format!("{failed}<div class=\"t\">{}</div>{needs}{proof}", linked(&item.title));
     let body = match (&item.draft, item.kind == Kind::Attention && can_act) {
         (Some(draft), true) => {
             let subject = draft
@@ -1385,7 +1415,16 @@ impl Update {
 
 /// The three parts of a render, compared with what the page holds.
 pub fn parts(view: &View) -> (String, String, String) {
-    (head_html(view), list_html(view), view.chat.as_ref().map(chat_html).unwrap_or_default())
+    (head_html(view), list_html(view) + &journal_html(view), view.chat.as_ref().map(chat_html).unwrap_or_default())
+}
+
+/// The quiet link to the day's journal, at the bottom of the page: opened in
+/// the side panel like any link to a file.
+fn journal_html(view: &View) -> String {
+    view.journal
+        .as_deref()
+        .map(|path| format!("<div class=\"jr\">{}Journal du jour</a></div>", crate::links::anchor(path, crate::links::Kind::Path)))
+        .unwrap_or_default()
 }
 
 pub fn update_script(update: &Update) -> String {
@@ -1497,6 +1536,7 @@ pre.scroll{margin-top:8px;max-height:240px;overflow:auto;background:var(--bg-inp
 .words{color:var(--crit)}.msg{white-space:pre-wrap;overflow-wrap:anywhere}
 textarea.ans{display:block;width:100%;margin-top:8px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:6px 10px;resize:vertical}
 textarea.ans:focus{border-color:var(--accent);outline:0}
+.state.top{margin:0 0 6px}.jr{margin:18px 0 6px;font-size:12px;color:var(--t3)}.jr a{color:var(--t3);text-decoration:underline}
 .state.ok{color:var(--ok-dot)}.state.warn{color:var(--warn-dot)}.state.crit{color:var(--crit)}
 .instr{margin-top:10px;border-top:1px solid var(--b3);padding-top:4px;cursor:auto}
 textarea.ins{display:block;width:100%;margin-top:4px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;line-height:19px;padding:6px 10px;resize:vertical}
@@ -1613,6 +1653,8 @@ body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
 .clk .q{font-size:13px;line-height:18px;color:var(--t2);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .clk .res{font-size:12px;color:var(--t3);margin-top:6px;display:flex;gap:8px;align-items:center;min-width:0}
 .clk .res b{color:var(--t2);font-weight:500}
+.clk .res .crit,.clk .res .crit b{color:var(--crit)}.clk .res .warn,.clk .res .warn b{color:var(--warn-dot)}.clk .res .ok b{color:var(--ok-dot)}
+.st.crit{color:var(--crit)}.st.crit i{background:var(--crit);border-color:var(--crit)}
 .verb{height:18px;border-radius:4px;padding:0 6px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;background:var(--sel-bg);color:var(--sel-text);margin-right:8px;vertical-align:1px}
 .verb.c{background:var(--bg-elev);color:var(--t1)}
 .box{background:var(--bg1);border:1px solid var(--b3);border-radius:8px;padding:2px 0}
@@ -2007,6 +2049,9 @@ mod tests {
             before: None,
             after: None,
             label: None,
+            failed: None,
+            proof: None,
+            plan: false,
         }
     }
 
@@ -2169,7 +2214,7 @@ mod tests {
         let view = |label: Option<&str>| View {
             items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
             limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(),
-            theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0,
+            theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, journal: None,
             label: label.map(str::to_string),
         };
         let all = list_html(&view(None));
@@ -2236,6 +2281,41 @@ mod tests {
     }
 
     #[test]
+    fn a_card_back_after_a_failure_says_why_and_a_plan_takes_a_no_go() {
+        // Back after its action failed: the reason first, the buttons as before.
+        let mut e = Entry { kind: "would".into(), ..entry("a-1", Level::Now, None, 1) };
+        e.failed = Some("Slack refused the message <403>, see /tmp/send.md".into());
+        let html = card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10);
+        let (fail, title) = (html.find("class=\"state crit top\">Échec : Slack refused the message &lt;403&gt;").expect("the reason"), html.find("class=\"t\"").unwrap());
+        assert!(fail < title, "at the card's head: {html}");
+        assert!(html.contains(r##"<a href="#" class="path" data-path="/tmp/send.md">"##) && html.contains("data-act=\"validate\""), "{html}");
+        // A proof is a link when it is one.
+        e.failed = None;
+        e.proof = Some("https://x.slack.com/archives/C1/p17".into());
+        assert!(card_html(&from_attention(&e, None, false).unwrap(), true, true, true, 10).contains(r#"Preuve : <a href="https://x.slack.com/archives/C1/p17">"#));
+        // An action plan: `No go`, distinct from the x, with or without a draft.
+        let plan = Entry { kind: "decision".into(), plan: true, body: Some("Plan : 1) write 2) send".into()), ..entry("a-2", Level::Point, None, 1) };
+        let item = from_attention(&plan, None, false).unwrap();
+        assert!(buttons(&item, true).contains(&Button::NoGo));
+        let html = card_html(&item, true, true, true, 10);
+        assert!(html.contains("data-act=\"nogo\"") && html.contains(">No go<") && html.contains("data-act=\"dismiss\""), "both: {html}");
+        let drafted = Entry { draft: Some(Draft { to: "A".into(), channel: "slack".into(), subject: None, text: "x".into() }), ..plan };
+        assert_eq!(buttons(&from_attention(&drafted, None, false).unwrap(), true), [Button::NoGo, Button::Correct, Button::Validate]);
+        assert!(!buttons(&from_attention(&entry("a-3", Level::Now, None, 1), None, false).unwrap(), true).contains(&Button::NoGo), "not on another card");
+        assert_eq!(Button::parse("nogo"), Some(Button::NoGo));
+        // The day's journal: a quiet link under the list, when there is one.
+        let items: Vec<Item> = Vec::new();
+        let view = |journal: Option<&str>| View {
+            items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 10,
+            band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine,
+            inflight: String::new(), inflight_n: 0, done_n: 0, journal: journal.map(str::to_string), label: None,
+        };
+        let (_, list, _) = parts(&view(Some("~/state/recap-2026-11-10.md")));
+        assert!(list.ends_with(r##"<div class="jr"><a href="#" class="path" data-path="~/state/recap-2026-11-10.md">Journal du jour</a></div>"##), "{list}");
+        assert!(!parts(&view(None)).1.contains("class=\"jr\""));
+    }
+
+    #[test]
     fn an_attention_card_carries_its_three_icons_top_right() {
         let item = from_attention(&entry("a-1", Level::Now, None, 1), None, true).unwrap();
         let html = card_html(&item, true, true, true, 10);
@@ -2251,7 +2331,7 @@ mod tests {
     fn the_list_shows_ten_cards_then_voir_plus() {
         let items: Vec<Item> =
             (0..23).map(|i| from_attention(&entry(&format!("a-{i}"), Level::Now, Some(if i < 4 { 1 } else { 2 }), i), None, false).unwrap()).collect();
-        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None };
+        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, journal: None, label: None };
         let html = list_html(&view(PAGE_SIZE));
         assert_eq!(html.matches("<article").count(), 10);
         assert!(html.contains("data-more=\"1\"><span>Voir plus (13)</span>"));
@@ -2478,7 +2558,7 @@ mod tests {
             from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap(),
             from_attention(&perso, None, false).unwrap(),
         ];
-        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None };
+        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, journal: None, label: None };
         assert!(list_html(&view(Filter::All)).contains("attention:a-1"));
         let only = list_html(&view(Filter::Only(Scope::Perso)));
         assert!(only.contains("attention:a-2") && !only.contains("attention:a-1"));
@@ -2499,7 +2579,7 @@ mod tests {
         let view = |filter, show, inflight: &str| View {
             items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true,
             limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(),
-            theme: String::new(), show, inflight: inflight.to_string(), inflight_n: 4, done_n: 7, label: None,
+            theme: String::new(), show, inflight: inflight.to_string(), inflight_n: 4, done_n: 7, journal: None, label: None,
         };
         // Default: no chip, one `Filtrer` control, the sort label on the right.
         let head = head_html(&view(Filter::All, Show::Mine, ""));
@@ -2542,13 +2622,13 @@ mod tests {
             from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap(),
             from_attention(&entry("a-1", Level::Point, None, 1), None, false).unwrap(),
         ];
-        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None });
+        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, journal: None, label: None });
         assert!(html.contains("Urgent <span class=\"k\">1</span>"));
         assert!(html.contains("Cette semaine <span class=\"k\">1</span>"));
         assert!(!html.contains("Aujourd'hui"));
         assert_eq!(subtitle(&items), ("2 actions pour toi".to_string(), "1 urgente".to_string()));
         assert_eq!(subtitle(&[]).0, "Aucune action pour toi");
-        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None }).contains("Rien ne t'attend"));
+        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, journal: None, label: None }).contains("Rien ne t'attend"));
     }
 
     #[test]
@@ -2721,7 +2801,7 @@ mod tests {
             limit: PAGE_SIZE, now: 0, band: band.to_string(), record: "<button data-rec=\"start\">R</button>".into(),
             record_note: "<div class=\"recn\">N</div>".into(),
             theme: theme_button(crate::theme::ThemeMode::Dark, "cmd+option+l"),
-            show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, label: None,
+            show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0, journal: None, label: None,
         };
         let head = head_html(&view("<div class=\"cu\">B</div>"));
         let (title, band, bar) = (head.find("ptitle").unwrap(), head.find("class=\"cu\"").unwrap(), head.find("class=\"bar\"").unwrap());
@@ -2748,6 +2828,7 @@ mod shot_demo {
             kind: "test".into(), title: "CLA-10067 (skeleton du desktop) : avant / après".into(),
             needs: Some("Valider le visuel".into()), action: None, topic: None, scope: crate::attention::Scope::Pro,
             prio: Some(2), draft: None, body: None, detail: None, src: Vec::new(), before: Some(b), after: Some(a), label: None,
+            failed: None, proof: None, plan: false,
         };
         let item = super::from_attention(&e, None, false).unwrap();
         let page = super::shell(false, "n").replace("<div id=\"list\"></div>", &format!("<div id=\"list\">{}</div>", super::card_html(&item, true, true, true, 10)));

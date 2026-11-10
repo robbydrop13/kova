@@ -16,6 +16,7 @@ to the work, without asking the user to launch anything. Code:
 kova render cockpit --list <json> --out <dir>
       [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
       [--state <card id>=delivered|noted|running|failed:<why>]... [--refs <json>]
+      [--journal <file.md>]
 kova render chat --transcript <jsonl> --out <file.html>
       [--markers "a|b"] [--base <the pane's folder>] [--exchanges N] [--unfold] [--light]
       [--refs <json>]

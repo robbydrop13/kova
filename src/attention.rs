@@ -107,7 +107,18 @@ pub struct Entry {
     pub after: Option<String>,
     /// Its label from the closed registry (`attn labels`), with its color.
     pub label: Option<Label>,
+    /// The card came back after its action failed (`attn fail`): why.
+    pub failed: Option<String>,
+    /// The proof that its action took place (a message id, a link, a
+    /// commit, a file).
+    pub proof: Option<String>,
+    /// An action plan the user says go or no go to: a `decision` posted by
+    /// `PLAN_FROM` with the plan in its body.
+    pub plan: bool,
 }
+
+/// The producer whose `decision` cards with a body are action plans.
+pub const PLAN_FROM: &str = "veille-actions";
 
 /// A card's label: a name from `attn`'s registry of ten at most and its
 /// `#RRGGBB` color (Robin, 10/11/2026).
@@ -159,6 +170,10 @@ struct Raw {
     label: Option<String>,
     #[serde(default)]
     label_color: Option<String>,
+    #[serde(default)]
+    failed: Option<String>,
+    #[serde(default)]
+    proof: Option<String>,
 }
 
 /// Parse the CLI's answer. `None` when it is not a JSON array at all; an
@@ -173,7 +188,12 @@ pub fn parse(text: &str) -> Option<Vec<Entry>> {
             .filter_map(|value| serde_json::from_value::<Raw>(value).ok())
             .filter(|raw| valid_id(&raw.id))
             .filter_map(|raw| {
+                // An action plan: said by who posts it and what it is.
+                let plan = raw.kind == "decision" && raw.from == PLAN_FROM && raw.body.as_deref().is_some_and(|b| !b.trim().is_empty());
                 Some(Entry {
+                    plan,
+                    failed: nonempty(raw.failed.clone()),
+                    proof: nonempty(raw.proof.clone()),
                     level: Level::parse(&raw.level)?,
                     since: epoch_of(&raw.ts).unwrap_or(0),
                     id: raw.id,
@@ -461,6 +481,9 @@ pub enum Verb {
     /// A free instruction typed on an opened Cockpit card:
     /// `act_command <id> instruct --text=<text>`.
     Instruct,
+    /// No go on an action plan, which is relevant but turned down:
+    /// `close_command <id> --reason nogo`. Not the x (`Dismiss`).
+    NoGo,
 }
 
 impl Verb {
@@ -473,6 +496,7 @@ impl Verb {
             Verb::Dismiss => "Retirer",
             Verb::Snooze => "Plus tard",
             Verb::Instruct => "instruct",
+            Verb::NoGo => "No go",
         }
     }
 }
@@ -604,6 +628,7 @@ fn verb_argv_with(
             args.extend([verb.label().to_string(), format!("--text={text}")]);
         }
         Verb::Resolve => args.extend(["--reason".to_string(), "done".to_string()]),
+        Verb::NoGo => args.extend(["--reason".to_string(), "nogo".to_string()]),
         Verb::Dismiss => {
             args.extend(["--reason".to_string(), "dismissed".to_string()]);
             // Refuser's reason, when one was typed: one argv element.
@@ -900,6 +925,23 @@ mod tests {
         assert_eq!(verb_argv(&act, &[], "a-1", Verb::Resolve, None), None);
         // An id that could be read as an option never reaches the argv.
         assert_eq!(verb_argv(&act, &close, "--help", Verb::Validate, None), None);
+    }
+
+    #[test]
+    fn an_entry_carries_its_failure_its_proof_and_whether_it_is_a_plan() {
+        let entries = parse(
+            r#"[{"id":"a-1","level":"point","kind":"decision","from":"veille-actions","title":"Leave the MDM","body":"Plan : 1) write to support 2) remove the profile"},
+                {"id":"a-2","level":"now","kind":"decision","from":"pm","title":"Pick","body":"Plan : 1) x","failed":" Slack refused ","proof":""},
+                {"id":"a-3","level":"now","kind":"info","from":"veille-actions","title":"Digest","body":"x","proof":"commit 53fdad9"},
+                {"id":"a-4","level":"now","kind":"decision","from":"veille-actions","title":"No body"}]"#,
+        )
+        .unwrap();
+        assert_eq!(entries.iter().map(|e| e.plan).collect::<Vec<_>>(), [true, false, false, false], "a decision of the plans' producer, with its plan");
+        assert_eq!(entries[1].failed.as_deref(), Some("Slack refused"));
+        assert_eq!((entries[1].proof.as_deref(), entries[2].proof.as_deref()), (None, Some("commit 53fdad9")));
+        // No go closes with its own reason, through the close command.
+        let close: Vec<String> = ["/bin/attn", "close", "--by", "robin"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(verb_argv(&[], &close, "a-1", Verb::NoGo, None).map(|(_, a)| a), Some(vec!["close".into(), "--by".into(), "robin".into(), "a-1".into(), "--reason".into(), "nogo".into()]));
     }
 
     #[test]

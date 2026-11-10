@@ -181,6 +181,9 @@ pub fn ask_card_html(
         shots: Vec::new(),
         label: None,
         validates: false,
+        failed: None,
+        proof: None,
+        plan: false,
         entry_kind: String::new(),
     };
     cockpit::card_html_with(&item, &sheet, &icons, true, now)
@@ -231,6 +234,9 @@ pub fn menu_card_html(menu: &Menu, plan: Option<&str>, now: u64) -> String {
         shots: Vec::new(),
         label: None,
         validates: false,
+        failed: None,
+        proof: None,
+        plan: false,
         entry_kind: String::new(),
     };
     cockpit::card_html_with(&item, &[], &[], false, now)
@@ -271,6 +277,9 @@ pub fn unread_wait_html(now: u64) -> String {
         shots: Vec::new(),
         label: None,
         validates: false,
+        failed: None,
+        proof: None,
+        plan: false,
         entry_kind: String::new(),
     };
     cockpit::card_html_with(&item, &[], &[], false, now)
@@ -516,6 +525,9 @@ mod tests {
             shots: Vec::new(),
             label: None,
             validates: false,
+        failed: None,
+        proof: None,
+        plan: false,
             entry_kind: String::new(),
         };
         let html = ask_card_html(&d, None, Some(&entry), true, crate::attention::Scope::Pro, 100);

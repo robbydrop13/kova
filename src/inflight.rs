@@ -47,8 +47,43 @@ pub struct Click {
     /// Epoch seconds; 0 when not yet.
     pub sent: u64,
     pub received: u64,
+    /// Not 0 only once the action is proven (`attn close --proof`).
     pub done: u64,
+    /// `preuve : X`, `échec : why`, `carte fermée sans preuve`, or other words.
     pub result: String,
+    /// The click is a go: the agent acts on it, and owes a proof.
+    pub go: bool,
+}
+
+/// What a click's `result` says, in the queue's own words (`attn inflight`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fate<'a> {
+    /// Nothing yet.
+    Open,
+    /// The action took place: its proof (a message id, a link, a commit, a file).
+    Proof(&'a str),
+    /// The action failed: why. Its card is back in the list.
+    Failed(&'a str),
+    /// The card was closed and nothing proves the action took place.
+    NoProof,
+    /// Other words (a card updated, a withdrawal passed on).
+    Words(&'a str),
+}
+
+pub fn fate(c: &Click) -> Fate<'_> {
+    let r = c.result.trim();
+    let after = |prefix: &str| r.strip_prefix(prefix).map(|rest| rest.trim_start().trim_start_matches(':').trim());
+    if r.is_empty() {
+        Fate::Open
+    } else if let Some(proof) = after("preuve") {
+        Fate::Proof(proof)
+    } else if let Some(why) = after("échec") {
+        Fate::Failed(why)
+    } else if r == "carte fermée sans preuve" {
+        Fate::NoProof
+    } else {
+        Fate::Words(r)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -93,6 +128,8 @@ struct RawClick {
     done: Option<String>,
     #[serde(default)]
     result: Option<String>,
+    #[serde(default)]
+    go: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +173,8 @@ pub fn parse(text: &str) -> Option<InFlight> {
             text: c.text.unwrap_or_default(),
             to: c.to.unwrap_or_default(),
             result: c.result.unwrap_or_default(),
+            // `true`, or how the go was read (`"explicit"`, `"validated"`).
+            go: matches!(&c.go, Some(Value::Bool(true))) || matches!(&c.go, Some(Value::String(s)) if !s.is_empty()),
         })
         .collect();
     let agents = raw
@@ -252,8 +291,11 @@ fn agents<'a>(data: &'a InFlight, panes: &'a [Pane], now: u64) -> (Vec<Live<'a>>
 }
 
 /// What the page calls a button.
-fn verb(button: &str) -> (&'static str, &'static str) {
+fn verb(button: &str, go: bool) -> (&'static str, &'static str) {
     match button.to_lowercase().as_str() {
+        // An instruction that says to act is a go.
+        "instruct" if go => ("Go", ""),
+        "nogo" => ("No go", " c"),
         "valider" | "envoyer" | "send" => ("Valider", ""),
         "corriger" => ("Corriger", ""),
         "instruct" => ("Consigne", " c"),
@@ -304,9 +346,12 @@ fn tracker(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
         Step::Sent => "<span class=\"st\"><i></i>Reçu</span>".to_string(),
         _ => format!("<span class=\"st ok\"><i></i>Reçu{}</span>", at(c.received)),
     };
-    let third = match st {
-        Step::Done => format!("<span class=\"st ok\"><i></i>Fait{}</span>", at(c.done)),
-        Step::Received => "<span class=\"st run\"><i></i>En cours</span>".to_string(),
+    let third = match (st, fate(c)) {
+        (Step::Done, _) => format!("<span class=\"st ok\"><i></i>Fait{}</span>", at(c.done)),
+        // Not done: the action failed, or nothing proves it.
+        (_, Fate::Failed(_)) => "<span class=\"st crit\"><i></i>Échec</span>".to_string(),
+        (_, Fate::NoProof) => "<span class=\"st warn\"><i></i>Sans preuve</span>".to_string(),
+        (Step::Received, _) => "<span class=\"st run\"><i></i>En cours</span>".to_string(),
         _ => "<span class=\"st\"><i></i>Fait</span>".to_string(),
     };
     let line = |ok: bool| format!("<span class=\"sep{}\"></span>", if ok { " ok" } else { "" });
@@ -319,15 +364,20 @@ fn tracker(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
 }
 
 fn click_html(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
-    let (word, class) = verb(&c.button);
+    let (word, class) = verb(&c.button, c.go);
     let quote = if c.text.trim().is_empty() {
         String::new()
     } else {
         format!("<div class=\"q\">\u{ab} {} \u{bb}</div>", linked(&one_line(&c.text, 220)))
     };
-    let res = match step(c, now) {
-        Step::Done if !c.result.trim().is_empty() => format!("<span><b>Résultat :</b> {}</span>", linked(&one_line(&c.result, 160))),
-        Step::Late => "<span>Pas encore remis : il le sera à son prochain outil, ou réveillé s'il dort</span>".to_string(),
+    // The result, in En cours as in Fait: a proof is a link when it is one
+    // (`links`), a failure is red, a close without proof amber.
+    let res = match (fate(c), step(c, now)) {
+        (Fate::Proof(proof), _) => format!("<span class=\"ok\"><b>Preuve :</b> {}</span>", linked(&one_line(proof, 200))),
+        (Fate::Failed(why), _) => format!("<span class=\"crit\"><b>Échec :</b> {}</span>", linked(&one_line(why, 200))),
+        (Fate::NoProof, _) => "<span class=\"warn\"><b>Sans preuve :</b> la carte a été fermée, rien ne prouve que l'action a eu lieu</span>".to_string(),
+        (Fate::Words(words), Step::Done) => format!("<span><b>Résultat :</b> {}</span>", linked(&one_line(words, 160))),
+        (_, Step::Late) => "<span>Pas encore remis : il le sera à son prochain outil, ou réveillé s'il dort</span>".to_string(),
         _ => String::new(),
     };
     format!(
@@ -611,6 +661,38 @@ mod tests {
         let list = list_html(&data, None, &[("pm".to_string(), true)], now, &|_| String::new());
         assert!(list.contains(r##"plan in <a href="#" class="path" data-path="/tmp/plan.md">"##), "{list}");
         assert!(list.contains(r#"ticket <a href="https://linear.app/claap/issue/CLA-7">CLA-7</a> &lt;first&gt;"#), "still escaped: {list}");
+    }
+
+    #[test]
+    fn a_go_shows_its_proof_its_failure_or_that_nothing_proves_it() {
+        let data = parse(
+            r#"{"clicks":[
+              {"act_id":"c-1","id":"a-1","scope":"pro","button":"Valider","title":"Send the plan","to":"pm","go":true,
+               "sent":"2026-11-10T10:00:00+01:00","received":"2026-11-10T10:00:05+01:00","done":"2026-11-10T10:05:00+01:00","result":"preuve : https://x.slack.com/archives/C1/p17"},
+              {"act_id":"c-2","id":"a-2","scope":"pro","button":"Valider","title":"Send the mail","to":"pm","go":true,
+               "sent":"2026-11-10T10:00:00+01:00","received":"2026-11-10T10:00:05+01:00","done":null,"result":"échec : mailbox <full>"},
+              {"act_id":"c-3","id":"a-3","scope":"pro","button":"instruct","title":"Post it","text":"envoie direct","to":"pm","go":"explicit",
+               "sent":"2026-11-10T10:00:00+01:00","received":"2026-11-10T10:00:05+01:00","done":null,"result":"carte fermée sans preuve"},
+              {"act_id":"c-4","id":"a-4","scope":"pro","button":"instruct","title":"Change it","text":"plus court","to":"pm","go":false,
+               "sent":"2026-11-10T10:00:00+01:00","received":"2026-11-10T10:00:05+01:00","done":"2026-11-10T10:05:00+01:00","result":"carte mise à jour"}
+            ]}"#,
+        )
+        .expect("inflight json");
+        assert_eq!(data.clicks.iter().map(|c| c.go).collect::<Vec<_>>(), [true, true, true, false]);
+        assert_eq!(fate(&data.clicks[0]), Fate::Proof("https://x.slack.com/archives/C1/p17"));
+        assert_eq!(fate(&data.clicks[1]), Fate::Failed("mailbox <full>"));
+        assert_eq!(fate(&data.clicks[2]), Fate::NoProof);
+        assert_eq!(fate(&data.clicks[3]), Fate::Words("carte mise à jour"));
+        let now = crate::attention::epoch_of("2026-11-10T10:06:00+01:00").unwrap();
+        // Fait: only what is proven or over.
+        let done = done_html(&data, None, now, &|_| String::new());
+        assert!(done.contains(r#"<span class="ok"><b>Preuve :</b> <a href="https://x.slack.com/archives/C1/p17">https://x.slack.com/archives/C1/p17</a></span>"#), "{done}");
+        assert!(done.contains("<b>Résultat :</b> carte mise à jour") && !done.contains("Échec") && !done.contains("Sans preuve"), "{done}");
+        // En cours: the failure in red, the close without proof in amber, both said.
+        let list = list_html(&data, None, &[], now, &|_| String::new());
+        assert!(list.contains(r#"<span class="crit"><b>Échec :</b> mailbox &lt;full&gt;</span>"#) && list.contains(r#"<span class="st crit"><i></i>Échec</span>"#), "{list}");
+        assert!(list.contains(r#"<span class="warn"><b>Sans preuve :</b>"#) && list.contains(r#"<span class="st warn"><i></i>Sans preuve</span>"#), "{list}");
+        assert!(list.contains(r#"<span class="verb">Go</span>"#), "an instruction that is a go: {list}");
     }
 
     #[test]

@@ -325,6 +325,12 @@ pub struct AttentionConfig {
     /// Writes the detail of an entry that says nothing (`attn explain`):
     /// Kova appends the id. Absent: `close_command`'s program with `explain`.
     pub explain_command: Vec<String>,
+    /// The day's journal, where routines write what they did instead of
+    /// posting cards: a path with `{date}` for the day (`YYYY-MM-DD`), a
+    /// leading `~/` the home folder
+    /// (`"~/notes/state/recap-{date}.md"`). The Cockpit links to today's
+    /// file when it exists. Empty (the default): no link.
+    pub journal_file: String,
     /// Prints the Cockpit's catch-up band as JSON (`attn catchup --json`,
     /// `crate::catchup`). Absent: `command`'s program with `catchup --json`.
     pub catchup_command: Vec<String>,
@@ -376,6 +382,20 @@ impl AttentionConfig {
     /// program with `add`.
     pub fn add_command(&self) -> Vec<String> {
         self.command.first().map(|bin| vec![bin.clone(), "add".to_string()]).unwrap_or_default()
+    }
+
+    /// Today's journal (`journal_file`), when the file exists.
+    pub fn journal_today(&self) -> Option<String> {
+        let file = self.journal_file.trim();
+        if file.is_empty() {
+            return None;
+        }
+        let path = file.replace("{date}", &crate::catchup::local_date(crate::ask::now_epoch()));
+        let on_disk = match path.strip_prefix("~/") {
+            Some(rest) => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+            None => std::path::PathBuf::from(&path),
+        };
+        on_disk.is_file().then_some(path)
     }
 
     /// `perso_dir` with a leading `~/` expanded, `None` when unset.
