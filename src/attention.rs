@@ -28,7 +28,7 @@ const LIST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long a click's command may take.
 const ACT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long a failed click's words stay on its row, in milliseconds.
-pub const FAILED_MS: u64 = 8_000;
+pub const FAILED_MS: u64 = 60_000;
 
 /// How urgent an entry is. The view lays the three levels out apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -482,9 +482,13 @@ impl Verb {
 pub enum Outcome {
     /// The command runs: the buttons wait.
     Running,
-    /// `Valider` or a correction went through: the card says so instead of
+    /// `Valider` or a correction went through and reached its agent
+    /// (`act_command … --exit-codes` exited 0): the card says so instead of
     /// offering it again.
     Sent,
+    /// The click is recorded but its agent does not have it yet (exit 3): it
+    /// will be handed over later. Not a failure; the card says so.
+    Noted,
     /// The entry was closed: hidden until the next read drops it.
     Closed,
     /// The command failed: its words, until `until_ms`.
@@ -500,6 +504,19 @@ pub fn outcomes() -> HashMap<String, Outcome> {
     let now = now_ms();
     map.retain(|_, o| !matches!(o, Outcome::Failed { until_ms, .. } if *until_ms <= now));
     map.clone()
+}
+
+/// A click refused before its command ran (an entry gone from the queue, no
+/// command configured): the card says why instead of doing nothing. One
+/// still running is left alone.
+pub fn click_refused(id: &str, words: &str) {
+    let mut guard = OUTCOMES.lock();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if matches!(map.get(id), Some(Outcome::Running)) {
+        return;
+    }
+    let words = words.strip_prefix("attention: ").unwrap_or(words).to_string();
+    map.insert(id.to_string(), Outcome::Failed { words, until_ms: now_ms() + FAILED_MS });
 }
 
 fn set_outcome(id: &str, outcome: Outcome) {
@@ -571,6 +588,10 @@ fn verb_argv_with(
     };
     let (bin, words) = base.split_first()?;
     let mut args: Vec<String> = words.to_vec();
+    // A click on an agent's card says how far it went (`run_click`).
+    if acts {
+        args.push(EXIT_CODES.to_string());
+    }
     args.push(id.to_string());
     match verb {
         Verb::Validate => args.push(verb.label().to_string()),
@@ -628,7 +649,8 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
         let id = id.to_string();
         std::thread::spawn(move || {
             let outcome = match run_click(&bin, &args) {
-                Ok(()) => Outcome::Sent,
+                Ok(Delivery::Delivered) => Outcome::Sent,
+                Ok(Delivery::Noted) => Outcome::Noted,
                 Err(words) => {
                     log::warn!("attention instruct {id}: {words}");
                     // Kept until the next instruction, not timed out: the
@@ -652,9 +674,13 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
     let id = id.to_string();
     std::thread::spawn(move || {
         match run_click(&bin, &args) {
-            Ok(()) => set_outcome(
+            Ok(delivery) => set_outcome(
                 &id,
-                if matches!(verb, Verb::Validate | Verb::Correct) { Outcome::Sent } else { Outcome::Closed },
+                match (verb, delivery) {
+                    (Verb::Validate | Verb::Correct, Delivery::Delivered) => Outcome::Sent,
+                    (Verb::Validate | Verb::Correct, Delivery::Noted) => Outcome::Noted,
+                    _ => Outcome::Closed,
+                },
             ),
             Err(words) => {
                 log::warn!("attention {} {id}: {words}", verb.label());
@@ -666,11 +692,38 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>) -> Result<(), Stri
     Ok(())
 }
 
-/// Run a click's argv: `Err` with the first line of its stderr on a failure.
-fn run_click(bin: &str, args: &[String]) -> Result<(), String> {
+/// The flag that makes `act_command` say how far a click went by its exit
+/// code: 0 handed to the agent, 3 recorded and not handed over yet, any
+/// other a failure with one line on stderr.
+pub const EXIT_CODES: &str = "--exit-codes";
+/// `act_command --exit-codes`: recorded, not handed to the agent yet.
+const EXIT_NOTED: i32 = 3;
+
+/// How far a click that did not fail went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Delivered,
+    Noted,
+}
+
+/// What a click's exit says: `code` is `None` when a signal ended it.
+/// `exit_codes` is whether the command was asked for them; without the
+/// flag, 3 is a failure like any other.
+pub fn delivery_of(code: Option<i32>, exit_codes: bool) -> Option<Delivery> {
+    match code {
+        Some(0) => Some(Delivery::Delivered),
+        Some(EXIT_NOTED) if exit_codes => Some(Delivery::Noted),
+        _ => None,
+    }
+}
+
+/// Run a click's argv: how far it went, or `Err` with the first line of its
+/// stderr on a failure.
+fn run_click(bin: &str, args: &[String]) -> Result<Delivery, String> {
+    let exit_codes = args.iter().any(|a| a == EXIT_CODES);
     crate::exec::run_with_deadline(std::process::Command::new(bin).args(args), ACT_DEADLINE).and_then(|out| {
-        if out.status.success() {
-            Ok(())
+        if let Some(delivery) = delivery_of(out.status.code(), exit_codes) {
+            Ok(delivery)
         } else {
             let err = String::from_utf8_lossy(&out.stderr);
             let line: String = err.lines().next().unwrap_or("").trim().chars().take(80).collect();
@@ -850,16 +903,37 @@ mod tests {
     }
 
     #[test]
+    fn a_click_s_exit_code_says_delivered_noted_or_failed() {
+        assert_eq!(delivery_of(Some(0), true), Some(Delivery::Delivered));
+        assert_eq!(delivery_of(Some(3), true), Some(Delivery::Noted), "recorded, not handed over yet: not a failure");
+        assert_eq!(delivery_of(Some(1), true), None);
+        assert_eq!(delivery_of(Some(2), true), None);
+        assert_eq!(delivery_of(None, true), None, "killed by a signal");
+        assert_eq!(delivery_of(Some(3), false), None, "a command not asked for exit codes: 3 is a failure");
+        // Only a click on an agent's card asks for them; a close does not.
+        let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
+        let close: Vec<String> = ["/bin/attn", "close"].iter().map(|s| s.to_string()).collect();
+        assert!(verb_argv(&act, &close, "a-1", Verb::Validate, None).unwrap().1.contains(&EXIT_CODES.to_string()));
+        assert!(!verb_argv(&act, &close, "a-1", Verb::Resolve, None).unwrap().1.contains(&EXIT_CODES.to_string()));
+        // A click refused before it ran shows on the card; one that runs is left alone.
+        click_refused("a-refused", "attention: no open entry \"a-refused\"");
+        assert!(matches!(outcomes().get("a-refused"), Some(Outcome::Failed { words, .. }) if words == "no open entry \"a-refused\""));
+        set_outcome("a-running", Outcome::Running);
+        click_refused("a-running", "attention: a click on a-running already runs");
+        assert_eq!(outcomes().get("a-running"), Some(&Outcome::Running));
+    }
+
+    #[test]
     fn a_draft_is_validated_or_corrected_and_the_text_is_one_argv_element() {
         let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
             verb_argv(&act, &[], "a-1", Verb::Validate, None).map(|(_, a)| a),
-            Some(vec!["act".into(), "a-1".into(), "Valider".into()])
+            Some(vec!["act".into(), "--exit-codes".into(), "a-1".into(), "Valider".into()])
         );
         // A text that looks like an option stays inside its `--text=` element.
         assert_eq!(
             verb_argv(&act, &[], "a-1", Verb::Correct, Some("--by evil\nBonjour")).map(|(_, a)| a),
-            Some(vec!["act".into(), "a-1".into(), "Corriger".into(), "--text=--by evil\nBonjour".into()])
+            Some(vec!["act".into(), "--exit-codes".into(), "a-1".into(), "Corriger".into(), "--text=--by evil\nBonjour".into()])
         );
         // A correction with nothing in it is not one.
         assert_eq!(verb_argv(&act, &[], "a-1", Verb::Correct, Some("  ")), None);
@@ -876,7 +950,7 @@ mod tests {
         let text = "Envoie les relevés \"octobre\" à l'expert\n--by evil; rm -rf ~";
         assert_eq!(
             verb_argv(&act, &[], "a-1", Verb::Instruct, Some(text)),
-            Some(("/bin/attn".to_string(), vec!["act".into(), "a-1".into(), "instruct".into(), format!("--text={text}")]))
+            Some(("/bin/attn".to_string(), vec!["act".into(), "--exit-codes".into(), "a-1".into(), "instruct".into(), format!("--text={text}")]))
         );
         // Nothing typed, nothing sent.
         assert_eq!(verb_argv(&act, &[], "a-1", Verb::Instruct, Some(" \n ")), None);

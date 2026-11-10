@@ -759,7 +759,11 @@ impl KovaView {
                         slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
                     }
                     Ok(()) => {}
-                    Err(why) => log::warn!("cockpit: {why}"),
+                    // Refused before it ran: the card stays and says why.
+                    Err(why) => {
+                        log::warn!("cockpit: {why}");
+                        crate::attention::click_refused(id, &why);
+                    }
                 }
             }
             (Kind::Sheet, Button::Open | Button::OpenSheet) => {

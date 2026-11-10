@@ -111,6 +111,8 @@ pub enum State {
     Running,
     /// The click went through: the receiver has it.
     Sent,
+    /// The click is recorded, the receiver does not have it yet.
+    Noted,
     Failed(String),
 }
 
@@ -324,6 +326,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         Some(Outcome::Closed) => return None,
         Some(Outcome::Running) => State::Running,
         Some(Outcome::Sent) => State::Sent,
+        Some(Outcome::Noted) => State::Noted,
         Some(Outcome::Failed { words, .. }) => State::Failed(words.clone()),
         None => State::Idle,
     };
@@ -586,7 +589,7 @@ impl Button {
 /// Buttons). `None` for a card that only informs (its check icon is the
 /// action) and once a go went through.
 pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
-    let sent = item.state == State::Sent;
+    let sent = matches!(item.state, State::Sent | State::Noted);
     match item.kind {
         Kind::Attention if item.draft.is_some() && can_act => (!sent).then_some(Button::Validate),
         Kind::Attention if item.ask.is_some() => Some(Button::OpenSheet),
@@ -609,7 +612,7 @@ pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
 /// (`primary`). A draft's verbs need `act_command`; a sent draft has none
 /// left. `Refuser` needs the close command (`card_html`).
 pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
-    let sent = item.state == State::Sent;
+    let sent = matches!(item.state, State::Sent | State::Noted);
     let links: Vec<Button> = match item.kind {
         Kind::Attention if item.draft.is_some() && can_act => if sent { Vec::new() } else { vec![Button::Correct] },
         Kind::Attention if item.ask.is_some() => Vec::new(),
@@ -653,8 +656,8 @@ pub fn icons(item: &Item, can_close: bool, can_snooze: bool) -> Vec<Button> {
 /// The user already acted on the card: a go went through, or a consigne
 /// was sent or is on its way.
 pub fn acted(item: &Item) -> bool {
-    item.state == State::Sent
-        || matches!(&item.instruction, Some(Instructed { outcome: Outcome::Sent | Outcome::Running, .. }))
+    matches!(item.state, State::Sent | State::Noted)
+        || matches!(&item.instruction, Some(Instructed { outcome: Outcome::Sent | Outcome::Noted | Outcome::Running, .. }))
 }
 
 /// `il y a 4 min`, `il y a 2 h`, `hier`, `il y a 3 j`; empty when unknown.
@@ -839,8 +842,9 @@ fn state_html(state: &State) -> String {
     match state {
         State::Idle => String::new(),
         State::Running => "<div class=\"state\">En cours</div>".to_string(),
-        State::Sent => "<div class=\"state ok\">Transmis</div>".to_string(),
-        State::Failed(words) => format!("<div class=\"state crit\">{}</div>", esc(words)),
+        State::Sent => "<div class=\"state ok\">Transmis à l'agent</div>".to_string(),
+        State::Noted => "<div class=\"state warn\">Noté, pas encore remis à l'agent</div>".to_string(),
+        State::Failed(words) => format!("<div class=\"state crit\">Non transmis : {}</div>", esc(words)),
     }
 }
 
@@ -897,7 +901,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
                  <div class=\"draft-foot\">{src}{acts}</div>{detail}{state}",
                 orig = esc(&draft.text),
                 text = esc(&draft.text),
-                ro = if item.state == State::Sent || running { " readonly" } else { "" },
+                ro = if matches!(item.state, State::Sent | State::Noted) || running { " readonly" } else { "" },
                 src = source_html(item, now),
                 state = state_html(&item.state),
             )
@@ -1004,8 +1008,11 @@ fn instruct_html(last: Option<&Instructed>) -> String {
             esc(words),
             esc(text)
         ),
+        Some(Instructed { text, outcome: Outcome::Noted }) => {
+            format!("<div class=\"state warn\">Consigne notée, pas encore remise à l'agent</div><p class=\"msg sent\">{}</p>", linked(text))
+        }
         Some(Instructed { text, .. }) => {
-            format!("<div class=\"state ok\">Consigne envoyée</div><p class=\"msg sent\">{}</p>", linked(text))
+            format!("<div class=\"state ok\">Consigne remise à l'agent</div><p class=\"msg sent\">{}</p>", linked(text))
         }
     };
     format!(
@@ -1489,7 +1496,7 @@ pre.scroll{margin-top:8px;max-height:240px;overflow:auto;background:var(--bg-inp
 .words{color:var(--crit)}.msg{white-space:pre-wrap;overflow-wrap:anywhere}
 textarea.ans{display:block;width:100%;margin-top:8px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:6px 10px;resize:vertical}
 textarea.ans:focus{border-color:var(--accent);outline:0}
-.state.ok{color:var(--ok-dot)}.state.crit{color:var(--crit)}
+.state.ok{color:var(--ok-dot)}.state.warn{color:var(--warn-dot)}.state.crit{color:var(--crit)}
 .instr{margin-top:10px;border-top:1px solid var(--b3);padding-top:4px;cursor:auto}
 textarea.ins{display:block;width:100%;margin-top:4px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;line-height:19px;padding:6px 10px;resize:vertical}
 textarea.ins:focus{border-color:var(--accent);outline:0}
@@ -2599,7 +2606,12 @@ mod tests {
         // Sent: the card says so with the text that went, escaped.
         item.instruction = Some(Instructed { text: "Relance <Fidsud> \"vite\"\nmerci".into(), outcome: Outcome::Sent });
         let html = card_html(&item, true, true, true, 10);
-        assert!(html.contains("Consigne envoyée</div><p class=\"msg sent\">Relance &lt;Fidsud&gt; &quot;vite&quot;\nmerci</p>"), "{html}");
+        assert!(html.contains("Consigne remise à l'agent</div><p class=\"msg sent\">Relance &lt;Fidsud&gt; &quot;vite&quot;\nmerci</p>"), "{html}");
+        // Recorded, not handed to the agent yet: said as such, not as a failure.
+        item.instruction = Some(Instructed { text: "plus tard".into(), outcome: Outcome::Noted });
+        let noted = card_html(&item, true, true, true, 10);
+        assert!(noted.contains("<div class=\"state warn\">Consigne notée, pas encore remise à l'agent</div><p class=\"msg sent\">plus tard</p>"), "{noted}");
+        item.instruction = Some(Instructed { text: "Relance <Fidsud> \"vite\"\nmerci".into(), outcome: Outcome::Sent });
         assert!(html.contains(&field), "the field stays for the next one");
         // In flight: the field waits.
         item.instruction = Some(Instructed { text: "x".into(), outcome: Outcome::Running });
@@ -2635,7 +2647,14 @@ mod tests {
         e.draft = Some(Draft { to: "A".into(), channel: "Email".into(), subject: None, text: "Hi".into() });
         let sent = from_attention(&e, Some(&Outcome::Sent), false).unwrap();
         let html = card_html(&sent, true, true, true, 10);
-        assert!(html.contains("Transmis") && html.contains("readonly") && !html.contains("data-act=\"validate\""));
+        assert!(html.contains("Transmis à l'agent") && html.contains("readonly") && !html.contains("data-act=\"validate\""));
+        // The three ends of a click: delivered, noted, failed with its reason.
+        let noted = card_html(&from_attention(&e, Some(&Outcome::Noted), false).unwrap(), true, true, true, 10);
+        assert!(noted.contains("<div class=\"state warn\">Noté, pas encore remis à l'agent</div>") && noted.contains("readonly"), "{noted}");
+        assert!(!noted.contains("data-act=\"validate\""), "not offered again: the click is recorded");
+        let failed = card_html(&from_attention(&e, Some(&Outcome::Failed { words: "session <gone>".into(), until_ms: 0 }), false).unwrap(), true, true, true, 10);
+        assert!(failed.contains("<div class=\"state crit\">Non transmis : session &lt;gone&gt;</div>"), "{failed}");
+        assert!(failed.contains("data-act=\"validate\""), "the card stays, with its buttons");
         // The icons stay: the entry waits for its receiver to close it.
         assert!(html.contains("class=\"icons\""));
         let running = from_attention(&e, Some(&Outcome::Running), false).unwrap();

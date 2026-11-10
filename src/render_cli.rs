@@ -20,6 +20,7 @@ kova render: write Kova's pages as HTML files, without a window
 
   kova render cockpit --list <json> --out <dir>
         [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
+        [--state <card id>=delivered|noted|running|failed:<why>]...
       <json> files hold what the `[attention]` commands print: `attn list --open --json`,
       `attn inflight --json`, `attn catchup --json`; panes: [[\"session\", working], ...].
       Writes default.html, menu.html, chips.html, en-cours.html, fait.html, and
@@ -146,7 +147,23 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
         Some(f) => Some(crate::catchup::parse(&read(f)?).ok_or("--catchup: not what `attn catchup --json` prints")?),
         None => None,
     };
-    let mut items: Vec<cockpit::Item> = entries.iter().filter_map(|e| cockpit::from_attention(e, None, true)).collect();
+    // Where a click on a card stands, as `attn act --exit-codes` would leave it.
+    let mut states: std::collections::HashMap<String, crate::attention::Outcome> = std::collections::HashMap::new();
+    for s in a.all("--state") {
+        use crate::attention::Outcome;
+        let (id, state) = s.split_once('=').ok_or("--state: <card id>=<state>")?;
+        let outcome = match state {
+            "delivered" => Outcome::Sent,
+            "noted" => Outcome::Noted,
+            "running" => Outcome::Running,
+            other => match other.strip_prefix("failed:") {
+                Some(why) => Outcome::Failed { words: why.to_string(), until_ms: 0 },
+                None => return Err(format!("--state: '{other}' is not delivered, noted, running or failed:<why>")),
+            },
+        };
+        states.insert(id.to_string(), outcome);
+    }
+    let mut items: Vec<cockpit::Item> = entries.iter().filter_map(|e| cockpit::from_attention(e, states.get(&e.id), true)).collect();
     cockpit::sort(&mut items);
     let now = now();
     let light = a.has("--light");
@@ -209,7 +226,7 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
     page("fait.html", &items, Filter::All, Show::Done, "")?;
     if let Some(id) = a.get("--open") {
         let entry = entries.iter().find(|e| e.id == id).ok_or_else(|| format!("--open: no card {id} in the list"))?;
-        let mut one: Vec<cockpit::Item> = cockpit::from_attention(entry, None, true).into_iter().collect();
+        let mut one: Vec<cockpit::Item> = cockpit::from_attention(entry, states.get(&entry.id), true).into_iter().collect();
         if let Some(item) = one.first_mut() {
             item.detail = Some(cockpit::entry_detail(entry, false));
         }

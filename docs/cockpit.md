@@ -54,7 +54,7 @@ it: one `WKWebView` per window over the active tab's panes area
   queue: `blocked` (an agent stuck on him) and `ask` (he has something to
   give) are the two that wait on his words. A decision sheet
   reads `Décider` rather than `Ouvrir la fiche`: the verb is what he does, the
-  field is where. Gone a go (`Transmis`), the card keeps its links only. A
+  field is where. Gone a go, the card keeps its links only and says how far the click went (below). A
   question opened in the chat shows its answers as its buttons. `Refuser` /
   `Autoriser` answer a permission prompt like the chat does, only if the
   screen still shows the prompt the card was rendered from.
@@ -63,8 +63,16 @@ it: one `WKWebView` per window over the active tab's panes area
   --reason dismissed`, plus `--note=<reason>` when one was typed (one argv
   element), and the card leaves; Escape folds the field (and only it). No
   close command, no `Refuser`; no act command, no `Valider`. `Valider` runs
-  `act_command ID Valider` (the chief of the scope receives it) and the card
-  reads `Transmis`.
+  `act_command --exit-codes ID Valider` (the chief of the scope receives
+  it). A click on an agent's card (`Valider`, a correction, an instruction)
+  ends one of three ways, read from the command's exit code
+  (`attention::delivery_of`): 0, `Transmis à l'agent` (green; an
+  instruction: `Consigne remise à l'agent`); 3, recorded but not handed
+  over yet, `Noté, pas encore remis à l'agent` (amber; the click is not
+  offered again); any other code, `Non transmis : <first line of stderr>`
+  (red, a minute; an instruction's stays until the next one), the card in
+  place with its buttons. A click refused before the command ran (the entry
+  gone from the queue, no command) says so the same way.
 - Icons (every attention card, top right, Feather, with a tooltip): clock
   `Plus tard`, x `Pas pertinent, retirer` (`close_command ID --reason
   dismissed`), check `C'est fait` (`close_command ID --reason done`). The clock
