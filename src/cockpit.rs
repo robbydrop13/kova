@@ -1128,44 +1128,94 @@ pub fn theme_button(mode: crate::theme::ThemeMode, shortcut: &str) -> String {
 pub fn head_html(view: &View) -> String {
     let (lead, tail) = subtitle(view.items);
     let tail = if tail.is_empty() { String::new() } else { format!(" \u{b7} <b>{}</b>", esc(&tail)) };
-    let count = |scope: Option<Scope>| view.items.iter().filter(|i| scope.is_none_or(|s| i.scope == s)).count();
-    // Under `En cours` the scope keeps its words without the cards' counts.
-    let mine = view.show == Show::Mine;
-    let seg = |filter: Filter, word: &str, label: &str, n: usize| {
-        let n = if mine { format!(" <span class=\"c\">{n}</span>") } else { String::new() };
-        format!(
-            "<button type=\"button\" class=\"{}\" data-filter=\"{word}\">{label}{n}</button>",
-            if view.filter == filter { "on" } else { "" }
-        )
-    };
-    let shows: String = SHOWS
-        .iter()
-        .map(|(show, word, label)| {
-            let n = match show {
-                Show::Mine => view.items.iter().filter(|i| view.filter.keeps(i)).count(),
-                Show::InFlight => view.inflight_n,
-            };
-            format!(
-                "<button type=\"button\" class=\"{}\" data-show=\"{word}\">{label} <span class=\"c\">{n}</span></button>",
-                if view.show == *show { "on" } else { "" }
-            )
-        })
-        .collect();
-    let sort = if mine { format!("{ICON_SORT}Par priorité") } else { "Dernières 24 h".to_string() };
+    let sort = if view.show == Show::Mine { format!("{ICON_SORT}Par priorité") } else { "Dernières 24 h".to_string() };
     format!(
         "<div class=\"phead\"><div><div class=\"ptitle\">Cockpit</div><div class=\"psub\">{}{tail}</div></div>\
          <div class=\"hbtns\">{}<button type=\"button\" class=\"btn {}\" data-chat=\"toggle\">{ICON_CHAT}<span>Chat</span></button>{}</div></div>\
-         {}{}<div class=\"bar\"><div class=\"filters\"><div class=\"seg\">{}{}{}</div><div class=\"seg show\">{shows}</div></div><span class=\"sortlbl\">{sort}</span></div>",
+         {}{}<div class=\"bar\">{}<span class=\"sortlbl\">{sort}</span></div>",
         esc(&lead),
         view.record,
         if view.chat.is_some() { "on" } else { "sec" },
         view.theme,
         view.record_note,
         view.band,
-        seg(Filter::All, "all", "Tout", count(None)),
-        seg(Filter::Only(Scope::Pro), "pro", scope_label(Scope::Pro), count(Some(Scope::Pro))),
-        seg(Filter::Only(Scope::Perso), "perso", scope_label(Scope::Perso), count(Some(Scope::Perso))),
+        filters_html(view),
     )
+}
+
+// Feather `filter`, the same size and stroke as the sort icon.
+const ICON_FILTER: &str = r#"<svg class="i" width="11" height="11" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>"#;
+const ICON_PLUS: &str = r#"<svg class="i" width="11" height="11" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>"#;
+
+/// One option of the filter menu: (word, label, count, chosen).
+struct FilterOption {
+    attr: &'static str,
+    word: &'static str,
+    label: String,
+    n: usize,
+    on: bool,
+}
+
+/// The filters, Linear-like (Robin, 10/11/2026): no chip is the whole list
+/// (`Tout`, `À moi`); `Filtrer` opens a menu of every dimension and its
+/// values with their counts; a value chosen shows as a chip
+/// `Espace : Claap` with its cross. Picking the chosen value again, or the
+/// cross, removes it. The menu itself lives outside the head (`#fm`), filled
+/// from `#fmsrc` here, so a push never closes it.
+pub fn filters_html(view: &View) -> String {
+    let count = |scope: Scope| view.items.iter().filter(|i| i.scope == scope).count();
+    let space = [Scope::Pro, Scope::Perso].map(|scope| FilterOption {
+        attr: "filter",
+        word: if scope == Scope::Perso { "perso" } else { "pro" },
+        label: scope_label(scope).to_string(),
+        n: count(scope),
+        on: view.filter == Filter::Only(scope),
+    });
+    let shows: Vec<FilterOption> = SHOWS
+        .iter()
+        .map(|(show, word, label)| FilterOption {
+            attr: "show",
+            word,
+            label: label.to_string(),
+            n: match show {
+                Show::Mine => view.items.iter().filter(|i| view.filter.keeps(i)).count(),
+                Show::InFlight => view.inflight_n,
+            },
+            on: view.show == *show,
+        })
+        .collect();
+    // The default of each dimension: what removing its chip puts back.
+    let groups: [(&str, &str, &str, &[FilterOption]); 2] =
+        [("Espace", "filter", "all", &space[..]), ("Vue", "show", "mine", &shows[..])];
+    let mut chips = String::new();
+    let mut menu = String::new();
+    for (name, attr, default, options) in groups {
+        menu.push_str(&format!("<div class=\"fm-h\">{name}</div>"));
+        for o in options {
+            // A chosen value: picked again, it goes back to the default.
+            let word = if o.on { default } else { o.word };
+            menu.push_str(&format!(
+                "<button type=\"button\" class=\"fm-o{}\" data-{}=\"{word}\"><span class=\"ok\">{ICON_CHECK}</span><span>{}</span><span class=\"c\">{}</span></button>",
+                if o.on { " on" } else { "" },
+                o.attr,
+                esc(&o.label),
+                o.n
+            ));
+            if o.on && o.word != default {
+                chips.push_str(&format!(
+                    "<span class=\"chip\"><button type=\"button\" class=\"cb\" data-fopen=\"1\"><span class=\"ck\">{name} :</span> {}</button>\
+                     <button type=\"button\" class=\"cx\" data-{attr}=\"{default}\" title=\"Retirer le filtre\" aria-label=\"Retirer le filtre {name}\">{ICON_X_S}</button></span>",
+                    esc(&o.label)
+                ));
+            }
+        }
+    }
+    let open = if chips.is_empty() {
+        format!("<button type=\"button\" class=\"flt\" data-fopen=\"1\">{ICON_FILTER}<span>Filtrer</span></button>")
+    } else {
+        format!("<button type=\"button\" class=\"flt\" data-fopen=\"1\" title=\"Ajouter un filtre\" aria-label=\"Ajouter un filtre\">{ICON_PLUS}</button>")
+    };
+    format!("<div class=\"filters\">{chips}{open}</div><div id=\"fmsrc\" hidden>{menu}</div>")
 }
 
 /// The chat column's top bar and, when the chief has no pane, the one line
@@ -1416,7 +1466,20 @@ body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
 .d.crit{background:var(--crit-dot)}.d.warn{background:var(--warn-dot)}.d.gray{background:var(--tag-gray)}
 .sec-h .k{color:var(--t3);font-weight:400}
 .empty{color:var(--t3);font-size:13px;margin-top:24px}
-.filters{display:flex;align-items:center;gap:10px}
+.filters{display:flex;align-items:center;gap:6px;min-height:26px;flex-wrap:wrap}
+.flt{height:24px;padding:0 6px;border-radius:6px;font-size:12px;color:var(--t3);display:inline-flex;align-items:center;gap:5px}
+.flt:hover,.chip button:hover{background:var(--hover);color:var(--t1)}
+.chip{display:inline-flex;align-items:center;height:24px;border:1px solid var(--b2);border-radius:6px;background:var(--bg1);font-size:12px;color:var(--t1);overflow:hidden}
+.chip .cb{height:100%;padding:0 4px 0 8px;font-size:12px;color:var(--t1)}
+.chip .ck{color:var(--t3)}
+.chip .cx{height:100%;width:22px;display:flex;align-items:center;justify-content:center;color:var(--t3);border-left:1px solid var(--b3)}
+.fm{min-width:200px}
+.fm .fm-h{font-size:11px;font-weight:600;color:var(--t3);padding:6px 10px 2px}
+.fm .fm-h:not(:first-child){margin-top:4px;border-top:1px solid var(--b3);padding-top:8px}
+.fm .fm-o{display:flex;align-items:center;gap:8px}
+.fm .fm-o .ok{width:13px;display:flex;color:var(--accent);visibility:hidden}
+.fm .fm-o.on .ok{visibility:visible}
+.fm .fm-o .c{margin-left:auto;font-size:11px;color:var(--t3)}
 .d.info{background:var(--info-dot)}
 .trk{display:flex;align-items:center;flex:none}
 .st{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--t3);white-space:nowrap}
@@ -1504,6 +1567,7 @@ body.chat-on .chat{display:flex}
 <section class="chat" id="chat"></section>
 <section class="page"><div class="inner"><div id="head"></div><div id="list"></div></div></section>
 {snooze_html}
+<div class="snz fm" id="fm" hidden></div>
 <div id="zoom" hidden><img alt=""><span></span></div>
 <script nonce="{nonce}">
 const $ = id => document.getElementById(id);
@@ -1616,7 +1680,7 @@ document.addEventListener('selectionchange', () => flush(false));
 window.addEventListener('blur', () => flush(true));
 window.kova = {
   update(u) {
-    if (u.head !== undefined) apply('head', u.head);
+    if (u.head !== undefined) { apply('head', u.head); fmFill(); }
     if (u.list !== undefined) apply('list', u.list);
     if (u.chat !== undefined) { apply('chat', u.chat); document.body.classList.toggle('chat-on', u.chat !== ''); }
     if (u.focus && !(document.activeElement && /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName))) window.focus();
@@ -1636,6 +1700,17 @@ window.kova = {
 let snzKey = null;
 {snooze_js}
 function snzClose() { $('snz').hidden = true; $('snzPick').hidden = true; snzKey = null; }
+// The filter menu, outside the head like the snooze one: a push refills it open.
+function fmFill() { const m = $('fm'), src = $('fmsrc'); if (!m.hidden && src) m.innerHTML = src.innerHTML; }
+function fmOpen(b) {
+  const m = $('fm'), src = $('fmsrc');
+  if (!src) return;
+  m.innerHTML = src.innerHTML;
+  m.hidden = false;
+  const r = b.getBoundingClientRect();
+  m.style.top = (r.bottom + 4) + 'px';
+  m.style.left = Math.max(8, Math.min(r.left, window.innerWidth - m.offsetWidth - 8)) + 'px';
+}
 function hide(key) { const c = document.querySelector('.card[data-key="' + CSS.escape(key) + '"]'); if (c) c.style.display = 'none'; }
 document.addEventListener('click', e => {
   // A card's screenshot opens full size over the page; a click closes it.
@@ -1662,7 +1737,17 @@ document.addEventListener('click', e => {
     return;
   }
   if (!$('snz').hidden) snzClose();
+  const fm = $('fm'), inMenu = e.target.closest('#fm');
+  if (!fm.hidden && !inMenu) fm.hidden = true;
   const b = e.target.closest('button');
+  if (b && b.dataset.fopen) { if (fm.hidden) fmOpen(b); else fm.hidden = true; return; }
+  if (inMenu) {
+    if (!b) return;
+    fm.hidden = true;
+    if (b.dataset.filter) return post({ type: 'filter', scope: b.dataset.filter });
+    if (b.dataset.show) return post({ type: 'show', show: b.dataset.show });
+    return;
+  }
   // The catch-up band: its buttons, its links, a row that opens in place.
   if (b && b.dataset.rec) return post({ type: 'record', what: b.dataset.rec });
   if (b && b.dataset.band) return post({ type: 'band', what: b.dataset.band });
@@ -1760,6 +1845,7 @@ document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   e.preventDefault();
   if (!$('snz').hidden) return snzClose();
+  if (!$('fm').hidden) { $('fm').hidden = true; return; }
   // An open reason field folds before the page closes.
   const why = document.querySelector('.card div.why:not([hidden])');
   if (why) { why.querySelector('input').value = ''; why.hidden = true; return; }
@@ -1960,7 +2046,7 @@ mod tests {
         assert_eq!(html.matches("<article").count(), 10);
         assert!(html.contains("data-more=\"1\"><span>Voir plus (13)</span>"));
         assert!(html.contains("Aujourd'hui <span class=\"k\">19</span>"), "a section counts all its cards");
-        assert!(head_html(&view(PAGE_SIZE)).contains("Tout <span class=\"c\">23</span>"));
+        assert!(head_html(&view(PAGE_SIZE)).contains("<span>Claap</span><span class=\"c\">23</span>"), "the menu counts every card");
         let html = list_html(&view(30));
         assert_eq!(html.matches("<article").count(), 23);
         assert!(!html.contains("data-more"));
@@ -2187,39 +2273,54 @@ mod tests {
         let only = list_html(&view(Filter::Only(Scope::Perso)));
         assert!(only.contains("attention:a-2") && !only.contains("attention:a-1"));
         let head = head_html(&view(Filter::Only(Scope::Perso)));
-        assert!(head.contains("Tout <span class=\"c\">2</span>"));
-        assert!(head.contains("class=\"on\" data-filter=\"perso\""));
+        // The menu counts every scope; the chosen one, picked again, goes back to all.
+        assert!(head.contains("data-filter=\"pro\"><span class=\"ok\">"), "{head}");
+        assert!(head.contains("<button type=\"button\" class=\"fm-o on\" data-filter=\"all\">"), "{head}");
+        assert!(head.contains("<span class=\"ck\">Espace :</span> Perso</button>"), "{head}");
         assert_eq!(Filter::parse("pro"), Some(Filter::Only(Scope::Pro)));
         assert_eq!(Filter::parse("nope"), None);
     }
 
     #[test]
-    fn the_show_filter_sits_next_to_the_scope_and_en_cours_replaces_the_cards() {
-        let items = vec![from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap()];
-        let view = |show, inflight: &str| View {
-            items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
+    fn the_filters_are_one_control_a_menu_and_removable_chips() {
+        let mut perso = entry("a-2", Level::Now, None, 2);
+        perso.scope = Scope::Perso;
+        let items = vec![from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap(), from_attention(&perso, None, false).unwrap()];
+        let view = |filter, show, inflight: &str| View {
+            items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true,
             limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(),
             theme: String::new(), show, inflight: inflight.to_string(), inflight_n: 4,
         };
-        // `À moi` is the list as it was, with both filters in the bar.
-        let mine = view(Show::Mine, "");
-        let head = head_html(&mine);
-        assert!(head.contains("<div class=\"filters\"><div class=\"seg\"><button type=\"button\" class=\"on\" data-filter=\"all\">Tout <span class=\"c\">1</span>"), "{head}");
-        assert!(head.contains("<div class=\"seg show\"><button type=\"button\" class=\"on\" data-show=\"mine\">\u{c0} moi <span class=\"c\">1</span></button>\
-                               <button type=\"button\" class=\"\" data-show=\"inflight\">En cours <span class=\"c\">4</span></button></div>"), "{head}");
-        assert!(head.contains("Par priorité"));
-        assert!(list_html(&mine).contains("attention:a-1"));
-        // `En cours`: its list in place of the cards, the scope without counts.
-        let flight = view(Show::InFlight, "<div class=\"clk\">X</div>");
-        assert_eq!(list_html(&flight), "<div class=\"clk\">X</div>");
+        // Default: no chip, one `Filtrer` control, the sort label on the right.
+        let head = head_html(&view(Filter::All, Show::Mine, ""));
+        assert!(head.contains("<div class=\"filters\"><button type=\"button\" class=\"flt\" data-fopen=\"1\">"), "{head}");
+        assert!(head.contains("<span>Filtrer</span>") && !head.contains("class=\"chip\"") && head.contains("Par priorité"));
+        assert!(!head.contains("class=\"seg\""), "no more segmented toggles");
+        // The menu: every dimension, its values and counts, nothing chosen.
+        let src = head.split("<div id=\"fmsrc\" hidden>").nth(1).unwrap();
+        assert!(src.starts_with("<div class=\"fm-h\">Espace</div>"), "{src}");
+        assert!(src.contains("data-filter=\"pro\"><span class=\"ok\">") && src.contains("<span>Claap</span><span class=\"c\">1</span>"));
+        assert!(src.contains("<div class=\"fm-h\">Vue</div>"));
+        assert!(src.contains("<button type=\"button\" class=\"fm-o on\" data-show=\"mine\">"), "À moi is the default, picked again it stays");
+        assert!(src.contains("data-show=\"inflight\"><span class=\"ok\">") && src.contains("<span>En cours</span><span class=\"c\">4</span>"));
+        assert!(list_html(&view(Filter::All, Show::Mine, "")).contains("attention:a-1"));
+        // Two filters chosen: two chips with their cross, the control turns into `+`.
+        let flight = view(Filter::Only(Scope::Pro), Show::InFlight, "<div class=\"clk\">X</div>");
         let head = head_html(&flight);
-        assert!(head.contains("data-filter=\"all\">Tout</button>") && head.contains("class=\"on\" data-show=\"inflight\""), "{head}");
+        assert!(head.contains("<span class=\"ck\">Espace :</span> Claap</button>"), "{head}");
+        assert!(head.contains("<span class=\"ck\">Vue :</span> En cours</button>"));
+        assert!(head.contains("class=\"cx\" data-filter=\"all\"") && head.contains("class=\"cx\" data-show=\"mine\""));
+        assert!(head.contains("title=\"Ajouter un filtre\"") && !head.contains("<span>Filtrer</span>"));
         assert!(head.contains("Dernières 24 h"));
-        assert!(list_html(&view(Show::InFlight, "")).contains("Lecture en cours"));
+        assert_eq!(list_html(&flight), "<div class=\"clk\">X</div>");
+        assert!(list_html(&view(Filter::All, Show::InFlight, "")).contains("Lecture en cours"));
         assert_eq!(Show::parse("inflight"), Some(Show::InFlight));
-        assert_eq!(Show::parse("mine"), Some(Show::Mine));
         assert_eq!(Show::parse("x"), None);
-        assert!(shell(false, "n").contains("if (b.dataset.show) return post({ type: 'show', show: b.dataset.show });"));
+        // The page: the menu outside the head, refilled by a push, picked items posted.
+        let page = shell(false, "n");
+        assert!(page.contains("<div class=\"snz fm\" id=\"fm\" hidden></div>"));
+        assert!(page.contains("if (u.head !== undefined) { apply('head', u.head); fmFill(); }"));
+        assert!(page.contains("if (b.dataset.show) return post({ type: 'show', show: b.dataset.show });"));
     }
 
     #[test]

@@ -510,26 +510,53 @@ mod tests {
 
 #[cfg(test)]
 mod preview {
-    /// A page to look at, not a check: `KOVA_INFLIGHT_JSON=<attn inflight --json> KOVA_PREVIEW_OUT=<file.html>
-    /// cargo test --lib inflight::preview -- --ignored` writes the Cockpit under `En cours` as Kova shows it.
+    /// Pages to look at, not checks: `KOVA_INFLIGHT_JSON=<attn inflight --json> KOVA_LIST_JSON=<attn list --open
+    /// --json --scope all> KOVA_PREVIEW_DIR=<dir> cargo test --lib inflight::preview -- --ignored` writes the Cockpit
+    /// as Kova shows it: `default.html` (no filter), `menu.html` (the filter menu open), `chips.html` (Espace :
+    /// Claap and Vue : En cours).
     #[test]
     #[ignore]
-    fn write_the_en_cours_page() {
-        let (Ok(src), Ok(out)) = (std::env::var("KOVA_INFLIGHT_JSON"), std::env::var("KOVA_PREVIEW_OUT")) else { return };
+    fn write_the_filter_pages() {
+        use crate::attention::Scope;
+        use crate::cockpit::{Filter, Show, View};
+        use std::path::Path;
+        let (Ok(src), Ok(list), Ok(dir)) =
+            (std::env::var("KOVA_INFLIGHT_JSON"), std::env::var("KOVA_LIST_JSON"), std::env::var("KOVA_PREVIEW_DIR"))
+        else {
+            return;
+        };
         let data = super::parse(&std::fs::read_to_string(src).unwrap()).expect("inflight json");
+        let entries = crate::attention::parse(&std::fs::read_to_string(list).unwrap()).expect("list json");
+        let mut items: Vec<crate::cockpit::Item> =
+            entries.iter().filter_map(|e| crate::cockpit::from_attention(e, None, true)).collect();
+        crate::cockpit::sort(&mut items);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let working = |n: &str| n == "claap-agent";
-        let list = super::list_html(&data, None, &working, now, &crate::catchup::local_clock);
-        let items: Vec<crate::cockpit::Item> = Vec::new();
-        let view = crate::cockpit::View {
-            items: &items, filter: crate::cockpit::Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
-            limit: crate::cockpit::PAGE_SIZE, now, band: String::new(), record: String::new(), record_note: String::new(),
-            theme: String::new(), show: crate::cockpit::Show::InFlight, inflight: list, inflight_n: super::count(&data, None, &working, now),
+        let page = |name: &str, filter: Filter, show: Show, script: &str| {
+            let scope = match filter {
+                Filter::All => None,
+                Filter::Only(s) => Some(s),
+            };
+            let inflight = if show == Show::InFlight {
+                super::list_html(&data, scope, &working, now, &crate::catchup::local_clock)
+            } else {
+                String::new()
+            };
+            let view = View {
+                items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true,
+                limit: crate::cockpit::PAGE_SIZE, now, band: String::new(), record: String::new(), record_note: String::new(),
+                theme: String::new(), show, inflight, inflight_n: super::count(&data, scope, &working, now),
+            };
+            let (head, body, chat) = crate::cockpit::parts(&view);
+            let update = crate::cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };
+            let html = crate::cockpit::shell(false, "preview").replace(
+                "</body>",
+                &format!("<script nonce=\"preview\">{}{script}</script></body>", crate::cockpit::update_script(&update)),
+            );
+            std::fs::write(Path::new(&dir).join(name), html).unwrap();
         };
-        let (head, body, chat) = crate::cockpit::parts(&view);
-        let update = crate::cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };
-        let page = crate::cockpit::shell(false, "preview")
-            .replace("</body>", &format!("<script nonce=\"preview\">{}</script></body>", crate::cockpit::update_script(&update)));
-        std::fs::write(out, page).unwrap();
+        page("default.html", Filter::All, Show::Mine, "");
+        page("menu.html", Filter::All, Show::Mine, ";document.querySelector('[data-fopen]').click()");
+        page("chips.html", Filter::Only(Scope::Pro), Show::InFlight, "");
     }
 }
