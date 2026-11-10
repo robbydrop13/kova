@@ -26,8 +26,10 @@ the transcript as it was.
 
 One `WKWebView` per window, created on first use, laid on the Cockpit's
 left third under the column's top bar, above the Cockpit's own page. The
-column takes its third and the action list sits right of it: only the side
-panel floats over the Cockpit, the chat does not (Robin, 09/11). It
+column floats over the page, like the side panel (`position:fixed`, a
+shadow on its right edge): the action list keeps the layout it has without
+the chat and does not move when the column opens (consigne k-181aa1, 09/11,
+"le chat ne passe toujours pas par-dessus le Cockpit"). It
 hides when the column or the Cockpit closes and while an overlay Kova draws
 in Metal needs the window (the switcher, the search palette, the filter,
 help, a rename); hidden, its state is dropped and the page comes back
