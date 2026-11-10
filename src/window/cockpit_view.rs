@@ -403,20 +403,23 @@ impl KovaView {
         // while `À moi` shows; a running pane marks its session at work.
         let show = slot.show.get();
         let flight = crate::inflight::snapshot();
-        let working = |name: &str| self.session_working(name);
+        let working = self.session_panes();
         let scope = match slot.filter.get() {
             Filter::All => None,
             Filter::Only(s) => Some(s),
         };
         let inflight_n = flight.as_deref().map(|d| crate::inflight::count(d, scope, &working, now / 1000)).unwrap_or(0);
+        let done_n = flight.as_deref().map(|d| crate::inflight::done_count(d, scope, now / 1000)).unwrap_or(0);
         let inflight = match (&flight, show) {
             (Some(d), Show::InFlight) => crate::inflight::list_html(d, scope, &working, now / 1000, &crate::catchup::local_clock),
+            (Some(d), Show::Done) => crate::inflight::done_html(d, scope, now / 1000, &crate::catchup::local_clock),
             _ => String::new(),
         };
         let view = View {
             show,
             inflight,
             inflight_n,
+            done_n,
             items: &items,
             filter: slot.filter.get(),
             chat: (!slot.chat_hidden.get()).then_some(ChatColumn { chief, found: chief_pane.is_some() }),
@@ -536,17 +539,18 @@ impl KovaView {
 
     /// The pane of this window that runs `name`, if any.
     /// Whether a pane of this window runs `name`'s session and is working.
-    fn session_working(&self, name: &str) -> bool {
+    /// Every session a pane holds, and whether that pane works now.
+    fn session_panes(&self) -> Vec<crate::inflight::Pane> {
         let tabs = self.ivars().tabs.borrow();
-        let mut found = false;
+        let mut out = Vec::new();
         for tab in tabs.iter() {
             tab.for_each_pane(&mut |p| {
-                if !found && holds_session(p, name) && p.is_working() {
-                    found = true;
+                for name in [p.claude_peer_name(), p.agent_session_name()].into_iter().flatten() {
+                    out.push((name, p.is_working()));
                 }
             });
         }
-        found
+        out
     }
 
     fn chief_pane(&self, name: &str) -> Option<PaneId> {
@@ -591,7 +595,7 @@ impl KovaView {
             }
             "show" => {
                 if let Some(show) = Show::parse(&s("show")) {
-                    if show == Show::InFlight && slot.show.get() != show {
+                    if show != Show::Mine && slot.show.get() != show {
                         crate::inflight::refresh();
                     }
                     slot.show.set(show);

@@ -70,11 +70,15 @@ impl Filter {
 pub enum Show {
     #[default]
     Mine,
+    /// Only what is still moving: clicks not done, agents at work.
     InFlight,
+    /// The clicks done or withdrawn in the last 24 h.
+    Done,
 }
 
 /// Every filter, in the order the page shows them: (value, word, label).
-pub const SHOWS: [(Show, &str, &str); 2] = [(Show::Mine, "mine", "\u{c0} moi"), (Show::InFlight, "inflight", "En cours")];
+pub const SHOWS: [(Show, &str, &str); 3] =
+    [(Show::Mine, "mine", "\u{c0} moi"), (Show::InFlight, "inflight", "En cours"), (Show::Done, "done", "Fait (24 h)")];
 
 impl Show {
     pub fn parse(word: &str) -> Option<Show> {
@@ -740,6 +744,8 @@ pub struct View<'a> {
     /// the cards under that filter, and what its button counts.
     pub inflight: String,
     pub inflight_n: usize,
+    /// What `Fait (24 h)` counts.
+    pub done_n: usize,
 }
 
 /// The cards the list shows first, and each `Voir plus` adds.
@@ -1117,7 +1123,7 @@ const SECTIONS: [(u8, &str, &str); 3] = [(1, "Urgent", "crit"), (2, "Aujourd'hui
 
 /// The cards the filter keeps, under their section headers.
 pub fn list_html(view: &View) -> String {
-    if view.show == Show::InFlight {
+    if view.show != Show::Mine {
         return if view.inflight.is_empty() { "<p class=\"empty\">Lecture en cours\u{2026}</p>".to_string() } else { view.inflight.clone() };
     }
     let kept: Vec<&Item> = view.items.iter().filter(|i| view.filter.keeps(i)).collect();
@@ -1195,7 +1201,11 @@ pub fn theme_button(mode: crate::theme::ThemeMode, shortcut: &str) -> String {
 pub fn head_html(view: &View) -> String {
     let (lead, tail) = subtitle(view.items);
     let tail = if tail.is_empty() { String::new() } else { format!(" \u{b7} <b>{}</b>", esc(&tail)) };
-    let sort = if view.show == Show::Mine { format!("{ICON_SORT}Par priorité") } else { "Dernières 24 h".to_string() };
+    let sort = match view.show {
+        Show::Mine => format!("{ICON_SORT}Par priorité"),
+        Show::InFlight => "En direct".to_string(),
+        Show::Done => "Dernières 24 h".to_string(),
+    };
     format!(
         "<div class=\"phead\"><div><div class=\"ptitle\">Cockpit</div><div class=\"psub\">{}{tail}</div></div>\
          <div class=\"hbtns\">{}<button type=\"button\" class=\"btn {}\" data-chat=\"toggle\">{ICON_CHAT}<span>Chat</span></button>{}</div></div>\
@@ -1247,6 +1257,7 @@ pub fn filters_html(view: &View) -> String {
             n: match show {
                 Show::Mine => view.items.iter().filter(|i| view.filter.keeps(i)).count(),
                 Show::InFlight => view.inflight_n,
+                Show::Done => view.done_n,
             },
             on: view.show == *show,
         })
@@ -1547,7 +1558,7 @@ body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
 .fm .fm-o .ok{width:13px;display:flex;color:var(--accent);visibility:hidden}
 .fm .fm-o.on .ok{visibility:visible}
 .fm .fm-o .c{margin-left:auto;font-size:11px;color:var(--t3)}
-.d.info{background:var(--info-dot)}
+.d.info{background:var(--info-dot)}.d.ok{background:var(--ok-dot)}
 .trk{display:flex;align-items:center;flex:none}
 .st{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--t3);white-space:nowrap}
 .st i{width:8px;height:8px;border-radius:50%;display:block;border:1.5px solid var(--t3);box-sizing:border-box}
@@ -2135,7 +2146,7 @@ mod tests {
     fn the_list_shows_ten_cards_then_voir_plus() {
         let items: Vec<Item> =
             (0..23).map(|i| from_attention(&entry(&format!("a-{i}"), Level::Now, Some(if i < 4 { 1 } else { 2 }), i), None, false).unwrap()).collect();
-        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0 };
+        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0 };
         let html = list_html(&view(PAGE_SIZE));
         assert_eq!(html.matches("<article").count(), 10);
         assert!(html.contains("data-more=\"1\"><span>Voir plus (13)</span>"));
@@ -2362,7 +2373,7 @@ mod tests {
             from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap(),
             from_attention(&perso, None, false).unwrap(),
         ];
-        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0 };
+        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0 };
         assert!(list_html(&view(Filter::All)).contains("attention:a-1"));
         let only = list_html(&view(Filter::Only(Scope::Perso)));
         assert!(only.contains("attention:a-2") && !only.contains("attention:a-1"));
@@ -2383,7 +2394,7 @@ mod tests {
         let view = |filter, show, inflight: &str| View {
             items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true,
             limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(),
-            theme: String::new(), show, inflight: inflight.to_string(), inflight_n: 4,
+            theme: String::new(), show, inflight: inflight.to_string(), inflight_n: 4, done_n: 7,
         };
         // Default: no chip, one `Filtrer` control, the sort label on the right.
         let head = head_html(&view(Filter::All, Show::Mine, ""));
@@ -2397,6 +2408,7 @@ mod tests {
         assert!(src.contains("<div class=\"fm-h\">Vue</div>"));
         assert!(src.contains("<button type=\"button\" class=\"fm-o on\" data-show=\"mine\">"), "À moi is the default, picked again it stays");
         assert!(src.contains("data-show=\"inflight\"><span class=\"ok\">") && src.contains("<span>En cours</span><span class=\"c\">4</span>"));
+        assert!(src.contains("data-show=\"done\"><span class=\"ok\">") && src.contains("<span>Fait (24 h)</span><span class=\"c\">7</span>"));
         assert!(list_html(&view(Filter::All, Show::Mine, "")).contains("attention:a-1"));
         // Two filters chosen: two chips with their cross, the control turns into `+`.
         let flight = view(Filter::Only(Scope::Pro), Show::InFlight, "<div class=\"clk\">X</div>");
@@ -2405,10 +2417,12 @@ mod tests {
         assert!(head.contains("<span class=\"ck\">Vue :</span> En cours</button>"));
         assert!(head.contains("class=\"cx\" data-filter=\"all\"") && head.contains("class=\"cx\" data-show=\"mine\""));
         assert!(head.contains("title=\"Ajouter un filtre\"") && !head.contains("<span>Filtrer</span>"));
-        assert!(head.contains("Dernières 24 h"));
+        assert!(head.contains("En direct"));
         assert_eq!(list_html(&flight), "<div class=\"clk\">X</div>");
         assert!(list_html(&view(Filter::All, Show::InFlight, "")).contains("Lecture en cours"));
         assert_eq!(Show::parse("inflight"), Some(Show::InFlight));
+        assert_eq!(Show::parse("done"), Some(Show::Done));
+        assert_eq!(list_html(&view(Filter::All, Show::Done, "<div class=\"clk\">D</div>")), "<div class=\"clk\">D</div>");
         assert_eq!(Show::parse("x"), None);
         // The page: the menu outside the head, refilled by a push, picked items posted.
         let page = shell(false, "n");
@@ -2423,13 +2437,13 @@ mod tests {
             from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap(),
             from_attention(&entry("a-1", Level::Point, None, 1), None, false).unwrap(),
         ];
-        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0 });
+        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0 });
         assert!(html.contains("Urgent <span class=\"k\">1</span>"));
         assert!(html.contains("Cette semaine <span class=\"k\">1</span>"));
         assert!(!html.contains("Aujourd'hui"));
         assert_eq!(subtitle(&items), ("2 actions pour toi".to_string(), "1 urgente".to_string()));
         assert_eq!(subtitle(&[]).0, "Aucune action pour toi");
-        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0 }).contains("Rien ne t'attend"));
+        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0 }).contains("Rien ne t'attend"));
     }
 
     #[test]
@@ -2590,7 +2604,7 @@ mod tests {
             limit: PAGE_SIZE, now: 0, band: band.to_string(), record: "<button data-rec=\"start\">R</button>".into(),
             record_note: "<div class=\"recn\">N</div>".into(),
             theme: theme_button(crate::theme::ThemeMode::Dark, "cmd+option+l"),
-            show: Show::Mine, inflight: String::new(), inflight_n: 0,
+            show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0,
         };
         let head = head_html(&view("<div class=\"cu\">B</div>"));
         let (title, band, bar) = (head.find("ptitle").unwrap(), head.find("class=\"cu\"").unwrap(), head.find("class=\"bar\"").unwrap());

@@ -56,6 +56,8 @@ pub struct Agent {
     pub name: String,
     pub state: String,
     pub doing: String,
+    /// When the session last wrote its status, epoch seconds.
+    pub since: u64,
     pub consignes: Vec<String>,
 }
 
@@ -101,6 +103,8 @@ struct RawAgent {
     #[serde(default)]
     doing: Option<String>,
     #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
     consignes: Vec<Value>,
 }
 
@@ -143,6 +147,7 @@ pub fn parse(text: &str) -> Option<InFlight> {
             name: a.name,
             state: a.state.unwrap_or_default(),
             doing: a.doing.unwrap_or_default(),
+            since: epoch(&a.since),
             consignes: a
                 .consignes
                 .into_iter()
@@ -180,24 +185,70 @@ pub fn step(c: &Click, now: u64) -> Step {
     }
 }
 
-/// What the filter's button counts: the clicks not done yet and the agents
-/// at work.
-pub fn count(data: &InFlight, scope: Option<Scope>, working: &dyn Fn(&str) -> bool, now: u64) -> usize {
-    let clicks = data.clicks.iter().filter(|c| scope.is_none_or(|s| c.scope == s) && step(c, now) != Step::Done).count();
-    clicks + agents(data, working).len()
+/// A click that is over: done, or a card the user withdrew (`Retiré`),
+/// which never shows as in flight (Robin, 10/11/2026).
+pub fn finished(c: &Click, now: u64) -> bool {
+    step(c, now) == Step::Done || c.button.eq_ignore_ascii_case("dismissed")
 }
 
-/// The agents the page lists: at work (the queue says so, or its pane runs
-/// now), or holding an open consigne.
-fn agents<'a>(data: &'a InFlight, working: &dyn Fn(&str) -> bool) -> Vec<(&'a Agent, bool)> {
-    let mut out: Vec<(&Agent, bool)> = data
-        .agents
-        .iter()
-        .map(|a| (a, a.state == "working" || working(&a.name)))
-        .filter(|(a, w)| *w || !a.consignes.is_empty())
-        .collect();
-    out.sort_by_key(|(a, w)| (!*w, std::cmp::Reverse(a.consignes.len())));
-    out
+/// The clicks one view keeps: `done` the finished ones, else the others.
+fn kept<'a>(data: &'a InFlight, scope: Option<Scope>, done: bool, now: u64) -> Vec<&'a Click> {
+    data.clicks.iter().filter(|c| scope.is_none_or(|s| c.scope == s) && finished(c, now) == done).collect()
+}
+
+/// What `En cours` counts: the clicks not over yet and the agents at work.
+pub fn count(data: &InFlight, scope: Option<Scope>, panes: &[Pane], now: u64) -> usize {
+    kept(data, scope, false, now).len() + agents(data, panes, now).0.len()
+}
+
+/// What `Fait (24 h)` counts.
+pub fn done_count(data: &InFlight, scope: Option<Scope>, now: u64) -> usize {
+    kept(data, scope, true, now).len()
+}
+
+/// A session a Kova pane holds: its name, and whether the pane works now.
+pub type Pane = (String, bool);
+
+/// A `working` status a session wrote longer ago than this, with no pane in
+/// Kova to vouch for it, is stale.
+pub const STATUS_FRESH_SECS: u64 = 1800;
+
+/// A session `En cours` lists.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Live<'a> {
+    pub name: &'a str,
+    pub doing: &'a str,
+    pub consignes: &'a [String],
+}
+
+/// The sessions at work now, and the open consignes held by the others.
+/// Liveness is read, not reported: a session in a Kova pane is at work when
+/// its pane works, whatever its last status says (Robin, 10/11/2026). A
+/// session with no pane counts on a fresh `working` status. Its status text
+/// shows only while that status says `working`; holding a consigne alone
+/// never lists a session.
+fn agents<'a>(data: &'a InFlight, panes: &'a [Pane], now: u64) -> (Vec<Live<'a>>, usize) {
+    let status = |n: &str| data.agents.iter().find(|a| a.name == n);
+    let mut out: Vec<Live> = Vec::new();
+    for (name, working) in panes {
+        if *working && !out.iter().any(|l| l.name == name) {
+            let a = status(name);
+            out.push(Live {
+                name,
+                doing: a.filter(|a| a.state == "working").map(|a| a.doing.as_str()).unwrap_or(""),
+                consignes: a.map(|a| a.consignes.as_slice()).unwrap_or(&[]),
+            });
+        }
+    }
+    for a in &data.agents {
+        let in_pane = panes.iter().any(|(n, _)| *n == a.name);
+        if !in_pane && a.state == "working" && now.saturating_sub(a.since) < STATUS_FRESH_SECS {
+            out.push(Live { name: &a.name, doing: &a.doing, consignes: &a.consignes });
+        }
+    }
+    out.sort_by(|x, y| x.name.cmp(y.name));
+    let idle = data.agents.iter().filter(|a| !out.iter().any(|l| l.name == a.name)).map(|a| a.consignes.len()).sum();
+    (out, idle)
 }
 
 /// What the page calls a button.
@@ -285,8 +336,7 @@ fn click_html(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
     )
 }
 
-fn agent_html(a: &Agent, working: bool) -> String {
-    let (dot, state) = if working { ("var(--info-dot)", "au travail") } else { ("var(--tag-gray)", "") };
+fn agent_html(a: &Live) -> String {
     let consignes = match a.consignes.len() {
         0 => String::new(),
         n => format!(
@@ -295,18 +345,32 @@ fn agent_html(a: &Agent, working: bool) -> String {
             esc(&one_line(&a.consignes[0], 160))
         ),
     };
-    let doing = if a.doing.trim().is_empty() { String::new() } else { format!("<div>{}</div>", esc(&one_line(&a.doing, 160))) };
+    let doing = if a.doing.trim().is_empty() { String::new() } else { format!("<div>{}</div>", esc(&one_line(a.doing, 160))) };
     format!(
-        "<div class=\"ag\"><div class=\"p\"><i style=\"background:{dot}\"></i><span>{}</span></div><div>{doing}{consignes}</div><span class=\"m\">{state}</span></div>",
-        esc(&a.name)
+        "<div class=\"ag\"><div class=\"p\"><i style=\"background:var(--info-dot)\"></i><span>{}</span></div><div>{doing}{consignes}</div><span class=\"m\">au travail</span></div>",
+        esc(a.name)
     )
 }
 
-/// The `En cours` list: the user's clicks, then the agents at work. `scope`
-/// keeps one side's clicks (the agents have no side).
-pub fn list_html(data: &InFlight, scope: Option<Scope>, working: &dyn Fn(&str) -> bool, now: u64, clock: &dyn Fn(u64) -> String) -> String {
-    let clicks: Vec<&Click> = data.clicks.iter().filter(|c| scope.is_none_or(|s| c.scope == s)).collect();
-    let listed = agents(data, working);
+/// The `Fait (24 h)` list: the clicks over, the latest first.
+pub fn done_html(data: &InFlight, scope: Option<Scope>, now: u64, clock: &dyn Fn(u64) -> String) -> String {
+    let clicks = kept(data, scope, true, now);
+    if clicks.is_empty() {
+        return "<p class=\"empty\">Rien de fait ces dernières 24 h</p>".to_string();
+    }
+    let mut out = format!("<div class=\"sec-h\"><span class=\"d ok\"></span>Fait <span class=\"k\">{}</span></div>", clicks.len());
+    for c in clicks {
+        out.push_str(&click_html(c, now, clock));
+    }
+    out
+}
+
+/// The `En cours` list: the user's clicks not over yet, then the agents at
+/// work. `scope` keeps one side's clicks (the agents have no side). What is
+/// over leaves it at once for `Fait (24 h)`.
+pub fn list_html(data: &InFlight, scope: Option<Scope>, panes: &[Pane], now: u64, clock: &dyn Fn(u64) -> String) -> String {
+    let clicks = kept(data, scope, false, now);
+    let (listed, idle) = agents(data, panes, now);
     if clicks.is_empty() && listed.is_empty() {
         return "<p class=\"empty\">Rien en cours pour toi</p>".to_string();
     }
@@ -320,20 +384,18 @@ pub fn list_html(data: &InFlight, scope: Option<Scope>, working: &dyn Fn(&str) -
             out.push_str(&click_html(c, now, clock));
         }
     }
-    if !listed.is_empty() || data.waiting_others > 0 {
+    if !listed.is_empty() {
         out.push_str(&format!(
             "<div class=\"sec-h\"><span class=\"d info\"></span>Agents au travail pour toi <span class=\"k\">{}</span></div><div class=\"box\">",
             listed.len()
         ));
-        for (a, w) in listed {
-            out.push_str(&agent_html(a, w));
+        for a in &listed {
+            out.push_str(&agent_html(a));
         }
-        if data.waiting_others > 0 {
-            let n = data.waiting_others;
+        if idle > 0 {
             out.push_str(&format!(
-                "<div class=\"fold\">{n} session{} attend{} quelqu'un d'autre (revue, merge)</div>",
-                if n > 1 { "s" } else { "" },
-                if n > 1 { "ent" } else { "" }
+                "<div class=\"fold\">{idle} consigne{} chez des sessions au repos</div>",
+                if idle > 1 { "s" } else { "" }
             ));
         }
         out.push_str("</div>");
@@ -473,38 +535,63 @@ mod tests {
         let data = parse(SAMPLE).unwrap();
         let now = at("2026-11-10T15:10:00+01:00");
         let clock = |t: u64| crate::catchup::clock(t, 3600);
-        let html = list_html(&data, None, &|_| false, now, &clock);
+        // Both views together: the done click sits in `Fait (24 h)`.
+        let html = list_html(&data, None, &[], now, &clock) + &done_html(&data, None, now, &clock);
         assert!(html.contains("Réponse à &lt;Alex&gt;"), "{html}");
         assert!(html.contains("\u{ab} il a répondu depuis, mets à jour \u{bb}"), "{html}");
         assert!(html.contains("<span class=\"st ok\"><i></i>Fait <em>14h49</em></span>"), "{html}");
         assert!(html.contains("<b>Résultat :</b> carte mise à jour"));
         assert!(html.contains("<span class=\"st run\"><i></i>En cours</span>"));
         assert!(html.contains("class=\"clk warn\"") && html.contains("Pas encore reçu <em>8 min</em>"), "{html}");
-        let pro = list_html(&data, Some(Scope::Pro), &|_| false, now, &clock);
+        let pro = list_html(&data, Some(Scope::Pro), &[], now, &clock);
         assert!(!pro.contains("Montre") && pro.contains("Mail à Sam"));
     }
 
     #[test]
-    fn agents_at_work_or_holding_a_consigne_are_listed_a_running_pane_counts() {
-        let data = parse(SAMPLE).unwrap();
+    fn the_agents_at_work_are_the_working_panes_never_a_stale_status() {
+        let mut data = parse(SAMPLE).unwrap();
         let now = at("2026-11-10T15:10:00+01:00");
         let clock = |t: u64| crate::catchup::clock(t, 3600);
-        let html = list_html(&data, None, &|_| false, now, &clock);
-        assert!(html.contains("builder") && html.contains("1 consigne :"), "{html}");
-        assert!(!html.contains("<span>claap-agent</span>"), "no consigne, not working: not listed");
-        assert!(!html.contains("<span>idle</span>"));
-        assert!(html.contains("11 sessions attendent quelqu'un d'autre"));
-        let working = list_html(&data, None, &|n| n == "claap-agent", now, &clock);
-        assert!(working.contains("<span>claap-agent</span></div><div></div><span class=\"m\">au travail</span>"), "{working}");
-        // Counted: the two clicks not done and the listed agents.
-        assert_eq!(count(&data, None, &|_| false, now), 3);
-        assert_eq!(count(&data, Some(Scope::Pro), &|n| n == "claap-agent", now), 3);
+        data.agents.push(Agent { name: "headless".into(), state: "working".into(), doing: "nuit".into(), since: now - 60, consignes: vec![] });
+        data.agents.push(Agent { name: "old".into(), state: "working".into(), doing: "vieux".into(), since: now - 7200, consignes: vec![] });
+        // builder's pane works: listed, its stale `done` text hidden, its consigne kept;
+        // night-qa is only a pane: listed; idle's pane rests: not listed, whatever it wrote.
+        let panes = vec![("builder".to_string(), true), ("night-qa".to_string(), true), ("idle".to_string(), false)];
+        let html = list_html(&data, None, &panes, now, &clock);
+        assert!(html.contains("<span>builder</span></div><div><div class=\"k\"><b>1 consigne :</b> Un filtre de plus</div></div>"), "{html}");
+        assert!(html.contains("<span>night-qa</span>") && html.contains("<span>headless</span>") && html.contains("nuit"));
+        assert!(!html.contains("<span>idle</span>") && !html.contains("<span>old</span>") && !html.contains("vieux"), "{html}");
+        assert!(html.contains("Agents au travail pour toi <span class=\"k\">3</span>"));
+        // No pane works: builder's consigne alone lists nobody, it goes to the fold.
+        let rest = list_html(&data, None, &[("builder".to_string(), false)], now, &clock);
+        assert!(!rest.contains("<span>builder</span>") && rest.contains("1 consigne chez des sessions au repos") == rest.contains("Agents au travail"), "{rest}");
+        assert_eq!(count(&data, None, &panes, now), 2 + 3);
+    }
+
+    #[test]
+    fn en_cours_keeps_only_what_moves_fait_keeps_the_rest() {
+        let mut data = parse(SAMPLE).unwrap();
+        let now = at("2026-11-10T15:10:00+01:00");
+        let clock = |t: u64| crate::catchup::clock(t, 3600);
+        let mut withdrawn = data.clicks[1].clone();
+        withdrawn.id = "c-x".into();
+        withdrawn.button = "dismissed".into();
+        withdrawn.title = "Carte retirée".into();
+        data.clicks.push(withdrawn);
+        let live = list_html(&data, None, &[], now, &clock);
+        assert!(!live.contains("Alex"), "a done click leaves En cours: {live}");
+        assert!(!live.contains("Carte retirée"), "Retiré never shows in En cours");
+        assert!(live.contains("Tes clics <span class=\"k\">2</span>"), "{live}");
+        let done = done_html(&data, None, now, &clock);
+        assert!(done.contains("Alex") && done.contains("Carte retirée"), "{done}");
+        assert!(!done.contains("Agents au travail"));
+        assert_eq!((count(&data, None, &[], now), done_count(&data, None, now)), (2, 2));
     }
 
     #[test]
     fn nothing_in_flight_says_so() {
         let empty = InFlight::default();
-        assert!(list_html(&empty, None, &|_| false, 0, &|_| String::new()).contains("Rien en cours pour toi"));
+        assert!(list_html(&empty, None, &[], 0, &|_| String::new()).contains("Rien en cours pour toi"));
     }
 }
 
@@ -531,21 +618,25 @@ mod preview {
             entries.iter().filter_map(|e| crate::cockpit::from_attention(e, None, true)).collect();
         crate::cockpit::sort(&mut items);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let working = |n: &str| n == "claap-agent";
+        let working: Vec<super::Pane> = std::env::var("KOVA_PANES_JSON")
+            .ok()
+            .and_then(|f| serde_json::from_str(&std::fs::read_to_string(f).ok()?).ok())
+            .unwrap_or_else(|| vec![("claap-agent".to_string(), true)]);
         let page = |name: &str, filter: Filter, show: Show, script: &str| {
             let scope = match filter {
                 Filter::All => None,
                 Filter::Only(s) => Some(s),
             };
-            let inflight = if show == Show::InFlight {
-                super::list_html(&data, scope, &working, now, &crate::catchup::local_clock)
-            } else {
-                String::new()
+            let inflight = match show {
+                Show::InFlight => super::list_html(&data, scope, &working, now, &crate::catchup::local_clock),
+                Show::Done => super::done_html(&data, scope, now, &crate::catchup::local_clock),
+                Show::Mine => String::new(),
             };
             let view = View {
                 items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true,
                 limit: crate::cockpit::PAGE_SIZE, now, band: String::new(), record: String::new(), record_note: String::new(),
                 theme: String::new(), show, inflight, inflight_n: super::count(&data, scope, &working, now),
+                done_n: super::done_count(&data, scope, now),
             };
             let (head, body, chat) = crate::cockpit::parts(&view);
             let update = crate::cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };
@@ -558,6 +649,8 @@ mod preview {
         page("default.html", Filter::All, Show::Mine, "");
         page("menu.html", Filter::All, Show::Mine, ";document.querySelector('[data-fopen]').click()");
         page("chips.html", Filter::Only(Scope::Pro), Show::InFlight, "");
+        page("en-cours.html", Filter::All, Show::InFlight, "");
+        page("fait.html", Filter::All, Show::Done, "");
     }
     /// `KOVA_CARD_JSON=<attn list --json with one card> KOVA_PREVIEW_DIR=<dir> cargo test --lib
     /// inflight::preview::write_a_card_with_its_source -- --ignored` writes `card.html` (the card opened, its
@@ -578,7 +671,7 @@ mod preview {
         let view = View {
             items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
             limit: crate::cockpit::PAGE_SIZE, now, band: String::new(), record: String::new(), record_note: String::new(),
-            theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0,
+            theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0, done_n: 0,
         };
         let (head, body, chat) = crate::cockpit::parts(&view);
         let update = crate::cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };
