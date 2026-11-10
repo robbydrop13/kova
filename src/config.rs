@@ -300,6 +300,9 @@ pub struct AttentionConfig {
     /// Marks the band read, now (`attn seen`). Absent: `command`'s program
     /// with `seen`.
     pub seen_command: Vec<String>,
+    /// Prints the Cockpit's `En cours` list as JSON (`attn inflight --json`,
+    /// `crate::inflight`). Absent: `command`'s program with `inflight --json`.
+    pub inflight_command: Vec<String>,
     /// The folder whose work is personal (`"~/Perso"`): a failed routine,
     /// a permission or an error whose cwd sits under it is scoped Perso in
     /// the Cockpit, anything else Pro. Empty: everything is Pro.
@@ -327,6 +330,15 @@ impl AttentionConfig {
             self.command.first().map(|bin| std::iter::once(bin.clone()).chain(words.iter().map(|w| w.to_string())).collect()).unwrap_or_default()
         };
         crate::catchup::Commands { read: or_list(&self.catchup_command, &["catchup", "--json"]), seen: or_list(&self.seen_command, &["seen"]) }
+    }
+
+    /// The `En cours` filter's command: as given, or the list command's
+    /// program with `inflight --json`.
+    pub fn inflight_command(&self) -> Vec<String> {
+        if !self.inflight_command.is_empty() {
+            return self.inflight_command.clone();
+        }
+        self.command.first().map(|bin| vec![bin.clone(), "inflight".to_string(), "--json".to_string()]).unwrap_or_default()
     }
 
     /// `attn add`, for the Cockpit's recording (`crate::record`): `command`'s
@@ -834,6 +846,7 @@ mod tests {
         assert_eq!(none.attention.perso_root(), None);
         let catchup = config.attention.catchup_commands();
         assert_eq!(catchup.read, ["/usr/local/bin/attn", "catchup", "--json"]);
+        assert_eq!(config.attention.inflight_command(), ["/usr/local/bin/attn", "inflight", "--json"]);
         assert_eq!(catchup.seen, ["/usr/local/bin/attn", "seen"]);
         assert_eq!(none.attention.catchup_commands(), crate::catchup::Commands::default());
         let given: Config = toml::from_str("[attention]\ncommand = [\"/a\"]\ncatchup_command = [\"/b\", \"x\"]\n").unwrap();

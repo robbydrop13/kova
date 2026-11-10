@@ -1,0 +1,535 @@
+//! The Cockpit's `En cours` filter (`docs/cockpit.md` § Filtres): what the
+//! agents do for the user, as `attn inflight --json` prints it. Every click
+//! the user gave (a go, a correction, a consigne, a removal) followed through
+//! `Envoyé`, `Reçu`, `Fait`, and the sessions at work with their open
+//! consignes.
+//!
+//! Read like the catch-up band (`crate::catchup`): cached, refreshed on a
+//! background thread at most every `MAX_AGE_SECS` while the page shows it,
+//! never on the tick. Every text is escaped into the HTML here.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::attention::Scope;
+
+/// How long a read stays fresh while the filter is on.
+pub const MAX_AGE_SECS: u64 = 15;
+/// A click received that long ago and still not done is not late; one not
+/// received after that is.
+pub const LATE_SECS: u64 = 180;
+const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InFlight {
+    pub clicks: Vec<Click>,
+    pub agents: Vec<Agent>,
+    /// Sessions that wait on someone else (a review, a merge), not listed.
+    pub waiting_others: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Click {
+    pub id: String,
+    pub scope: Scope,
+    /// The button as the queue records it: `Valider`, `Corriger`,
+    /// `instruct`, `dismissed`.
+    pub button: String,
+    pub title: String,
+    pub text: String,
+    /// The session the click goes to.
+    pub to: String,
+    /// Epoch seconds; 0 when not yet.
+    pub sent: u64,
+    pub received: u64,
+    pub done: u64,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Agent {
+    pub name: String,
+    pub state: String,
+    pub doing: String,
+    pub consignes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawInFlight {
+    #[serde(default)]
+    clicks: Vec<Value>,
+    #[serde(default)]
+    agents: Vec<Value>,
+    #[serde(default)]
+    waiting_others: usize,
+}
+
+#[derive(Deserialize)]
+struct RawClick {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    button: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    sent: Option<String>,
+    #[serde(default)]
+    received: Option<String>,
+    #[serde(default)]
+    done: Option<String>,
+    #[serde(default)]
+    result: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawAgent {
+    name: String,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    doing: Option<String>,
+    #[serde(default)]
+    consignes: Vec<Value>,
+}
+
+fn epoch(ts: &Option<String>) -> u64 {
+    ts.as_deref().and_then(crate::attention::epoch_of).unwrap_or(0)
+}
+
+/// Parse the CLI's answer. `None` when it is not the expected object; a click
+/// or an agent that does not read is skipped alone.
+pub fn parse(text: &str) -> Option<InFlight> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let raw: RawInFlight = serde_json::from_value(value).ok()?;
+    let clicks = raw
+        .clicks
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<RawClick>(v).ok())
+        .filter(|c| !c.button.trim().is_empty())
+        .map(|c| Click {
+            sent: epoch(&c.sent),
+            received: epoch(&c.received),
+            done: epoch(&c.done),
+            id: c.id,
+            scope: if c.scope.as_deref() == Some("perso") { Scope::Perso } else { Scope::Pro },
+            button: c.button,
+            title: c.title.unwrap_or_default(),
+            text: c.text.unwrap_or_default(),
+            to: c.to.unwrap_or_default(),
+            result: c.result.unwrap_or_default(),
+        })
+        .collect();
+    let agents = raw
+        .agents
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<RawAgent>(v).ok())
+        .filter(|a| !a.name.trim().is_empty())
+        .map(|a| Agent {
+            name: a.name,
+            state: a.state.unwrap_or_default(),
+            doing: a.doing.unwrap_or_default(),
+            consignes: a
+                .consignes
+                .into_iter()
+                .filter_map(|c| c.get("text").and_then(Value::as_str).map(str::to_string))
+                .filter(|t| !t.trim().is_empty())
+                .collect(),
+        })
+        .collect();
+    Some(InFlight { clicks, agents, waiting_others: raw.waiting_others })
+}
+
+// ---------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------
+
+/// Where a click stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Sent,
+    /// Sent `LATE_SECS` ago or more and still not received.
+    Late,
+    Received,
+    Done,
+}
+
+pub fn step(c: &Click, now: u64) -> Step {
+    if c.done > 0 {
+        Step::Done
+    } else if c.received > 0 {
+        Step::Received
+    } else if c.sent > 0 && now.saturating_sub(c.sent) >= LATE_SECS {
+        Step::Late
+    } else {
+        Step::Sent
+    }
+}
+
+/// What the filter's button counts: the clicks not done yet and the agents
+/// at work.
+pub fn count(data: &InFlight, scope: Option<Scope>, working: &dyn Fn(&str) -> bool, now: u64) -> usize {
+    let clicks = data.clicks.iter().filter(|c| scope.is_none_or(|s| c.scope == s) && step(c, now) != Step::Done).count();
+    clicks + agents(data, working).len()
+}
+
+/// The agents the page lists: at work (the queue says so, or its pane runs
+/// now), or holding an open consigne.
+fn agents<'a>(data: &'a InFlight, working: &dyn Fn(&str) -> bool) -> Vec<(&'a Agent, bool)> {
+    let mut out: Vec<(&Agent, bool)> = data
+        .agents
+        .iter()
+        .map(|a| (a, a.state == "working" || working(&a.name)))
+        .filter(|(a, w)| *w || !a.consignes.is_empty())
+        .collect();
+    out.sort_by_key(|(a, w)| (!*w, std::cmp::Reverse(a.consignes.len())));
+    out
+}
+
+/// What the page calls a button.
+fn verb(button: &str) -> (&'static str, &'static str) {
+    match button.to_lowercase().as_str() {
+        "valider" | "envoyer" | "send" => ("Valider", ""),
+        "corriger" => ("Corriger", ""),
+        "instruct" => ("Consigne", " c"),
+        "dismissed" => ("Retiré", " c"),
+        "done" => ("Fait", " c"),
+        _ => ("Clic", " c"),
+    }
+}
+
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn one_line(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(max).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
+fn tracker(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
+    let at = |t: u64| if t > 0 { format!(" <em>{}</em>", esc(&clock(t))) } else { String::new() };
+    let st = step(c, now);
+    let second = match st {
+        Step::Late => {
+            let mins = now.saturating_sub(c.sent) / 60;
+            format!("<span class=\"st warn\"><i></i>Pas encore reçu <em>{mins} min</em></span>")
+        }
+        Step::Sent => "<span class=\"st\"><i></i>Reçu</span>".to_string(),
+        _ => format!("<span class=\"st ok\"><i></i>Reçu{}</span>", at(c.received)),
+    };
+    let third = match st {
+        Step::Done => format!("<span class=\"st ok\"><i></i>Fait{}</span>", at(c.done)),
+        Step::Received => "<span class=\"st run\"><i></i>En cours</span>".to_string(),
+        _ => "<span class=\"st\"><i></i>Fait</span>".to_string(),
+    };
+    let line = |ok: bool| format!("<span class=\"sep{}\"></span>", if ok { " ok" } else { "" });
+    format!(
+        "<div class=\"trk\"><span class=\"st ok\"><i></i>Envoyé{}</span>{}{second}{}{third}</div>",
+        at(c.sent),
+        line(c.received > 0),
+        line(c.done > 0)
+    )
+}
+
+fn click_html(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
+    let (word, class) = verb(&c.button);
+    let quote = if c.text.trim().is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"q\">\u{ab} {} \u{bb}</div>", esc(&one_line(&c.text, 220)))
+    };
+    let res = match step(c, now) {
+        Step::Done if !c.result.trim().is_empty() => format!("<span><b>Résultat :</b> {}</span>", esc(&one_line(&c.result, 160))),
+        Step::Late => "<span>Pas encore remis : il le sera à son prochain outil, ou réveillé s'il dort</span>".to_string(),
+        _ => String::new(),
+    };
+    format!(
+        "<div class=\"clk{}\" data-act-card=\"{}\"><div class=\"row\"><div class=\"txt\"><div class=\"t\"><span class=\"verb{class}\">{word}</span>{}</div>{quote}\
+         <div class=\"res\"><span class=\"tag\"><i></i>{}</span>{res}</div></div>{}</div></div>",
+        if step(c, now) == Step::Late { " warn" } else { "" },
+        esc(&c.id),
+        esc(&c.title),
+        esc(&c.to),
+        tracker(c, now, clock),
+    )
+}
+
+fn agent_html(a: &Agent, working: bool) -> String {
+    let (dot, state) = if working { ("var(--info-dot)", "au travail") } else { ("var(--tag-gray)", "") };
+    let consignes = match a.consignes.len() {
+        0 => String::new(),
+        n => format!(
+            "<div class=\"k\"><b>{}</b> {}</div>",
+            if n == 1 { "1 consigne :".to_string() } else { format!("{n} consignes, dont :") },
+            esc(&one_line(&a.consignes[0], 160))
+        ),
+    };
+    let doing = if a.doing.trim().is_empty() { String::new() } else { format!("<div>{}</div>", esc(&one_line(&a.doing, 160))) };
+    format!(
+        "<div class=\"ag\"><div class=\"p\"><i style=\"background:{dot}\"></i><span>{}</span></div><div>{doing}{consignes}</div><span class=\"m\">{state}</span></div>",
+        esc(&a.name)
+    )
+}
+
+/// The `En cours` list: the user's clicks, then the agents at work. `scope`
+/// keeps one side's clicks (the agents have no side).
+pub fn list_html(data: &InFlight, scope: Option<Scope>, working: &dyn Fn(&str) -> bool, now: u64, clock: &dyn Fn(u64) -> String) -> String {
+    let clicks: Vec<&Click> = data.clicks.iter().filter(|c| scope.is_none_or(|s| c.scope == s)).collect();
+    let listed = agents(data, working);
+    if clicks.is_empty() && listed.is_empty() {
+        return "<p class=\"empty\">Rien en cours pour toi</p>".to_string();
+    }
+    let mut out = String::new();
+    if !clicks.is_empty() {
+        out.push_str(&format!(
+            "<div class=\"sec-h\"><span class=\"d info\"></span>Tes clics <span class=\"k\">{}</span></div>",
+            clicks.len()
+        ));
+        for c in clicks {
+            out.push_str(&click_html(c, now, clock));
+        }
+    }
+    if !listed.is_empty() || data.waiting_others > 0 {
+        out.push_str(&format!(
+            "<div class=\"sec-h\"><span class=\"d info\"></span>Agents au travail pour toi <span class=\"k\">{}</span></div><div class=\"box\">",
+            listed.len()
+        ));
+        for (a, w) in listed {
+            out.push_str(&agent_html(a, w));
+        }
+        if data.waiting_others > 0 {
+            let n = data.waiting_others;
+            out.push_str(&format!(
+                "<div class=\"fold\">{n} session{} attend{} quelqu'un d'autre (revue, merge)</div>",
+                if n > 1 { "s" } else { "" },
+                if n > 1 { "ent" } else { "" }
+            ));
+        }
+        out.push_str("</div>");
+    }
+    out
+}
+
+// ---------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------
+
+static COMMAND: RwLock<Vec<String>> = RwLock::new(Vec::new());
+static CACHE: RwLock<Option<Arc<InFlight>>> = RwLock::new(None);
+static FILLED_AT: AtomicU64 = AtomicU64::new(0);
+static REFRESHING: AtomicBool = AtomicBool::new(false);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Adopt the configured command; an empty one turns the filter's list off.
+pub fn set_command(argv: &[String]) {
+    if *COMMAND.read() == argv {
+        return;
+    }
+    *COMMAND.write() = argv.to_vec();
+    *CACHE.write() = None;
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    FILLED_AT.store(0, Ordering::Relaxed);
+}
+
+/// The list as last read, and a read in the background once it aged out.
+/// `None` while off or before the first read lands.
+pub fn snapshot() -> Option<Arc<InFlight>> {
+    let argv = COMMAND.read().clone();
+    if argv.is_empty() {
+        return None;
+    }
+    let age = now_secs().saturating_sub(FILLED_AT.load(Ordering::Relaxed));
+    if age >= MAX_AGE_SECS && !REFRESHING.swap(true, Ordering::AcqRel) {
+        let generation = GENERATION.load(Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let read = read(&argv);
+            if GENERATION.load(Ordering::Relaxed) == generation {
+                if let Some(data) = read {
+                    *CACHE.write() = Some(Arc::new(data));
+                }
+                FILLED_AT.store(now_secs(), Ordering::Relaxed);
+            }
+            REFRESHING.store(false, Ordering::Release);
+        });
+    }
+    CACHE.read().clone()
+}
+
+/// Read again on the next `snapshot`: the filter was switched on.
+pub fn refresh() {
+    FILLED_AT.store(0, Ordering::Relaxed);
+}
+
+fn read(argv: &[String]) -> Option<InFlight> {
+    let (bin, args) = argv.split_first()?;
+    if !Path::new(bin).is_file() {
+        log::warn!("inflight: {bin} is not a file");
+        return None;
+    }
+    let out = match crate::exec::run_with_deadline(std::process::Command::new(bin).args(args), READ_DEADLINE) {
+        Ok(out) => out,
+        Err(e) => {
+            log::warn!("inflight: {e}");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        log::warn!("inflight: {bin} exited with {}", out.status);
+        return None;
+    }
+    let data = parse(&String::from_utf8_lossy(&out.stdout));
+    if data.is_none() {
+        log::warn!("inflight: cannot read the list");
+    }
+    data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"{
+ "clicks": [
+  {"act_id": "c-1", "id": "a-1", "scope": "pro", "button": "instruct", "title": "Réponse à <Alex>",
+   "text": "il a répondu depuis,\n mets à jour", "to": "claap-agent",
+   "sent": "2026-11-10T14:46:35+01:00", "received": "2026-11-10T14:47:00+01:00", "done": "2026-11-10T14:49:54+01:00",
+   "result": "carte mise à jour"},
+  {"act_id": "c-2", "id": "a-2", "scope": "pro", "button": "Valider", "title": "Mail à Sam", "text": null,
+   "to": "claap-agent", "sent": "2026-11-10T14:48:01+01:00", "received": "2026-11-10T14:48:02+01:00", "done": null},
+  {"act_id": "c-3", "id": "a-3", "scope": "perso", "button": "instruct", "title": "Montre", "text": "teste",
+   "to": "watch-app", "sent": "2026-11-10T15:02:00+01:00", "received": null, "done": null},
+  {"act_id": "c-4", "title": "no button"}
+ ],
+ "agents": [
+  {"name": "builder", "state": "done", "doing": "x", "consignes": [{"id": "k-1", "text": "Un filtre de plus"}]},
+  {"name": "claap-agent", "state": null, "doing": null, "consignes": []},
+  {"name": "idle", "state": "awaiting-you", "doing": "rien", "consignes": []}
+ ],
+ "waiting_others": 11
+}"#;
+
+    fn at(ts: &str) -> u64 {
+        crate::attention::epoch_of(ts).unwrap()
+    }
+
+    #[test]
+    fn the_cli_answer_parses_and_a_click_without_button_is_skipped() {
+        let data = parse(SAMPLE).expect("parses");
+        assert_eq!(data.clicks.len(), 3);
+        assert_eq!(data.clicks[2].scope, Scope::Perso);
+        assert_eq!(data.clicks[1].done, 0);
+        assert_eq!(data.agents[0].consignes, ["Un filtre de plus"]);
+        assert_eq!(data.waiting_others, 11);
+        assert_eq!(parse("[]"), None);
+    }
+
+    #[test]
+    fn a_click_steps_from_sent_to_done_and_turns_late_when_not_received() {
+        let data = parse(SAMPLE).unwrap();
+        let now = at("2026-11-10T15:10:00+01:00");
+        assert_eq!(step(&data.clicks[0], now), Step::Done);
+        assert_eq!(step(&data.clicks[1], now), Step::Received);
+        assert_eq!(step(&data.clicks[2], now), Step::Late);
+        assert_eq!(step(&data.clicks[2], at("2026-11-10T15:02:30+01:00")), Step::Sent);
+    }
+
+    #[test]
+    fn the_list_shows_the_tracker_escaped_and_the_scope_filter_keeps_one_side() {
+        let data = parse(SAMPLE).unwrap();
+        let now = at("2026-11-10T15:10:00+01:00");
+        let clock = |t: u64| crate::catchup::clock(t, 3600);
+        let html = list_html(&data, None, &|_| false, now, &clock);
+        assert!(html.contains("Réponse à &lt;Alex&gt;"), "{html}");
+        assert!(html.contains("\u{ab} il a répondu depuis, mets à jour \u{bb}"), "{html}");
+        assert!(html.contains("<span class=\"st ok\"><i></i>Fait <em>14h49</em></span>"), "{html}");
+        assert!(html.contains("<b>Résultat :</b> carte mise à jour"));
+        assert!(html.contains("<span class=\"st run\"><i></i>En cours</span>"));
+        assert!(html.contains("class=\"clk warn\"") && html.contains("Pas encore reçu <em>8 min</em>"), "{html}");
+        let pro = list_html(&data, Some(Scope::Pro), &|_| false, now, &clock);
+        assert!(!pro.contains("Montre") && pro.contains("Mail à Sam"));
+    }
+
+    #[test]
+    fn agents_at_work_or_holding_a_consigne_are_listed_a_running_pane_counts() {
+        let data = parse(SAMPLE).unwrap();
+        let now = at("2026-11-10T15:10:00+01:00");
+        let clock = |t: u64| crate::catchup::clock(t, 3600);
+        let html = list_html(&data, None, &|_| false, now, &clock);
+        assert!(html.contains("builder") && html.contains("1 consigne :"), "{html}");
+        assert!(!html.contains("<span>claap-agent</span>"), "no consigne, not working: not listed");
+        assert!(!html.contains("<span>idle</span>"));
+        assert!(html.contains("11 sessions attendent quelqu'un d'autre"));
+        let working = list_html(&data, None, &|n| n == "claap-agent", now, &clock);
+        assert!(working.contains("<span>claap-agent</span></div><div></div><span class=\"m\">au travail</span>"), "{working}");
+        // Counted: the two clicks not done and the listed agents.
+        assert_eq!(count(&data, None, &|_| false, now), 3);
+        assert_eq!(count(&data, Some(Scope::Pro), &|n| n == "claap-agent", now), 3);
+    }
+
+    #[test]
+    fn nothing_in_flight_says_so() {
+        let empty = InFlight::default();
+        assert!(list_html(&empty, None, &|_| false, 0, &|_| String::new()).contains("Rien en cours pour toi"));
+    }
+}
+
+#[cfg(test)]
+mod preview {
+    /// A page to look at, not a check: `KOVA_INFLIGHT_JSON=<attn inflight --json> KOVA_PREVIEW_OUT=<file.html>
+    /// cargo test --lib inflight::preview -- --ignored` writes the Cockpit under `En cours` as Kova shows it.
+    #[test]
+    #[ignore]
+    fn write_the_en_cours_page() {
+        let (Ok(src), Ok(out)) = (std::env::var("KOVA_INFLIGHT_JSON"), std::env::var("KOVA_PREVIEW_OUT")) else { return };
+        let data = super::parse(&std::fs::read_to_string(src).unwrap()).expect("inflight json");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let working = |n: &str| n == "claap-agent";
+        let list = super::list_html(&data, None, &working, now, &crate::catchup::local_clock);
+        let items: Vec<crate::cockpit::Item> = Vec::new();
+        let view = crate::cockpit::View {
+            items: &items, filter: crate::cockpit::Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
+            limit: crate::cockpit::PAGE_SIZE, now, band: String::new(), record: String::new(), record_note: String::new(),
+            theme: String::new(), show: crate::cockpit::Show::InFlight, inflight: list, inflight_n: super::count(&data, None, &working, now),
+        };
+        let (head, body, chat) = crate::cockpit::parts(&view);
+        let update = crate::cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };
+        let page = crate::cockpit::shell(false, "preview")
+            .replace("</body>", &format!("<script nonce=\"preview\">{}</script></body>", crate::cockpit::update_script(&update)));
+        std::fs::write(out, page).unwrap();
+    }
+}

@@ -32,7 +32,7 @@ use objc2_web_kit::{
 use serde_json::Value;
 
 use crate::attention::{Scope, Verb};
-use crate::cockpit::{self, Button, ChatColumn, Detail, Filter, Item, Kind, RoutineAct, State, Update, View};
+use crate::cockpit::{self, Button, ChatColumn, Detail, Filter, Item, Kind, RoutineAct, Show, State, Update, View};
 use crate::routines::Routine;
 use crate::surface::PaneId;
 
@@ -69,6 +69,8 @@ pub struct CockpitSlot {
     chat_hidden: Cell<bool>,
     chief: Cell<Scope>,
     filter: Cell<Filter>,
+    /// The second filter: `À moi` (default) or `En cours`.
+    show: Cell<Show>,
     frame: Cell<Option<Frame>>,
     /// The chat's place this tick, read by `chat_view`.
     chat_target: Cell<Option<(PaneId, Frame)>>,
@@ -397,7 +399,24 @@ impl KovaView {
             }
         }
         page.prompts = prompts;
+        // `En cours`: read in the background, counted on its button even
+        // while `À moi` shows; a running pane marks its session at work.
+        let show = slot.show.get();
+        let flight = crate::inflight::snapshot();
+        let working = |name: &str| self.session_working(name);
+        let scope = match slot.filter.get() {
+            Filter::All => None,
+            Filter::Only(s) => Some(s),
+        };
+        let inflight_n = flight.as_deref().map(|d| crate::inflight::count(d, scope, &working, now / 1000)).unwrap_or(0);
+        let inflight = match (&flight, show) {
+            (Some(d), Show::InFlight) => crate::inflight::list_html(d, scope, &working, now / 1000, &crate::catchup::local_clock),
+            _ => String::new(),
+        };
         let view = View {
+            show,
+            inflight,
+            inflight_n,
             items: &items,
             filter: slot.filter.get(),
             chat: (!slot.chat_hidden.get()).then_some(ChatColumn { chief, found: chief_pane.is_some() }),
@@ -516,6 +535,20 @@ impl KovaView {
     }
 
     /// The pane of this window that runs `name`, if any.
+    /// Whether a pane of this window runs `name`'s session and is working.
+    fn session_working(&self, name: &str) -> bool {
+        let tabs = self.ivars().tabs.borrow();
+        let mut found = false;
+        for tab in tabs.iter() {
+            tab.for_each_pane(&mut |p| {
+                if !found && holds_session(p, name) && p.is_working() {
+                    found = true;
+                }
+            });
+        }
+        found
+    }
+
     fn chief_pane(&self, name: &str) -> Option<PaneId> {
         let tabs = self.ivars().tabs.borrow();
         let mut found = None;
@@ -553,6 +586,15 @@ impl KovaView {
                 if let Some(filter) = Filter::parse(&s("scope")) {
                     slot.filter.set(filter);
                     slot.limit.set(cockpit::PAGE_SIZE);
+                }
+                true
+            }
+            "show" => {
+                if let Some(show) = Show::parse(&s("show")) {
+                    if show == Show::InFlight && slot.show.get() != show {
+                        crate::inflight::refresh();
+                    }
+                    slot.show.set(show);
                 }
                 true
             }

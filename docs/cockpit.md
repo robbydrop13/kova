@@ -114,6 +114,15 @@ from another frame, another URL or an earlier load are dropped. The tick
 gathers the items every 250 ms and pushes only the parts that changed; a draft
 being rewritten keeps its text, caret and focus through a push.
 
+## Filtres
+
+The bar under the title holds two filters side by side: the scope (`Tout`, `Claap`, `Perso`) and what the list shows (`cockpit::Show`, `SHOWS`), extensible: a new filter is a variant and a line in `SHOWS`.
+
+- `À moi` (default): the list as above, what waits on the user. Its button counts the cards the scope keeps.
+- `En cours`: what the agents do for the user, read from `attn inflight --json` (`[attention] inflight_command`, default `command`'s program with `inflight --json`), cached and refreshed on a thread every 15 s (`crate::inflight`). Its button counts the clicks not done and the agents listed. Under it the scope buttons lose their counts and the sort label reads `Dernières 24 h`.
+  - `Tes clics`: every click of the last 24 h (Valider, Corriger, Consigne, Retiré; a removal that follows a go on the same card is left out), newest first, with a tracker `Envoyé`, `Reçu`, `Fait` and their times. `Reçu` is the `delivered` op of the click; `Fait` is the agent closing the card (`close`, or `settled` when the user had already cleared it) or updating it (`update`), and a removal is done once received. Not received after 3 min: orange, `Pas encore reçu <n> min`. The scope keeps one side's clicks.
+  - `Agents au travail pour toi`: sessions at work (their status says `working`, or a pane of the window runs them and works) or holding a consigne opened in the last 48 h, with what they do and their latest consigne; the sessions waiting on someone else are counted on one line.
+
 ## Catch-up band
 
 `Depuis ton passage de <HHhMM>` and `<n> projets ont bougé`, between the

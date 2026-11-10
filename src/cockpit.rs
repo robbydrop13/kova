@@ -61,6 +61,26 @@ impl Filter {
     }
 }
 
+/// What the list shows: the second filter, next to the scope's
+/// (`docs/cockpit.md` § Filtres). `À moi` is what waits on the user, `En
+/// cours` what the agents do for them (`crate::inflight`). A new filter is a
+/// variant and a line in `SHOWS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Show {
+    #[default]
+    Mine,
+    InFlight,
+}
+
+/// Every filter, in the order the page shows them: (value, word, label).
+pub const SHOWS: [(Show, &str, &str); 2] = [(Show::Mine, "mine", "\u{c0} moi"), (Show::InFlight, "inflight", "En cours")];
+
+impl Show {
+    pub fn parse(word: &str) -> Option<Show> {
+        SHOWS.iter().find(|(_, w, _)| *w == word).map(|(s, _, _)| *s)
+    }
+}
+
 /// Where an item comes from, which decides its buttons.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -665,6 +685,12 @@ pub struct View<'a> {
     pub record_note: String,
     /// The theme button (`theme_button`), right of Chat.
     pub theme: String,
+    /// The second filter (`Show`).
+    pub show: Show,
+    /// The `En cours` list (`crate::inflight::list_html`), shown in place of
+    /// the cards under that filter, and what its button counts.
+    pub inflight: String,
+    pub inflight_n: usize,
 }
 
 /// The cards the list shows first, and each `Voir plus` adds.
@@ -1024,6 +1050,9 @@ const SECTIONS: [(u8, &str, &str); 3] = [(1, "Urgent", "crit"), (2, "Aujourd'hui
 
 /// The cards the filter keeps, under their section headers.
 pub fn list_html(view: &View) -> String {
+    if view.show == Show::InFlight {
+        return if view.inflight.is_empty() { "<p class=\"empty\">Lecture en cours\u{2026}</p>".to_string() } else { view.inflight.clone() };
+    }
     let kept: Vec<&Item> = view.items.iter().filter(|i| view.filter.keeps(i)).collect();
     if kept.is_empty() {
         return "<p class=\"empty\">Rien ne t'attend ici</p>".to_string();
@@ -1100,16 +1129,33 @@ pub fn head_html(view: &View) -> String {
     let (lead, tail) = subtitle(view.items);
     let tail = if tail.is_empty() { String::new() } else { format!(" \u{b7} <b>{}</b>", esc(&tail)) };
     let count = |scope: Option<Scope>| view.items.iter().filter(|i| scope.is_none_or(|s| i.scope == s)).count();
+    // Under `En cours` the scope keeps its words without the cards' counts.
+    let mine = view.show == Show::Mine;
     let seg = |filter: Filter, word: &str, label: &str, n: usize| {
+        let n = if mine { format!(" <span class=\"c\">{n}</span>") } else { String::new() };
         format!(
-            "<button type=\"button\" class=\"{}\" data-filter=\"{word}\">{label} <span class=\"c\">{n}</span></button>",
+            "<button type=\"button\" class=\"{}\" data-filter=\"{word}\">{label}{n}</button>",
             if view.filter == filter { "on" } else { "" }
         )
     };
+    let shows: String = SHOWS
+        .iter()
+        .map(|(show, word, label)| {
+            let n = match show {
+                Show::Mine => view.items.iter().filter(|i| view.filter.keeps(i)).count(),
+                Show::InFlight => view.inflight_n,
+            };
+            format!(
+                "<button type=\"button\" class=\"{}\" data-show=\"{word}\">{label} <span class=\"c\">{n}</span></button>",
+                if view.show == *show { "on" } else { "" }
+            )
+        })
+        .collect();
+    let sort = if mine { format!("{ICON_SORT}Par priorité") } else { "Dernières 24 h".to_string() };
     format!(
         "<div class=\"phead\"><div><div class=\"ptitle\">Cockpit</div><div class=\"psub\">{}{tail}</div></div>\
          <div class=\"hbtns\">{}<button type=\"button\" class=\"btn {}\" data-chat=\"toggle\">{ICON_CHAT}<span>Chat</span></button>{}</div></div>\
-         {}{}<div class=\"bar\"><div class=\"seg\">{}{}{}</div><span class=\"sortlbl\">{ICON_SORT}Par priorité</span></div>",
+         {}{}<div class=\"bar\"><div class=\"filters\"><div class=\"seg\">{}{}{}</div><div class=\"seg show\">{shows}</div></div><span class=\"sortlbl\">{sort}</span></div>",
         esc(&lead),
         view.record,
         if view.chat.is_some() { "on" } else { "sec" },
@@ -1370,6 +1416,35 @@ body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
 .d.crit{background:var(--crit-dot)}.d.warn{background:var(--warn-dot)}.d.gray{background:var(--tag-gray)}
 .sec-h .k{color:var(--t3);font-weight:400}
 .empty{color:var(--t3);font-size:13px;margin-top:24px}
+.filters{display:flex;align-items:center;gap:10px}
+.d.info{background:var(--info-dot)}
+.trk{display:flex;align-items:center;flex:none}
+.st{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--t3);white-space:nowrap}
+.st i{width:8px;height:8px;border-radius:50%;display:block;border:1.5px solid var(--t3);box-sizing:border-box}
+.st.ok{color:var(--t2)}.st.ok i{background:var(--ok-dot);border-color:var(--ok-dot)}
+.st.run{color:var(--t1)}.st.run i{border-color:var(--info-dot);background:color-mix(in srgb,var(--info-dot) 35%,transparent)}
+.st.warn{color:var(--warn-dot)}.st.warn i{background:var(--warn-dot);border-color:var(--warn-dot)}
+.st em{font-style:normal;color:var(--t3);font-size:11px}
+.sep{width:22px;height:1px;background:var(--b2);margin:0 8px}.sep.ok{background:var(--ok-dot)}
+.clk{background:var(--bg1);border:1px solid var(--b3);border-radius:8px;padding:10px 14px 10px 16px;margin-bottom:6px}
+.clk.warn{border-color:color-mix(in srgb,var(--warn-dot) 50%,transparent)}
+.clk .row{display:flex;align-items:center;gap:16px}
+.clk .txt{flex:1;min-width:0}
+.clk .t{font-size:14px;line-height:19px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.clk .q{font-size:13px;line-height:18px;color:var(--t2);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.clk .res{font-size:12px;color:var(--t3);margin-top:6px;display:flex;gap:8px;align-items:center;min-width:0}
+.clk .res b{color:var(--t2);font-weight:500}
+.verb{height:18px;border-radius:4px;padding:0 6px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;background:var(--sel-bg);color:var(--sel-text);margin-right:8px;vertical-align:1px}
+.verb.c{background:var(--bg-elev);color:var(--t1)}
+.box{background:var(--bg1);border:1px solid var(--b3);border-radius:8px;padding:2px 0}
+.ag{display:grid;grid-template-columns:200px 1fr auto;gap:14px;align-items:baseline;padding:9px 14px 9px 16px;border-top:1px solid var(--b3);font-size:13px;line-height:18px}
+.ag:first-child{border-top:0}
+.ag .p{font-weight:600;display:flex;align-items:center;gap:8px;white-space:nowrap;min-width:0}
+.ag .p i{width:8px;height:8px;border-radius:50%;display:block;flex:none}
+.ag .k{font-size:12px;color:var(--t3);margin-top:3px}.ag .k b{color:var(--t2);font-weight:500}
+.ag .m{font-size:12px;color:var(--info-dot);white-space:nowrap}
+.fold{font-size:12px;color:var(--t3);padding:9px 16px;border-top:1px solid var(--b3)}
+.box .fold:first-child{border-top:0}
 .draft{margin-top:10px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px}
 .draft:focus-within{border-color:var(--accent)}
 .draft .hd{display:flex;align-items:center;gap:14px;padding:8px 12px;border-bottom:1px solid var(--b3);font-size:12px;color:var(--t3);flex-wrap:wrap}
@@ -1608,6 +1683,7 @@ document.addEventListener('click', e => {
   if (b.disabled) return;
   if (b.dataset.more) return post({ type: 'more' });
   if (b.dataset.filter) return post({ type: 'filter', scope: b.dataset.filter });
+  if (b.dataset.show) return post({ type: 'show', show: b.dataset.show });
   if (b.dataset.chief) return post({ type: 'chief', scope: b.dataset.chief });
   if (b.dataset.chat) return post({ type: 'chat', what: b.dataset.chat });
   if (b.dataset.theme) return post({ type: 'theme' });
@@ -1879,7 +1955,7 @@ mod tests {
     fn the_list_shows_ten_cards_then_voir_plus() {
         let items: Vec<Item> =
             (0..23).map(|i| from_attention(&entry(&format!("a-{i}"), Level::Now, Some(if i < 4 { 1 } else { 2 }), i), None, false).unwrap()).collect();
-        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new() };
+        let view = |limit| View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0 };
         let html = list_html(&view(PAGE_SIZE));
         assert_eq!(html.matches("<article").count(), 10);
         assert!(html.contains("data-more=\"1\"><span>Voir plus (13)</span>"));
@@ -2106,7 +2182,7 @@ mod tests {
             from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap(),
             from_attention(&perso, None, false).unwrap(),
         ];
-        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new() };
+        let view = |filter| View { items: &items, filter, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0 };
         assert!(list_html(&view(Filter::All)).contains("attention:a-1"));
         let only = list_html(&view(Filter::Only(Scope::Perso)));
         assert!(only.contains("attention:a-2") && !only.contains("attention:a-1"));
@@ -2118,18 +2194,47 @@ mod tests {
     }
 
     #[test]
+    fn the_show_filter_sits_next_to_the_scope_and_en_cours_replaces_the_cards() {
+        let items = vec![from_attention(&entry("a-1", Level::Now, None, 1), None, false).unwrap()];
+        let view = |show, inflight: &str| View {
+            items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
+            limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(),
+            theme: String::new(), show, inflight: inflight.to_string(), inflight_n: 4,
+        };
+        // `À moi` is the list as it was, with both filters in the bar.
+        let mine = view(Show::Mine, "");
+        let head = head_html(&mine);
+        assert!(head.contains("<div class=\"filters\"><div class=\"seg\"><button type=\"button\" class=\"on\" data-filter=\"all\">Tout <span class=\"c\">1</span>"), "{head}");
+        assert!(head.contains("<div class=\"seg show\"><button type=\"button\" class=\"on\" data-show=\"mine\">\u{c0} moi <span class=\"c\">1</span></button>\
+                               <button type=\"button\" class=\"\" data-show=\"inflight\">En cours <span class=\"c\">4</span></button></div>"), "{head}");
+        assert!(head.contains("Par priorité"));
+        assert!(list_html(&mine).contains("attention:a-1"));
+        // `En cours`: its list in place of the cards, the scope without counts.
+        let flight = view(Show::InFlight, "<div class=\"clk\">X</div>");
+        assert_eq!(list_html(&flight), "<div class=\"clk\">X</div>");
+        let head = head_html(&flight);
+        assert!(head.contains("data-filter=\"all\">Tout</button>") && head.contains("class=\"on\" data-show=\"inflight\""), "{head}");
+        assert!(head.contains("Dernières 24 h"));
+        assert!(list_html(&view(Show::InFlight, "")).contains("Lecture en cours"));
+        assert_eq!(Show::parse("inflight"), Some(Show::InFlight));
+        assert_eq!(Show::parse("mine"), Some(Show::Mine));
+        assert_eq!(Show::parse("x"), None);
+        assert!(shell(false, "n").contains("if (b.dataset.show) return post({ type: 'show', show: b.dataset.show });"));
+    }
+
+    #[test]
     fn sections_and_subtitle_name_the_priorities() {
         let items = vec![
             from_need(&need(NeedKind::Permission, "pane:1", 1), false).unwrap(),
             from_attention(&entry("a-1", Level::Point, None, 1), None, false).unwrap(),
         ];
-        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new() });
+        let html = list_html(&View { items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 100, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0 });
         assert!(html.contains("Urgent <span class=\"k\">1</span>"));
         assert!(html.contains("Cette semaine <span class=\"k\">1</span>"));
         assert!(!html.contains("Aujourd'hui"));
         assert_eq!(subtitle(&items), ("2 actions pour toi".to_string(), "1 urgente".to_string()));
         assert_eq!(subtitle(&[]).0, "Aucune action pour toi");
-        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new() }).contains("Rien ne t'attend"));
+        assert!(list_html(&View { items: &[], filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true, limit: PAGE_SIZE, now: 0, band: String::new(), record: String::new(), record_note: String::new(), theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0 }).contains("Rien ne t'attend"));
     }
 
     #[test]
@@ -2290,6 +2395,7 @@ mod tests {
             limit: PAGE_SIZE, now: 0, band: band.to_string(), record: "<button data-rec=\"start\">R</button>".into(),
             record_note: "<div class=\"recn\">N</div>".into(),
             theme: theme_button(crate::theme::ThemeMode::Dark, "cmd+option+l"),
+            show: Show::Mine, inflight: String::new(), inflight_n: 0,
         };
         let head = head_html(&view("<div class=\"cu\">B</div>"));
         let (title, band, bar) = (head.find("ptitle").unwrap(), head.find("class=\"cu\"").unwrap(), head.find("class=\"bar\"").unwrap());

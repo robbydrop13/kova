@@ -52,6 +52,7 @@ mod voice;
 mod voice_io;
 mod attention;
 mod catchup;
+mod inflight;
 mod cockpit;
 mod record;
 mod window;

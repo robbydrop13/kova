@@ -109,6 +109,7 @@ define_class!(
             crate::voice::configure(config.chat.voice_auto_send, &config.chat.voice_vocabulary);
             crate::attention::set_commands(&config.attention.commands());
             crate::catchup::set_commands(&config.attention.catchup_commands());
+            crate::inflight::set_command(&config.attention.inflight_command());
             setup_menu(mtm, config);
 
             // Restore session (all windows) or create a single fresh window
@@ -1848,6 +1849,7 @@ fn handle_ipc_reload_config(
     crate::voice::configure(config.chat.voice_auto_send, &config.chat.voice_vocabulary);
     crate::attention::set_commands(&config.attention.commands());
     crate::catchup::set_commands(&config.attention.catchup_commands());
+    crate::inflight::set_command(&config.attention.inflight_command());
     let mut applied = 0usize;
     for win in windows.borrow().iter() {
         if let Some(view) = kova_view(win) {
