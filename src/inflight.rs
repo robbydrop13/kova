@@ -278,6 +278,11 @@ fn esc(s: &str) -> String {
     out
 }
 
+/// A text of the list as HTML, its links clickable (`links::linkify_refs`).
+fn linked(s: &str) -> String {
+    crate::links::linkify_refs(s)
+}
+
 fn one_line(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
@@ -318,10 +323,10 @@ fn click_html(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
     let quote = if c.text.trim().is_empty() {
         String::new()
     } else {
-        format!("<div class=\"q\">\u{ab} {} \u{bb}</div>", esc(&one_line(&c.text, 220)))
+        format!("<div class=\"q\">\u{ab} {} \u{bb}</div>", linked(&one_line(&c.text, 220)))
     };
     let res = match step(c, now) {
-        Step::Done if !c.result.trim().is_empty() => format!("<span><b>Résultat :</b> {}</span>", esc(&one_line(&c.result, 160))),
+        Step::Done if !c.result.trim().is_empty() => format!("<span><b>Résultat :</b> {}</span>", linked(&one_line(&c.result, 160))),
         Step::Late => "<span>Pas encore remis : il le sera à son prochain outil, ou réveillé s'il dort</span>".to_string(),
         _ => String::new(),
     };
@@ -330,7 +335,7 @@ fn click_html(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
          <div class=\"res\"><span class=\"tag\"><i></i>{}</span>{res}</div></div>{}</div></div>",
         if step(c, now) == Step::Late { " warn" } else { "" },
         esc(&c.id),
-        esc(&c.title),
+        linked(&c.title),
         esc(&c.to),
         tracker(c, now, clock),
     )
@@ -342,10 +347,10 @@ fn agent_html(a: &Live) -> String {
         n => format!(
             "<div class=\"k\"><b>{}</b> {}</div>",
             if n == 1 { "1 consigne :".to_string() } else { format!("{n} consignes, dont :") },
-            esc(&one_line(&a.consignes[0], 160))
+            linked(&one_line(&a.consignes[0], 160))
         ),
     };
-    let doing = if a.doing.trim().is_empty() { String::new() } else { format!("<div>{}</div>", esc(&one_line(a.doing, 160))) };
+    let doing = if a.doing.trim().is_empty() { String::new() } else { format!("<div>{}</div>", linked(&one_line(a.doing, 160))) };
     format!(
         "<div class=\"ag\"><div class=\"p\"><i style=\"background:var(--info-dot)\"></i><span>{}</span></div><div>{doing}{consignes}</div><span class=\"m\">au travail</span></div>",
         esc(a.name)
@@ -586,6 +591,26 @@ mod tests {
         assert!(done.contains("Alex") && done.contains("Carte retirée"), "{done}");
         assert!(!done.contains("Agents au travail"));
         assert_eq!((count(&data, None, &[], now), done_count(&data, None, now)), (2, 2));
+    }
+
+    #[test]
+    fn a_click_s_title_instruction_and_result_and_an_agent_s_lines_carry_their_links() {
+        let data = parse(
+            r#"{"clicks":[{"act_id":"c-1","id":"a-1","scope":"pro","button":"instruct","title":"Read /tmp/plan.md for CLA-12","from":"pm",
+                "text":"see https://x.io/a and #12345","to":"pm","sent":"2026-11-10T10:00:00+01:00","received":"2026-11-10T10:00:05+01:00",
+                "done":"2026-11-10T10:05:00+01:00","result":"written to ~/out/report.html"}],
+               "agents":[{"name":"pm","state":"working","doing":"plan in /tmp/plan.md","since":"2026-11-10T10:00:00+01:00",
+                "consignes":[{"id":"k-1","text":"ticket CLA-7 <first>","ts":"2026-11-10T10:00:00+01:00"}]}]}"#,
+        )
+        .expect("inflight json");
+        let now = crate::attention::epoch_of("2026-11-10T10:06:00+01:00").unwrap();
+        let done = done_html(&data, None, now, &|_| String::new());
+        assert!(done.contains(r##"Read <a href="#" class="path" data-path="/tmp/plan.md">/tmp/plan.md</a> for <a href="https://linear.app/claap/issue/CLA-12">CLA-12</a>"##), "{done}");
+        assert!(done.contains(r#"see <a href="https://x.io/a">https://x.io/a</a> and <a href="https://github.com/claap-app/claap/pull/12345">#12345</a>"#), "{done}");
+        assert!(done.contains(r##"written to <a href="#" class="path" data-path="~/out/report.html">~/out/report.html</a>"##), "{done}");
+        let list = list_html(&data, None, &[("pm".to_string(), true)], now, &|_| String::new());
+        assert!(list.contains(r##"plan in <a href="#" class="path" data-path="/tmp/plan.md">"##), "{list}");
+        assert!(list.contains(r#"ticket <a href="https://linear.app/claap/issue/CLA-7">CLA-7</a> &lt;first&gt;"#), "still escaped: {list}");
     }
 
     #[test]

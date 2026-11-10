@@ -205,9 +205,10 @@ is gone is dropped.
 - Error: the provider's words and the pane's last 15 non-blank lines; the
   card's `Voir le pane` closes the page and focuses the pane.
 - Attention entry: `needs`, `body` (line breaks kept), `detail`, the `src`
-  list, and its links: the `action` (not a `kova-sheet:`) plus every http(s)
-  link in the body, detail and sources, opening in the side panel like
-  `Voir`. An entry with no `needs`, `body` or `detail` says `Je regarde de
+  list, and under it the `action` (not a `kova-sheet:`) plus the http(s)
+  links of the sources, opening in the side panel like `Voir`. The links
+  inside the title, needs, body and detail (a URL, a local file, `CLA-123`,
+  `#12345`) are in the text itself (`docs/links.md`). An entry with no `needs`, `body` or `detail` says `Je regarde de
   quoi il s'agit…` and Kova runs `explain_command ID` (default: the attn
   program with `explain`, about 40 s) in the background, never twice at once
   for one id; the next read brings the `detail` it saved. A source naming a

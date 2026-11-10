@@ -185,20 +185,6 @@ pub enum Detail {
     Entry { needs: String, body: String, detail: String, src: Vec<Source>, links: Vec<String>, explaining: bool },
 }
 
-/// The http(s) links in a text, in order, without the punctuation that
-/// closes a sentence around them.
-pub fn links_in(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for word in text.split(|c: char| c.is_whitespace() || c == '<' || c == '>') {
-        let Some(at) = word.find("http://").or_else(|| word.find("https://")) else { continue };
-        let link = word[at..].trim_end_matches(|c: char| ".,;:!?)]}\"'`".contains(c));
-        if link.len() > "https://".len() && !out.iter().any(|l| l == link) {
-            out.push(link.to_string());
-        }
-    }
-    out
-}
-
 /// A source of an attention entry as the card shows it: its words, and what
 /// a click opens in the side panel when the source names a URL or a local
 /// file the panel shows (`side_panel::open_target`). A source that opens is
@@ -209,18 +195,14 @@ pub struct Source {
     pub open: Option<String>,
 }
 
-/// The part of a source that opens: a URL as is; else, from its first `/`,
-/// `~` or `file://`, the longest run of words `opens` accepts (a path may
-/// hold spaces, and agents add `l.3` or a remark after it).
+/// The part of a source that opens: the first link `links::find` sees in
+/// it (a URL, or a path, which may hold spaces and be followed by `l.3` or a
+/// remark) that `opens` accepts.
 pub fn source_target(text: &str, opens: &dyn Fn(&str) -> bool) -> Option<String> {
     let t = text.trim();
-    if let Some(link) = links_in(t).into_iter().next() {
-        return Some(link);
-    }
-    let start = t.find("file://").or_else(|| t.find(['/', '~']))?;
-    let rest = &t[start..];
-    let words: Vec<&str> = rest.split(' ').collect();
-    (1..=words.len()).rev().map(|n| words[..n].join(" ")).map(|c| c.trim_end_matches([',', ';', ')', '.']).to_string()).find(|c| opens(c))
+    // `file:///a/b.md` reads as its path.
+    let t = &t.replace("file://", " ");
+    crate::links::targets(t, opens).into_iter().find(|l| crate::links::is_web(l) || opens(l))
 }
 
 /// `source_target` against the real filesystem and `$HOME`.
@@ -229,21 +211,16 @@ fn opens_on_disk(link: &str) -> bool {
     crate::window::side_panel::open_target(link, home.as_deref(), &|p: &Path| p.is_file()).is_some()
 }
 
-/// What a link reads as: a file's name, a URL without its scheme.
-pub fn link_label(link: &str) -> String {
-    if let Some(rest) = link.strip_prefix("https://").or_else(|| link.strip_prefix("http://")) {
-        let mut out: String = rest.chars().take(70).collect();
-        if rest.chars().count() > 70 {
-            out.push('\u{2026}');
-        }
-        return out;
-    }
-    let file = link.split('#').next().unwrap_or(link).trim_end_matches('/');
-    Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| link.to_string())
+/// A text of a card as HTML: escaped, its URLs, local files, issue ids
+/// and pull request numbers as links (`links::linkify_refs`). A click
+/// posts `open`, which goes to the side panel.
+fn linked(s: &str) -> String {
+    crate::links::linkify_refs(s)
 }
 
-/// What an opened attention card shows: its needs, body, detail, sources,
-/// and its action plus every http(s) link in the rest. `explaining` says
+/// What an opened attention card shows: its needs, body, detail (their
+/// links inline), its sources, and under them its action plus the http(s)
+/// links of its sources. `explaining` says
 /// `attn explain` runs for it.
 pub fn entry_detail(entry: &Entry, explaining: bool) -> Detail {
     entry_detail_with(entry, explaining, &opens_on_disk)
@@ -256,8 +233,7 @@ pub fn entry_detail_with(entry: &Entry, explaining: bool, opens: &dyn Fn(&str) -
     if let Some(action) = entry.action.as_deref().filter(|a| ask_ref(a).is_none()) {
         links.push(action.to_string());
     }
-    let rest = [text(&entry.body), text(&entry.detail), entry.src.join("\n")].join("\n");
-    for link in links_in(&rest) {
+    for link in crate::links::targets(&entry.src.join("\n"), &|_| false).into_iter().filter(|l| crate::links::is_web(l)) {
         if !links.contains(&link) {
             links.push(link);
         }
@@ -899,9 +875,9 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     let needs = if item.needs.trim().is_empty() {
         String::new()
     } else {
-        format!("<div class=\"need\">{ICON_CHEVRON}<span>{}</span></div>", esc(&item.needs))
+        format!("<div class=\"need\">{ICON_CHEVRON}<span>{}</span></div>", linked(&item.needs))
     };
-    let head = format!("<div class=\"t\">{}</div>{needs}", esc(&item.title));
+    let head = format!("<div class=\"t\">{}</div>{needs}", linked(&item.title));
     let body = match (&item.draft, item.kind == Kind::Attention && can_act) {
         (Some(draft), true) => {
             let subject = draft
@@ -1029,7 +1005,7 @@ fn instruct_html(last: Option<&Instructed>) -> String {
             esc(text)
         ),
         Some(Instructed { text, .. }) => {
-            format!("<div class=\"state ok\">Consigne envoyée</div><p class=\"msg sent\">{}</p>", esc(text))
+            format!("<div class=\"state ok\">Consigne envoyée</div><p class=\"msg sent\">{}</p>", linked(text))
         }
     };
     format!(
@@ -1091,11 +1067,11 @@ pub fn detail_html(detail: &Detail, running: bool) -> String {
                     )
                 })
                 .collect();
-            format!("<p class=\"msg\">{}</p>{field}<div class=\"dacts\">{buttons}</div>", esc(message))
+            format!("<p class=\"msg\">{}</p>{field}<div class=\"dacts\">{buttons}</div>", linked(message))
         }
         Detail::Entry { needs, body, detail, src, links, explaining } => {
             let para = |class: &str, t: &str| {
-                if t.trim().is_empty() { String::new() } else { format!("<p class=\"{class}\">{}</p>", esc(t.trim())) }
+                if t.trim().is_empty() { String::new() } else { format!("<p class=\"{class}\">{}</p>", linked(t.trim())) }
             };
             let mut out = String::new();
             if needs.trim().is_empty() && body.trim().is_empty() && detail.trim().is_empty() {
@@ -1117,15 +1093,15 @@ pub fn detail_html(detail: &Detail, running: bool) -> String {
                         Some(open) => {
                             let around = s.text.replacen(open.as_str(), "", 1);
                             let around = around.trim();
-                            let around = if around.is_empty() { String::new() } else { format!(" <span class=\"w\">{}</span>", esc(around)) };
+                            let around = if around.is_empty() { String::new() } else { format!(" <span class=\"w\">{}</span>", linked(around)) };
                             format!(
                                 "<li><button type=\"button\" class=\"link\" data-act=\"link\" data-arg=\"{}\" title=\"{}\">{}</button>{around}</li>",
                                 esc(open),
                                 esc(open),
-                                esc(&link_label(open))
+                                esc(&crate::links::label(open, 70))
                             )
                         }
-                        None => format!("<li>{}</li>", esc(&s.text)),
+                        None => format!("<li>{}</li>", linked(&s.text)),
                     })
                     .collect();
                 out.push_str(&format!("<div class=\"lbl\">Sources</div><ul class=\"srcs\">{items}</ul>"));
@@ -1133,7 +1109,7 @@ pub fn detail_html(detail: &Detail, running: bool) -> String {
             if !links.is_empty() {
                 let items: String = links
                     .iter()
-                    .map(|l| format!("<button type=\"button\" class=\"link\" data-act=\"link\" data-arg=\"{0}\" title=\"{0}\">{1}</button>", esc(l), esc(&link_label(l))))
+                    .map(|l| format!("<button type=\"button\" class=\"link\" data-act=\"link\" data-arg=\"{0}\" title=\"{0}\">{1}</button>", esc(l), esc(&crate::links::label(l, 70))))
                     .collect();
                 out.push_str(&format!("<div class=\"links\">{items}</div>"));
             }
@@ -1479,7 +1455,8 @@ pub fn shell(light: bool, nonce: &str) -> String {
 
 /// The card's look, shared by the Cockpit and the chat's ask cards: the
 /// design system's variables (`vars`) must be in scope where it applies.
-pub const CARD_CSS: &str = r#"svg.i{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+pub const CARD_CSS: &str = r#".card a,.clk a,.ag a,.cu a{color:var(--accent);text-decoration:none;overflow-wrap:anywhere}.card a:hover,.clk a:hover,.ag a:hover,.cu a:hover{text-decoration:underline}
+svg.i{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
 button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 button:disabled{opacity:.5;cursor:default}
 .btn{height:28px;border-radius:6px;padding:0 12px;font-size:13px;font-weight:500;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;color:var(--t1)}
@@ -1844,6 +1821,15 @@ function fmOpen(b) {
 }
 function hide(key) { const c = document.querySelector('.card[data-key="' + CSS.escape(key) + '"]'); if (c) c.style.display = 'none'; }
 document.addEventListener('click', e => {
+  // A link inside a text (a card, En cours, Fait, the band): the side
+  // panel, never this page, and not the card or the row under it.
+  const a = e.target.closest('a');
+  if (a) {
+    e.preventDefault();
+    const href = a.dataset.path || a.getAttribute('href');
+    if (href && href !== '#') post({ type: 'open', href });
+    return;
+  }
   // A card's screenshot opens full size over the page; a click closes it.
   const z = $('zoom');
   if (!z.hidden) { z.hidden = true; return; }
@@ -2141,11 +2127,12 @@ mod tests {
         e.src = vec!["https://a.b/c".into(), "s-42".into()];
         e.action = Some("~/notes/plan.md".into());
         let Detail::Entry { links, .. } = entry_detail(&e, false) else { panic!() };
-        assert_eq!(links, ["~/notes/plan.md", "https://linear.app/x/CLA-1", "https://a.b/c"]);
+        assert_eq!(links, ["~/notes/plan.md", "https://a.b/c"], "the action and the sources' links; the body's are in its text");
         let html = detail_html(&entry_detail(&e, false), false);
         assert!(html.contains("Choisir &lt;vite&gt;") && html.contains("Ligne 1\nVoir"));
         assert!(html.contains("<li>s-42</li>"));
-        assert!(html.contains("data-act=\"link\" data-arg=\"https://linear.app/x/CLA-1\" title=\"https://linear.app/x/CLA-1\">linear.app/x/CLA-1</button>"));
+        assert!(html.contains("Voir <a href=\"https://linear.app/x/CLA-1\">https://linear.app/x/CLA-1</a>, et (<a href=\"https://a.b/c\">https://a.b/c</a>)."), "{html}");
+        assert!(html.contains("data-act=\"link\" data-arg=\"https://a.b/c\" title=\"https://a.b/c\">a.b/c</button>"));
         // The action, a local file, reads as its name.
         assert!(html.contains("data-arg=\"~/notes/plan.md\" title=\"~/notes/plan.md\">plan.md</button>"), "{html}");
         assert!(!html.contains("Je regarde"));
@@ -2158,7 +2145,6 @@ mod tests {
         // A sheet's action is its button, not a link.
         let sheet = Entry { action: Some("kova-sheet:19e0e20f".into()), ..bare };
         assert!(matches!(entry_detail(&sheet, false), Detail::Entry { links, .. } if links.is_empty()));
-        assert_eq!(links_in("x http://"), Vec::<String>::new());
     }
 
     #[test]
@@ -2220,7 +2206,25 @@ mod tests {
         assert!(html.contains(">shot.png</button> <span class=\"w\">capture :</span></li>"), "{html}");
         assert!(html.contains("<li>git log packages/mobile</li>"));
         assert_eq!(source_target("voir https://a.b/c, merci", &|_| false).as_deref(), Some("https://a.b/c"));
-        assert_eq!(link_label("/a/b/report.html#top"), "report.html");
+        assert_eq!(source_target("file:///tmp/shot.png", &opens).as_deref(), Some("/tmp/shot.png"));
+    }
+
+    #[test]
+    fn a_card_s_title_needs_and_body_link_files_ids_and_pull_requests() {
+        let mut e = entry("a-1", Level::Now, None, 1);
+        e.needs = Some("Say go after /tmp/plan.md and #13937 <ok>".into());
+        e.title = "Review ~/notes/plan.html for CLA-10208".into();
+        e.body = Some("Site https://x.io/a, [the plan](/tmp/plan.md). Not /v1/list.json".into());
+        let mut item = from_attention(&e, None, true).expect("a card");
+        let closed = card_html(&item, true, true, true, 10);
+        assert!(closed.contains(r##"Review <a href="#" class="path" data-path="~/notes/plan.html">~/notes/plan.html</a> for <a href="https://linear.app/claap/issue/CLA-10208">CLA-10208</a>"##), "{closed}");
+        assert!(closed.contains(r##"after <a href="#" class="path" data-path="/tmp/plan.md">/tmp/plan.md</a> and <a href="https://github.com/claap-app/claap/pull/13937">#13937</a> &lt;ok&gt;"##), "{closed}");
+        item.detail = Some(entry_detail(&e, false));
+        let open = card_html(&item, true, true, true, 10);
+        assert!(open.contains(r##"Site <a href="https://x.io/a">https://x.io/a</a>, <a href="#" class="path" data-path="/tmp/plan.md">the plan</a>. Not /v1/list.json"##), "{open}");
+        // The page sends a link's click to the side panel, not to the card under it.
+        let page = shell(false, "n");
+        assert!(page.contains("const a = e.target.closest('a');") && page.contains("post({ type: 'open', href })"));
     }
 
     #[test]

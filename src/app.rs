@@ -426,8 +426,9 @@ impl AppDelegate {
                         }
                     }
                     // Web links clicked on the card open in the side panel.
-                    for url in crate::ask_card::take_link_opens() {
-                        open_in_front_panel(&ivars.windows, window::side_panel::PanelTarget::Web(url));
+                    for link in crate::ask_card::take_link_opens() {
+                        let target = crate::links::open(&link, None).unwrap_or(window::side_panel::PanelTarget::Web(link));
+                        open_in_front_panel(&ivars.windows, target);
                     }
                     // Answers posted by a decision sheet in a side panel.
                     let posts = window::side_panel::take_sheet_posts();

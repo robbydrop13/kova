@@ -386,7 +386,13 @@ fn inline(s: &str) -> String {
     while let Some(open) = rest.find('`') {
         let Some(len) = rest[open + 1..].find('`').filter(|&l| l > 0) else { break };
         out.push_str(&linked_emph(&rest[..open]));
-        out.push_str(&format!("<code>{}</code>", esc(&rest[open + 1..open + 1 + len])));
+        let code = &rest[open + 1..open + 1 + len];
+        // A code span that is, whole, the path of a file the panel shows.
+        let file = Some(code.trim()).filter(|c| crate::links::is_file_path(c, &crate::links::on_disk)).and_then(|c| crate::links::file_url(c, None));
+        match file {
+            Some(url) => out.push_str(&format!("<code><a href=\"{}\">{}</a></code>", esc(&url), esc(code))),
+            None => out.push_str(&format!("<code>{}</code>", esc(code))),
+        }
         rest = &rest[open + 1 + len + 1..];
     }
     out.push_str(&linked_emph(rest));
@@ -397,7 +403,15 @@ fn linked_emph(s: &str) -> String {
     crate::text_links::spans(s)
         .iter()
         .map(|span| match span {
-            crate::text_links::Span::Text(t) => emph(t),
+            // What `text_links` leaves as text: local files, issue ids and
+            // pull request numbers (`links::pieces`), the rest as before.
+            crate::text_links::Span::Text(t) => crate::links::pieces(t)
+                .iter()
+                .map(|(piece, url)| match url {
+                    Some(url) => format!("<a href=\"{}\">{}</a>", esc(url), esc(piece)),
+                    None => emph(piece),
+                })
+                .collect(),
             crate::text_links::Span::Link { label, url } => format!("<a href=\"{}\">{}</a>", esc(url), esc(label)),
         })
         .collect()
@@ -882,6 +896,20 @@ mod tests {
         assert!(html.contains("data-action=\"K&lt;O\""));
         assert!(html.contains("id=\"note\""));
         assert!(!render_question("a", "b", &["OK".into()], false, &tokens::DARK).contains("id=\"note\""));
+    }
+
+    #[test]
+    fn a_sheet_s_text_links_local_files_ids_and_pull_requests() {
+        let dir = std::env::temp_dir().join(format!("kova sheet {}", crate::ask::new_question_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plan.md");
+        std::fs::write(&file, "x").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let url = crate::links::file_url(&path, None).unwrap();
+        let html = rich(&format!("Read {path} and `{path}` for CLA-7, **not** /tmp/kova-none.md <b>"));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(html.contains(&format!("Read <a href=\"{url}\">{}</a> and <code><a href=\"{url}\">{}</a></code>", esc(&path), esc(&path))), "{html}");
+        assert!(html.contains("<a href=\"https://linear.app/claap/issue/CLA-7\">CLA-7</a>") && html.contains("<strong>not</strong> /tmp/kova-none.md &lt;b&gt;"), "{html}");
     }
 
     #[test]

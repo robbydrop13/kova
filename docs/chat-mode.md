@@ -127,7 +127,7 @@ as text, keeps a link only to http(s), mailto or a local `.md` / `.html`
 file (a link to anything else is shown as its text) and never loads an
 image. A bare http(s) URL is a link, and so is the path of a file the side
 panel shows (`side_panel::FILE_EXTENSIONS`: markdown, HTML, images, PDF,
-text, log, JSON; `src/chat/links.rs`): an absolute or `~/` path to a `.md` /
+text, log, JSON; `src/links.rs`, shared with every page: `docs/links.md`): an absolute or `~/` path to a `.md` /
 `.html` file as written, every other one when the file exists (another
 extension, a path with spaces, a path relative to the pane's folder or one
 of its parents such as `artifacts/plan.md`, a markdown link to it). A code

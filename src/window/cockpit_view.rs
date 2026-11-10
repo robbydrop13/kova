@@ -617,6 +617,14 @@ impl KovaView {
                 self.cockpit_band_click(&s("what"), &s("proj"), &s("link"));
                 true
             }
+            // A link inside a text of the page (`links::linkify_refs`).
+            "open" => {
+                if let Some(target) = crate::links::open(&s("href"), None) {
+                    self.open_in_side_panel(target);
+                    self.mark_dirty();
+                }
+                true
+            }
             "record" => {
                 match s("what").as_str() {
                     // Only on the click: nothing else starts a recording.

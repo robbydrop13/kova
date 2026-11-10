@@ -433,7 +433,7 @@ impl KovaView {
                     let cwd = pane.cached_cwd().map(std::path::PathBuf::from);
                     match super::side_panel::target_on_disk(&href, cwd.as_deref()) {
                         Some(target) => return Reply::Open(target),
-                        None if crate::chat::links::is_web(&href) => st.note = Some("Lien non pris en charge".to_string()),
+                        None if crate::links::is_web(&href) => st.note = Some("Lien non pris en charge".to_string()),
                         None => st.note = Some("Fichier introuvable".to_string()),
                     }
                 }
@@ -1090,8 +1090,10 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
     let key = (st.conv.revision, working, st.exchanges);
     if st.shown != Some(key) || st.first {
         st.shown = Some(key);
-        crate::chat::links::set_base(pane.cached_cwd().as_deref().map(std::path::Path::new));
+        crate::links::set_base(pane.cached_cwd().as_deref().map(std::path::Path::new));
         let (entries, more) = page::entries(&st.conv, st.exchanges, working);
+        // Only the chat has a pane's folder: every other page reads none.
+        crate::links::set_base(None);
         update.entries = Some(page::wire(&entries, &mut st.sent_entries));
         // Earlier exchanges may also be in the file, before what was read.
         update.more = more || st.tail.as_ref().is_some_and(|t| t.can_widen());

@@ -213,17 +213,9 @@ const ICON_TERM: &str = r#"<svg class="i" width="11" height="11" viewBox="0 0 24
 const ICON_UP: &str = r#"<svg class="i" width="14" height="14" viewBox="0 0 24 24"><polyline points="18 15 12 9 6 15"/></svg>"#;
 const ICON_DOWN: &str = r#"<svg class="i" width="14" height="14" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>"#;
 
-/// What a link reads as: a file's name, a URL without its scheme.
-fn link_label(link: &str) -> String {
-    if let Some(rest) = link.strip_prefix("https://").or_else(|| link.strip_prefix("http://")) {
-        let mut out: String = rest.chars().take(60).collect();
-        if rest.chars().count() > 60 {
-            out.push('\u{2026}');
-        }
-        return out;
-    }
-    let file = link.split('#').next().unwrap_or(link).trim_end_matches('/');
-    Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| link.to_string())
+/// A text of the band as HTML, its links clickable (`links::linkify_refs`).
+fn linked(s: &str) -> String {
+    crate::links::linkify_refs(s)
 }
 
 fn row_html(p: &Project, band: &Band) -> String {
@@ -231,7 +223,7 @@ fn row_html(p: &Project, band: &Band) -> String {
     let waiting = p
         .waiting
         .first()
-        .map(|w| format!("<div class=\"w\"><b>À toi :</b> {}</div>", esc(&w.title)))
+        .map(|w| format!("<div class=\"w\"><b>À toi :</b> {}</div>", linked(&w.title)))
         .unwrap_or_default();
     let session = if p.session.trim().is_empty() {
         "<span></span>".to_string()
@@ -244,7 +236,7 @@ fn row_html(p: &Project, band: &Band) -> String {
         if open { " open" } else { "" },
         esc(&p.project),
         esc(&p.project),
-        esc(&p.headline),
+        linked(&p.headline),
     )
 }
 
@@ -265,12 +257,12 @@ fn detail_html(p: &Project, band: &Band) -> String {
                             "<button type=\"button\" class=\"link\" data-blink=\"{}\" title=\"{}\">{}</button>",
                             esc(l),
                             esc(l),
-                            esc(&link_label(l))
+                            esc(&crate::links::label(l, 60))
                         )
                     })
                     .collect();
                 let links = if links.is_empty() { links } else { format!("<span class=\"lks\">{links}</span>") };
-                format!("<li>{tm}<span>{}</span>{links}</li>", esc(&c.what))
+                format!("<li>{tm}<span>{}</span>{links}</li>", linked(&c.what))
             })
             .collect();
         out.push_str(&format!("<div class=\"lbl\">Changements</div><ul class=\"chg\">{items}</ul>"));
@@ -283,7 +275,7 @@ fn detail_html(p: &Project, band: &Band) -> String {
                 let needs = if w.needs.trim().is_empty() || w.needs.trim() == w.title.trim() {
                     String::new()
                 } else {
-                    format!("<span class=\"dim\"> \u{b7} {}</span>", esc(&w.needs))
+                    format!("<span class=\"dim\"> \u{b7} {}</span>", linked(&w.needs))
                 };
                 // A waiting item that is a card: the card has the actions.
                 let key = format!("attention:{}", w.id);
@@ -292,7 +284,7 @@ fn detail_html(p: &Project, band: &Band) -> String {
                 } else {
                     String::new()
                 };
-                format!("<li><span>{}</span>{needs}{goto}</li>", esc(&w.title))
+                format!("<li><span>{}</span>{needs}{goto}</li>", linked(&w.title))
             })
             .collect();
         out.push_str(&format!("<div class=\"lbl\">À toi</div><ul class=\"chg\">{items}</ul>"));

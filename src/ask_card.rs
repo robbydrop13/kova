@@ -192,7 +192,7 @@ define_class!(
                 };
                 s.map(|s| s.to_string())
             };
-            match url.filter(|u| crate::text_links::allowed(u)) {
+            match url.filter(|u| crate::text_links::allowed(u) || local_file(u).is_some()) {
                 Some(url) => {
                     open_link(url);
                     Bool::YES
@@ -207,7 +207,11 @@ define_class!(
 /// (the tick takes it, `take_link_opens`), anything else for its app.
 fn open_link(url: String) {
     log::info!("Ask card: link clicked: {}", url);
-    if crate::text_links::opens_in_panel(&url) {
+    if let Some(path) = local_file(&url) {
+        if let Ok(mut links) = LINK_OPENS.lock() {
+            links.push(path);
+        }
+    } else if crate::text_links::opens_in_panel(&url) {
         if let Ok(mut links) = LINK_OPENS.lock() {
             links.push(url);
         }
@@ -216,9 +220,16 @@ fn open_link(url: String) {
     }
 }
 
+/// The local file a card's link names (`links::file_url`), when the side
+/// panel shows it.
+fn local_file(url: &str) -> Option<String> {
+    crate::links::path_of_file_url(url).filter(|p| crate::links::open(p, None).is_some())
+}
+
 static LINK_OPENS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Web links clicked on the card since the last call.
+/// Links clicked on the card since the last call: web pages, and the paths
+/// of local files, all for the side panel (`links::open`).
 pub fn take_link_opens() -> Vec<String> {
     match LINK_OPENS.lock() {
         Ok(mut links) => std::mem::take(&mut *links),
@@ -230,17 +241,26 @@ pub fn take_link_opens() -> Vec<String> {
 fn linked_body(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttributedString> {
     let out = objc2_foundation::NSMutableAttributedString::new();
     for span in crate::text_links::spans(text) {
-        let piece = match &span {
-            crate::text_links::Span::Text(t) => attributed(t, font, color),
-            crate::text_links::Span::Link { label, url } => {
-                let keys: [&NSAttributedStringKey; 2] = unsafe { [NSFontAttributeName, objc2_app_kit::NSLinkAttributeName] };
-                let link = ns(url);
-                let values: [&AnyObject; 2] = [font.as_ref(), link.as_ref()];
-                let attrs = NSDictionary::from_slices(&keys, &values);
-                unsafe { NSAttributedString::new_with_attributes(&ns(label), &attrs) }
-            }
+        let link_piece = |label: &str, url: &str| {
+            let keys: [&NSAttributedStringKey; 2] = unsafe { [NSFontAttributeName, objc2_app_kit::NSLinkAttributeName] };
+            let link = ns(url);
+            let values: [&AnyObject; 2] = [font.as_ref(), link.as_ref()];
+            let attrs = NSDictionary::from_slices(&keys, &values);
+            unsafe { NSAttributedString::new_with_attributes(&ns(label), &attrs) }
         };
-        out.appendAttributedString(&piece);
+        match &span {
+            // What `text_links` leaves as text: local files, issue ids and
+            // pull request numbers (`links::pieces`).
+            crate::text_links::Span::Text(t) => {
+                for (piece, url) in crate::links::pieces(t) {
+                    match url {
+                        Some(url) => out.appendAttributedString(&link_piece(&piece, &url)),
+                        None => out.appendAttributedString(&attributed(&piece, font, color)),
+                    }
+                }
+            }
+            crate::text_links::Span::Link { label, url } => out.appendAttributedString(&link_piece(label, url)),
+        }
     }
     Retained::into_super(out)
 }

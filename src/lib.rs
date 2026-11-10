@@ -29,6 +29,7 @@ mod ipc;
 mod keybindings;
 mod launch_wake;
 mod launchers;
+mod links;
 mod notification;
 mod omp_session;
 mod pane;

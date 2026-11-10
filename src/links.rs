@@ -1,25 +1,44 @@
-//! Links in the chat's text: http(s) URLs, and paths to the local files the
-//! side panel shows (`window::side_panel::FILE_EXTENSIONS`: markdown, HTML,
-//! images, PDF, text, JSON). A click opens them there. Any other path stays
-//! text.
+//! The links of every text Kova shows as HTML: the chat, the Cockpit's
+//! cards, En cours and Fait, the catch-up band, the decision sheets. One
+//! detector (`find`), one HTML renderer (`linkify`), one opener (`open`),
+//! which always goes to the side panel.
 //!
-//! An absolute or `~/` path to a `.md` or `.html` file is a link as written.
-//! Every other one only when the file exists: another extension, a path
-//! with spaces, a path relative to the pane's folder or one of its parents
-//! (`artifacts/plan.md`), a whole code span (`` `~/notes/plan.md` ``).
+//! What is a link:
+//! - an http(s) URL;
+//! - the path of a local file the side panel shows
+//!   (`window::side_panel::FILE_EXTENSIONS`: markdown, HTML, images, PDF,
+//!   text, JSON). An absolute or `~/` path to a `.md` or `.html` file as
+//!   written; every other one only when the file exists: another extension,
+//!   a path with spaces (`~/AI directory/x.md`), a path relative to the
+//!   base folder or one of its parents (`artifacts/plan.md`), so a sentence
+//!   that happens to start with `/` is never taken for one;
+//! - a markdown link `[label](destination)` to one of those;
+//! - with `linkify_refs`, a bare Linear id (`CLA-123`, `CLAR-`, `CLAD-`), to
+//!   its issue, and a bare `#12345`, to that pull request of the Claap repo.
 //!
-//! In an agent's answer, a bare Linear id (`CLA-123`, `CLAR-`, `CLAD-`) links
-//! to its issue and a bare `#12345` to that pull request of the Claap repo.
-//!
-//! A path may hold spaces (`~/AI directory/x.md`): one is linked only when
-//! the file exists, so a sentence that happens to start with `/` is never
-//! taken for one.
+//! Existence is the opener's own test (`side_panel::target_on_disk`): a
+//! link drawn is a link that opens.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use super::page::escape;
 use crate::window::side_panel::{self, FILE_EXTENSIONS as PANEL_EXTENSIONS, PanelTarget};
+
+/// `s` as HTML text.
+pub fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 thread_local! {
     /// The folder of the pane whose chat is rendered: what a relative path
@@ -39,6 +58,27 @@ pub struct Link {
     pub start: usize,
     pub end: usize,
     pub kind: Kind,
+    /// A markdown link `[label](destination)`: the bytes of its label and of
+    /// its destination. `None`: the text between `start` and `end` is both.
+    pub md: Option<((usize, usize), (usize, usize))>,
+}
+
+impl Link {
+    /// What the link opens.
+    pub fn target<'a>(&self, text: &'a str) -> &'a str {
+        match self.md {
+            Some((_, (a, b))) => &text[a..b],
+            None => &text[self.start..self.end],
+        }
+    }
+
+    /// What the link reads as.
+    pub fn label<'a>(&self, text: &'a str) -> &'a str {
+        match self.md {
+            Some(((a, b), _)) => &text[a..b],
+            None => &text[self.start..self.end],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,8 +135,141 @@ pub fn find(text: &str, exists: &dyn Fn(&str) -> bool) -> Vec<Link> {
     for path in paths(text, &links, exists) {
         links.push(path);
     }
+    // A markdown link is one link: what was found inside it goes.
+    let md = markdown_links(text, exists);
+    links.retain(|l| !md.iter().any(|m| m.start < l.end && l.start < m.end));
+    links.extend(md);
     links.sort_by_key(|l| l.start);
     links
+}
+
+/// `[label](destination)` on one line, to a URL or a file the panel shows.
+fn markdown_links(text: &str, exists: &dyn Fn(&str) -> bool) -> Vec<Link> {
+    let mut out: Vec<Link> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("](") {
+        let mid = from + rel;
+        from = mid + 2;
+        let line_start = text[..mid].rfind('\n').map_or(0, |i| i + 1);
+        let Some(open) = text[line_start..mid].rfind('[').map(|i| line_start + i) else { continue };
+        let Some(close) = text[mid + 2..].find([')', '\n']).map(|i| mid + 2 + i).filter(|&i| text[i..].starts_with(')')) else { continue };
+        let (label, dest) = (&text[open + 1..mid], text[mid + 2..close].trim());
+        if label.trim().is_empty() || out.last().is_some_and(|l| open < l.end) {
+            continue;
+        }
+        let kind = if is_web(dest) && !dest.contains(char::is_whitespace) {
+            Kind::Url
+        } else if is_panel_path(dest) || is_file_path(dest, exists) {
+            Kind::Path
+        } else {
+            continue;
+        };
+        let at = mid + 2 + (text[mid + 2..close].len() - text[mid + 2..close].trim_start().len());
+        out.push(Link { start: open, end: close + 1, kind, md: Some(((open + 1, mid), (at, at + dest.len()))) });
+        from = close + 1;
+    }
+    out
+}
+
+/// What the links of `text` open, in order, once each.
+pub fn targets(text: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for link in find(text, exists) {
+        let target = link.target(text).to_string();
+        if !out.contains(&target) {
+            out.push(target);
+        }
+    }
+    out
+}
+
+/// What a link reads as when it stands alone (a button, a list): a file's
+/// name, a URL without its scheme, `max` chars at most.
+pub fn label(link: &str, max: usize) -> String {
+    if let Some(rest) = link.strip_prefix("https://").or_else(|| link.strip_prefix("http://")) {
+        let mut out: String = rest.chars().take(max).collect();
+        if rest.chars().count() > max {
+            out.push('\u{2026}');
+        }
+        return out;
+    }
+    let file = link.split('#').next().unwrap_or(link).trim_end_matches('/');
+    Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| link.to_string())
+}
+
+/// A local path as a `file:` URL, for a page whose links are navigations
+/// (a decision sheet in the side panel) or an attributed string (the
+/// floating ask card): the path resolved as `open` would, percent-encoded.
+/// `None` when it names nothing the panel shows.
+pub fn file_url(path: &str, cwd: Option<&Path>) -> Option<String> {
+    let file = match open(path, cwd)? {
+        PanelTarget::Markdown(p) | PanelTarget::Html(p) | PanelTarget::File(p) => p,
+        _ => return None,
+    };
+    let mut out = String::from("file://");
+    for b in file.to_string_lossy().bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    Some(out)
+}
+
+/// The path a `file_url` names.
+pub fn path_of_file_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() && let Ok(b) = u8::from_str_radix(rest.get(i + 1..i + 3)?, 16) {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The paths (as `file:` URLs), issue ids and pull request numbers of a
+/// text whose URLs and markdown links were already taken out
+/// (`text_links::spans`): each piece, and what it opens when it is a link.
+pub fn pieces(text: &str) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for link in find_with_refs(text, &on_disk) {
+        if link.start < at {
+            continue;
+        }
+        let target = link.target(text);
+        let url = match link.kind {
+            Kind::Url => Some(target.to_string()),
+            Kind::Path => file_url(target, None),
+            Kind::Issue => Some(format!("{LINEAR_ISSUE}{target}")),
+            Kind::Pull => Some(format!("{GITHUB_PULL}{}", target.trim_start_matches('#'))),
+        };
+        let Some(url) = url else { continue };
+        if link.start > at {
+            out.push((text[at..link.start].to_string(), None));
+        }
+        out.push((link.label(text).to_string(), Some(url)));
+        at = link.end;
+    }
+    if at < text.len() {
+        out.push((text[at..].to_string(), None));
+    }
+    out
+}
+
+/// What a clicked link shows in the side panel, if anything: the one way a
+/// link of any page opens. `cwd` is the folder a relative path is read
+/// against (the pane's, when the page has one).
+pub fn open(href: &str, cwd: Option<&Path>) -> Option<PanelTarget> {
+    side_panel::target_on_disk(href, cwd)
 }
 
 /// `find`, plus the bare issue ids and pull request numbers (`refs`).
@@ -134,7 +307,7 @@ fn refs(text: &str, taken: &[Link]) -> Vec<Link> {
                 if (end == bytes.len() || !bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_')
                     && !taken.iter().any(|l| l.start < end && i < l.end) =>
             {
-                out.push(Link { start: i, end, kind });
+                out.push(Link { start: i, end, kind, md: None });
                 i = end;
             }
             _ => i += 1,
@@ -174,7 +347,7 @@ fn urls(text: &str) -> Vec<Link> {
             url = trimmed;
         }
         if url.len() > "https://".len() {
-            out.push(Link { start: at, end: at + url.len(), kind: Kind::Url });
+            out.push(Link { start: at, end: at + url.len(), kind: Kind::Url, md: None });
             from = at + url.len();
         }
     }
@@ -221,7 +394,7 @@ fn paths(text: &str, urls: &[Link], exists: &dyn Fn(&str) -> bool) -> Vec<Link> 
             if let Some(start) = found
                 && !out.iter().chain(urls).any(|l| l.start < end && start < l.end)
             {
-                out.push(Link { start, end, kind: Kind::Path });
+                out.push(Link { start, end, kind: Kind::Path, md: None });
             }
         }
     }
@@ -247,9 +420,8 @@ fn render(text: &str, links: Vec<Link>) -> String {
             continue;
         }
         out.push_str(&escape(&text[at..link.start]));
-        let target = &text[link.start..link.end];
-        out.push_str(&anchor(target, link.kind));
-        out.push_str(&escape(target));
+        out.push_str(&anchor(link.target(text), link.kind));
+        out.push_str(&escape(link.label(text)));
         out.push_str("</a>");
         at = link.end;
     }
@@ -356,6 +528,50 @@ mod tests {
         assert!(is_file_path("docs/plan.md", &exists) && is_file_path("~/AI directory/x/data.json", &exists) && is_file_path("a b/report.pdf", &exists));
         assert!(!is_file_path("docs/plan.md", &none) && !is_file_path("plan.md", &|_| true) && !is_file_path("https://x.io/a.md", &|_| true));
         assert!(!is_file_path("src/main.rs", &|_| true), "not a file the panel shows");
+    }
+
+    #[test]
+    fn a_markdown_link_is_one_link_named_by_its_label() {
+        let exists = |p: &str| p == "~/AI directory/x/plan.md" || p == "docs/a.pdf";
+        let html = linkify_refs_with("See [the plan](~/AI directory/x/plan.md), [site](https://x.io/a_b) and [doc](docs/a.pdf). Not [x](javascript:1) nor [y](src/main.rs) nor [z] (a).", &exists);
+        assert_eq!(
+            html,
+            r##"See <a href="#" class="path" data-path="~/AI directory/x/plan.md">the plan</a>, <a href="https://x.io/a_b">site</a> and <a href="#" class="path" data-path="docs/a.pdf">doc</a>. Not [x](javascript:1) nor [y](src/main.rs) nor [z] (a)."##
+        );
+        assert_eq!(
+            super::targets("a [p](~/AI directory/x/plan.md) b https://x.io c https://x.io", &exists),
+            ["~/AI directory/x/plan.md", "https://x.io"],
+            "what opens, once each"
+        );
+        assert_eq!(linkify_refs_with("[CLA-12](https://linear.app/claap/issue/CLA-12) (title)", &none), r#"<a href="https://linear.app/claap/issue/CLA-12">CLA-12</a> (title)"#, "the id inside a link is not linked twice");
+    }
+
+    #[test]
+    fn a_path_travels_as_a_file_url_and_comes_back() {
+        let dir = std::env::temp_dir().join(format!("kova links é {}", crate::ask::new_question_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plan b.md");
+        std::fs::write(&file, "x").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let url = file_url(&path, None).expect("a file the panel shows");
+        assert!(url.starts_with("file:///") && !url.contains(' ') && url.contains("plan%20b.md"), "{url}");
+        assert_eq!(path_of_file_url(&url).as_deref(), Some(path.as_str()));
+        assert_eq!(file_url(&dir.join("none.md").to_string_lossy(), None), None, "nothing there, no link");
+        let text = format!("Read {path} for CLA-7 and #12345.");
+        let got = pieces(&text);
+        assert_eq!(got[0], ("Read ".to_string(), None));
+        assert_eq!(got[1], (path.clone(), Some(url)));
+        assert_eq!(got[3], ("CLA-7".to_string(), Some("https://linear.app/claap/issue/CLA-7".to_string())));
+        assert_eq!(got[5].1.as_deref(), Some("https://github.com/claap-app/claap/pull/12345"));
+        assert_eq!(got.iter().map(|(t, _)| t.as_str()).collect::<String>(), text, "the pieces give the text back");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_lone_link_reads_as_a_file_name_or_a_short_url() {
+        assert_eq!(label("~/AI directory/x/plan.md#top", 70), "plan.md");
+        assert_eq!(label("https://linear.app/x/CLA-1", 70), "linear.app/x/CLA-1");
+        assert_eq!(label("https://linear.app/x/CLA-1", 6), "linear\u{2026}");
     }
 
     #[test]

@@ -241,8 +241,9 @@ fn render_chat(a: &Args) -> Result<i32, String> {
         conv.apply_all(&lines);
     }
     let read_ms = began.elapsed().as_millis();
-    crate::chat::links::set_base(a.get("--base").map(Path::new));
+    crate::links::set_base(a.get("--base").map(Path::new));
     let (entries, more) = page::entries(&conv, exchanges, false);
+    crate::links::set_base(None);
     let html: String = entries.iter().map(|e| e.html.as_str()).collect();
     let users: Vec<usize> = conv.items.iter().enumerate().filter(|(_, i)| matches!(i, Item::User { .. })).map(|(n, _)| n).collect();
     let start = if users.len() > exchanges { users[users.len() - exchanges] } else { 0 };

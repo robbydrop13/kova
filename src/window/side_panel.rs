@@ -157,7 +157,7 @@ impl PanelTarget {
 }
 
 /// The extensions `file_kind` knows, lower case: what the chat looks for to
-/// link a file's path (`chat::links`).
+/// link a file's path (`links`).
 pub const FILE_EXTENSIONS: &[&str] = &["md", "markdown", "html", "htm", "png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "txt", "log", "json"];
 
 /// Whether a local file is one the panel shows, by its extension.
@@ -950,8 +950,13 @@ impl SidePanelView {
     /// A link clicked on a sheet or long question: shown here, the sheet
     /// kept to come back to.
     pub fn open_from_sheet(&self, url: String) {
+        self.open_target_from_sheet(PanelTarget::Web(url));
+    }
+
+    /// `open_from_sheet` for any target: a local file a sheet's text names.
+    pub fn open_target_from_sheet(&self, target: PanelTarget) {
         let from = self.ivars().current.borrow().clone();
-        self.open_target(PanelTarget::Web(url));
+        self.open_target(target);
         *self.ivars().return_to.borrow_mut() = from;
     }
 
@@ -1129,6 +1134,15 @@ define_class!(
                     WKNavigationActionPolicy::Cancel
                 }
                 (Some("http" | "https" | "about" | "data" | "blob"), _) => WKNavigationActionPolicy::Allow,
+                // A sheet's link to a local file (`links::file_url`): the
+                // file in the panel, Back to the sheet.
+                (Some("file"), Some(u)) if on_sheet && clicked => {
+                    let path = u.path().map(|p| p.to_string()).unwrap_or_default();
+                    if let (Some(panel), Some(target)) = (panel.as_ref(), crate::links::open(&path, None)) {
+                        panel.open_target_from_sheet(target);
+                    }
+                    WKNavigationActionPolicy::Cancel
+                }
                 (Some("file"), Some(u)) => {
                     let path = u.path().map(|p| p.to_string()).unwrap_or_default();
                     let kind = file_kind(Path::new(&path)).map(|make| make(PathBuf::new()));

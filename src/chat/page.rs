@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use super::conversation::{BlockKind, Conversation, Item, Tool};
-use super::links::{linkify, linkify_refs};
+use crate::links::{self, linkify, linkify_refs};
 
 /// How many exchanges (a user message and what follows it) the page opens
 /// on; `Show earlier` adds as many again.
@@ -62,20 +62,7 @@ pub struct Theme {
     pub ok: String,
 }
 
-pub fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
+pub use crate::links::escape;
 
 fn fnv(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -123,12 +110,12 @@ pub fn markdown(source: &str) -> String {
         Event::Start(Tag::Link { link_type, dest_url, title, id }) => {
             let dest = dest_url.trim();
             let lower = dest.to_ascii_lowercase();
-            if super::links::is_panel_path(dest) || super::links::is_file_path(dest, &super::links::on_disk) {
+            if links::is_panel_path(dest) || links::is_file_path(dest, &links::on_disk) {
                 path_link = true;
                 in_link += 1;
-                return Event::InlineHtml(CowStr::from(super::links::anchor(dest, super::links::Kind::Path)));
+                return Event::InlineHtml(CowStr::from(links::anchor(dest, links::Kind::Path)));
             }
-            if !(super::links::is_web(dest) || lower.starts_with("mailto:")) {
+            if !(links::is_web(dest) || lower.starts_with("mailto:")) {
                 unsafe_link = true;
                 in_link += 1;
                 return Event::Text("".into());
@@ -151,9 +138,9 @@ pub fn markdown(source: &str) -> String {
             Event::End(TagEnd::Link)
         }
         // A code span that is, whole, the path of a file the panel shows.
-        Event::Code(code) if in_link == 0 && super::links::is_file_path(code.trim(), &super::links::on_disk) => {
+        Event::Code(code) if in_link == 0 && links::is_file_path(code.trim(), &links::on_disk) => {
             let path = code.trim();
-            Event::InlineHtml(CowStr::from(format!("<code>{}{}</a></code>", super::links::anchor(path, super::links::Kind::Path), escape(path))))
+            Event::InlineHtml(CowStr::from(format!("<code>{}{}</a></code>", links::anchor(path, links::Kind::Path), escape(path))))
         }
         Event::Start(Tag::Image { link_type, title, id, .. }) => {
             Event::Start(Tag::Image { link_type, dest_url: "".into(), title, id })
@@ -1272,11 +1259,11 @@ mod tests {
             std::fs::write(dir.join(f), "x").unwrap();
         }
         let abs = dir.join("docs/night qa/shot.png").to_string_lossy().into_owned();
-        crate::chat::links::set_base(Some(&dir));
+        crate::links::set_base(Some(&dir));
         let html = markdown(&format!(
             "Plan in `docs/plan.md`, capture `{abs}`, log docs/run.log and [the plan](docs/plan.md).\n\nNot `docs/none.md`, `cargo test docs/plan.md` nor `src/main.rs`.\n\n```\ndocs/plan.md\n```"
         ));
-        crate::chat::links::set_base(None);
+        crate::links::set_base(None);
         std::fs::remove_dir_all(&dir).ok();
         assert!(html.contains(r##"<code><a href="#" class="path" data-path="docs/plan.md">docs/plan.md</a></code>"##), "relative to the pane's folder: {html}");
         assert!(html.contains(&format!(r#"data-path="{abs}">{abs}</a></code>"#)), "absolute, with spaces: {html}");
