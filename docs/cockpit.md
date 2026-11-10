@@ -205,7 +205,10 @@ is gone is dropped.
   `Voir`. An entry with no `needs`, `body` or `detail` says `Je regarde de
   quoi il s'agit…` and Kova runs `explain_command ID` (default: the attn
   program with `explain`, about 40 s) in the background, never twice at once
-  for one id; the next read brings the `detail` it saved.
+  for one id; the next read brings the `detail` it saved. A source naming a
+  local file the side panel opens (md, html, image, pdf, txt, log, json; the
+  path may hold spaces and words may follow it) is a link named by the file,
+  its full path as the tooltip, never a dead path; other sources stay words.
 - Every opened attention card, button or not, ends with a `Consigne` field (`Une consigne pour cette carte`): Enter runs `act_command ID instruct --text=<text>` (one argv element, `attention::clean_text`), which hands it to the chief of the card's scope; Shift+Enter is a new line, nothing typed sends nothing. The field clears and the card shows `Consigne envoyée` with the text sent; on a draft it sits under the draft's actions, apart from the correction, and never marks the draft sent. A typed instruction survives the refresh.
 - Decision sheet: its card's text (the decisions); `Décider` opens it.
 - Question: its text and its answers as buttons (a free answer brings a

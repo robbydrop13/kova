@@ -12,6 +12,7 @@
 //! `Corriger` goes to `act_command`, and whoever receives the click sends.
 
 use serde::Serialize;
+use std::path::Path;
 
 use crate::attention::{Draft, Entry, Instructed, Level, Outcome, Scope};
 use crate::window::needs::{NeedItem, NeedKind};
@@ -175,7 +176,7 @@ pub enum Detail {
     Ask { message: String, answers: Vec<(String, bool)>, input: bool },
     /// An attention entry: what it says, its sources and its links. With
     /// nothing to say, `attn explain` writes a detail meanwhile.
-    Entry { needs: String, body: String, detail: String, src: Vec<String>, links: Vec<String>, explaining: bool },
+    Entry { needs: String, body: String, detail: String, src: Vec<Source>, links: Vec<String>, explaining: bool },
 }
 
 /// The http(s) links in a text, in order, without the punctuation that
@@ -192,10 +193,58 @@ pub fn links_in(text: &str) -> Vec<String> {
     out
 }
 
+/// A source of an attention entry as the card shows it: its words, and what
+/// a click opens in the side panel when the source names a URL or a local
+/// file the panel shows (`side_panel::open_target`). A source that opens is
+/// never shown as a dead path (Robin, 10/11/2026).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub text: String,
+    pub open: Option<String>,
+}
+
+/// The part of a source that opens: a URL as is; else, from its first `/`,
+/// `~` or `file://`, the longest run of words `opens` accepts (a path may
+/// hold spaces, and agents add `l.3` or a remark after it).
+pub fn source_target(text: &str, opens: &dyn Fn(&str) -> bool) -> Option<String> {
+    let t = text.trim();
+    if let Some(link) = links_in(t).into_iter().next() {
+        return Some(link);
+    }
+    let start = t.find("file://").or_else(|| t.find(['/', '~']))?;
+    let rest = &t[start..];
+    let words: Vec<&str> = rest.split(' ').collect();
+    (1..=words.len()).rev().map(|n| words[..n].join(" ")).map(|c| c.trim_end_matches([',', ';', ')', '.']).to_string()).find(|c| opens(c))
+}
+
+/// `source_target` against the real filesystem and `$HOME`.
+fn opens_on_disk(link: &str) -> bool {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    crate::window::side_panel::open_target(link, home.as_deref(), &|p: &Path| p.is_file()).is_some()
+}
+
+/// What a link reads as: a file's name, a URL without its scheme.
+pub fn link_label(link: &str) -> String {
+    if let Some(rest) = link.strip_prefix("https://").or_else(|| link.strip_prefix("http://")) {
+        let mut out: String = rest.chars().take(70).collect();
+        if rest.chars().count() > 70 {
+            out.push('\u{2026}');
+        }
+        return out;
+    }
+    let file = link.split('#').next().unwrap_or(link).trim_end_matches('/');
+    Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| link.to_string())
+}
+
 /// What an opened attention card shows: its needs, body, detail, sources,
 /// and its action plus every http(s) link in the rest. `explaining` says
 /// `attn explain` runs for it.
 pub fn entry_detail(entry: &Entry, explaining: bool) -> Detail {
+    entry_detail_with(entry, explaining, &opens_on_disk)
+}
+
+/// `entry_detail` with what the side panel opens given.
+pub fn entry_detail_with(entry: &Entry, explaining: bool, opens: &dyn Fn(&str) -> bool) -> Detail {
     let text = |s: &Option<String>| s.as_deref().unwrap_or_default().to_string();
     let mut links: Vec<String> = Vec::new();
     if let Some(action) = entry.action.as_deref().filter(|a| ask_ref(a).is_none()) {
@@ -211,7 +260,7 @@ pub fn entry_detail(entry: &Entry, explaining: bool) -> Detail {
         needs: text(&entry.needs),
         body: text(&entry.body),
         detail: text(&entry.detail),
-        src: entry.src.clone(),
+        src: entry.src.iter().map(|s| Source { text: s.clone(), open: source_target(s, opens) }).collect(),
         links,
         explaining,
     }
@@ -1030,13 +1079,31 @@ pub fn detail_html(detail: &Detail, running: bool) -> String {
             out.push_str(&para("msg", body));
             out.push_str(&para("msg", detail));
             if !src.is_empty() {
-                let items: String = src.iter().map(|s| format!("<li>{}</li>", esc(s))).collect();
+                let items: String = src
+                    .iter()
+                    .map(|s| match &s.open {
+                        // The file's name opens it in the panel; what the
+                        // source says around the path stays as words.
+                        Some(open) => {
+                            let around = s.text.replacen(open.as_str(), "", 1);
+                            let around = around.trim();
+                            let around = if around.is_empty() { String::new() } else { format!(" <span class=\"w\">{}</span>", esc(around)) };
+                            format!(
+                                "<li><button type=\"button\" class=\"link\" data-act=\"link\" data-arg=\"{}\" title=\"{}\">{}</button>{around}</li>",
+                                esc(open),
+                                esc(open),
+                                esc(&link_label(open))
+                            )
+                        }
+                        None => format!("<li>{}</li>", esc(&s.text)),
+                    })
+                    .collect();
                 out.push_str(&format!("<div class=\"lbl\">Sources</div><ul class=\"srcs\">{items}</ul>"));
             }
             if !links.is_empty() {
                 let items: String = links
                     .iter()
-                    .map(|l| format!("<button type=\"button\" class=\"link\" data-act=\"link\" data-arg=\"{0}\">{0}</button>", esc(l)))
+                    .map(|l| format!("<button type=\"button\" class=\"link\" data-act=\"link\" data-arg=\"{0}\" title=\"{0}\">{1}</button>", esc(l), esc(&link_label(l))))
                     .collect();
                 out.push_str(&format!("<div class=\"links\">{items}</div>"));
             }
@@ -2011,7 +2078,9 @@ mod tests {
         let html = detail_html(&entry_detail(&e, false), false);
         assert!(html.contains("Choisir &lt;vite&gt;") && html.contains("Ligne 1\nVoir"));
         assert!(html.contains("<li>s-42</li>"));
-        assert!(html.contains("data-act=\"link\" data-arg=\"https://linear.app/x/CLA-1\""));
+        assert!(html.contains("data-act=\"link\" data-arg=\"https://linear.app/x/CLA-1\" title=\"https://linear.app/x/CLA-1\">linear.app/x/CLA-1</button>"));
+        // The action, a local file, reads as its name.
+        assert!(html.contains("data-arg=\"~/notes/plan.md\" title=\"~/notes/plan.md\">plan.md</button>"), "{html}");
         assert!(!html.contains("Je regarde"));
         // An entry that says nothing waits for `attn explain`.
         let bare = entry("a-2", Level::Point, None, 1);
@@ -2023,6 +2092,31 @@ mod tests {
         let sheet = Entry { action: Some("kova-sheet:19e0e20f".into()), ..bare };
         assert!(matches!(entry_detail(&sheet, false), Detail::Entry { links, .. } if links.is_empty()));
         assert_eq!(links_in("x http://"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_local_file_source_is_a_link_to_the_panel_never_a_dead_path() {
+        let opens = |p: &str| ["/Users/me/AI directory/Claap/qa list.md", "/tmp/shot.png"].contains(&p);
+        let mut e = entry("a-1", Level::Point, None, 1);
+        e.src = vec![
+            "/Users/me/AI directory/Claap/qa list.md l.3".into(),
+            "capture : /tmp/shot.png".into(),
+            "/tmp/missing.md".into(),
+            "git log packages/mobile".into(),
+        ];
+        let d = entry_detail_with(&e, false, &opens);
+        let Detail::Entry { src, .. } = &d else { panic!() };
+        assert_eq!(src[0].open.as_deref(), Some("/Users/me/AI directory/Claap/qa list.md"), "a path with spaces, a line after it");
+        assert_eq!(src[1].open.as_deref(), Some("/tmp/shot.png"));
+        assert_eq!(src[2].open, None, "a file that is not there stays words");
+        assert_eq!(src[3].open, None);
+        let html = detail_html(&d, false);
+        assert!(html.contains("<li><button type=\"button\" class=\"link\" data-act=\"link\" data-arg=\"/Users/me/AI directory/Claap/qa list.md\" \
+                               title=\"/Users/me/AI directory/Claap/qa list.md\">qa list.md</button> <span class=\"w\">l.3</span></li>"), "{html}");
+        assert!(html.contains(">shot.png</button> <span class=\"w\">capture :</span></li>"), "{html}");
+        assert!(html.contains("<li>git log packages/mobile</li>"));
+        assert_eq!(source_target("voir https://a.b/c, merci", &|_| false).as_deref(), Some("https://a.b/c"));
+        assert_eq!(link_label("/a/b/report.html#top"), "report.html");
     }
 
     #[test]

@@ -947,7 +947,9 @@ impl KovaView {
     /// only one the card shows.
     fn cockpit_link(&self, key: &str, link: &str) {
         let shown = self.ivars().cockpit.page.borrow().items.iter().any(|i| {
-            i.key == key && matches!(&i.detail, Some(Detail::Entry { links, .. }) if links.iter().any(|l| l == link))
+            i.key == key
+                && matches!(&i.detail, Some(Detail::Entry { links, src, .. })
+                    if links.iter().any(|l| l == link) || src.iter().any(|s| s.open.as_deref() == Some(link)))
         });
         if !shown {
             return;

@@ -559,4 +559,38 @@ mod preview {
         page("menu.html", Filter::All, Show::Mine, ";document.querySelector('[data-fopen]').click()");
         page("chips.html", Filter::Only(Scope::Pro), Show::InFlight, "");
     }
+    /// `KOVA_CARD_JSON=<attn list --json with one card> KOVA_PREVIEW_DIR=<dir> cargo test --lib
+    /// inflight::preview::write_a_card_with_its_source -- --ignored` writes `card.html` (the card opened, its
+    /// sources as links) and `panel.html` (its first local md source as the side panel shows it).
+    #[test]
+    #[ignore]
+    fn write_a_card_with_its_source() {
+        use crate::cockpit::{Filter, Show, View};
+        use std::path::Path;
+        let (Ok(card), Ok(dir)) = (std::env::var("KOVA_CARD_JSON"), std::env::var("KOVA_PREVIEW_DIR")) else {
+            return;
+        };
+        let entries = crate::attention::parse(&std::fs::read_to_string(card).unwrap()).expect("list json");
+        let mut items: Vec<crate::cockpit::Item> =
+            entries.iter().filter_map(|e| crate::cockpit::from_attention(e, None, true)).collect();
+        items[0].detail = Some(crate::cockpit::entry_detail(&entries[0], false));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let view = View {
+            items: &items, filter: Filter::All, chat: None, can_act: true, can_close: true, can_snooze: true,
+            limit: crate::cockpit::PAGE_SIZE, now, band: String::new(), record: String::new(), record_note: String::new(),
+            theme: String::new(), show: Show::Mine, inflight: String::new(), inflight_n: 0,
+        };
+        let (head, body, chat) = crate::cockpit::parts(&view);
+        let update = crate::cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };
+        let html = crate::cockpit::shell(false, "preview")
+            .replace("</body>", &format!("<script nonce=\"preview\">{}</script></body>", crate::cockpit::update_script(&update)));
+        std::fs::write(Path::new(&dir).join("card.html"), html).unwrap();
+        let md = entries[0].src.iter().map(Path::new).find(|p| p.extension().is_some_and(|e| e == "md")).expect("an md source");
+        let page = crate::window::side_panel::render_markdown(
+            &std::fs::read_to_string(md).unwrap(),
+            &md.file_name().unwrap().to_string_lossy(),
+            &crate::window::sidebar::tokens::DARK,
+        );
+        std::fs::write(Path::new(&dir).join("panel.html"), page).unwrap();
+    }
 }

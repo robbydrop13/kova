@@ -26,6 +26,7 @@ pub enum Stored {
     Markdown(PathBuf),
     Html(PathBuf),
     Sheet(String),
+    File(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +47,7 @@ impl Stored {
             PanelTarget::Web(u) => Stored::Web(u.clone()),
             PanelTarget::Markdown(p) => Stored::Markdown(p.clone()),
             PanelTarget::Html(p) => Stored::Html(p.clone()),
+            PanelTarget::File(p) => Stored::File(p.clone()),
             PanelTarget::Sheet(id) => Stored::Sheet(id.clone()),
             PanelTarget::History | PanelTarget::Question(_) => return None,
         })
@@ -56,6 +58,7 @@ impl Stored {
             Stored::Web(u) => PanelTarget::Web(u.clone()),
             Stored::Markdown(p) => PanelTarget::Markdown(p.clone()),
             Stored::Html(p) => PanelTarget::Html(p.clone()),
+            Stored::File(p) => PanelTarget::File(p.clone()),
             Stored::Sheet(id) => PanelTarget::Sheet(id.clone()),
         }
     }
@@ -65,7 +68,7 @@ impl Stored {
     fn valid(&self) -> bool {
         match self {
             Stored::Web(u) => crate::ask::is_panel_url(u),
-            Stored::Markdown(p) | Stored::Html(p) => p.is_absolute(),
+            Stored::Markdown(p) | Stored::Html(p) | Stored::File(p) => p.is_absolute(),
             Stored::Sheet(id) => crate::ask::is_safe_question_id(id),
         }
     }
@@ -137,7 +140,7 @@ pub fn detail(target: &Stored, home: Option<&Path>) -> String {
     };
     match target {
         Stored::Web(u) => super::side_panel::header_title(None, Some(u)).unwrap_or_else(|| u.clone()),
-        Stored::Markdown(p) | Stored::Html(p) => short(p),
+        Stored::Markdown(p) | Stored::Html(p) | Stored::File(p) => short(p),
         Stored::Sheet(_) => "Decision sheet in Kova".into(),
     }
 }

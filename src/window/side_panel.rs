@@ -108,6 +108,9 @@ pub enum PanelTarget {
     Markdown(PathBuf),
     /// A local HTML file, loaded as is.
     Html(PathBuf),
+    /// Any other local file WebKit shows itself (an image, a PDF, text,
+    /// JSON), loaded as is with no script.
+    File(PathBuf),
     /// A decision sheet Kova renders itself (`kova ask --decisions`), by
     /// the id of its question.
     Sheet(String),
@@ -122,7 +125,7 @@ impl PanelTarget {
     pub fn fallback_title(&self) -> String {
         match self {
             PanelTarget::Web(url) => url.clone(),
-            PanelTarget::Markdown(p) | PanelTarget::Html(p) => {
+            PanelTarget::Markdown(p) | PanelTarget::Html(p) | PanelTarget::File(p) => {
                 p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
             }
             PanelTarget::Sheet(_) => "Decision".to_string(),
@@ -147,7 +150,7 @@ impl PanelTarget {
     pub fn external(&self) -> String {
         match self {
             PanelTarget::Web(url) => url.clone(),
-            PanelTarget::Markdown(p) | PanelTarget::Html(p) => p.to_string_lossy().into_owned(),
+            PanelTarget::Markdown(p) | PanelTarget::Html(p) | PanelTarget::File(p) => p.to_string_lossy().into_owned(),
             PanelTarget::Sheet(_) | PanelTarget::Question(_) | PanelTarget::History => String::new(),
         }
     }
@@ -159,6 +162,9 @@ fn file_kind(path: &Path) -> Option<fn(PathBuf) -> PanelTarget> {
     match ext.as_str() {
         "md" | "markdown" => Some(PanelTarget::Markdown),
         "html" | "htm" => Some(PanelTarget::Html),
+        // A local file a card or an agent points at opens here, never as a
+        // dead path (Robin, 10/11/2026).
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "pdf" | "txt" | "log" | "json" => Some(PanelTarget::File),
         _ => None,
     }
 }
@@ -698,7 +704,7 @@ impl SidePanelView {
                 }
             }
             PanelTarget::Markdown(path) => self.render_markdown_file(&web, path),
-            PanelTarget::Html(path) => {
+            PanelTarget::Html(path) | PanelTarget::File(path) => {
                 let file = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
                 let dir = path.parent().unwrap_or(Path::new("/"));
                 let read = NSURL::fileURLWithPath(&NSString::from_str(&dir.to_string_lossy()));
@@ -1350,7 +1356,11 @@ mod tests {
         // Missing, relative, another type, or plain words: nothing to open.
         assert_eq!(open_target("/tmp/x/draft.md", None, &none), None);
         assert_eq!(open_target("artifacts/a.md", None, &yes), None);
-        assert_eq!(open_target("/tmp/x/a.pdf", None, &yes), None);
+        assert_eq!(open_target("/tmp/x/a.zip", None, &yes), None);
+        // An image, a PDF, text or JSON a card points at opens too (Robin, 10/11/2026).
+        for f in ["/tmp/x/a.pdf", "/tmp/x/shot.PNG", "/tmp/x/out.json", "/tmp/x/run.log"] {
+            assert_eq!(open_target(f, None, &yes), Some(PanelTarget::File(PathBuf::from(f))), "{f}");
+        }
         assert_eq!(open_target("call the bank", None, &yes), None);
         assert_eq!(open_target("https://example.com/a b", None, &yes), None);
         assert_eq!(open_target("file:///tmp/x/a.md", None, &yes), Some(PanelTarget::Markdown(PathBuf::from("/tmp/x/a.md"))));
