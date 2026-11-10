@@ -113,6 +113,8 @@ pub enum State {
     Sent,
     /// The go is sent by the command itself, not an agent: its own line.
     SentByCode(String),
+    /// The click changed nothing, the command says why: its own line.
+    Said(String),
     /// The click is recorded, the receiver does not have it yet.
     Noted,
     Failed(String),
@@ -338,6 +340,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         Some(Outcome::Running) => State::Running,
         Some(Outcome::Sent) => State::Sent,
         Some(Outcome::SentByCode(line)) => State::SentByCode(line.clone()),
+        Some(Outcome::Said(line)) => State::Said(line.clone()),
         Some(Outcome::Noted) => State::Noted,
         Some(Outcome::Failed { words, .. }) => State::Failed(words.clone()),
         None => State::Idle,
@@ -539,6 +542,10 @@ pub enum Button {
     /// No go on an action plan: closed as `nogo`, which its agent learns as
     /// a plan turned down, not as a card that was not relevant.
     NoGo,
+    /// The two ways out of a send nobody knows the end of: the user saw the
+    /// message (`C'est parti`), or nothing left and it goes again (`Renvoyer`).
+    Left,
+    Resend,
 }
 
 impl Button {
@@ -558,12 +565,16 @@ impl Button {
             Button::Snooze => "snooze",
             Button::Dismiss => "dismiss",
             Button::NoGo => "nogo",
+            Button::Left => "left",
+            Button::Resend => "resend",
         }
     }
 
     pub fn parse(word: &str) -> Option<Button> {
         match word {
             "nogo" => Some(Button::NoGo),
+            "left" => Some(Button::Left),
+            "resend" => Some(Button::Resend),
             "expand" => Some(Button::Expand),
             "open" => Some(Button::Open),
             "done" => Some(Button::Done),
@@ -596,6 +607,8 @@ impl Button {
             Button::Snooze => "Plus tard",
             Button::Dismiss => "Pas pertinent, retirer",
             Button::NoGo => "No go",
+            Button::Left => "C'est parti",
+            Button::Resend => "Renvoyer",
         }
     }
 
@@ -619,7 +632,7 @@ pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
     if item.uncertain.is_some() && (item.draft.is_some() || item.validates) {
         return None;
     }
-    let sent = matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted);
+    let sent = matches!(item.state, State::Sent | State::SentByCode(_) | State::Said(_) | State::Noted);
     match item.kind {
         Kind::Attention if item.draft.is_some() && can_act => (!sent).then_some(Button::Validate),
         Kind::Attention if item.ask.is_some() => Some(Button::OpenSheet),
@@ -642,7 +655,7 @@ pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
 /// (`primary`). A draft's verbs need `act_command`; a sent draft has none
 /// left. `Refuser` needs the close command (`card_html`).
 pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
-    let sent = matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted);
+    let sent = matches!(item.state, State::Sent | State::SentByCode(_) | State::Said(_) | State::Noted);
     let links: Vec<Button> = match item.kind {
         Kind::Attention if item.draft.is_some() && can_act => match (sent, item.plan) {
             (true, _) => Vec::new(),
@@ -660,10 +673,12 @@ pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
         Kind::Permission => vec![Button::Deny],
         Kind::Sheet | Kind::Ask | Kind::Error | Kind::FailedRoutine => Vec::new(),
     };
-    // An uncertain card keeps `Valider`, last and as a link, not in blue.
-    let again = (item.uncertain.is_some() && !sent && can_act && item.kind == Kind::Attention && (item.draft.is_some() || item.validates))
-        .then_some(Button::Validate);
-    links.into_iter().chain(primary(item, can_act)).chain(again).collect()
+    // A send nobody knows the end of: the user settles it, nothing else is
+    // offered on the draft (no blue button: neither answer is the default).
+    if item.uncertain.is_some() && item.kind == Kind::Attention && (item.draft.is_some() || item.validates) {
+        return if sent || !can_act { Vec::new() } else { vec![Button::Left, Button::Resend] };
+    }
+    links.into_iter().chain(primary(item, can_act)).collect()
 }
 
 /// A card's icons, top right: snooze, remove, done. On an attention card a
@@ -695,7 +710,7 @@ pub fn icons(item: &Item, can_close: bool, can_snooze: bool) -> Vec<Button> {
 /// The user already acted on the card: a go went through, or a consigne
 /// was sent or is on its way.
 pub fn acted(item: &Item) -> bool {
-    matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted)
+    matches!(item.state, State::Sent | State::SentByCode(_) | State::Said(_) | State::Noted)
         || matches!(&item.instruction, Some(Instructed { outcome: Outcome::Sent | Outcome::Noted | Outcome::Running, .. }))
 }
 
@@ -886,6 +901,8 @@ fn state_html(state: &State) -> String {
         State::Running => "<div class=\"state\">En cours</div>".to_string(),
         State::Sent => "<div class=\"state ok\">Transmis à l'agent</div>".to_string(),
         State::SentByCode(line) => format!("<div class=\"state ok\">{}</div>", esc(line)),
+        // Neutral: neither a delivery (green) nor a failure (red).
+        State::Said(line) => format!("<div class=\"state\">{}</div>", linked(line)),
         State::Noted => "<div class=\"state warn\">Noté, pas encore remis à l'agent</div>".to_string(),
         State::Failed(words) => format!("<div class=\"state crit\">Non transmis : {}</div>", esc(words)),
     }
@@ -929,7 +946,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     let unsure = item
         .uncertain
         .as_deref()
-        .map(|why| format!("<div class=\"state warn top\">Peut-être parti, vérifie le fil : {}</div>", linked(why)))
+        .map(|why| format!("<div class=\"state warn top\">Peut-être parti : {}</div>", linked(why)))
         .unwrap_or_default();
     let failed = format!("{failed}{unsure}");
     let proof = item.proof.as_deref().map(|p| format!("<div class=\"state ok\">Preuve : {}</div>", linked(p))).unwrap_or_default();
@@ -971,7 +988,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
                  <div class=\"draft-foot\">{src}{acts}</div>{detail}{state}",
                 orig = esc(&draft.text),
                 text = esc(&draft.text),
-                ro = if matches!(item.state, State::Sent | State::SentByCode(_) | State::Noted) || running { " readonly" } else { "" },
+                ro = if matches!(item.state, State::Sent | State::SentByCode(_) | State::Said(_) | State::Noted) || running { " readonly" } else { "" },
                 src = source_html(item, now),
                 state = state_html(&item.state),
             )
@@ -2363,10 +2380,17 @@ mod tests {
         e.uncertain = Some("Slack n'a pas répondu <30 s>".into());
         let item = from_attention(&e, None, false).unwrap();
         assert_eq!(primary(&item, true), None);
-        assert_eq!(buttons(&item, true), [Button::Correct, Button::Validate]);
+        assert_eq!(buttons(&item, true), [Button::Left, Button::Resend], "the user settles it: it left, or send it again");
         let html = card_html(&item, true, true, true, 10);
-        assert!(html.contains("<div class=\"state warn top\">Peut-être parti, vérifie le fil : Slack n&#39;a pas répondu &lt;30 s&gt;</div>"), "{html}");
-        assert!(html.contains("data-act=\"validate\"") && !html.contains("class=\"btn acc\" data-act=\"validate\""), "a link, not the blue button: {html}");
+        assert!(html.contains("<div class=\"state warn top\">Peut-être parti : Slack n&#39;a pas répondu &lt;30 s&gt;</div>"), "{html}");
+        assert!(html.contains("class=\"link\" data-act=\"left\">C'est parti</button>") && html.contains("class=\"link\" data-act=\"resend\">Renvoyer</button>"), "{html}");
+        assert!(!html.contains("data-act=\"validate\"") && !html.contains("btn acc"), "no blue button, no Valider: {html}");
+        assert_eq!((Button::parse("left"), Button::parse("resend")), (Some(Button::Left), Some(Button::Resend)));
+        // A click that changed nothing: the command's words, neutral, and the draft is not offered again.
+        e.uncertain = None;
+        let said = card_html(&from_attention(&e, Some(&Outcome::Said("déjà remis à claap-agent à 14:02 pour cette version".into())), false).unwrap(), true, true, true, 10);
+        assert!(said.contains("<div class=\"state\">déjà remis à claap-agent à 14:02 pour cette version</div>"), "{said}");
+        assert!(!said.contains("Transmis à l'agent") && !said.contains("Non transmis") && !said.contains("data-act=\"validate\""), "{said}");
     }
 
     #[test]

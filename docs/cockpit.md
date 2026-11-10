@@ -115,8 +115,17 @@ it: one `WKWebView` per window over the active tab's panes area
   …`, shown as it is, not as a failure. The target reads in words when the
   queue gives them (`draft.target_label`, the raw id in the tooltip; amber
   for `target_kind` `external`). A card back with `uncertain` (nobody knows
-  whether the message left) says `Peut-être parti, vérifie le fil : why` at
-  its head, and its `Valider` is a link, not the blue button.
+  whether the message left) says `Peut-être parti : <what to check>` at its
+  head, the queue's own words, and offers two buttons and no other on its
+  draft: `C'est parti` (`act_command ID parti`: the user saw the message;
+  the card closes) and `Renvoyer` (`act_command ID Renvoyer`: nothing left,
+  a new go), both with the click key and `--seen` like any go, neither in
+  blue. In `En cours` such a click reads `Peut-être parti`, one being sent
+  `Envoi en cours`. A click that changed nothing because this version is
+  already taken exits 0 with a first line that says so (`déjà envoyé par le
+  code…`, `envoi par le code … incertain`, `envoi par le code en cours…`,
+  `déjà remis à…`, `attention::ALREADY`): the card shows that line as it
+  is, in a neutral tone, neither `Transmis à l'agent` nor a failure.
 - `No go` (10/11/2026), on an action plan only: a `decision` posted by
   `veille-actions` with its plan in the body (`attention::PLAN_FROM`). It
   runs `close_command ID --reason nogo`: the plan's agent learns a no go,

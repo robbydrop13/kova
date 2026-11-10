@@ -70,6 +70,11 @@ pub enum Fate<'a> {
     Failed(&'a str),
     /// The card was closed and nothing proves the action took place.
     NoProof,
+    /// Nobody knows whether the message left (a send that timed out): what
+    /// to check. Not over: the user settles it on the card.
+    Uncertain(&'a str),
+    /// The command is sending the message itself, no end yet.
+    Sending,
     /// The action became pointless (the user did it himself, the subject
     /// went away): why. Over, but neither done nor proven.
     Superseded(&'a str),
@@ -86,6 +91,8 @@ pub fn fate(c: &Click) -> Fate<'_> {
         "superseded" => return Fate::Superseded(after("sans objet").unwrap_or(r)),
         "failed" => return Fate::Failed(after("échec").unwrap_or(r)),
         "no_proof" => return Fate::NoProof,
+        "uncertain" => return Fate::Uncertain(after("peut-être parti").unwrap_or(r)),
+        "sending" => return Fate::Sending,
         "done" | "dismissed" => return if r.is_empty() { Fate::Open } else { Fate::Words(r) },
         // Absent, or a word this build does not know: read the text.
         _ => {}
@@ -375,6 +382,8 @@ fn tracker(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
         // Not done: the action failed, or nothing proves it.
         (_, Fate::Failed(_)) => "<span class=\"st crit\"><i></i>Échec</span>".to_string(),
         (_, Fate::NoProof) => "<span class=\"st warn\"><i></i>Sans preuve</span>".to_string(),
+        (_, Fate::Uncertain(_)) => "<span class=\"st warn\"><i></i>Peut-être parti</span>".to_string(),
+        (_, Fate::Sending) => "<span class=\"st run\"><i></i>Envoi en cours</span>".to_string(),
         (Step::Received, _) => "<span class=\"st run\"><i></i>En cours</span>".to_string(),
         _ => "<span class=\"st\"><i></i>Fait</span>".to_string(),
     };
@@ -400,6 +409,7 @@ fn click_html(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
         (Fate::Proof(proof), _) => format!("<span class=\"ok\"><b>Preuve :</b> {}</span>", linked(&one_line(proof, 200))),
         (Fate::Failed(why), _) => format!("<span class=\"crit\"><b>Échec :</b> {}</span>", linked(&one_line(why, 200))),
         (Fate::Superseded(why), _) => format!("<span class=\"dim\"><b>Sans objet :</b> {}</span>", linked(&one_line(why, 200))),
+        (Fate::Uncertain(why), _) => format!("<span class=\"warn\"><b>Peut-être parti :</b> {}</span>", linked(&one_line(why, 220))),
         (Fate::NoProof, _) => "<span class=\"warn\"><b>Sans preuve :</b> la carte a été fermée, rien ne prouve que l'action a eu lieu</span>".to_string(),
         (Fate::Words(words), Step::Done) => format!("<span><b>Résultat :</b> {}</span>", linked(&one_line(words, 160))),
         (_, Step::Late) => "<span>Pas encore remis : il le sera à son prochain outil, ou réveillé s'il dort</span>".to_string(),
@@ -745,6 +755,13 @@ mod tests {
         assert_eq!(fate(&data.clicks[2]), Fate::Failed("canal archivé"));
         assert_eq!(fate(&data.clicks[3]), Fate::NoProof);
         assert_eq!((fate(&data.clicks[4]), fate(&data.clicks[5])), (Fate::Words("carte mise à jour"), Fate::Words("retrait transmis")));
+        // A send by the command itself: on its way, then maybe gone.
+        let mut code = data.clicks[3].clone();
+        code.outcome = "uncertain".into();
+        code.result = "peut-être parti : timeout ; vérification dans Slack, sinon C'est parti ou Renvoyer".into();
+        assert_eq!(fate(&code), Fate::Uncertain("timeout ; vérification dans Slack, sinon C'est parti ou Renvoyer"));
+        code.outcome = "sending".into();
+        assert_eq!(fate(&code), Fate::Sending);
         // The field wins over the text; without it, the text is read as before.
         let mut odd = data.clicks[0].clone();
         odd.outcome = "superseded".into();

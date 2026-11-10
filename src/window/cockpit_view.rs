@@ -742,7 +742,15 @@ impl KovaView {
             }
             (
                 Kind::Attention,
-                Button::Done | Button::Dismiss | Button::Refuse | Button::NoGo | Button::Snooze | Button::Validate | Button::Correct,
+                Button::Done
+                | Button::Dismiss
+                | Button::Refuse
+                | Button::NoGo
+                | Button::Snooze
+                | Button::Validate
+                | Button::Correct
+                | Button::Left
+                | Button::Resend,
             ) => {
                 let Some(id) = attention_id else { return };
                 let (verb, text) = match button {
@@ -750,6 +758,9 @@ impl KovaView {
                     Button::Dismiss => (Verb::Dismiss, None),
                     // A plan turned down: its agent learns a no go, not "not relevant".
                     Button::NoGo => (Verb::NoGo, None),
+                    // A send nobody knows the end of, settled by the user.
+                    Button::Left => (Verb::Left, None),
+                    Button::Resend => (Verb::Resend, None),
                     // Closed as dismissed, with the reason typed, if any.
                     Button::Refuse => (Verb::Dismiss, text),
                     Button::Snooze => (Verb::Snooze, text),

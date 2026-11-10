@@ -176,7 +176,10 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
         let (id, state) = s.split_once('=').ok_or("--state: <card id>=<state>")?;
         let outcome = match state {
             "delivered" => Outcome::Sent,
-            said if crate::attention::code_send_line(said).is_some() => Outcome::SentByCode(said.to_string()),
+            said if crate::attention::said_line(said).is_some() => match crate::attention::said_line(said) {
+                Some(crate::attention::Delivery::Said(line)) => Outcome::Said(line),
+                _ => Outcome::SentByCode(said.to_string()),
+            },
             "noted" => Outcome::Noted,
             "running" => Outcome::Running,
             other => match other.strip_prefix("failed:") {

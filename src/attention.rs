@@ -94,7 +94,7 @@ pub struct Draft {
 /// A go's argv with the fingerprint of the draft the user saw: `Valider`
 /// and a correction only, and only a fingerprint that reads as one.
 pub fn with_seen(mut args: Vec<String>, verb: Verb, seen: Option<&str>) -> Vec<String> {
-    if matches!(verb, Verb::Validate | Verb::Correct)
+    if matches!(verb, Verb::Validate | Verb::Correct | Verb::Left | Verb::Resend)
         && let Some(seen) = seen.filter(|s| valid_seen(s))
     {
         args.push(format!("--seen={seen}"));
@@ -521,6 +521,12 @@ pub enum Verb {
     /// A free instruction typed on an opened Cockpit card:
     /// `act_command <id> instruct --text=<text>`.
     Instruct,
+    /// On a card whose send is uncertain: the user saw the message, it
+    /// left (`act_command <id> parti`).
+    Left,
+    /// On a card whose send is uncertain: nothing left, send it again
+    /// (`act_command <id> Renvoyer`, which the CLI takes as a new go).
+    Resend,
     /// No go on an action plan, which is relevant but turned down:
     /// `close_command <id> --reason nogo`. Not the x (`Dismiss`).
     NoGo,
@@ -537,6 +543,8 @@ impl Verb {
             Verb::Snooze => "Plus tard",
             Verb::Instruct => "instruct",
             Verb::NoGo => "No go",
+            Verb::Left => "parti",
+            Verb::Resend => "Renvoyer",
         }
     }
 }
@@ -553,6 +561,10 @@ pub enum Outcome {
     /// The go did not go to an agent: the command sends the message itself
     /// and says so on its first line (`CODE_SEND`), shown as it is.
     SentByCode(String),
+    /// The click changed nothing and the command says why on its first line
+    /// (this version already left, is on its way, is with the agent, may
+    /// have left): shown as it is, neither a failure nor a delivery.
+    Said(String),
     /// The click is recorded but its agent does not have it yet (exit 3): it
     /// will be handed over later. Not a failure; the card says so.
     Noted,
@@ -647,7 +659,7 @@ fn verb_argv_with(
     if !valid_id(id) {
         return None;
     }
-    let acts = matches!(verb, Verb::Validate | Verb::Correct | Verb::Instruct);
+    let acts = matches!(verb, Verb::Validate | Verb::Correct | Verb::Instruct | Verb::Left | Verb::Resend);
     let base = match verb {
         Verb::Snooze => snooze,
         _ if acts => act,
@@ -661,7 +673,7 @@ fn verb_argv_with(
     }
     args.push(id.to_string());
     match verb {
-        Verb::Validate => args.push(verb.label().to_string()),
+        Verb::Validate | Verb::Left | Verb::Resend => args.push(verb.label().to_string()),
         Verb::Correct => {
             let text = text.filter(|t| !t.trim().is_empty())?;
             args.extend([verb.label().to_string(), format!("--text={text}")]);
@@ -723,7 +735,7 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>
         let id = id.to_string();
         std::thread::spawn(move || {
             let outcome = match run_click(&bin, &args) {
-                Ok(Delivery::Delivered | Delivery::ByCode(_)) => Outcome::Sent,
+                Ok(Delivery::Delivered | Delivery::ByCode(_) | Delivery::Said(_)) => Outcome::Sent,
                 Ok(Delivery::Noted) => Outcome::Noted,
                 Err(words) => {
                     log::warn!("attention instruct {id}: {words}");
@@ -751,9 +763,11 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>
             Ok(delivery) => set_outcome(
                 &id,
                 match (verb, delivery) {
-                    (Verb::Validate | Verb::Correct, Delivery::Delivered) => Outcome::Sent,
-                    (Verb::Validate | Verb::Correct, Delivery::ByCode(line)) => Outcome::SentByCode(line),
-                    (Verb::Validate | Verb::Correct, Delivery::Noted) => Outcome::Noted,
+                    // Whatever the verb: the command's own words, when it says them.
+                    (_, Delivery::Said(line)) => Outcome::Said(line),
+                    (Verb::Validate | Verb::Correct | Verb::Resend, Delivery::Delivered) => Outcome::Sent,
+                    (Verb::Validate | Verb::Correct | Verb::Resend, Delivery::ByCode(line)) => Outcome::SentByCode(line),
+                    (Verb::Validate | Verb::Correct | Verb::Resend, Delivery::Noted) => Outcome::Noted,
                     _ => Outcome::Closed,
                 },
             ),
@@ -781,21 +795,32 @@ pub enum Delivery {
     Noted,
     /// The command sends the message itself: its own words.
     ByCode(String),
+    /// Nothing new was done, the command says why: its own words.
+    Said(String),
 }
 
 /// How `act_command` starts its first line when it sends a validated draft
 /// itself instead of handing it to an agent (`envoi par le code (slack à
 /// U123)`).
 pub const CODE_SEND: &str = "envoi par le code";
-/// Its first line for a second click on a version already sent or on its
-/// way: not an error, shown as it is.
-pub const ALREADY_SENT: &str = "déjà parti";
+/// How its first line starts when the click changed nothing because this
+/// version of the draft is already taken (sent, on its way, uncertain, with
+/// the agent): not an error, shown as it is, in a neutral tone.
+pub const ALREADY: &[&str] = &["déjà envoyé par le code", "déjà remis à", "déjà parti", "déjà noté", "envoi par le code"];
 
-/// The line a command that exited 0 printed, when it says it sends the
-/// message itself: one line, 120 chars at most.
-pub fn code_send_line(stdout: &str) -> Option<String> {
-    let line = stdout.lines().next()?.trim();
-    (line.starts_with(CODE_SEND) || line.starts_with(ALREADY_SENT)).then(|| line.chars().filter(|c| !c.is_control()).take(120).collect())
+/// What a command that exited 0 says on its first line, when it says
+/// something a card shows: `ByCode` for the send it starts
+/// (`envoi par le code (slack à U123)`), `Said` for a click that changed
+/// nothing (`ALREADY`). One line, 160 chars at most.
+pub fn said_line(stdout: &str) -> Option<Delivery> {
+    let line: String = stdout.lines().next()?.trim().chars().filter(|c| !c.is_control()).take(160).collect();
+    if line.starts_with(&format!("{CODE_SEND} (")) {
+        Some(Delivery::ByCode(line))
+    } else if ALREADY.iter().any(|p| line.starts_with(p)) {
+        Some(Delivery::Said(line))
+    } else {
+        None
+    }
 }
 
 /// What a click's exit says: `code` is `None` when a signal ended it.
@@ -865,8 +890,8 @@ fn run_click_with(bin: &str, args: &[String], key: Option<&str>) -> Result<Deliv
     }
     crate::exec::run_with_deadline(&mut command, ACT_DEADLINE).and_then(|out| {
         if let Some(delivery) = delivery_of(out.status.code(), exit_codes) {
-            Ok(match (delivery, code_send_line(&String::from_utf8_lossy(&out.stdout))) {
-                (Delivery::Delivered, Some(line)) => Delivery::ByCode(line),
+            Ok(match (delivery, said_line(&String::from_utf8_lossy(&out.stdout))) {
+                (Delivery::Delivered, Some(said)) => said,
                 (delivery, _) => delivery,
             })
         } else {
@@ -1159,17 +1184,32 @@ mod tests {
         assert_eq!(delivery_of(Some(2), true), None);
         assert_eq!(delivery_of(None, true), None, "killed by a signal");
         // The command sends the message itself and says so: its line, as it is.
-        assert_eq!(code_send_line("envoi par le code (slack à U0BJ301TJNM)\nmore\n").as_deref(), Some("envoi par le code (slack à U0BJ301TJNM)"));
-        assert_eq!(code_send_line("remis à claap-agent\n"), None);
-        assert_eq!(code_send_line("déjà parti ou en cours pour cette version du brouillon\n").as_deref(), Some("déjà parti ou en cours pour cette version du brouillon"), "a second click: not an error");
+        assert_eq!(said_line("envoi par le code (slack à U0BJ301TJNM)\nmore\n"), Some(Delivery::ByCode("envoi par le code (slack à U0BJ301TJNM)".into())));
+        assert_eq!(said_line("remis à claap-agent\n"), None);
+        // A click that changed nothing: the command's words, not a delivery nor a failure.
+        for line in [
+            "déjà parti ou en cours pour cette version du brouillon",
+            "déjà envoyé par le code, preuve slack:D1/17.5 : n'envoie pas, rien n'est noté",
+            "envoi par le code de 14:02 incertain (timeout) : vérifie dans Slack, puis C'est parti ou Renvoyer sur la carte",
+            "envoi par le code en cours depuis 14:02 : n'envoie pas, rien n'est noté",
+            "déjà remis à claap-agent à 14:02 pour cette version (clic c-1) : il l'envoie",
+        ] {
+            assert_eq!(said_line(line), Some(Delivery::Said(line.to_string())), "{line}");
+        }
+        // The two ways out of an uncertain send: act verbs, with the fingerprint.
+        let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Left, None).map(|(_, a)| a.join(" ")).as_deref(), Some("act --exit-codes a-1 parti"));
+        assert_eq!(verb_argv(&act, &[], "a-1", Verb::Resend, None).map(|(_, a)| a.join(" ")).as_deref(), Some("act --exit-codes a-1 Renvoyer"));
         let argv = |verb, seen| with_seen(vec!["act".to_string(), "a-1".to_string()], verb, seen).join(" ");
         assert_eq!(argv(Verb::Validate, Some("3fe43fde4beeba99")), "act a-1 --seen=3fe43fde4beeba99");
         assert_eq!(argv(Verb::Correct, Some("3fe43fde4beeba99")), "act a-1 --seen=3fe43fde4beeba99");
         assert_eq!(argv(Verb::Instruct, Some("3fe43fde4beeba99")), "act a-1", "a go only");
+        assert_eq!(argv(Verb::Resend, Some("3fe43fde4beeba99")), "act a-1 --seen=3fe43fde4beeba99");
+        assert_eq!(argv(Verb::Left, Some("3fe43fde4beeba99")), "act a-1 --seen=3fe43fde4beeba99");
         assert_eq!(argv(Verb::Validate, Some("--by=evil")), "act a-1", "not a fingerprint: not passed on");
         assert_eq!(argv(Verb::Validate, None), "act a-1");
         assert!(valid_seen("3fe43fde4beeba99") && !valid_seen("3fe4") && !valid_seen("--by=robin0000000") && !valid_seen("zzzzzzzzzzzzzzzz"));
-        assert_eq!(code_send_line(""), None);
+        assert_eq!(said_line(""), None);
         assert_eq!(delivery_of(Some(3), false), None, "a command not asked for exit codes: 3 is a failure");
         // Only a click on an agent's card asks for them; a close does not.
         let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
