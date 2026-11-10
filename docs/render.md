@@ -24,8 +24,11 @@ kova render question --message <text or @file> --out <file.html>
       [--from <who>] [--button <label>]... [--input] [--light]
 ```
 
-`--refs` is `[links] refs_file`: the titles drawn after the ticket and pull
-request ids a text does not tell (`docs/links.md`).
+The pages are what the app would show: `[chat] rewrite_markers` and
+`[links] refs_file` (the titles drawn after the ticket and pull request ids
+a text does not tell, `docs/links.md`) are read from Kova's config, as the
+app does. `--markers` and `--refs` replace them; `--no-config` ignores the
+config, for a page that depends on the flags alone (a test, a fixture).
 
 Each prints the files it wrote. Exit 0 when written, 2 on a bad call (the
 reason on stderr, nothing written).

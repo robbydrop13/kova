@@ -39,6 +39,9 @@ kova render: write Kova's pages as HTML files, without a window
         [--from <who>] [--button <label>]... [--input] [--light]
       A long `kova ask` question as the side panel shows it.
 
+The pages are what the app would show: `[chat] rewrite_markers` and `[links] refs_file`
+come from Kova's config unless --markers or --refs is given; --no-config ignores it.
+
 Then: scripts/render-shot.sh <file.html> <file.png> [width,height]";
 
 struct Args {
@@ -46,7 +49,7 @@ struct Args {
 }
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["--light", "--unfold", "--input"];
+const SWITCHES: &[&str] = &["--light", "--unfold", "--input", "--no-config"];
 
 impl Args {
     fn parse(args: &[String]) -> Result<Args, String> {
@@ -117,10 +120,22 @@ pub fn run(args: &[String]) -> i32 {
         println!("{USAGE}");
         return 0;
     }
-    let done = Args::parse(&args[1..]).and_then(|a| {
+    let done = Args::parse(&args[1..]).map(|mut a| {
+        // What the app would show: the user's config gives what a flag does
+        // not (`[chat] rewrite_markers`, `[links] refs_file`). `--no-config`
+        // for a page that depends on the flags alone.
+        if !a.has("--no-config") {
+            let config = crate::config::Config::load();
+            if !a.has("--markers") && !config.chat.rewrite_markers.is_empty() {
+                a.flags.push(("--markers".to_string(), Some(config.chat.rewrite_markers.join("|"))));
+            }
+            if !a.has("--refs") && let Some(file) = config.links.refs_path() {
+                a.flags.push(("--refs".to_string(), Some(file.to_string_lossy().into_owned())));
+            }
+        }
         // The ids' titles (`[links] refs_file`), for the pages that draw them.
         crate::refs::set_file(a.get("--refs").map(Path::new));
-        Ok(a)
+        a
     });
     let done = done.and_then(|a| match what {
         "cockpit" => render_cockpit(&a),
@@ -338,7 +353,7 @@ mod tests {
         let d = dir();
         let out = d.join("chat.html");
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/transcripts/stop_hook_form_rewrite.jsonl");
-        let code = run(&argv(&["chat", "--transcript", fixture, "--out", &out.to_string_lossy(), "--markers", "Rewrite it in full"]));
+        let code = run(&argv(&["chat", "--transcript", fixture, "--out", &out.to_string_lossy(), "--markers", "Rewrite it in full", "--no-config"]));
         assert_eq!(code, 0);
         let html = std::fs::read_to_string(&out).unwrap();
         assert!(html.contains("Version précédente") && html.contains(r#"<script nonce="render">"#));
@@ -352,7 +367,7 @@ mod tests {
         let list = d.join("list.json");
         std::fs::write(&list, r#"[{"id":"a-1","level":"now","kind":"decision","from":"pm","title":"Pick a plan","needs":"Say A or B","ts":"2026-11-10T10:00:00+01:00"}]"#).unwrap();
         let out = d.join("pages");
-        let code = run(&argv(&["cockpit", "--list", &list.to_string_lossy(), "--out", &out.to_string_lossy(), "--open", "a-1"]));
+        let code = run(&argv(&["cockpit", "--list", &list.to_string_lossy(), "--out", &out.to_string_lossy(), "--open", "a-1", "--no-config"]));
         assert_eq!(code, 0);
         for page in ["default.html", "menu.html", "chips.html", "en-cours.html", "fait.html", "card.html"] {
             assert!(out.join(page).is_file(), "{page}");
@@ -365,8 +380,8 @@ mod tests {
     fn a_bad_call_says_why_and_writes_nothing() {
         assert_eq!(run(&argv(&[])), 2);
         assert_eq!(run(&argv(&["help"])), 0);
-        assert_eq!(run(&argv(&["chat", "--out", "/tmp/x.html"])), 2, "no transcript");
-        assert_eq!(run(&argv(&["chat", "--transcript", "/nonexistent.jsonl", "--out", "/tmp/kova-render-none.html"])), 2);
+        assert_eq!(run(&argv(&["chat", "--out", "/tmp/x.html", "--no-config"])), 2, "no transcript");
+        assert_eq!(run(&argv(&["chat", "--transcript", "/nonexistent.jsonl", "--out", "/tmp/kova-render-none.html", "--no-config"])), 2);
         assert!(!Path::new("/tmp/kova-render-none.html").exists());
         assert_eq!(run(&argv(&["terminal"])), 2);
     }
