@@ -1670,7 +1670,7 @@ body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
 .clk .q{font-size:13px;line-height:18px;color:var(--t2);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .clk .res{font-size:12px;color:var(--t3);margin-top:6px;display:flex;gap:8px;align-items:center;min-width:0}
 .clk .res b{color:var(--t2);font-weight:500}
-.clk .res .crit,.clk .res .crit b{color:var(--crit)}.clk .res .warn,.clk .res .warn b{color:var(--warn-dot)}.clk .res .ok b{color:var(--ok-dot)}
+.clk .res .crit,.clk .res .crit b{color:var(--crit)}.clk .res .warn,.clk .res .warn b{color:var(--warn-dot)}.clk .res .ok b{color:var(--ok-dot)}.clk .res .dim,.clk .res .dim b{color:var(--t3)}
 .st.crit{color:var(--crit)}.st.crit i{background:var(--crit);border-color:var(--crit)}
 .verb{height:18px;border-radius:4px;padding:0 6px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;background:var(--sel-bg);color:var(--sel-text);margin-right:8px;vertical-align:1px}
 .verb.c{background:var(--bg-elev);color:var(--t1)}

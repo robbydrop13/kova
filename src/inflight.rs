@@ -53,6 +53,10 @@ pub struct Click {
     pub result: String,
     /// The click is a go: the agent acts on it, and owes a proof.
     pub go: bool,
+    /// What became of it, in the queue's own word: `proof`, `superseded`,
+    /// `failed`, `no_proof`, `done`, `dismissed`. Empty when the queue does
+    /// not say (an older one): `fate` then reads `result`.
+    pub outcome: String,
 }
 
 /// What a click's `result` says, in the queue's own words (`attn inflight`).
@@ -66,6 +70,9 @@ pub enum Fate<'a> {
     Failed(&'a str),
     /// The card was closed and nothing proves the action took place.
     NoProof,
+    /// The action became pointless (the user did it himself, the subject
+    /// went away): why. Over, but neither done nor proven.
+    Superseded(&'a str),
     /// Other words (a card updated, a withdrawal passed on).
     Words(&'a str),
 }
@@ -73,8 +80,20 @@ pub enum Fate<'a> {
 pub fn fate(c: &Click) -> Fate<'_> {
     let r = c.result.trim();
     let after = |prefix: &str| r.strip_prefix(prefix).map(|rest| rest.trim_start().trim_start_matches(':').trim());
+    // The queue's `outcome` decides; `result` only gives the words.
+    match c.outcome.as_str() {
+        "proof" => return Fate::Proof(after("preuve").unwrap_or(r)),
+        "superseded" => return Fate::Superseded(after("sans objet").unwrap_or(r)),
+        "failed" => return Fate::Failed(after("échec").unwrap_or(r)),
+        "no_proof" => return Fate::NoProof,
+        "done" | "dismissed" => return if r.is_empty() { Fate::Open } else { Fate::Words(r) },
+        // Absent, or a word this build does not know: read the text.
+        _ => {}
+    }
     if r.is_empty() {
         Fate::Open
+    } else if let Some(why) = after("sans objet") {
+        Fate::Superseded(why)
     } else if let Some(proof) = after("preuve") {
         Fate::Proof(proof)
     } else if let Some(why) = after("échec") {
@@ -130,6 +149,8 @@ struct RawClick {
     result: Option<String>,
     #[serde(default)]
     go: Option<Value>,
+    #[serde(default)]
+    outcome: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +196,7 @@ pub fn parse(text: &str) -> Option<InFlight> {
             result: c.result.unwrap_or_default(),
             // `true`, or how the go was read (`"explicit"`, `"validated"`).
             go: matches!(&c.go, Some(Value::Bool(true))) || matches!(&c.go, Some(Value::String(s)) if !s.is_empty()),
+            outcome: c.outcome.unwrap_or_default().trim().to_string(),
         })
         .collect();
     let agents = raw
@@ -347,6 +369,8 @@ fn tracker(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
         _ => format!("<span class=\"st ok\"><i></i>Reçu{}</span>", at(c.received)),
     };
     let third = match (st, fate(c)) {
+        // Over without having been done: never `Fait`.
+        (_, Fate::Superseded(_)) => "<span class=\"st\"><i></i>Sans objet</span>".to_string(),
         (Step::Done, _) => format!("<span class=\"st ok\"><i></i>Fait{}</span>", at(c.done)),
         // Not done: the action failed, or nothing proves it.
         (_, Fate::Failed(_)) => "<span class=\"st crit\"><i></i>Échec</span>".to_string(),
@@ -375,6 +399,7 @@ fn click_html(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
     let res = match (fate(c), step(c, now)) {
         (Fate::Proof(proof), _) => format!("<span class=\"ok\"><b>Preuve :</b> {}</span>", linked(&one_line(proof, 200))),
         (Fate::Failed(why), _) => format!("<span class=\"crit\"><b>Échec :</b> {}</span>", linked(&one_line(why, 200))),
+        (Fate::Superseded(why), _) => format!("<span class=\"dim\"><b>Sans objet :</b> {}</span>", linked(&one_line(why, 200))),
         (Fate::NoProof, _) => "<span class=\"warn\"><b>Sans preuve :</b> la carte a été fermée, rien ne prouve que l'action a eu lieu</span>".to_string(),
         (Fate::Words(words), Step::Done) => format!("<span><b>Résultat :</b> {}</span>", linked(&one_line(words, 160))),
         (_, Step::Late) => "<span>Pas encore remis : il le sera à son prochain outil, ou réveillé s'il dort</span>".to_string(),
@@ -693,6 +718,49 @@ mod tests {
         assert!(list.contains(r#"<span class="crit"><b>Échec :</b> mailbox &lt;full&gt;</span>"#) && list.contains(r#"<span class="st crit"><i></i>Échec</span>"#), "{list}");
         assert!(list.contains(r#"<span class="warn"><b>Sans preuve :</b>"#) && list.contains(r#"<span class="st warn"><i></i>Sans preuve</span>"#), "{list}");
         assert!(list.contains(r#"<span class="verb">Go</span>"#), "an instruction that is a go: {list}");
+    }
+
+    /// The six ends the queue names (`outcome`), real shapes of 10/11.
+    #[test]
+    fn the_queue_s_outcome_decides_and_a_superseded_click_is_neither_done_nor_proven() {
+        let click = |n: u8, outcome: &str, done: bool, result: &str| {
+            format!(
+                r#"{{"act_id":"c-{n}","id":"a-{n}","scope":"pro","button":"Valider","title":"T{n}","to":"pm","go":true,"sent":"2026-11-10T10:00:00+01:00","received":"2026-11-10T10:00:05+01:00","done":{},"result":{},"outcome":"{outcome}"}}"#,
+                if done { "\"2026-11-10T10:05:00+01:00\"" } else { "null" },
+                serde_json::to_string(result).unwrap()
+            )
+        };
+        let raw = format!(
+            r#"{{"clicks":[{},{},{},{},{},{}]}}"#,
+            click(1, "proof", true, "preuve : Slack DM https://x.slack.com/archives/D1/p17"),
+            click(2, "superseded", true, "sans objet : Robin lui a répondu lui-même (https://x.slack.com/archives/D1/p18)"),
+            click(3, "failed", false, "échec : canal archivé"),
+            click(4, "no_proof", false, "carte fermée sans preuve"),
+            click(5, "done", true, "carte mise à jour"),
+            click(6, "dismissed", true, "retrait transmis"),
+        );
+        let data = parse(&raw).expect("inflight json");
+        assert_eq!(fate(&data.clicks[0]), Fate::Proof("Slack DM https://x.slack.com/archives/D1/p17"));
+        assert_eq!(fate(&data.clicks[1]), Fate::Superseded("Robin lui a répondu lui-même (https://x.slack.com/archives/D1/p18)"));
+        assert_eq!(fate(&data.clicks[2]), Fate::Failed("canal archivé"));
+        assert_eq!(fate(&data.clicks[3]), Fate::NoProof);
+        assert_eq!((fate(&data.clicks[4]), fate(&data.clicks[5])), (Fate::Words("carte mise à jour"), Fate::Words("retrait transmis")));
+        // The field wins over the text; without it, the text is read as before.
+        let mut odd = data.clicks[0].clone();
+        odd.outcome = "superseded".into();
+        assert!(matches!(fate(&odd), Fate::Superseded(_)), "the queue's word, whatever the text starts with");
+        odd.outcome = String::new();
+        odd.result = "sans objet : plus besoin".into();
+        assert_eq!(fate(&odd), Fate::Superseded("plus besoin"), "an older queue: the text");
+        let now = crate::attention::epoch_of("2026-11-10T10:06:00+01:00").unwrap();
+        let done = done_html(&data, None, now, &|_| String::new());
+        // Sans objet: in Fait, grey, its reason linked, never `Fait` nor `Preuve`.
+        let row = done.split("<div class=\"clk").find(|r| r.contains("T2")).expect("the superseded click is in Fait");
+        assert!(row.contains(r#"<span class="dim"><b>Sans objet :</b> Robin lui a répondu lui-même (<a href="https://x.slack.com/archives/D1/p18">"#), "{row}");
+        assert!(row.contains(r#"<span class="st"><i></i>Sans objet</span>"#) && !row.contains("Fait") && !row.contains("Preuve"), "{row}");
+        assert!(done.contains("<b>Preuve :</b> Slack DM <a href=") && done.contains("carte mise à jour") && done.contains("retrait transmis"));
+        let list = list_html(&data, None, &[], now, &|_| String::new());
+        assert!(list.contains("<b>Échec :</b> canal archivé") && list.contains("<b>Sans preuve :</b>") && !list.contains("Sans objet"), "{list}");
     }
 
     #[test]

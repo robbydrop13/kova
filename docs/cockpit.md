@@ -74,8 +74,13 @@ it: one `WKWebView` per window over the active tab's panes area
   place with its buttons. A click refused before the command ran (the entry
   gone from the queue, no command) says so the same way.
 - A go, its proof, its failure (10/11/2026). The queue says what became of a
-  click (`inflight_command`: `go`, `done` only with a proof, `result`), and
-  `En cours` and `Fait` show it (`inflight::fate`): `preuve : X`, `Preuve :`
+  click (`inflight_command`: `go`, `done` only with a proof, `result`, and
+  `outcome`: `proof`, `superseded`, `failed`, `no_proof`, `done` or
+  `dismissed`), and `En cours` and `Fait` show it (`inflight::fate`, which
+  reads `outcome` and falls back on the words of `result` when the queue
+  does not give it). `superseded`: the action became pointless; `Sans objet`
+  and its reason in grey, kept in `Fait` but never shown as `Fait` nor as a
+  proof. The others: `preuve : X`, `Preuve :`
   and X as a link when it is one (`links`), in `Fait`; `échec : why`, `Échec`
   in red, still in `En cours`; `carte fermée sans preuve`, `Sans preuve` in
   amber, still in `En cours` (nothing proves the action took place). An
