@@ -141,7 +141,17 @@ define_class!(
                         win_vec.push(win);
                     }
                     if config.session.wake_on_launch {
-                        let waker = crate::launch_wake::LaunchWaker::new(config.session.wake_stagger_s, std::time::Instant::now());
+                        // Who has open work goes first: asked once, off the main thread, 3 s at most.
+                        crate::inflight::set_command(&config.attention.inflight_command());
+                        std::thread::spawn(|| {
+                            let owners = crate::inflight::open_owners(std::time::Duration::from_secs(3));
+                            if let Ok(mut slot) = LAUNCH_OWNERS.lock() {
+                                *slot = Some(owners);
+                            }
+                        });
+                        let waker = crate::launch_wake::LaunchWaker::selective(config.session.wake_stagger_s, std::time::Instant::now())
+                            .paced(config.session.wake_batch, config.session.wake_ready_timeout_s);
+                        log::info!("Launch wake: started, {} at a time, {} s at most each", config.session.wake_batch, config.session.wake_ready_timeout_s);
                         *self.ivars().launch_wake.borrow_mut() = Some(waker);
                     }
                 }
@@ -1583,9 +1593,14 @@ fn handle_ipc_clear_anchors(
     crate::ipc::IpcResponse::Ok { data: Some(serde_json::json!({ "removed": removed })) }
 }
 
-/// The launch waker's turn (`launch_wake`): once its stagger is over, wake
-/// the next agent asleep since the launch, in place like `wake-pane`. It
-/// retires when nothing sleeps and no restored tab is still to spawn.
+/// The sessions with open work, once the queue answered the launch's question.
+static LAUNCH_OWNERS: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+
+/// The launch waker's turn (`launch_wake`): wake the next agent asleep since
+/// the launch, in place like `wake-pane`, a batch at a time (the chiefs, the
+/// sessions with open work, then the others). It retires when nothing
+/// sleeps, none of its wakes is still starting and no restored tab is still
+/// to spawn, and logs when each agent was ready.
 fn wake_restored_agents(ivars: &AppDelegateIvars) {
     let mut slot = ivars.launch_wake.borrow_mut();
     let Some(waker) = slot.as_mut() else { return };
@@ -1593,26 +1608,48 @@ fn wake_restored_agents(ivars: &AppDelegateIvars) {
     if !waker.due(now) {
         return;
     }
+    if waker.pending()
+        && let Some(owners) = LAUNCH_OWNERS.lock().ok().and_then(|mut o| o.take())
+    {
+        log::info!("Launch wake: {} session(s) with open work", owners.len());
+        waker.set_wanted(owners);
+    }
     let windows = ivars.windows.borrow();
     let views: Vec<_> = windows.iter().filter_map(|win| kova_view(win)).collect();
     let mut panes = Vec::new();
     for view in &views {
         view.launch_wake_panes(&mut panes);
     }
-    let Some((pane_id, session)) = waker.pick(&panes) else {
-        if views.iter().any(|view| view.has_deferred_tabs()) {
-            waker.idle(now);
-        } else {
-            log::info!("Launch wake: every restored agent is awake");
+    let deferred = views.iter().any(|view| view.has_deferred_tabs());
+    let step = waker.step(&panes, deferred, now);
+    for r in waker.take_ready() {
+        log::info!(
+            "Launch wake: pane {} {} {:.0} s after the start ({:.0} s after its wake)",
+            r.pane_id,
+            if r.timed_out { "showed no prompt in time, the line goes on," } else { "ready" },
+            r.at,
+            r.took
+        );
+    }
+    match step {
+        crate::launch_wake::Step::Wait => {
+            if waker.due(now) {
+                waker.idle(now);
+            }
+        }
+        crate::launch_wake::Step::Wake(pane_id, session) => {
+            let woken = views.iter().find_map(|view| view.ipc_wake_pane(pane_id)).unwrap_or(false);
+            if woken {
+                log::info!("Launch wake: pane {} resumes {}", pane_id, session);
+                waker.started_one(pane_id, now);
+            }
+            waker.record(pane_id, session, now);
+        }
+        crate::launch_wake::Step::Done { woken, timed_out, secs } => {
+            log::info!("Launch wake: every restored agent is awake: {woken} woken, {timed_out} showed no prompt in time, the last one ready {secs:.0} s after the start");
             *slot = None;
         }
-        return;
-    };
-    let woken = views.iter().find_map(|view| view.ipc_wake_pane(pane_id)).unwrap_or(false);
-    if woken {
-        log::info!("Launch wake: pane {} resumes {}", pane_id, session);
     }
-    waker.record(pane_id, session, now);
 }
 
 /// IPC: resume the agent asleep in `pane_id` where it is, focus untouched.

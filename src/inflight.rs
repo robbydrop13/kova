@@ -723,6 +723,33 @@ pub fn list_html(data: &InFlight, scope: Option<Scope>, panes: &[Pane], now: u64
     out
 }
 
+/// The sessions with open work, for the launch waker: the owners of the
+/// tasks an agent has to act on or that wait on someone else, and the
+/// sessions that say they work.
+pub fn open_owners_of(data: &InFlight) -> std::collections::HashSet<String> {
+    let tasks = data.tasks.iter().flatten().filter(|t| matches!(t.state, TaskState::ToDo | TaskState::WaitsOther)).map(|t| t.owner.clone());
+    let working = data.agents.iter().filter(|a| a.state == "working").map(|a| a.name.clone());
+    tasks.chain(working).filter(|n| !n.trim().is_empty()).collect()
+}
+
+/// `open_owners_of` what the in-flight command prints, read now with
+/// `deadline`. Empty when it does not answer in time or cannot be read.
+pub fn open_owners(deadline: std::time::Duration) -> std::collections::HashSet<String> {
+    let argv = COMMAND.read().clone();
+    let Some((bin, args)) = argv.split_first() else { return Default::default() };
+    match crate::exec::run_with_deadline(std::process::Command::new(bin).args(args), deadline) {
+        Ok(out) if out.status.success() => parse(&String::from_utf8_lossy(&out.stdout)).map(|d| open_owners_of(&d)).unwrap_or_default(),
+        Ok(out) => {
+            log::warn!("Launch wake: the queue exited with {}, the chiefs only", out.status);
+            Default::default()
+        }
+        Err(e) => {
+            log::warn!("Launch wake: {e}, the chiefs only");
+            Default::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Reading
 // ---------------------------------------------------------------
@@ -1051,6 +1078,15 @@ mod tests {
         // One side only.
         let pro = list_html(&data, Some(Scope::Pro), &[], now, &|_| String::new());
         assert!(pro.contains("Abandonné (24 h) <span class=\"k\">1</span>") && !pro.contains("Doublon de k-1"), "{pro}");
+        // Who a launch wakes: the owners of what is to do or waits on another, and who says it works.
+        let mut busy = parse(r#"{"clicks":[],"agents":[{"name":"qa","state":"working"},{"name":"idle","state":"idle"}],"tasks":[
+            {"id":"t","state":"a_faire","title":"x","owner":"pm"},{"id":"u","state":"attend_autre","title":"x","owner":"dev"},
+            {"id":"v","state":"attend_robin","title":"x","owner":"waits"},{"id":"w","state":"fait","title":"x","owner":"done"}]}"#).unwrap();
+        let mut owners: Vec<String> = open_owners_of(&busy).into_iter().collect();
+        owners.sort();
+        assert_eq!(owners, ["dev", "pm", "qa"]);
+        busy.tasks = None;
+        assert_eq!(open_owners_of(&busy).len(), 1);
         // Without `tasks` (an older queue, or its legacy reading): as before.
         let legacy = parse(r#"{"clicks":[],"agents":[]}"#).unwrap();
         assert!(legacy.tasks.is_none());

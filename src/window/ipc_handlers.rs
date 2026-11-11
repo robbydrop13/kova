@@ -724,14 +724,21 @@ impl KovaView {
                 if dormant.is_none() && live.is_none() {
                     return;
                 }
+                let osc = pane.terminal.read().title.clone();
+                let titles = [osc.as_deref(), pane.custom_title.as_deref()];
                 let rank = match dormant {
-                    Some(_) => {
-                        let osc = pane.terminal.read().title.clone();
-                        crate::launch_wake::rank(&[osc.as_deref(), pane.custom_title.as_deref()], cockpit_chief, &chiefs)
-                    }
+                    Some(_) => crate::launch_wake::rank(&titles, cockpit_chief, &chiefs),
                     None => 2,
                 };
-                out.push(crate::launch_wake::PaneInfo { pane_id: pane.id, dormant, live, rank });
+                // Started: its agent is registered and shows its prompt, or works.
+                let ready = dormant.is_none()
+                    && pane.agent_session_id().is_some()
+                    && (pane.is_working() || {
+                        let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+                        crate::chat::input::composer(&visible) != crate::chat::input::Composer::Unreadable
+                    });
+                let names = crate::launch_wake::names(&titles);
+                out.push(crate::launch_wake::PaneInfo { pane_id: pane.id, dormant, live, rank, names, ready });
             });
         }
     }

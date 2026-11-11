@@ -29,15 +29,22 @@ pub struct Config {
 #[serde(default)]
 pub struct SessionConfig {
     /// Wake every restored agent after the launch, as if each tab had been
-    /// clicked. Off: each one waits until its pane is first shown.
+    /// clicked: the chiefs, the sessions with open work, then the others.
+    /// Off: each one waits until its pane is first shown.
     pub wake_on_launch: bool,
-    /// Seconds between two wakes, so the agents do not all start at once.
+    /// The least seconds between two wakes (the pace is `wake_batch`).
     pub wake_stagger_s: f64,
+    /// How many agents start together: the next one starts when one of them
+    /// shows its prompt.
+    pub wake_batch: usize,
+    /// An agent that shows no prompt after this many seconds stops holding
+    /// its place in the batch.
+    pub wake_ready_timeout_s: f64,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        SessionConfig { wake_on_launch: true, wake_stagger_s: 3.0 }
+        SessionConfig { wake_on_launch: true, wake_stagger_s: 0.0, wake_batch: 3, wake_ready_timeout_s: 40.0 }
     }
 }
 
@@ -949,10 +956,10 @@ mod tests {
     }
 
     #[test]
-    fn launch_wake_is_on_every_3_s_unless_said_otherwise() {
+    fn launch_wake_is_on_three_at_a_time_unless_said_otherwise() {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.session.wake_on_launch);
-        assert_eq!(config.session.wake_stagger_s, 3.0);
+        assert_eq!((config.session.wake_stagger_s, config.session.wake_batch, config.session.wake_ready_timeout_s), (0.0, 3, 40.0));
         let config: Config = toml::from_str("[session]\nwake_on_launch = false\nwake_stagger_s = 5\n").unwrap();
         assert!(!config.session.wake_on_launch);
         assert_eq!(config.session.wake_stagger_s, 5.0);
