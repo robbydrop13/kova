@@ -948,6 +948,49 @@ pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, 
     card_html_with(item, &list, &icons(item, can_close, can_snooze), can_act, now)
 }
 
+thread_local! {
+    /// MOCK-UP ONLY (branch `reply-zone-mock`, not for main): the reply zone
+    /// variant an opened attention card shows, `'a'` or `'b'`, and the cards
+    /// shown as "asked" (key -> the question typed). Set by `kova render`.
+    pub static REPLY_MOCK: std::cell::RefCell<(Option<char>, std::collections::HashMap<String, String>)> =
+        std::cell::RefCell::new((None, std::collections::HashMap::new()));
+}
+
+const ICON_NOGO: &str = r#"<svg class="i" width="13" height="13" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>"#;
+const ICON_Q: &str = r#"<svg class="i" width="13" height="13" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
+
+/// MOCK-UP ONLY: the reply zone of an opened card. One field, and the
+/// decision in the same gesture.
+/// - `a`: three buttons. `No go` (outlined, a cross), `Demander` (a link,
+///   a bubble), `Go` (filled, a check). Text and shape tell them apart, not
+///   green and red.
+/// - `b`: one choice then one send: a segmented `Go | No go | Question`,
+///   then `Envoyer`.
+fn reply_zone_html(item: &Item, variant: char, asked: Option<&str>) -> String {
+    let go = if item.draft.is_some() { "Go, envoyer" } else { "Go" };
+    let placeholder = if item.draft.is_some() { "Un commentaire pour l'agent (facultatif)" } else { "Ton commentaire (facultatif)" };
+    let asked_html = asked
+        .map(|q| format!("<div class=\"state warn\">Attend l'agent \u{b7} ta question est partie</div><p class=\"msg sent\">{}</p>", linked(q)))
+        .unwrap_or_default();
+    let buttons = match variant {
+        'b' => format!(
+            "<div class=\"rz-b\"><div class=\"seg\" role=\"radiogroup\"><button type=\"button\" class=\"on\">{ICON_CHECK}<span>Go</span></button>\
+             <button type=\"button\">{ICON_NOGO}<span>No go</span></button><button type=\"button\">{ICON_Q}<span>Question</span></button></div>\
+             <button type=\"button\" class=\"btn acc\"><span>Envoyer</span></button></div>"
+        ),
+        _ => format!(
+            "<div class=\"rz-a\"><span class=\"hint\">Entrée : demander \u{b7} \u{2318}Entrée : go</span>\
+             <button type=\"button\" class=\"btn out\">{ICON_NOGO}<span>No go</span></button>\
+             <button type=\"button\" class=\"link\">{ICON_Q}<span>Demander</span></button>\
+             <button type=\"button\" class=\"btn acc\">{ICON_CHECK}<span>{go}</span></button></div>"
+        ),
+    };
+    format!(
+        "<div class=\"instr rz\"><div class=\"lbl\">Ta réponse</div>{asked_html}\
+         <textarea class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{placeholder}\"></textarea>{buttons}</div>"
+    )
+}
+
 /// One card with the buttons and icons given: the chat's ask cards pick
 /// their own (`chat::cards::ask_card_html`) on the Cockpit's markup.
 pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_act: bool, now: u64) -> String {
@@ -966,7 +1009,22 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     }
     // An opened attention card takes an instruction, action or not, under
     // the draft's actions when it has a draft.
-    if item.kind == Kind::Attention && item.detail.is_some() && can_act {
+    let (mock, asked) = REPLY_MOCK.with(|m| {
+        let m = m.borrow();
+        (m.0.filter(|_| item.kind == Kind::Attention && item.detail.is_some() && can_act), m.1.get(&item.key).cloned())
+    });
+    // MOCK-UP ONLY: the card's own verbs move into the reply zone; an asked
+    // card keeps the clock only, the check and the cross are out of reach.
+    let (acts, icons) = match mock {
+        Some(_) => (
+            format!("<div class=\"acts\">{}</div>", list.iter().filter(|b| matches!(b, Button::Open)).map(|&b| button_html(b, running, false)).collect::<String>()),
+            if asked.is_some() { icons_html(&[Button::Snooze], running) } else { icons },
+        ),
+        None => (acts, icons),
+    };
+    if let Some(variant) = mock {
+        detail.push_str(&reply_zone_html(item, variant, asked.as_deref()));
+    } else if item.kind == Kind::Attention && item.detail.is_some() && can_act {
         detail.push_str(&instruct_html(item.instruction.as_ref()));
     }
     // Folded, a card is its title, its label, its source and its age: what
@@ -1636,6 +1694,13 @@ textarea.ans{display:block;width:100%;margin-top:8px;background:var(--bg-input);
 textarea.ans:focus{border-color:var(--accent);outline:0}
 .draft .hd code.tg{font:11.5px "SF Mono",Menlo,monospace;color:var(--t3);background:none;border:0;padding:0}
 .draft .hd span.tg{color:var(--t3)}.draft .hd span.tg.ext{color:var(--warn-dot)}
+.rz .rz-a,.rz .rz-b{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:8px}
+.rz .hint{margin-right:auto;font-size:11.5px;color:var(--t3)}
+.rz .btn{display:inline-flex;align-items:center;gap:6px}.rz .link{display:inline-flex;align-items:center;gap:6px}
+.rz .btn.out{background:none;border:1px solid var(--b2);color:var(--t1);height:28px;padding:0 12px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer}
+.rz .seg{display:inline-flex;border:1px solid var(--b2);border-radius:7px;overflow:hidden;margin-right:auto}
+.rz .seg button{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;background:none;border:0;border-left:1px solid var(--b2);color:var(--t2);font-size:13px;cursor:pointer}
+.rz .seg button:first-child{border-left:0}.rz .seg button.on{background:var(--bg-elev);color:var(--t1);font-weight:600}
 .state.top{margin:0 0 6px}.jr{margin:18px 0 6px;font-size:12px;color:var(--t3)}.jr a{color:var(--t3);text-decoration:underline}
 .state.ok{color:var(--ok-dot)}.state.warn{color:var(--warn-dot)}.state.crit{color:var(--crit)}
 .instr{margin-top:10px;border-top:1px solid var(--b3);padding-top:4px;cursor:auto}
