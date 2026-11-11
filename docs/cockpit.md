@@ -326,6 +326,20 @@ A failed routine has no `Needs attention` section in the Scheduled list any
 more (06/11/2026): its row sits in its normal group and says it failed; the
 Scheduled icon keeps its red dot.
 
+## Reply zone
+
+When the queue lists `gestures` on a card (`attn list --open --json`), the card answers through one zone instead of its former buttons. A queue that lists none keeps the former card unchanged: the cutover is the queue's, there is no setting.
+
+- One field, `Ta réponse`, and the gestures listed, each a worded button with an icon: `No go` (outlined, a cross), `Demander` (a link, a bubble), `Go` (filled, a check; the queue's `go_label`, `Go, envoyer` on a draft). Only the gestures listed show.
+- `Go` and `No go` send the text typed, if any, and file the card. `Demander` needs a text: the button is disabled while the field is empty. Nothing is posted from the keyboard: Enter is a new line.
+- `Vu` sits at the card's head, where the check and the cross were: filed with no judgement. The clock stays.
+- A card with a draft shows its zone at once. `Go` carries the draft's fingerprint (`--seen`). The draft can be rewritten in place: its header then reads `Modifié par toi` with `Rétablir le brouillon`, and `Go` carries the user's text (`--draft=<text>`); an untouched draft sends none.
+- Another card shows its zone once opened. Folded, a card that waits on a go carries `Go` (one click) next to `Répondre`, which opens the zone; where a bare go says nothing (`Décider`, `Tester`, `Brief`), the one button opens the zone.
+- While the field is empty, `Écris ta question pour demander` says under it why `Demander` is off (also its tooltip).
+- A card that waits for its agent (`waiting: "agent"`, `ask`) says so at its head, folded or not: `Attend l'agent`, the delivery in the queue's own words (`non remis`, `sera lu à son prochain pas`), the question asked, and `Annuler ma demande` when `cancel` is listed. It has no check, no cross and no `Vu`.
+- Each gesture runs `act_command --exit-codes --client-id=<uuid> <id> <go|nogo|ask|seen|cancel> [--text=<text>] [--seen=<fingerprint>] [--draft=<text>]` (`attention::gesture_argv`). The id is new per click and kept when the same gesture is clicked again after a failure. What the card shows next is read from the queue; a failure or a refusal leaves the command's line on the card, and a question that did not go is kept under the field.
+- `En cours` shows a click's `label` from `attn inflight --json` (`non remis`, `sans réponse`, `sera lu à son prochain pas`) as it is.
+
 ## Chat
 
 A chief of staff's chat sits on the left third (the side panel keeps the

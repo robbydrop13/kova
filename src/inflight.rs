@@ -144,6 +144,10 @@ pub struct Click {
     /// `failed`, `no_proof`, `done`, `dismissed`. Empty when the queue does
     /// not say (an older one): `fate` then reads `result`.
     pub outcome: String,
+    /// Where its delivery stands, in the queue's own words (`non remis`,
+    /// `sans réponse`, `sera lu à son prochain pas`), from its journal:
+    /// shown as it is. Empty: nothing to say.
+    pub label: String,
 }
 
 /// What a click's `result` says, in the queue's own words (`attn inflight`).
@@ -277,6 +281,8 @@ struct RawClick {
     go: Option<Value>,
     #[serde(default)]
     outcome: Option<String>,
+    #[serde(default)]
+    label: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -323,6 +329,7 @@ pub fn parse(text: &str) -> Option<InFlight> {
             // `true`, or how the go was read (`"explicit"`, `"validated"`).
             go: matches!(&c.go, Some(Value::Bool(true))) || matches!(&c.go, Some(Value::String(s)) if !s.is_empty()),
             outcome: c.outcome.unwrap_or_default().trim().to_string(),
+            label: c.label.as_ref().and_then(Value::as_str).unwrap_or_default().trim().chars().filter(|ch| !ch.is_control()).take(80).collect(),
         })
         .collect();
     let agents = raw
@@ -477,6 +484,10 @@ fn verb(button: &str, go: bool) -> (&'static str, &'static str) {
         // An instruction that says to act is a go.
         "instruct" if go => ("Go", ""),
         "nogo" => ("No go", " c"),
+        "go" => ("Go", ""),
+        "ask" => ("Demande", " c"),
+        "seen" => ("Vu", " c"),
+        "cancel" => ("Demande annulée", " c"),
         "valider" | "envoyer" | "send" => ("Valider", ""),
         "corriger" => ("Corriger", ""),
         "instruct" => ("Consigne", " c"),
@@ -564,6 +575,8 @@ fn click_html(c: &Click, now: u64, clock: &dyn Fn(u64) -> String) -> String {
         (Fate::Uncertain(why), _) => format!("<span class=\"warn\"><b>Peut-être parti :</b> {}</span>", linked(&one_line(why, 220))),
         (Fate::NoProof, _) => "<span class=\"warn\"><b>Sans preuve :</b> la carte a été fermée, rien ne prouve que l'action a eu lieu</span>".to_string(),
         (Fate::Words(words), Step::Done) => format!("<span><b>Résultat :</b> {}</span>", linked(&one_line(words, 160))),
+        // The journal's own word on the delivery, before Kova's reading of the times.
+        (_, step) if step != Step::Done && !c.label.is_empty() => format!("<span class=\"warn\"><b>{}</b></span>", esc(&c.label)),
         (_, Step::Late) => "<span>Pas encore remis : il le sera à son prochain outil, ou réveillé s'il dort</span>".to_string(),
         _ => String::new(),
     };
@@ -1098,4 +1111,21 @@ mod tests {
         let empty = InFlight::default();
         assert!(list_html(&empty, None, &[], 0, &|_| String::new()).contains("Rien en cours pour toi"));
     }
+    #[test]
+    fn a_click_shows_the_journal_s_word_on_its_delivery() {
+        let now = at("2026-11-10T15:10:00+01:00");
+        let data = parse(
+            r#"{"clicks":[
+              {"act_id":"c-1","id":"a-1","scope":"pro","button":"ask","title":"T","text":"pourquoi ?","to":"pm","sent":"2026-11-10T15:00:00+01:00","label":"non remis"},
+              {"act_id":"c-2","id":"a-2","scope":"pro","button":"ask","title":"T","to":"pm","sent":"2026-11-10T15:00:00+01:00","received":"2026-11-10T15:00:05+01:00","label":"sans réponse"},
+              {"act_id":"c-3","id":"a-3","scope":"pro","button":"go","title":"T","to":"pm","sent":"2026-11-10T15:00:00+01:00","label":null}],"agents":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(data.clicks.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["non remis", "sans réponse", ""]);
+        let html = list_html(&data, None, &[], now, &|_| "15:00".to_string());
+        assert!(html.contains("<span class=\"warn\"><b>non remis</b></span>") && html.contains("<b>sans réponse</b>"), "{html}");
+        assert_eq!(html.matches("Pas encore remis : il le sera").count(), 1, "the journal's word replaces Kova's own, which the click without a label keeps: {html}");
+        assert!(html.contains(">Demande</span>") && html.contains(">Go</span>"), "{html}");
+    }
+
 }

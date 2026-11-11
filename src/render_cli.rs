@@ -277,6 +277,18 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
     page("chips.html", &items, Filter::Only(Scope::Pro), Show::InFlight, "")?;
     page("en-cours.html", &items, Filter::All, Show::InFlight, "")?;
     page("fait.html", &items, Filter::All, Show::Done, "")?;
+    let opened = a.all("--open");
+    if opened.len() > 1 {
+        let mut all: Vec<cockpit::Item> = Vec::new();
+        for id in &opened {
+            let entry = entries.iter().find(|e| &e.id == id).ok_or_else(|| format!("--open: no card {id} in the list"))?;
+            if let Some(mut item) = cockpit::from_attention(entry, states.get(&entry.id), true) {
+                item.detail = Some(cockpit::entry_detail(entry, false));
+                all.push(item);
+            }
+        }
+        page("cards.html", &all, Filter::All, Show::Mine, "")?;
+    }
     if let Some(id) = a.get("--open") {
         let entry = entries.iter().find(|e| e.id == id).ok_or_else(|| format!("--open: no card {id} in the list"))?;
         let mut one: Vec<cockpit::Item> = cockpit::from_attention(entry, states.get(&entry.id), true).into_iter().collect();
