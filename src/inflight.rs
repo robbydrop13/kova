@@ -31,6 +31,93 @@ pub struct InFlight {
     pub agents: Vec<Agent>,
     /// Sessions that wait on someone else (a review, a merge), not listed.
     pub waiting_others: usize,
+    /// The tasks, in the queue's order (by state, then the latest first):
+    /// the open ones whatever their age, the done and dropped ones of the
+    /// last 24 h. `None` when the queue does not give them (an older one,
+    /// or its legacy reading): `En cours` then shows as before.
+    pub tasks: Option<Vec<Task>>,
+}
+
+/// Where a task stands: the queue's five states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskState {
+    /// `a_faire`: an agent has to act.
+    ToDo,
+    /// `attend_robin`: it waits on the user.
+    WaitsUser,
+    /// `attend_autre`: it waits on someone else.
+    WaitsOther,
+    /// `fait`: done, with its proof.
+    Done,
+    /// `abandonne`: dropped, with its reason.
+    Dropped,
+}
+
+impl TaskState {
+    /// The five, in the order `En cours` shows them.
+    pub const ALL: [TaskState; 5] = [TaskState::ToDo, TaskState::WaitsUser, TaskState::WaitsOther, TaskState::Done, TaskState::Dropped];
+
+    fn parse(word: &str) -> Option<TaskState> {
+        match word {
+            "a_faire" => Some(TaskState::ToDo),
+            "attend_robin" => Some(TaskState::WaitsUser),
+            "attend_autre" => Some(TaskState::WaitsOther),
+            "fait" => Some(TaskState::Done),
+            "abandonne" => Some(TaskState::Dropped),
+            _ => None,
+        }
+    }
+
+    /// The state in words, always written: nothing rests on a color.
+    pub fn word(self) -> &'static str {
+        match self {
+            TaskState::ToDo => "À faire",
+            TaskState::WaitsUser => "Attend Robin",
+            TaskState::WaitsOther => "Attend un autre",
+            TaskState::Done => "Fait",
+            TaskState::Dropped => "Abandonné",
+        }
+    }
+
+    /// Its section's key and dot class.
+    fn key(self) -> (&'static str, &'static str) {
+        match self {
+            TaskState::ToDo => ("a_faire", "info"),
+            TaskState::WaitsUser => ("attend_robin", "warn"),
+            TaskState::WaitsOther => ("attend_autre", "gray"),
+            TaskState::Done => ("fait", "ok"),
+            TaskState::Dropped => ("abandonne", "gray"),
+        }
+    }
+
+    /// Open: still to act on, shown unfolded whatever its age.
+    pub fn open(self) -> bool {
+        matches!(self, TaskState::ToDo | TaskState::WaitsUser | TaskState::WaitsOther)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Task {
+    pub id: String,
+    pub state: TaskState,
+    pub scope: Scope,
+    pub title: String,
+    /// The session that has to act.
+    pub owner: String,
+    /// `a_faire`: the next action.
+    pub next: String,
+    /// `attend_*`: who and what.
+    pub waiting_on: String,
+    /// `fait`: the proof (a link, a message id, a commit).
+    pub proof: String,
+    /// `abandonne`: `dismissed`, `nogo`, `superseded`, `retiree`, `ttl`,
+    /// `drop`, or the agent's own words; `why` says more.
+    pub reason: String,
+    pub why: String,
+    /// The card is put away, the task waits for its proof.
+    pub hidden: bool,
+    /// Epoch seconds of its last change; 0 when unknown.
+    pub updated: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -130,6 +217,38 @@ struct RawInFlight {
     agents: Vec<Value>,
     #[serde(default)]
     waiting_others: usize,
+    #[serde(default)]
+    tasks: Option<Vec<Value>>,
+}
+
+#[derive(Deserialize)]
+struct RawTask {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default)]
+    waiting_on: Option<String>,
+    #[serde(default)]
+    proof: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    why: Option<String>,
+    #[serde(default)]
+    hidden: Option<bool>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -224,7 +343,36 @@ pub fn parse(text: &str) -> Option<InFlight> {
                 .collect(),
         })
         .collect();
-    Some(InFlight { clicks, agents, waiting_others: raw.waiting_others })
+    // A task without a state this build knows, or without a title, is
+    // skipped alone; every other field has a default.
+    let tasks = raw.tasks.map(|list| {
+        list.into_iter()
+            .filter_map(|v| serde_json::from_value::<RawTask>(v).ok())
+            .filter_map(|t| {
+                let text = |s: Option<String>| s.unwrap_or_default().trim().to_string();
+                let title = text(t.title);
+                Some(Task {
+                    state: TaskState::parse(t.state.as_deref()?)?,
+                    id: text(t.id),
+                    scope: if t.scope.as_deref() == Some("perso") { Scope::Perso } else { Scope::Pro },
+                    owner: text(t.owner),
+                    next: text(t.next),
+                    waiting_on: text(t.waiting_on),
+                    proof: text(t.proof),
+                    reason: text(t.reason),
+                    why: text(t.why),
+                    hidden: t.hidden == Some(true),
+                    updated: match epoch(&t.updated_at) {
+                        0 => epoch(&t.created_at),
+                        at => at,
+                    },
+                    title,
+                })
+                .filter(|t| !t.title.is_empty())
+            })
+            .collect()
+    });
+    Some(InFlight { clicks, agents, waiting_others: raw.waiting_others, tasks })
 }
 
 // ---------------------------------------------------------------
@@ -266,6 +414,10 @@ fn kept<'a>(data: &'a InFlight, scope: Option<Scope>, done: bool, now: u64) -> V
 
 /// What `En cours` counts: the clicks not over yet and the agents at work.
 pub fn count(data: &InFlight, scope: Option<Scope>, panes: &[Pane], now: u64) -> usize {
+    // With tasks: the open ones, each once (a click's card is a task too).
+    if let Some(tasks) = &data.tasks {
+        return tasks.iter().filter(|t| t.state.open() && scope.is_none_or(|s| t.scope == s)).count();
+    }
     kept(data, scope, false, now).len() + agents(data, panes, now).0.len()
 }
 
@@ -455,16 +607,94 @@ pub fn done_html(data: &InFlight, scope: Option<Scope>, now: u64, clock: &dyn Fn
     out
 }
 
-/// The `En cours` list: the user's clicks not over yet, then the agents at
-/// work. `scope` keeps one side's clicks (the agents have no side). What is
-/// over leaves it at once for `Fait (24 h)`.
+/// Why a task was dropped, in words: the queue's reason, then its `why`.
+fn dropped_words(t: &Task) -> String {
+    let reason = match t.reason.as_str() {
+        "dismissed" => "pas pertinent",
+        "nogo" => "no go",
+        "superseded" => "sans objet",
+        "retiree" => "retirée",
+        "ttl" => "expirée",
+        "drop" => "lâchée",
+        other => other,
+    };
+    match (reason.is_empty(), t.why.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => reason.to_string(),
+        (true, false) => t.why.clone(),
+        (false, false) => format!("{reason} : {}", t.why),
+    }
+}
+
+/// One task: its title, who has to act, its state in words and what the
+/// state has to say (the next action, who it waits on, the proof, why it was
+/// dropped).
+fn task_html(t: &Task, now: u64) -> String {
+    let detail = match t.state {
+        TaskState::ToDo if !t.next.is_empty() => format!("<b>Prochaine action :</b> {}", linked(&one_line(&t.next, 220))),
+        TaskState::WaitsUser | TaskState::WaitsOther if !t.waiting_on.is_empty() => linked(&one_line(&t.waiting_on, 220)),
+        TaskState::Done if !t.proof.is_empty() => format!("<b>Preuve :</b> {}", linked(&one_line(&t.proof, 220))),
+        TaskState::Done => "<b>Preuve :</b> aucune".to_string(),
+        TaskState::Dropped => {
+            let words = dropped_words(t);
+            if words.is_empty() { String::new() } else { format!("<b>Raison :</b> {}", linked(&one_line(&words, 220))) }
+        }
+        _ => String::new(),
+    };
+    let put_away = if t.hidden { "<span class=\"dim\">carte rangée, attend sa preuve</span>" } else { "" };
+    let owner = if t.owner.is_empty() { String::new() } else { format!("<span class=\"tag\"><i></i>{}</span>", esc(&t.owner)) };
+    let age = crate::cockpit::age(t.updated, now);
+    let age = if age.is_empty() { String::new() } else { format!("<span class=\"dim\">{}</span>", esc(&age)) };
+    format!(
+        "<div class=\"tk\"><div class=\"t\">{}</div><div class=\"res\">{owner}<span class=\"w {}\">{}</span>{}{put_away}{age}</div></div>",
+        linked(&one_line(&t.title, 200)),
+        t.state.key().0,
+        t.state.word(),
+        if detail.is_empty() { String::new() } else { format!("<span>{detail}</span>") },
+    )
+}
+
+/// The five sections of the tasks, in the queue's order, each with its
+/// state in words and its count; an empty one says so. The open ones are
+/// unfolded whatever their age; done and dropped (the last 24 h) are there,
+/// folded, a click away.
+fn tasks_html(tasks: &[Task], scope: Option<Scope>, now: u64) -> String {
+    let mut out = String::new();
+    for state in TaskState::ALL {
+        let rows: Vec<&Task> = tasks.iter().filter(|t| t.state == state && scope.is_none_or(|s| t.scope == s)).collect();
+        let (key, dot) = state.key();
+        let day = if state.open() { "" } else { " (24 h)" };
+        let head = format!("<span class=\"d {dot}\"></span>{}{day} <span class=\"k\">{}</span>", state.word(), rows.len());
+        let body: String = if rows.is_empty() {
+            "<div class=\"fold\">Aucune</div>".to_string()
+        } else {
+            rows.iter().map(|t| task_html(t, now)).collect()
+        };
+        if state.open() {
+            out.push_str(&format!("<div class=\"sec-h\">{head}</div><div class=\"box\">{body}</div>"));
+        } else {
+            out.push_str(&format!(
+                "<details class=\"tks\" data-tk=\"{key}\"><summary class=\"sec-h\">{head}</summary><div class=\"box\">{body}</div></details>"
+            ));
+        }
+    }
+    out
+}
+
+/// The `En cours` list. With the queue's tasks: their five states, then the
+/// user's clicks not over yet and the agents at work. Without them (an
+/// older queue): the clicks and the agents, as before. `scope` keeps one
+/// side's tasks and clicks (the agents have no side).
 pub fn list_html(data: &InFlight, scope: Option<Scope>, panes: &[Pane], now: u64, clock: &dyn Fn(u64) -> String) -> String {
     let clicks = kept(data, scope, false, now);
     let (listed, idle) = agents(data, panes, now);
-    if clicks.is_empty() && listed.is_empty() {
+    if data.tasks.is_none() && clicks.is_empty() && listed.is_empty() {
         return "<p class=\"empty\">Rien en cours pour toi</p>".to_string();
     }
     let mut out = String::new();
+    if let Some(tasks) = &data.tasks {
+        out.push_str(&tasks_html(tasks, scope, now));
+    }
     if !clicks.is_empty() {
         out.push_str(&format!(
             "<div class=\"sec-h\"><span class=\"d info\"></span>Tes clics <span class=\"k\">{}</span></div>",
@@ -778,6 +1008,53 @@ mod tests {
         assert!(done.contains("<b>Preuve :</b> Slack DM <a href=") && done.contains("carte mise à jour") && done.contains("retrait transmis"));
         let list = list_html(&data, None, &[], now, &|_| String::new());
         assert!(list.contains("<b>Échec :</b> canal archivé") && list.contains("<b>Sans preuve :</b>") && !list.contains("Sans objet"), "{list}");
+    }
+
+    #[test]
+    fn the_five_task_states_show_in_their_sections_with_their_word_and_count() {
+        let task = |id: &str, state: &str, extra: &str| {
+            format!(r#"{{"id":"{id}","state":"{state}","scope":"pro","title":"Task {id} <x>","owner":"pm","updated_at":"2026-11-11T06:00:00+01:00"{extra}}}"#)
+        };
+        let raw = format!(
+            r#"{{"source":"tasks","clicks":[],"agents":[],"task_counts":{{}},"tasks":[{},{},{},{},{},{},{},{{"id":"t-x","state":"later","title":"unknown state"}},{{"id":"t-y","state":"fait"}}]}}"#,
+            task("t-1", "a_faire", r#","next":"send the validated draft, see /tmp/plan.md","created_at":"2026-10-01T06:00:00+01:00""#),
+            task("t-2", "a_faire", r#","next":null"#),
+            task("t-3", "attend_robin", r#","waiting_on":"Robin : go or not on CLA-12","hidden":true"#),
+            task("t-4", "fait", r#","proof":"https://x.slack.com/archives/D1/p17""#),
+            task("t-5", "fait", ""),
+            task("t-6", "abandonne", r#","reason":"superseded","why":"Robin answered himself""#),
+            task("t-7", "abandonne", r#","reason":"Doublon de k-1","scope":"perso""#),
+        );
+        let data = parse(&raw).expect("inflight json");
+        let tasks = data.tasks.as_ref().expect("tasks");
+        assert_eq!(tasks.len(), 7, "an unknown state and a task without a title are skipped alone");
+        let now = crate::attention::epoch_of("2026-11-11T07:00:00+01:00").unwrap();
+        let html = list_html(&data, None, &[], now, &|_| String::new());
+        // Five sections in order, each with its word and its count, the empty one too.
+        let heads: Vec<&str> = ["À faire <span class=\"k\">2</span>", "Attend Robin <span class=\"k\">1</span>", "Attend un autre <span class=\"k\">0</span>", "Fait (24 h) <span class=\"k\">2</span>", "Abandonné (24 h) <span class=\"k\">2</span>"].to_vec();
+        let mut at = 0;
+        for h in &heads {
+            at += html[at..].find(h).unwrap_or_else(|| panic!("{h} missing or out of order: {html}"));
+        }
+        assert!(html.contains("<div class=\"fold\">Aucune</div>"), "{html}");
+        // The open ones unfolded, done and dropped folded but there.
+        assert!(html.contains("<details class=\"tks\" data-tk=\"fait\">") && html.contains("<details class=\"tks\" data-tk=\"abandonne\">"));
+        assert!(!html.contains("data-tk=\"a_faire\""), "open states are not folded");
+        // A row: title escaped, owner, the state in words, what the state says.
+        assert!(html.contains("Task t-1 &lt;x&gt;") && html.contains("<span class=\"w a_faire\">À faire</span>"), "{html}");
+        assert!(html.contains(r##"<b>Prochaine action :</b> send the validated draft, see <a href="#" class="path" data-path="/tmp/plan.md">"##), "{html}");
+        assert!(html.contains("<span class=\"w attend_robin\">Attend Robin</span><span>Robin : go or not on <a href=\"https://linear.app/claap/issue/CLA-12\">CLA-12</a></span><span class=\"dim\">carte rangée, attend sa preuve</span>"), "{html}");
+        assert!(html.contains(r#"<b>Preuve :</b> <a href="https://x.slack.com/archives/D1/p17">"#) && html.contains("<b>Preuve :</b> aucune"), "{html}");
+        assert!(html.contains("<b>Raison :</b> sans objet : Robin answered himself") && html.contains("<b>Raison :</b> Doublon de k-1"), "{html}");
+        // No age limit on what is to do: the queue decides, Kova filters nothing.
+        assert_eq!(count(&data, None, &[], now), 3, "the open tasks");
+        // One side only.
+        let pro = list_html(&data, Some(Scope::Pro), &[], now, &|_| String::new());
+        assert!(pro.contains("Abandonné (24 h) <span class=\"k\">1</span>") && !pro.contains("Doublon de k-1"), "{pro}");
+        // Without `tasks` (an older queue, or its legacy reading): as before.
+        let legacy = parse(r#"{"clicks":[],"agents":[]}"#).unwrap();
+        assert!(legacy.tasks.is_none());
+        assert!(list_html(&legacy, None, &[], now, &|_| String::new()).contains("Rien en cours pour toi"));
     }
 
     #[test]

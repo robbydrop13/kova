@@ -73,6 +73,21 @@ it: one `WKWebView` per window over the active tab's panes area
   (red, a minute; an instruction's stays until the next one), the card in
   place with its buttons. A click refused before the command ran (the entry
   gone from the queue, no command) says so the same way.
+- The tasks and their five states (11/11/2026). When `inflight_command`
+  gives `tasks` (the queue's own list, already sorted: the open ones
+  whatever their age, the done and dropped ones of the last 24 h), `En
+  cours` shows them first, in five sections in the queue's order, each with
+  its state in words and its count, an empty one included: `À faire`,
+  `Attend Robin`, `Attend un autre`, then `Fait (24 h)` and `Abandonné
+  (24 h)`, folded and one click away (a section the user opened stays open
+  across refreshes). A row is the task's title, the session that has to act,
+  the state's word again, and what the state says: the next action, who and
+  what it waits on, the proof (a link when it is one), why it was dropped
+  (`dismissed`, `nogo`, `superseded`, `retiree`, `ttl`, `drop` in words, then
+  its `why`). Kova filters nothing by age. The view's count is the open
+  tasks. The clicks and the agents follow, as before. Without `tasks` (an
+  older queue, or its legacy reading) the list is what it was
+  (`inflight::tasks_html`, `list_html`).
 - A go, its proof, its failure (10/11/2026). The queue says what became of a
   click (`inflight_command`: `go`, `done` only with a proof, `result`, and
   `outcome`: `proof`, `superseded`, `failed`, `no_proof`, `done` or

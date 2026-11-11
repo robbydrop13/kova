@@ -1764,6 +1764,14 @@ body.chat-on .inner{max-width:none;margin:0 32px;padding-left:0;padding-right:0}
 .ag .p i{width:8px;height:8px;border-radius:50%;display:block;flex:none}
 .ag .k{font-size:12px;color:var(--t3);margin-top:3px}.ag .k b{color:var(--t2);font-weight:500}
 .ag .m{font-size:12px;color:var(--info-dot);white-space:nowrap}
+.tk{padding:9px 14px 9px 16px;border-top:1px solid var(--b3);font-size:13px;line-height:18px;min-width:0}
+.tk:first-child{border-top:0}.tk .t{font-weight:500;overflow-wrap:anywhere}
+.tk .res{font-size:12px;color:var(--t3);margin-top:5px;display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;min-width:0}
+.tk .res b{color:var(--t2);font-weight:500}.tk .res span{min-width:0;overflow-wrap:anywhere}.tk .dim{color:var(--t3)}
+.tk .w{font-weight:600;color:var(--t2);white-space:nowrap}.tk .w.a_faire{color:var(--info-dot)}.tk .w.attend_robin{color:var(--warn-dot)}.tk .w.fait{color:var(--ok-dot)}
+.tk a{color:var(--accent);text-decoration:none;overflow-wrap:anywhere}.tk a:hover{text-decoration:underline}
+details.tks>summary{cursor:pointer;list-style:none}details.tks>summary::-webkit-details-marker{display:none}
+details.tks>summary::after{content:"Afficher";font-weight:400;color:var(--accent);margin-left:6px}details.tks[open]>summary::after{content:"Masquer"}
 .fold{font-size:12px;color:var(--t3);padding:9px 16px;border-top:1px solid var(--b3)}
 .box .fold:first-child{border-top:0}
 .draft{margin-top:10px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px}
@@ -1939,7 +1947,12 @@ window.addEventListener('blur', () => flush(true));
 window.kova = {
   update(u) {
     if (u.head !== undefined) { apply('head', u.head); fmFill(); }
-    if (u.list !== undefined) apply('list', u.list);
+    if (u.list !== undefined) {
+      // A folded section the user opened (done, dropped) stays open.
+      const open = [...document.querySelectorAll('details[data-tk][open]')].map(d => d.dataset.tk);
+      apply('list', u.list);
+      open.forEach(k => { const d = document.querySelector('details[data-tk="' + k + '"]'); if (d) d.open = true; });
+    }
     if (u.chat !== undefined) { apply('chat', u.chat); document.body.classList.toggle('chat-on', u.chat !== ''); }
     if (u.focus && !(document.activeElement && /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName))) window.focus();
     if (u.reveal) {
