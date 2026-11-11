@@ -970,7 +970,8 @@ fn reply_zone_html(item: &Item, variant: char, asked: Option<&str>) -> String {
     let go = if item.draft.is_some() { "Go, envoyer" } else { "Go" };
     let placeholder = if item.draft.is_some() { "Un commentaire pour l'agent (facultatif)" } else { "Ton commentaire (facultatif)" };
     let asked_html = asked
-        .map(|q| format!("<div class=\"state warn\">Attend l'agent \u{b7} ta question est partie</div><p class=\"msg sent\">{}</p>", linked(q)))
+        .map(|q| format!("<div class=\"state warn\">Attend l'agent \u{b7} ta question est partie</div><p class=\"msg sent\">{}</p>\
+             <button type=\"button\" class=\"link undo\">Annuler ma demande</button>", linked(q)))
         .unwrap_or_default();
     let buttons = match variant {
         'b' => format!(
@@ -1018,7 +1019,18 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     let (acts, icons) = match mock {
         Some(_) => (
             format!("<div class=\"acts\">{}</div>", list.iter().filter(|b| matches!(b, Button::Open)).map(|&b| button_html(b, running, false)).collect::<String>()),
-            if asked.is_some() { icons_html(&[Button::Snooze], running) } else { icons },
+            // Asked: the clock only. Else the clock and a neutral `Vu`, with
+            // its word, where the check and the cross were: it puts the card
+            // away without saying go nor no go.
+            if asked.is_some() {
+                icons_html(&[Button::Snooze], running)
+            } else {
+                icons_html(&[Button::Snooze], running).replacen(
+                    "</div>",
+                    &format!("<button type=\"button\" class=\"link vu\" title=\"Ranger la carte, sans go ni no go\">{ICON_CHECK}<span>Vu</span></button></div>"),
+                    1,
+                )
+            },
         ),
         None => (acts, icons),
     };
@@ -1695,6 +1707,8 @@ textarea.ans:focus{border-color:var(--accent);outline:0}
 .draft .hd code.tg{font:11.5px "SF Mono",Menlo,monospace;color:var(--t3);background:none;border:0;padding:0}
 .draft .hd span.tg{color:var(--t3)}.draft .hd span.tg.ext{color:var(--warn-dot)}
 .rz .rz-a,.rz .rz-b{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:8px}
+.rz .undo{display:block;margin:2px 0 8px;font-size:12px;font-weight:400;color:var(--t3);text-decoration:underline}
+.icons .vu{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;margin-left:4px}
 .rz .hint{margin-right:auto;font-size:11.5px;color:var(--t3)}
 .rz .btn{display:inline-flex;align-items:center;gap:6px}.rz .link{display:inline-flex;align-items:center;gap:6px}
 .rz .btn.out{background:none;border:1px solid var(--b2);color:var(--t1);height:28px;padding:0 12px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer}
