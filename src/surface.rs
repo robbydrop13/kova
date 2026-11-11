@@ -258,7 +258,10 @@ fn derive_display_title(
 /// the gap between two PTY writes, where wall-clock time could jump.
 pub(crate) fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    // Never under the settle cap: a time of 0 (a shell that wrote nothing yet)
+    // then reads as long ago from the process's first millisecond, not only
+    // once it has run for a while.
+    PROMPT_SETTLE_CAP_MS + START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
 /// How long the shell must stay silent, after its first byte, before Kova types
