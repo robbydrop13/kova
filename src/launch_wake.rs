@@ -149,7 +149,7 @@ impl LaunchWaker {
             started: now,
             woken: 0,
             last_ready: now,
-            batch: 3,
+            batch: 6,
             ready_timeout: Duration::from_secs(40),
             timed_out: 0,
             ready_log: Vec::new(),

@@ -29,7 +29,7 @@
 # [session]
 # wake_on_launch = true             # after a relaunch, wake every restored agent, chiefs first,
 #                                   # without switching tab (false = each waits until its pane is shown)
-# wake_batch = 3                    # how many start together; the next starts when one shows its prompt
+# wake_batch = 6                    # how many start together; the next starts when one shows its prompt
 # wake_ready_timeout_s = 40         # an agent with no prompt after this long stops holding its place
 # wake_stagger_s = 0                # the least seconds between two wakes
 
