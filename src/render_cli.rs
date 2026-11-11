@@ -309,13 +309,17 @@ fn render_chat(a: &Args) -> Result<i32, String> {
     let html: String = entries.iter().map(|e| e.html.as_str()).collect();
     let users: Vec<usize> = conv.items.iter().enumerate().filter(|(_, i)| matches!(i, Item::User { .. })).map(|(n, _)| n).collect();
     let start = if users.len() > exchanges { users[users.len() - exchanges] } else { 0 };
+    // Each text the assistant wrote has its entry: shown (`t:`) or folded
+    // as a previous version (`v:`). By id, not by rendering the text again:
+    // the ids' titles come from a cache that may change in between.
+    let ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
     let (mut texts, mut missing) = (0, 0);
     for item in &conv.items[start..] {
-        let Item::Assistant { blocks, .. } = item else { continue };
-        for block in blocks {
+        let Item::Assistant { id, blocks, .. } = item else { continue };
+        for (k, block) in blocks.iter().enumerate() {
             if let BlockKind::Text(t) = &block.kind {
                 texts += 1;
-                if !html.contains(page::markdown(t).as_str()) {
+                if !ids.contains(format!("t:{id}:{k}").as_str()) && !ids.contains(format!("v:{id}:{k}").as_str()) {
                     missing += 1;
                     eprintln!("kova render: a text is not on the page: {:?}", t.chars().take(120).collect::<String>());
                 }

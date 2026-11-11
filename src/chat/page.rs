@@ -172,7 +172,10 @@ pub fn markdown_using(source: &str, lookup: &dyn Fn(&str) -> Option<crate::refs:
     });
     let mut out = String::new();
     html::push_html(&mut out, parser);
-    out
+    // A table too wide for the column scrolls inside its own block (`.tw`),
+    // never the thread. (Only the renderer writes these tags: every text of
+    // the source is escaped.)
+    out.replace("<table>", "<div class=\"tw\"><table>").replace("</table>", "</table></div>")
 }
 
 /// The entries of the last `exchanges` exchanges, and whether earlier ones
@@ -581,7 +584,7 @@ pub fn shell(theme: &Theme, title: &str, nonce: &str) -> String {
 * {{ box-sizing: border-box; }}
 html, body {{ margin: 0; height: 100%; background: var(--bg); color: var(--t1);
   font: 14.5px/1.6 "Inter", -apple-system, system-ui, sans-serif; }}
-body {{ display: flex; flex-direction: column; }}
+body {{ display: flex; flex-direction: column; overflow-x: hidden; }}
 #banner {{ display: flex; align-items: center; gap: 8px; min-height: 26px; padding: 0 2px; margin-bottom: 4px;
   font-size: 12.5px; color: var(--t2); }}
 #banner #state {{ min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }}
@@ -590,33 +593,40 @@ body {{ display: flex; flex-direction: column; }}
 #banner.waiting .dot {{ background: var(--awaiting); }}
 #banner.waiting {{ color: var(--t1); font-weight: 600; }}
 @keyframes pulse {{ 0%, 100% {{ opacity: .35; }} 50% {{ opacity: 1; }} }}
-#scroll {{ flex: 1; overflow-y: auto; padding: 16px 18px 8px; position: relative; }}
-#log {{ max-width: 860px; margin: 0 auto; }}
+/* The thread scrolls down only, never sideways: what is too wide wraps
+   (text, paths, code), or scrolls inside its own block (a table). */
+#scroll {{ flex: 1; overflow-y: auto; overflow-x: hidden; padding: 16px 18px 8px; position: relative; }}
+#log {{ max-width: 860px; min-width: 0; margin: 0 auto; }}
 #more {{ display: none; margin: 0 auto 12px; font: inherit; font-size: 12px; color: var(--t3); background: none;
   border: 1px solid var(--b3); border-radius: 6px; padding: 3px 10px; cursor: pointer; }}
 #more.on {{ display: block; }}
 .user {{ display: flex; justify-content: flex-end; margin: 18px 0 10px; }}
 .bubble {{ max-width: 80%; background: var(--bg2); border: 1px solid var(--b3); border-radius: 14px; padding: 7px 12px;
   white-space: pre-wrap; overflow-wrap: anywhere; }}
-.asst {{ margin: 8px 0; color: var(--t1); overflow-wrap: anywhere; }}
+.asst {{ margin: 8px 0; min-width: 0; color: var(--t1); overflow-wrap: anywhere; }}
 .asst p {{ margin: .5em 0; }} .asst ul, .asst ol {{ margin: .4em 0; padding-left: 1.4em; }}
 .asst h1, .asst h2, .asst h3 {{ font-size: 15px; margin: 1em 0 .4em; }}
 .rt {{ color: var(--t3); }}
 .asst a {{ color: var(--accent); text-decoration: none; }} .asst a:hover {{ text-decoration: underline; }}
 .asst code {{ font: 12.5px/1.5 "SF Mono", Menlo, monospace; background: var(--bg2); border: 1px solid var(--b3);
   border-radius: 4px; padding: 0 4px; }}
-.asst pre {{ background: var(--bg2); border: 1px solid var(--b3); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }}
+.asst pre {{ background: var(--bg2); border: 1px solid var(--b3); border-radius: 8px; padding: 10px 12px;
+  white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: hidden; }}
+.asst .tw {{ max-width: 100%; overflow-x: auto; }}
 .asst pre code {{ background: none; border: 0; padding: 0; }}
 .asst table {{ border-collapse: collapse; font-size: 13px; }} .asst th, .asst td {{ border: 1px solid var(--b3); padding: 4px 8px; }}
 .asst blockquote {{ margin: .6em 0; padding: 0 12px; border-left: 3px solid var(--b2); color: var(--t3); }}
 #log > :last-child.asst.streaming::after {{ content: ""; display: inline-block; width: 7px; height: 7px; margin-left: 4px;
   border-radius: 50%; background: var(--working); animation: pulse 1.2s ease-in-out infinite; }}
 .note {{ margin: 10px 0; text-align: center; font-size: 12px; color: var(--t3); }}
-.tools {{ margin: 4px 0; }}
+.tools {{ margin: 4px 0; min-width: 0; }} .tool {{ min-width: 0; }}
 .trow {{ display: flex; align-items: center; gap: 8px; width: 100%; height: 26px; padding: 0 6px; margin: 0;
   font: inherit; font-size: 13px; color: var(--t2); background: none; border: 0; border-radius: 6px; cursor: pointer; text-align: left; }}
 .trow:hover {{ background: var(--bg2); }}
-.verb {{ flex: none; color: var(--t1); font-weight: 500; }}
+/* A long label (another session's message, a finished task) is cut with an
+   ellipsis: it never pushes the row past the column. */
+.verb {{ flex: 0 1 auto; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  color: var(--t1); font-weight: 500; }}
 .target {{ flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
   font: 12.5px "SF Mono", Menlo, monospace; color: var(--t3); }}
 .tdet {{ flex: none; font-size: 12px; color: var(--t3); }}
@@ -638,7 +648,7 @@ body {{ display: flex; flex-direction: column; }}
 #asks {{ flex: none; {ask_vars} line-height: normal; font-family: Inter, "SF Pro Text", -apple-system, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased; }}
 {card_css}
-#cards {{ max-width: 860px; width: 100%; margin: 0 auto; padding: 0 18px; }}
+#cards {{ max-width: 860px; width: 100%; min-width: 0; margin: 0 auto; padding: 0 18px; overflow-x: hidden; }}
 #cards > .card {{ margin: 8px 0; cursor: auto; }}
 #cards .pcard {{ line-height: 1.6; margin: 8px 0; padding: 10px 12px; border: 1px solid var(--b2); border-radius: 10px; background: var(--bg2); }}
 .cfrom {{ font-size: 11.5px; color: var(--t3); text-transform: uppercase; letter-spacing: .04em; }}
@@ -1287,6 +1297,38 @@ mod tests {
         assert!(!html.contains("fix: sign out") && !html.contains("Live upload"), "told, or only in code: {html}");
         // No cache: the answer as written.
         assert!(!markdown_using("CLA-10040 et CLA-9905", &|_| None).contains("rt"));
+    }
+
+    #[test]
+    fn the_thread_never_scrolls_sideways() {
+        let page = shell(
+            &Theme {
+                dark: true,
+                bg: "#000".into(),
+                bg2: "#111".into(),
+                t1: "#fff".into(),
+                t2: "#eee".into(),
+                t3: "#ddd".into(),
+                b2: "#333".into(),
+                b3: "#222".into(),
+                accent: "#36f".into(),
+                working: "#3c6".into(),
+                awaiting: "#fa0".into(),
+                error: "#f33".into(),
+                ok: "#3c6".into(),
+            },
+            "t",
+            "n",
+        );
+        // Down only; a code block wraps; a table scrolls in its own block.
+        assert!(page.contains("#scroll { flex: 1; overflow-y: auto; overflow-x: hidden;"), "the thread");
+        assert!(page.contains("body { display: flex; flex-direction: column; overflow-x: hidden; }"));
+        assert!(page.contains(".verb { flex: 0 1 auto; min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;"), "a long row label is cut, not wider than the column");
+        assert!(page.contains("white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: hidden; }") && page.contains(".asst .tw { max-width: 100%; overflow-x: auto; }"));
+        let html = markdown("| a | b |\n|---|---|\n| 1 | <table> |\n\n```\nlong line\n```");
+        assert!(html.contains("<div class=\"tw\"><table>") && html.contains("</table></div>"), "{html}");
+        assert_eq!(html.matches("<table>").count(), 1, "a `<table>` in the text is text: {html}");
+        assert!(html.contains("&lt;table&gt;"));
     }
 
     #[test]

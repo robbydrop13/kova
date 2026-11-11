@@ -119,6 +119,11 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
   thread, a light sweeping across it (still under `prefers-reduced-motion`);
   a click unfolds the reasoning when the transcript holds it (it often keeps
   only its signature);
+- the thread scrolls down only, never sideways (Robin, 11/11/2026): text,
+  paths and code blocks wrap, a table too wide scrolls inside its own block,
+  and a long row label (another session's message, a finished task) is cut
+  with an ellipsis. Measured on a chief's thread at 520 points: such a label
+  made the column 29 points wider than its view;
 - the last 20 exchanges at open, `Show earlier` above for more; the view
   opens on the last user message; nothing folds by itself.
 
