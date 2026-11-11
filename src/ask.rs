@@ -1797,7 +1797,7 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
                 open (its id is in the answer) that no longer matters
   --decisions   a decision sheet Kova shows itself, from a JSON file (the decision-sheet skill's
                 format: title, intro, links, decisions with options, one marked reco). The card
-                says \"New decision\" (the message defaults to \"<title> : <N> décisions\"), Open shows
+                says \"New decision\" (the message defaults to \"<title> \u{b7} <N> décisions\"), Open shows
                 the sheet in the side panel, answers are saved as they are given, and Done prints
                 them, one line per decision: \"D1: A (label)\", \". Note: ...\", \"D2: other: ...\",
                 \"D3: open\", then \"Note: ...\". A single decision of up to three short options is
@@ -2799,7 +2799,7 @@ mod tests {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let path = sheet_file(TWO);
         let c = parse_cli(&args(&["--decisions", &path])).unwrap();
-        assert!(c.message.starts_with("Plan : 2 décisions\n\u{2022} "), "the message defaults to the title and the decisions");
+        assert!(c.message.starts_with("Plan \u{b7} 2 décisions\n\u{2022} "), "the message defaults to the title and the decisions");
         assert_eq!((c.actions.clone(), c.input), (vec!["Done".to_string()], false));
         assert!(parse_cli(&args(&["x", "--decisions", &path, "--decision", "https://a.b/c"])).is_err());
         assert!(parse_cli(&args(&["x", "--decisions", "/nonexistent/d.json"])).is_err());
@@ -2899,7 +2899,7 @@ mod tests {
         let rest = board.questions()[0].clone();
         assert!(still.contains(&format!("kova ask --drop {}", rest.id)));
         assert!(rest.follow_up && rest.is_decision());
-        assert_eq!(rest.message, "Plan : 1 décision restante\n\u{2022} Who?");
+        assert_eq!(rest.message, "Plan \u{b7} 1 décision restante\n\u{2022} Who?");
         assert_eq!(rest.sheet.as_ref().unwrap().decisions.len(), 1);
         assert_eq!(rest.sheet.as_ref().unwrap().decisions[0].id, "D2");
         // A message in the conversation does not take it back; its asker can drop it.

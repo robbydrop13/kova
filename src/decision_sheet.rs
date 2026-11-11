@@ -349,10 +349,11 @@ impl Sheet {
         const SHOWN: usize = 5;
         let n = self.decisions.len();
         let title = self.title.trim().trim_end_matches([':', ' ', '\u{a0}']);
-        // French like the Cockpit: `Plan : 3 décisions`, `1 décision restante`.
+        // French like the Cockpit: `Plan · 3 décisions`, `1 décision restante`.
+        // One count, whatever the title already says (`tile_title`).
         let s = if n == 1 { "" } else { "s" };
         let tail = if tail.is_empty() { String::new() } else { format!("{tail}{s}") };
-        let mut out = format!("{title} : {n} décision{s}{tail}");
+        let mut out = tile_title(&format!("{title} : {n} décision{s}{tail}"));
         for d in self.decisions.iter().take(SHOWN) {
             out.push_str("\n\u{2022} ");
             out.push_str(&plain(d.title.trim()));
@@ -367,6 +368,65 @@ impl Sheet {
     pub fn answered(&self, answers: &SheetAnswers) -> usize {
         self.decisions.iter().filter(|d| answers.get(&d.id).is_some()).count()
     }
+}
+
+/// A decision sheet's title as every tile shows it: `<Subject> · <N>
+/// décisions`, nothing else. `line` is the first line of the sheet's card
+/// text (`Subject : N décisions`, as older sheets were posted, or a title
+/// that already carried a count: `Subject : 2 décisions (P6 et P7) : 2
+/// décisions`). Every count goes from the subject, with the separator or
+/// the parentheses that held it, and the last one is said once after ` · `.
+/// A line with no count is someone's own words: left as it is.
+pub fn tile_title(line: &str) -> String {
+    let chars: Vec<char> = line.trim().chars().collect();
+    // (start, end, text) of each `N décision(s)[ restante(s)]`.
+    let mut counts: Vec<(usize, usize, String)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() && (i == 0 || !chars[i - 1].is_alphanumeric()) {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let rest: String = chars[j..].iter().collect();
+            let word = ["\u{a0}décisions", " décisions", "\u{a0}décision", " décision"].iter().find(|w| rest.starts_with(**w));
+            if let Some(word) = word {
+                let mut end = j + word.chars().count();
+                let after: String = chars[end..].iter().collect();
+                if let Some(tail) = [" restantes", " restante"].iter().find(|t| after.starts_with(**t)) {
+                    end += tail.chars().count();
+                }
+                if end == chars.len() || !chars[end].is_alphanumeric() {
+                    counts.push((i, end, chars[i..end].iter().collect::<String>().replace('\u{a0}', " ")));
+                    i = end;
+                    continue;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    let Some(count) = counts.last().map(|c| c.2.clone()) else { return line.trim().to_string() };
+    // The subject: the line without its counts, each with what held it.
+    let mut subject = String::new();
+    let mut at = 0;
+    for (start, end, _) in &counts {
+        let mut before: String = chars[at..*start].iter().collect();
+        let mut next = *end;
+        let opened = before.trim_end().ends_with('(');
+        if opened && chars.get(next) == Some(&')') {
+            before = before.trim_end().trim_end_matches('(').to_string();
+            next += 1;
+        }
+        let kept = before.trim_end().trim_end_matches([':', '-', '\u{2013}', ',', '\u{b7}', '\u{2022}']).trim_end();
+        subject.push_str(kept);
+        at = next;
+    }
+    subject.push_str(&chars[at..].iter().collect::<String>());
+    let subject = subject.split_whitespace().collect::<Vec<_>>().join(" ");
+    let subject = subject.trim_matches([':', '-', '\u{2013}', ',', '\u{b7}', '\u{2022}', ' ']).to_string();
+    if subject.is_empty() { count } else { format!("{subject} \u{b7} {count}") }
 }
 
 // ---------------------------------------------------------------
@@ -1016,12 +1076,24 @@ mod tests {
     fn the_card_message_names_each_decision() {
         let mut s = sheet();
         s.title = "Plan : ".into();
-        assert_eq!(s.card_message(""), "Plan : 2 décisions\n\u{2022} Ship when?\n\u{2022} Who owns it?");
+        assert_eq!(s.card_message(""), "Plan \u{b7} 2 décisions\n\u{2022} Ship when?\n\u{2022} Who owns it?");
+        // One form, one count: `<Subject> · <N> décisions`, whatever the title said.
+        assert_eq!(tile_title("AssemblyAI : quel modèle on utilise : 4 décisions"), "AssemblyAI : quel modèle on utilise \u{b7} 4 décisions");
+        assert_eq!(tile_title("Lem context API : 2 décisions (P6 et P7) : 2 décisions"), "Lem context API (P6 et P7) \u{b7} 2 décisions");
+        assert_eq!(tile_title("Lem PRD après l'atelier du 10/11 : 14 décisions : 14 décisions"), "Lem PRD après l'atelier du 10/11 \u{b7} 14 décisions");
+        assert_eq!(tile_title("Plan (3 décisions) : 3 décisions restantes"), "Plan \u{b7} 3 décisions restantes");
+        assert_eq!(tile_title("Plan - 1 décision"), "Plan \u{b7} 1 décision");
+        assert_eq!(tile_title("Plan \u{b7} 2 décisions"), "Plan \u{b7} 2 décisions", "already in form");
+        assert_eq!(tile_title("3 décisions"), "3 décisions");
+        assert_eq!(tile_title("Peux-tu trancher le pricing ?"), "Peux-tu trancher le pricing ?", "no count: someone's own words");
+        assert_eq!(tile_title("Top 10 décisionnaires : 2 décisions"), "Top 10 décisionnaires \u{b7} 2 décisions", "a number before another word is not a count");
+        let counted = Sheet { title: "Lem context API : 2 décisions (P6 et P7)".into(), ..s.clone() };
+        assert!(counted.card_message("").starts_with("Lem context API (P6 et P7) \u{b7} 2 décisions\n"), "{}", counted.card_message(""));
         for i in 3..=7 {
             s.decisions.push(SheetDecision { id: format!("D{i}"), ..s.decisions[0].clone() });
         }
         let m = s.card_message(" restante");
-        assert!(m.starts_with("Plan : 7 décisions restantes\n"));
+        assert!(m.starts_with("Plan \u{b7} 7 décisions restantes\n"));
         assert_eq!(m.lines().count(), 7, "title, 5 decisions, then the rest counted");
         assert!(m.ends_with("\n+2 autres"));
     }

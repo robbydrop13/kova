@@ -144,6 +144,9 @@ pub fn ask_card_html(
         return cockpit::card_html_with(&item, &sheet, &icons, can_act, now);
     }
     let (title, rest) = q.message.trim().split_once('\n').unwrap_or((q.message.trim(), ""));
+    // A decision sheet's title in its one form, `<Subject> · <N> décisions`.
+    let formed = if q.is_decision() { crate::decision_sheet::tile_title(title) } else { title.to_string() };
+    let title = formed.as_str();
     // The title is cut to one line: a long first line is said again in full.
     let mut message = if title.chars().count() > TITLE_MAX { q.message.trim() } else { rest.trim() }.to_string();
     if let Some(d) = handoff_detail.filter(|d| !d.trim().is_empty()) {
@@ -496,7 +499,7 @@ mod tests {
         d.asked_at = 40;
         let html = ask_card_html(&d, None, None, true, crate::attention::Scope::Pro, 100);
         assert!(html.starts_with("<article class=\"card open\" data-key=\"430b8a55-1\">"), "{html}");
-        assert!(html.contains("<div class=\"t\">Plan : 2 décisions</div>"));
+        assert!(html.contains("<div class=\"t\">Plan \u{b7} 2 décisions</div>"), "an older sheet's colon reads in the one form: {html}");
         assert!(html.contains("Répondre à la fiche") && html.contains("kova \u{b7} il y a 1 min"), "{html}");
         assert!(html.contains("data-act=\"snooze\"") && html.contains("data-act=\"dismiss\"") && html.contains("data-act=\"done\""));
         assert!(html.contains("class=\"btn acc\" data-act=\"open\"><span>Décider</span>") && !html.contains("Ouvrir"), "{html}");

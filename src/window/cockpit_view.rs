@@ -243,16 +243,29 @@ impl KovaView {
         let mtm = MainThreadMarker::from(self);
         let mut sheets = std::collections::HashSet::new();
         let mut waiting = Vec::new();
+        // Each waiting ask's message: its tile is titled by its first line.
+        let mut messages: HashMap<String, String> = HashMap::new();
         crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|q| {
             if q.panel_link().is_some() && !q.is_long() {
                 sheets.insert(format!("ask:{}", q.id));
             }
+            messages.insert(format!("ask:{}", q.id), q.message.clone());
             waiting.push(q.id.clone());
         });
         let mut actions = Vec::new();
         let mut items: Vec<Item> = {
             let st = self.ivars().sidebar.borrow();
-            st.needs.iter().filter_map(|need| cockpit::from_need(need, sheets.contains(&need.key))).collect()
+            st.needs
+                .iter()
+                .filter_map(|need| {
+                    let sheet = sheets.contains(&need.key);
+                    let mut item = cockpit::from_need(need, sheet)?;
+                    if let Some(message) = messages.get(&need.key) {
+                        item.title = cockpit::ask_title(message, sheet);
+                    }
+                    Some(item)
+                })
+                .collect()
         };
         if let Some(entries) = crate::attention::snapshot() {
             let outcomes = crate::attention::outcomes();

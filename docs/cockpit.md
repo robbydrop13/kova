@@ -193,6 +193,22 @@ Filters work like Linear's (Robin, 10/11/2026; `cockpit::filters_html`). The bar
   - `Agents au travail pour toi`: liveness is read, not self-reported. A session a Kova pane holds is listed while its pane works, whatever its last status says; a session with no pane, while its `working` status is under 30 min old. Its status text shows only while that status says `working`; its open consignes show under it. Consignes held by sessions at rest are one count line; holding a consigne never lists a session.
 - `Fait (24 h)`: the clicks over in the last 24 h (done or `Retiré`), newest first, with their result.
 
+A tile, folded (Robin, 11/11/2026: the tiles said too much): its title, its
+label, its source and its age, nothing under the title. What is expected
+reads in the title, `<Subject> · <what is expected>`, and under it once the
+card is open. The titles Kova composes follow that form: a decision sheet
+is `<Subject> · <N> décisions` and nothing else (`decision_sheet::tile_title`:
+one count, whatever the sheet's title already said, never its first
+question; `kova ask --decisions` posts it so, and an older sheet posted with
+a colon reads the same), a permission `<pane> · permission à donner`, a
+stopped turn `<pane> · tour arrêté`, a failed routine `Routine <name> · en
+échec`. A question's tile is the first line of its message. An attention
+card's title is its agent's words, shown as written.
+
+A label is a pill filled with its color, its name in near black or white,
+whichever reads best on it (`cockpit::ink_on`, WCAG luminance): the name
+says what it is, nothing rests on the color alone.
+
 A card's label (`attn add|update --label`, a closed registry of ten in `claude-config/labels.json`; `attn list --json` adds `label_color`) shows as a tag tinted with its color next to the space tag. Only a `#RRGGBB` color reaches the page; another reads gray.
 
 The Cockpit page runs down over the global status bar: its shortcuts and counters belong to the terminal.

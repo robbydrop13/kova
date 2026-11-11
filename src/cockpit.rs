@@ -437,27 +437,36 @@ pub fn scoped_card_css(scope: &str) -> String {
 /// A live need as an item. `sheet` says an ask is a decision sheet. An
 /// attention need is left out: the queue's own entry stands for it. Live
 /// needs carry no scope: they count as work.
+/// A waiting ask's tile title: the first line of its message, nothing of
+/// what follows; a decision sheet's in its one form
+/// (`decision_sheet::tile_title`). The host sets it on the item `from_need`
+/// made, whose need only carries the message flattened for the sidebar.
+pub fn ask_title(message: &str, sheet: bool) -> String {
+    let first = message.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+    if sheet { crate::decision_sheet::tile_title(first) } else { first.to_string() }
+}
+
 pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
     let (kind, prio, title, needs, from) = match need.kind {
         NeedKind::Attention => return None,
         NeedKind::Permission => (
             Kind::Permission,
             1,
-            format!("{} attend une permission", need.title),
+            format!("{} \u{b7} permission à donner", need.title),
             if need.detail.trim().is_empty() { "Autoriser ou refuser".to_string() } else { need.detail.clone() },
             format!("pane {}", need.title),
         ),
         NeedKind::Error => (
             Kind::Error,
             1,
-            format!("{} : le tour s'est arrêté", need.title),
+            format!("{} \u{b7} tour arrêté", need.title),
             if need.detail.trim().is_empty() { "Regarder le pane".to_string() } else { need.detail.clone() },
             format!("pane {}", need.title),
         ),
         NeedKind::FailedRoutine => (
             Kind::FailedRoutine,
             2,
-            format!("Routine {} en échec", need.title),
+            format!("Routine {} \u{b7} en échec", need.title),
             "Regarder pourquoi elle a échoué".to_string(),
             "routines".to_string(),
         ),
@@ -468,6 +477,12 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
             if sheet { "Répondre à la fiche" } else { "Répondre à la question" }.to_string(),
             need.title.clone(),
         ),
+    };
+    // A sheet: `<Subject> · <N> décisions` (older ones were posted with a
+    // colon, and their card text follows on the same line).
+    let title = match kind {
+        Kind::Sheet => crate::decision_sheet::tile_title(title.split(" \u{2022} ").next().unwrap_or(&title)),
+        _ => title,
     };
     Some(Item {
         key: need.key.clone(),
@@ -870,16 +885,31 @@ fn label_dot(view: &View, name: &str) -> String {
     format!("<i class=\"ld\" style=\"background:{}\"></i>", esc(color))
 }
 
-/// A card's label: a tag tinted with its color.
+/// A card's label: a pill filled with its color, its name in the ink that
+/// reads best on it (`ink_on`). The name says what the label is: nothing
+/// rests on the color alone.
 fn label_html(label: &Option<crate::attention::Label>) -> String {
     match label {
         Some(l) if crate::attention::hex_color(&l.color) => format!(
-            "<span class=\"tag lb\" style=\"color:{0};background:{0}22\">{1}</span>",
+            "<span class=\"tag lb\" style=\"background:{};color:{}\">{}</span>",
             l.color,
+            ink_on(&l.color),
             esc(&l.name)
         ),
         _ => String::new(),
     }
+}
+
+/// Near black or white, whichever contrasts more with a `#RRGGBB` fill
+/// (WCAG relative luminance): the label's name stays readable on any color.
+pub fn ink_on(fill: &str) -> &'static str {
+    let channel = |i: usize| {
+        let v = u8::from_str_radix(fill.get(i..i + 2).unwrap_or("80"), 16).unwrap_or(128) as f64 / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    let l = 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
+    // Contrast with white is 1.05 / (l + 0.05), with #111 about (l + 0.05) / 0.056.
+    if 1.05 / (l + 0.05) >= (l + 0.05) / 0.056 { "#FFFFFF" } else { "#111111" }
 }
 
 fn tag_html(scope: Scope) -> String {
@@ -936,7 +966,9 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     if item.kind == Kind::Attention && item.detail.is_some() && can_act {
         detail.push_str(&instruct_html(item.instruction.as_ref()));
     }
-    let needs = if item.needs.trim().is_empty() {
+    // Folded, a card is its title, its label, its source and its age: what
+    // is expected reads in the title, and under it once the card is open.
+    let needs = if item.needs.trim().is_empty() || item.detail.is_none() {
         String::new()
     } else {
         format!("<div class=\"need\">{ICON_CHEVRON}<span>{}</span></div>", linked(&item.needs))
@@ -1580,7 +1612,7 @@ button:disabled{opacity:.5;cursor:default}
 .src span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tag{height:18px;border-radius:4px;padding:0 6px;font-size:11px;font-weight:500;display:inline-flex;align-items:center;gap:5px;background:var(--bg-elev);color:var(--t2);flex:none}
 .tag i{width:6px;height:6px;border-radius:50%;display:block;background:var(--tag-blue)}
-.tag i.perso{background:var(--tag-green)}.tag.lb{font-weight:600}.fm-o i.ld{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
+.tag i.perso{background:var(--tag-green)}.tag.lb{font-weight:600;padding:0 8px;border-radius:9px}.fm-o i.ld{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
 .acts{display:flex;align-items:center;gap:14px;flex:none}
 .state{font-size:12px;color:var(--t3);margin-top:6px}
 .detail{margin-top:10px;border-top:1px solid var(--b3);padding-top:10px;font-size:13px;line-height:19px}
@@ -2278,7 +2310,8 @@ mod tests {
             label: label.map(str::to_string),
         };
         let all = list_html(&view(None));
-        assert!(all.contains("<span class=\"tag lb\" style=\"color:#F59E0B;background:#F59E0B22\">QA</span>"), "{all}");
+        assert!(all.contains("<span class=\"tag lb\" style=\"background:#F59E0B;color:#111111\">QA</span>"), "a filled pill, its name in the ink that reads on it: {all}");
+        assert_eq!((ink_on("#F59E0B"), ink_on("#1E3A8A"), ink_on("#FFFFFF"), ink_on("#000000")), ("#111111", "#FFFFFF", "#111111", "#FFFFFF"));
         // The menu: a Label group, the most used first, each with its dot.
         let head = head_html(&view(None));
         let src = head.split("<div id=\"fmsrc\" hidden>").nth(1).unwrap();
@@ -2331,9 +2364,11 @@ mod tests {
         let mut item = from_attention(&e, None, true).expect("a card");
         let closed = card_html(&item, true, true, true, 10);
         assert!(closed.contains(r##"Review <a href="#" class="path" data-path="~/notes/plan.html">~/notes/plan.html</a> for <a href="https://linear.app/claap/issue/CLA-10208">CLA-10208</a>"##), "{closed}");
-        assert!(closed.contains(r##"after <a href="#" class="path" data-path="/tmp/plan.md">/tmp/plan.md</a> and <a href="https://github.com/claap-app/claap/pull/13937">#13937</a> &lt;ok&gt;"##), "{closed}");
+        // Folded: the title, the label, the source and the age, no line under the title.
+        assert!(!closed.contains("class=\"need\"") && !closed.contains("Say go after"), "{closed}");
         item.detail = Some(entry_detail(&e, false));
         let open = card_html(&item, true, true, true, 10);
+        assert!(open.contains(r##"<div class="need">"##) && open.contains(r##"after <a href="#" class="path" data-path="/tmp/plan.md">/tmp/plan.md</a> and <a href="https://github.com/claap-app/claap/pull/13937">#13937</a> &lt;ok&gt;"##), "{open}");
         assert!(open.contains(r##"Site <a href="https://x.io/a">https://x.io/a</a>, <a href="#" class="path" data-path="/tmp/plan.md">the plan</a>. Not /v1/list.json"##), "{open}");
         // The page sends a link's click to the side panel, not to the card under it.
         let page = shell(false, "n");
@@ -2481,7 +2516,14 @@ mod tests {
         assert_eq!(from_need(&need(NeedKind::FailedRoutine, "routine:n", 5), false).map(|i| i.prio), Some(2));
         assert!(from_need(&need(NeedKind::Attention, "attention:a-1", 5), false).is_none());
         let perm = from_need(&need(NeedKind::Permission, "pane:1", 5), false).expect("an item");
-        assert_eq!(perm.title, "build attend une permission");
+        assert_eq!(perm.title, "build \u{b7} permission à donner");
+        // A sheet's tile: one form, one count, nothing of the first question.
+        let mut sheet_need = need(NeedKind::Ask, "ask:q", 5);
+        sheet_need.detail = "Lem context API : 2 décisions (P6 et P7) : 2 décisions \u{2022} Les serveurs écrivent-ils ?".into();
+        assert_eq!(ask_title("Lem context API : 2 décisions (P6 et P7) : 2 décisions\n\u{2022} Les serveurs écrivent-ils ?", true), "Lem context API (P6 et P7) \u{b7} 2 décisions");
+        assert_eq!(ask_title("\nPeux-tu relire ?\nle détail", false), "Peux-tu relire ?");
+        let folded = card_html(&from_need(&sheet_need, true).unwrap(), true, true, true, 10);
+        assert!(!folded.contains("Répondre à la fiche") && !folded.contains("class=\"need\""), "{folded}");
         assert_eq!(perm.needs, "git push");
         assert_eq!(perm.scope, Scope::Pro);
     }

@@ -21,7 +21,7 @@ kova render: write Kova's pages as HTML files, without a window
   kova render cockpit --list <json> --out <dir>
         [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
         [--state <card id>=delivered|noted|running|failed:<why>]... [--refs <json>]
-        [--journal <file.md>]
+        [--journal <file.md>] [--ask <question.json>]...
       <json> files hold what the `[attention]` commands print: `attn list --open --json`,
       `attn inflight --json`, `attn catchup --json`; panes: [[\"session\", working], ...].
       Writes default.html, menu.html, chips.html, en-cours.html, fait.html, and
@@ -190,6 +190,24 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
         states.insert(id.to_string(), outcome);
     }
     let mut items: Vec<cockpit::Item> = entries.iter().filter_map(|e| cockpit::from_attention(e, states.get(&e.id), true)).collect();
+    // Waiting asks, each from its file of the board's store: their tiles as
+    // the Cockpit makes them (`from_need`, then `ask_title`).
+    for file in a.all("--ask") {
+        let q: crate::ask::Question = serde_json::from_str(&read(&file)?).map_err(|e| format!("--ask {file}: {e}"))?;
+        let sheet = q.panel_link().is_some() && !q.is_long();
+        let need = crate::window::needs::NeedItem {
+            kind: crate::window::needs::NeedKind::Ask,
+            key: format!("ask:{}", q.id),
+            pane_id: None,
+            since: q.asked_at,
+            title: q.from.name.clone(),
+            detail: q.message.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "),
+        };
+        if let Some(mut item) = cockpit::from_need(&need, sheet) {
+            item.title = cockpit::ask_title(&q.message, sheet);
+            items.push(item);
+        }
+    }
     cockpit::sort(&mut items);
     let now = now();
     let light = a.has("--light");
