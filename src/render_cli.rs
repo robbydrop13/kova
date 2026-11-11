@@ -189,12 +189,6 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
         };
         states.insert(id.to_string(), outcome);
     }
-    // MOCK-UP ONLY: `--reply-mock a|b`, `--asked <id>=<question>`.
-    cockpit::REPLY_MOCK.with(|m| {
-        let mut m = m.borrow_mut();
-        m.0 = a.get("--reply-mock").and_then(|v| v.chars().next());
-        m.1 = a.all("--asked").iter().filter_map(|s| s.split_once('=')).map(|(id, q)| (format!("attention:{id}"), q.to_string())).collect();
-    });
     let mut items: Vec<cockpit::Item> = entries.iter().filter_map(|e| cockpit::from_attention(e, states.get(&e.id), true)).collect();
     // Waiting asks, each from its file of the board's store: their tiles as
     // the Cockpit makes them (`from_need`, then `ask_title`).

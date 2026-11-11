@@ -684,6 +684,7 @@ impl KovaView {
                     "answer" => self.cockpit_answer(&key, &s("arg"), text.as_deref().unwrap_or_default()),
                     "link" => self.cockpit_link(&key, &s("arg")),
                     "instruct" => self.cockpit_instruct(&key, text.as_deref().unwrap_or_default()),
+                    "reply" => self.cockpit_reply(&key, &s("arg"), text.as_deref()),
                     "pane" => {
                         self.close_cockpit();
                         self.sidebar_open_need(&key);
@@ -836,6 +837,33 @@ impl KovaView {
                 }
             }
             _ => {}
+        }
+        self.mark_dirty();
+    }
+
+    /// A gesture of a card's reply zone (`cockpit::zoned`): only one the
+    /// queue offered on the card as the page showed it. Go carries the
+    /// fingerprint of the draft shown. A card filed leaves the page at once,
+    /// and comes back with the command's line if the gesture failed.
+    fn cockpit_reply(&self, key: &str, word: &str, text: Option<&str>) {
+        use crate::attention::Gesture;
+        let slot = &self.ivars().cockpit;
+        let Some(id) = key.strip_prefix("attention:") else { return };
+        let Some(gesture) = Gesture::parse(word) else { return };
+        let Some(item) = slot.page.borrow().items.iter().find(|i| i.key == key).cloned() else { return };
+        if !cockpit::zoned(&item, crate::attention::can_act()) || !item.reply.gestures.contains(&gesture) {
+            return;
+        }
+        let seen = item.draft.as_ref().and_then(|d| d.seen.clone());
+        match crate::attention::perform_gesture(id, gesture, text, seen.as_deref()) {
+            Ok(()) if gesture.files() => {
+                slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
+            }
+            Ok(()) => {}
+            Err(why) => {
+                log::warn!("cockpit: {why}");
+                crate::attention::click_refused(id, &why);
+            }
         }
         self.mark_dirty();
     }

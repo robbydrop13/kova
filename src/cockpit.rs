@@ -171,6 +171,8 @@ pub struct Item {
     pub shots: Vec<(String, String)>,
     /// Its label, a colored tag next to its space (`attn labels`).
     pub label: Option<crate::attention::Label>,
+    /// An attention entry's reply zone as the queue gives it (`zoned`).
+    pub reply: crate::attention::Reply,
 }
 
 /// What an opened card shows inside it, instead of a jump to another view.
@@ -362,6 +364,7 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
         uncertain: entry.uncertain.clone(),
         proof: entry.proof.clone(),
         plan: entry.plan,
+        reply: entry.reply.clone(),
         entry_kind: entry.kind.clone(),
         detail: None,
         state,
@@ -501,6 +504,7 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         uncertain: None,
         proof: None,
         plan: false,
+        reply: Default::default(),
         entry_kind: String::new(),
         detail: None,
         state: State::Idle,
@@ -561,13 +565,20 @@ pub enum Button {
     /// message (`C'est parti`), or nothing left and it goes again (`Renvoyer`).
     Left,
     Resend,
+    /// Open a card on its reply zone (`zoned`): `Répondre`.
+    Respond,
+    /// `Vu`, at the head of a card with a reply zone: filed with no
+    /// judgement, where the check and the cross were.
+    Seen,
 }
 
 impl Button {
     /// The word the page posts.
     pub fn act(self) -> &'static str {
         match self {
-            Button::Expand | Button::Brief | Button::Decide | Button::Test | Button::Reply => "expand",
+            Button::Expand | Button::Brief | Button::Decide | Button::Test | Button::Reply | Button::Respond => "expand",
+            // A gesture of the reply zone: its word goes as the argument.
+            Button::Seen => "reply",
             Button::Log => "routine",
             Button::Pane => "pane",
             Button::Open | Button::OpenSheet => "open",
@@ -611,7 +622,8 @@ impl Button {
             Button::OpenSheet | Button::Decide => "Décider",
             Button::Brief => "Brief",
             Button::Test => "Tester",
-            Button::Reply => "Répondre",
+            Button::Reply | Button::Respond => "Répondre",
+            Button::Seen => "Vu",
             Button::Log => "Voir le log",
             Button::Pane => "Voir le pane",
             Button::Done => "C'est fait",
@@ -632,7 +644,7 @@ impl Button {
         match self {
             // A draft's Corriger is a consigne to the card's agent, not an edit
             // of the text (07/11): it opens the card on its instruction field.
-            Button::Brief | Button::Decide | Button::Test | Button::Correct => Some("ins"),
+            Button::Brief | Button::Decide | Button::Test | Button::Correct | Button::Respond => Some("ins"),
             Button::Reply => Some("ans"),
             _ => None,
         }
@@ -643,6 +655,20 @@ impl Button {
 /// Buttons). `None` for a card that only informs (its check icon is the
 /// action) and once a go went through.
 pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
+    if zoned(item, can_act) {
+        // The verdict is given in the reply zone. A folded card's button
+        // opens it there; a draft and an opened card show the zone already.
+        if item.draft.is_some() || item.detail.is_some() || !answers(item) {
+            return None;
+        }
+        return Some(match item.entry_kind.as_str() {
+            "test" => Button::Test,
+            "blocked" | "ask" | "brief" => Button::Brief,
+            "decision" => Button::Decide,
+            _ if item.validates => Button::Respond,
+            _ => return None,
+        });
+    }
     // Maybe sent already: validating again is not what the card puts first.
     if item.uncertain.is_some() && (item.draft.is_some() || item.validates) {
         return None;
@@ -666,10 +692,36 @@ pub fn primary(item: &Item, can_act: bool) -> Option<Button> {
     }
 }
 
+/// Whether the card answers through the reply zone: an attention entry the
+/// queue lists gestures for (`attention::Reply`), with `act_command` set. One
+/// that stands for a decision sheet is answered in the sheet. A queue that
+/// lists none keeps the former buttons: the cutover is the queue's.
+pub fn zoned(item: &Item, can_act: bool) -> bool {
+    item.kind == Kind::Attention && can_act && item.ask.is_none() && !item.reply.gestures.is_empty()
+}
+
+/// Whether a zoned card offers a verdict or a question (not only `Vu` or
+/// `Annuler ma demande`): what its field and its three buttons are for.
+fn answers(item: &Item) -> bool {
+    use crate::attention::Gesture;
+    item.reply.gestures.iter().any(|g| matches!(g, Gesture::Go | Gesture::NoGo | Gesture::Ask))
+}
+
 /// A card's actions, left to right: the links, then the blue button last
 /// (`primary`). A draft's verbs need `act_command`; a sent draft has none
 /// left. `Refuser` needs the close command (`card_html`).
 pub fn buttons(item: &Item, can_act: bool) -> Vec<Button> {
+    if zoned(item, can_act) {
+        // `Voir`, then what opens the zone. A send nobody knows the end of
+        // keeps its two ways out.
+        let open = item.openable.then_some(Button::Open);
+        let unsure = if item.uncertain.is_some() && (item.draft.is_some() || item.validates) && item.state == State::Idle {
+            vec![Button::Left, Button::Resend]
+        } else {
+            Vec::new()
+        };
+        return open.into_iter().chain(unsure).chain(primary(item, can_act)).collect();
+    }
     let sent = matches!(item.state, State::Sent | State::SentByCode(_) | State::Said(_) | State::Noted);
     let links: Vec<Button> = match item.kind {
         Kind::Attention if item.draft.is_some() && can_act => match (sent, item.plan) {
@@ -720,6 +772,14 @@ pub fn icons(item: &Item, can_close: bool, can_snooze: bool) -> Vec<Button> {
         out.extend([Button::Dismiss, Button::Done]);
     }
     out
+}
+
+/// The icons of a card with a reply zone (`zoned`): the clock, and `Vu` when
+/// the queue offers it. No check, no cross: a card that waits for its agent
+/// has neither within reach.
+pub fn zone_icons(item: &Item, can_snooze: bool) -> Vec<Button> {
+    let seen = item.reply.gestures.contains(&crate::attention::Gesture::Seen);
+    can_snooze.then_some(Button::Snooze).into_iter().chain(seen.then_some(Button::Seen)).collect()
 }
 
 /// The user already acted on the card: a go went through, or a consigne
@@ -845,6 +905,12 @@ fn icons_html(list: &[Button], disabled: bool) -> String {
     let one: String = list
         .iter()
         .map(|&b| {
+            if b == Button::Seen {
+                return format!(
+                    "<button type=\"button\" class=\"link vu\" data-act=\"reply\" data-arg=\"seen\" title=\"Ranger la carte, sans go ni no go\"{}>{ICON_CHECK}<span>Vu</span></button>",
+                    if disabled { " disabled" } else { "" }
+                );
+            }
             let icon = match b {
                 Button::Snooze => ICON_CLOCK_S,
                 Button::Dismiss => ICON_X_S,
@@ -945,50 +1011,78 @@ fn state_html(state: &State) -> String {
 pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, now: u64) -> String {
     // `Refuser` closes the entry: no close command, no `Refuser`.
     let list: Vec<Button> = buttons(item, can_act).into_iter().filter(|&b| can_close || b != Button::Refuse).collect();
-    card_html_with(item, &list, &icons(item, can_close, can_snooze), can_act, now)
-}
-
-thread_local! {
-    /// MOCK-UP ONLY (branch `reply-zone-mock`, not for main): the reply zone
-    /// variant an opened attention card shows, `'a'` or `'b'`, and the cards
-    /// shown as "asked" (key -> the question typed). Set by `kova render`.
-    pub static REPLY_MOCK: std::cell::RefCell<(Option<char>, std::collections::HashMap<String, String>)> =
-        std::cell::RefCell::new((None, std::collections::HashMap::new()));
+    let icon_list = if zoned(item, can_act) { zone_icons(item, can_snooze) } else { icons(item, can_close, can_snooze) };
+    card_html_with(item, &list, &icon_list, can_act, now)
 }
 
 const ICON_NOGO: &str = r#"<svg class="i" width="13" height="13" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>"#;
 const ICON_Q: &str = r#"<svg class="i" width="13" height="13" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
 
-/// MOCK-UP ONLY: the reply zone of an opened card. One field, and the
-/// decision in the same gesture.
-/// - `a`: three buttons. `No go` (outlined, a cross), `Demander` (a link,
-///   a bubble), `Go` (filled, a check). Text and shape tell them apart, not
-///   green and red.
-/// - `b`: one choice then one send: a segmented `Go | No go | Question`,
-///   then `Envoyer`.
-fn reply_zone_html(item: &Item, variant: char, asked: Option<&str>) -> String {
-    let go = if item.draft.is_some() { "Go, envoyer" } else { "Go" };
-    let placeholder = if item.draft.is_some() { "Un commentaire pour l'agent (facultatif)" } else { "Ton commentaire (facultatif)" };
-    let asked_html = asked
-        .map(|q| format!("<div class=\"state warn\">Attend l'agent \u{b7} ta question est partie</div><p class=\"msg sent\">{}</p>\
-             <button type=\"button\" class=\"link undo\">Annuler ma demande</button>", linked(q)))
-        .unwrap_or_default();
-    let buttons = match variant {
-        'b' => format!(
-            "<div class=\"rz-b\"><div class=\"seg\" role=\"radiogroup\"><button type=\"button\" class=\"on\">{ICON_CHECK}<span>Go</span></button>\
-             <button type=\"button\">{ICON_NOGO}<span>No go</span></button><button type=\"button\">{ICON_Q}<span>Question</span></button></div>\
-             <button type=\"button\" class=\"btn acc\"><span>Envoyer</span></button></div>"
-        ),
-        _ => format!(
-            "<div class=\"rz-a\"><span class=\"hint\">Entrée : demander \u{b7} \u{2318}Entrée : go</span>\
-             <button type=\"button\" class=\"btn out\">{ICON_NOGO}<span>No go</span></button>\
-             <button type=\"button\" class=\"link\">{ICON_Q}<span>Demander</span></button>\
-             <button type=\"button\" class=\"btn acc\">{ICON_CHECK}<span>{go}</span></button></div>"
-        ),
+/// The placeholders of the reply zone's field.
+pub const REPLY_PLACEHOLDER: &str = "Ton commentaire (facultatif), ou ta question";
+
+/// The reply zone of a card (`zoned`): one field, `Ta réponse`, and the
+/// gestures the queue offers, each a button with its word and its icon
+/// (nothing rests on a color): `No go` outlined with a cross, `Demander` a
+/// link with a bubble, `Go` (the queue's own label: `Go, envoyer` on a
+/// draft) filled with a check. `Demander` needs a text: it is disabled
+/// while the field is empty. Nothing is posted from the keyboard: Enter is
+/// a new line. A question that did not go is kept under the field.
+fn reply_zone_html(item: &Item, running: bool) -> String {
+    use crate::attention::Gesture;
+    if !answers(item) {
+        return String::new();
+    }
+    let has = |g: Gesture| item.reply.gestures.contains(&g);
+    let lock = if running { " disabled data-lock" } else { "" };
+    let mut buttons = String::new();
+    if has(Gesture::NoGo) {
+        buttons.push_str(&format!("<button type=\"button\" class=\"btn out\" data-act=\"reply\" data-arg=\"nogo\"{lock}>{ICON_NOGO}<span>No go</span></button>"));
+    }
+    if has(Gesture::Ask) {
+        // Disabled until something is typed (`syncReply`).
+        buttons.push_str(&format!(
+            "<button type=\"button\" class=\"link\" data-act=\"reply\" data-arg=\"ask\" disabled{}>{ICON_Q}<span>Demander</span></button>",
+            if running { " data-lock" } else { "" }
+        ));
+    }
+    if has(Gesture::Go) {
+        let label = item.reply.go_label.as_deref().unwrap_or(if item.draft.is_some() { "Go, envoyer" } else { "Go" });
+        buttons.push_str(&format!("<button type=\"button\" class=\"btn acc\" data-act=\"reply\" data-arg=\"go\"{lock}>{ICON_CHECK}<span>{}</span></button>", esc(label)));
+    }
+    let failed = match &item.instruction {
+        Some(Instructed { text, outcome: Outcome::Failed { words, .. } }) => {
+            format!("<div class=\"state crit\">Demande non envoyée : {}</div><p class=\"msg sent\">{}</p>", esc(words), esc(text))
+        }
+        _ => String::new(),
     };
     format!(
-        "<div class=\"instr rz\"><div class=\"lbl\">Ta réponse</div>{asked_html}\
-         <textarea class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{placeholder}\"></textarea>{buttons}</div>"
+        "<div class=\"instr rz\"><div class=\"lbl\">Ta réponse</div>\
+         <textarea class=\"ins rz-t\" rows=\"2\" spellcheck=\"true\" placeholder=\"{REPLY_PLACEHOLDER}\"{}></textarea>\
+         <div class=\"rz-a\">{buttons}</div>{failed}</div>",
+        if running { " readonly" } else { "" }
+    )
+}
+
+/// A card that waits for its agent, said at its head, folded or not: the
+/// state in words with its bubble (`Attend l'agent`, then the delivery as
+/// the queue words it: `non remis`, `sera lu à son prochain pas`), the
+/// question the user asked, and `Annuler ma demande` when the queue offers it.
+fn asked_html(item: &Item, can_act: bool, running: bool) -> String {
+    let Some(asked) = item.reply.asked.as_ref().filter(|_| zoned(item, can_act)) else { return String::new() };
+    let label = asked.label.as_deref().map(|l| format!(" \u{b7} {}", esc(l))).unwrap_or_default();
+    let cancel = if item.reply.gestures.contains(&crate::attention::Gesture::Cancel) {
+        format!(
+            "<button type=\"button\" class=\"link undo\" data-act=\"reply\" data-arg=\"cancel\"{}>Annuler ma demande</button>",
+            if running { " disabled" } else { "" }
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<div class=\"asked\"><div class=\"state warn top\">{ICON_Q}<span>Attend l'agent{label}</span></div>\
+         <p class=\"msg sent\">Ta question : {}</p>{cancel}</div>",
+        linked(&asked.text)
     )
 }
 
@@ -1010,32 +1104,12 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     }
     // An opened attention card takes an instruction, action or not, under
     // the draft's actions when it has a draft.
-    let (mock, asked) = REPLY_MOCK.with(|m| {
-        let m = m.borrow();
-        (m.0.filter(|_| item.kind == Kind::Attention && item.detail.is_some() && can_act), m.1.get(&item.key).cloned())
-    });
-    // MOCK-UP ONLY: the card's own verbs move into the reply zone; an asked
-    // card keeps the clock only, the check and the cross are out of reach.
-    let (acts, icons) = match mock {
-        Some(_) => (
-            format!("<div class=\"acts\">{}</div>", list.iter().filter(|b| matches!(b, Button::Open)).map(|&b| button_html(b, running, false)).collect::<String>()),
-            // Asked: the clock only. Else the clock and a neutral `Vu`, with
-            // its word, where the check and the cross were: it puts the card
-            // away without saying go nor no go.
-            if asked.is_some() {
-                icons_html(&[Button::Snooze], running)
-            } else {
-                icons_html(&[Button::Snooze], running).replacen(
-                    "</div>",
-                    &format!("<button type=\"button\" class=\"link vu\" title=\"Ranger la carte, sans go ni no go\">{ICON_CHECK}<span>Vu</span></button></div>"),
-                    1,
-                )
-            },
-        ),
-        None => (acts, icons),
-    };
-    if let Some(variant) = mock {
-        detail.push_str(&reply_zone_html(item, variant, asked.as_deref()));
+    let zone = zoned(item, can_act);
+    if zone {
+        // A draft is shown whole, so its zone is too; else once opened.
+        if item.draft.is_some() || item.detail.is_some() {
+            detail.push_str(&reply_zone_html(item, running));
+        }
     } else if item.kind == Kind::Attention && item.detail.is_some() && can_act {
         detail.push_str(&instruct_html(item.instruction.as_ref()));
     }
@@ -1053,7 +1127,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
         .as_deref()
         .map(|why| format!("<div class=\"state warn top\">Peut-être parti : {}</div>", linked(why)))
         .unwrap_or_default();
-    let failed = format!("{failed}{unsure}");
+    let failed = format!("{failed}{unsure}{}", asked_html(item, can_act, running));
     let proof = item.proof.as_deref().map(|p| format!("<div class=\"state ok\">Preuve : {}</div>", linked(p))).unwrap_or_default();
     let head = format!("{failed}<div class=\"t\">{}</div>{needs}{proof}", linked(&item.title));
     let body = match (&item.draft, item.kind == Kind::Attention && can_act) {
@@ -1088,12 +1162,15 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
             // a text that starts with a newline keeps it.
             format!(
                 "<div class=\"row\"><div class=\"txt\">{head}</div>{icons}</div>\
-                 <div class=\"draft\"><div class=\"hd\">{to}{channel}{subject}<span class=\"edit\">{ICON_EDIT}Modifiable</span></div>\
+                 <div class=\"draft\"><div class=\"hd\">{to}{channel}{subject}{edit}</div>\
                  <textarea class=\"bd\" spellcheck=\"true\" data-orig=\"{orig}\"{ro}>\n{text}</textarea></div>\
                  <div class=\"draft-foot\">{src}{acts}</div>{detail}{state}",
                 orig = esc(&draft.text),
                 text = esc(&draft.text),
-                ro = if matches!(item.state, State::Sent | State::SentByCode(_) | State::Said(_) | State::Noted) || running { " readonly" } else { "" },
+                // In a reply zone a draft is not rewritten in place: a change is
+                // asked for (`Demander`), and the go carries the version shown.
+                edit = if zone { String::new() } else { format!("<span class=\"edit\">{ICON_EDIT}Modifiable</span>") },
+                ro = if zone || matches!(item.state, State::Sent | State::SentByCode(_) | State::Said(_) | State::Noted) || running { " readonly" } else { "" },
                 src = source_html(item, now),
                 state = state_html(&item.state),
             )
@@ -1706,15 +1783,13 @@ textarea.ans{display:block;width:100%;margin-top:8px;background:var(--bg-input);
 textarea.ans:focus{border-color:var(--accent);outline:0}
 .draft .hd code.tg{font:11.5px "SF Mono",Menlo,monospace;color:var(--t3);background:none;border:0;padding:0}
 .draft .hd span.tg{color:var(--t3)}.draft .hd span.tg.ext{color:var(--warn-dot)}
-.rz .rz-a,.rz .rz-b{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-top:8px}
-.rz .undo{display:block;margin:2px 0 8px;font-size:12px;font-weight:400;color:var(--t3);text-decoration:underline}
-.icons .vu{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;margin-left:4px}
-.rz .hint{margin-right:auto;font-size:11.5px;color:var(--t3)}
-.rz .btn{display:inline-flex;align-items:center;gap:6px}.rz .link{display:inline-flex;align-items:center;gap:6px}
+.rz .rz-a{display:flex;align-items:center;justify-content:flex-end;gap:14px;margin-top:8px}
+.rz .btn,.rz .link,.icons .vu,.asked .state{display:inline-flex;align-items:center;gap:6px}
 .rz .btn.out{background:none;border:1px solid var(--b2);color:var(--t1);height:28px;padding:0 12px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer}
-.rz .seg{display:inline-flex;border:1px solid var(--b2);border-radius:7px;overflow:hidden;margin-right:auto}
-.rz .seg button{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;background:none;border:0;border-left:1px solid var(--b2);color:var(--t2);font-size:13px;cursor:pointer}
-.rz .seg button:first-child{border-left:0}.rz .seg button.on{background:var(--bg-elev);color:var(--t1);font-weight:600}
+.rz button:disabled{opacity:.45;cursor:default}
+.icons .vu{font-size:12.5px;margin-left:6px}
+.asked{margin:0 0 8px}.asked .msg.sent{margin:2px 0 0}
+.asked .undo{display:block;margin-top:4px;font-size:12px;font-weight:400;color:var(--t3);text-decoration:underline}
 .state.top{margin:0 0 6px}.jr{margin:18px 0 6px;font-size:12px;color:var(--t3)}.jr a{color:var(--t3);text-decoration:underline}
 .state.ok{color:var(--ok-dot)}.state.warn{color:var(--warn-dot)}.state.crit{color:var(--crit)}
 .instr{margin-top:10px;border-top:1px solid var(--b3);padding-top:4px;cursor:auto}
@@ -1933,6 +2008,11 @@ function sync(card) {
   if (v) v.textContent = changed ? 'Valider la correction' : 'Valider';
   if (c) c.textContent = changed ? 'Annuler' : 'Corriger';
 }
+// A reply zone's Demander needs a text: disabled while its field is empty.
+function syncReply(card) {
+  const t = card.querySelector('textarea.rz-t'), b = card.querySelector('[data-arg=ask]');
+  if (t && b) b.disabled = b.hasAttribute('data-lock') || !t.value.trim();
+}
 // The list is replaced whole; a draft being rewritten keeps its text, its
 // caret and the keyboard.
 function setList(html) {
@@ -1988,6 +2068,7 @@ function setList(html) {
       if (card.dataset.key === whyFocus) why.focus();
     }
   });
+  document.querySelectorAll('.card').forEach(syncReply);
   document.querySelector('.page').scrollTop = top;
   if (wantFocus) {
     const c = document.querySelector('.card.open[data-key="' + CSS.escape(wantFocus.key) + '"]');
@@ -2149,6 +2230,18 @@ document.addEventListener('click', e => {
     msg.text = ans ? ans.value : '';
     if (!msg.text.trim()) { if (ans) ans.focus(); return; }
   }
+  // A reply zone's gesture: the field's text goes with it. Go, No go and Vu
+  // file the card; a question clears the field and the card stays.
+  if (act === 'reply') {
+    const f = card.querySelector('textarea.rz-t');
+    msg.text = f && msg.arg !== 'seen' && msg.arg !== 'cancel' ? f.value : '';
+    if (msg.arg === 'ask') {
+      if (!msg.text.trim()) { if (f) f.focus(); return; }
+      f.value = '';
+    } else if (msg.arg !== 'cancel') hide(card.dataset.key);
+    card.querySelectorAll('[data-act=reply]').forEach(x => x.disabled = true);
+    return post(msg);
+  }
   if (act === 'expand' && b.dataset.focus) {
     if (card.classList.contains('open')) return focusIn(card, b.dataset.focus);
     wantFocus = { key: card.dataset.key, what: b.dataset.focus };
@@ -2178,13 +2271,15 @@ document.addEventListener('click', e => {
 document.addEventListener('input', e => {
   const t = e.target;
   if (t.classList && t.classList.contains('bd')) { grow(t); sync(t.closest('.card')); }
+  if (t.classList && t.classList.contains('rz-t')) syncReply(t.closest('.card'));
 });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !$('zoom').hidden) { $('zoom').hidden = true; return; }
   const t = e.target;
   // An instruction: Enter sends it, Shift+Enter is a new line, nothing typed
   // sends nothing.
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && t.classList && t.classList.contains('ins')) {
+  // A reply zone's field posts nothing from the keyboard: Enter is a new line.
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && t.classList && t.classList.contains('ins') && !t.classList.contains('rz-t')) {
     e.preventDefault();
     if (t.readOnly || !t.value.trim()) return;
     post({ type: 'act', key: t.closest('.card').dataset.key, act: 'instruct', text: t.value });
@@ -2245,7 +2340,109 @@ mod tests {
             uncertain: None,
             proof: None,
             plan: false,
+            reply: Default::default(),
         }
+    }
+
+    fn zone_entry(id: &str, json: &str) -> Entry {
+        let list = crate::attention::parse(&format!(r#"[{{"id":"{id}","level":"now","kind":"would","title":"T","needs":"N","from":"pm",{json}}}]"#)).unwrap();
+        list.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn a_card_the_queue_lists_gestures_for_answers_in_its_reply_zone() {
+        use crate::attention::Gesture;
+        let e = zone_entry("a-1", r#""gestures":["go","nogo","ask","seen"],"go_label":"Go","waiting":"robin","ask":null"#);
+        assert_eq!(e.reply.gestures, [Gesture::Go, Gesture::NoGo, Gesture::Ask, Gesture::Seen]);
+        let mut item = from_attention(&e, None, false).unwrap();
+        assert!(zoned(&item, true) && !zoned(&item, false), "no act_command, no zone");
+        // Folded: Répondre opens it; the clock and Vu, no check, no cross.
+        assert_eq!(buttons(&item, true), [Button::Respond]);
+        let folded = card_html(&item, true, true, true, 10);
+        assert!(folded.contains(r#"data-act="expand" data-focus="ins""#) && folded.contains("<span>Répondre</span>"), "{folded}");
+        assert!(folded.contains(r#"data-act="reply" data-arg="seen""#) && folded.contains("<span>Vu</span>"), "{folded}");
+        assert!(!folded.contains(r#"data-act="done""#) && !folded.contains(r#"data-act="dismiss""#) && !folded.contains("class=\"instr"), "{folded}");
+        assert!(folded.contains(r#"data-act="snooze""#), "the clock stays");
+        // Opened: one field, three worded buttons with their icon, Demander
+        // disabled until something is typed; the former verbs are gone.
+        item.detail = Some(entry_detail(&e, false));
+        let open = card_html(&item, true, true, true, 10);
+        assert!(open.contains("<div class=\"lbl\">Ta réponse</div>") && open.contains("class=\"ins rz-t\""), "{open}");
+        let at = |w: &str| open.find(w).unwrap_or_else(|| panic!("{w} in {open}"));
+        assert!(at(r#"data-arg="nogo""#) < at(r#"data-arg="ask" disabled"#) && at(r#"data-arg="ask" disabled"#) < at(r#"data-arg="go""#));
+        for word in ["<span>No go</span>", "<span>Demander</span>", "<span>Go</span>"] {
+            assert!(open.contains(&format!("</svg>{word}")), "{word} carries an icon: {open}");
+        }
+        assert!(!open.contains(r#"data-act="validate""#) && !open.contains(r#"data-act="refuse""#) && !open.contains("Consigne"), "{open}");
+        // A queue that lists none keeps the former card, byte for byte.
+        let old = Entry { reply: Default::default(), ..e.clone() };
+        let mut old_item = from_attention(&old, None, false).unwrap();
+        old_item.detail = Some(entry_detail(&old, false));
+        let before = card_html(&old_item, true, true, true, 10);
+        assert!(before.contains(r#"data-act="validate""#) && before.contains(r#"data-act="done""#) && before.contains("Consigne") && !before.contains("rz"), "{before}");
+        // Only the gestures listed show: deduce nothing.
+        let few = zone_entry("a-2", r#""gestures":["ask"],"waiting":"robin""#);
+        let mut few_item = from_attention(&few, None, false).unwrap();
+        few_item.detail = Some(entry_detail(&few, false));
+        let html = card_html(&few_item, true, true, true, 10);
+        assert!(html.contains(r#"data-arg="ask""#) && !html.contains(r#"data-arg="go""#) && !html.contains(r#"data-arg="nogo""#) && !html.contains(r#"data-arg="seen""#), "{html}");
+    }
+
+    #[test]
+    fn a_draft_in_a_reply_zone_reads_go_envoyer_and_is_not_rewritten_in_place() {
+        let e = zone_entry(
+            "a-1",
+            r#""draft":{"to":"Sacha","channel":"slack","text":"Bonjour","seen":"0123456789abcdef"},"gestures":["go","nogo","ask","seen"],"go_label":"Go, envoyer","waiting":"robin""#,
+        );
+        let item = from_attention(&e, None, false).unwrap();
+        // Folded or not, a draft shows its zone: the go replaces Valider, Corriger is gone.
+        let html = card_html(&item, true, true, true, 10);
+        assert!(html.contains("<span>Go, envoyer</span>") && html.contains("class=\"ins rz-t\""), "{html}");
+        assert!(!html.contains(r#"data-act="validate""#) && !html.contains(r#"data-act="correct""#) && !html.contains("Modifiable"), "{html}");
+        assert!(html.contains("readonly>\nBonjour</textarea>"), "{html}");
+        assert_eq!(buttons(&item, true), [], "the verdict is in the zone");
+    }
+
+    #[test]
+    fn a_card_that_waits_for_its_agent_says_so_in_words_with_the_question_asked() {
+        let e = zone_entry(
+            "a-1",
+            r#""gestures":["cancel"],"go_label":"Go","waiting":"agent","ask":{"act_id":"c-1","text":"pourquoi pas <B> ?","ts":"2026-11-12T09:14:02+01:00","to":"night-qa","shown":false,"label":"non remis"}"#,
+        );
+        let asked = e.reply.asked.clone().expect("asked");
+        assert_eq!((asked.text.as_str(), asked.to.as_str(), asked.label.as_deref()), ("pourquoi pas <B> ?", "night-qa", Some("non remis")));
+        let mut item = from_attention(&e, None, false).unwrap();
+        // Folded already: the state in words with its bubble, the delivery as
+        // the queue words it, the question, and the way back.
+        let folded = card_html(&item, true, true, true, 10);
+        assert!(folded.contains("</svg><span>Attend l'agent \u{b7} non remis</span>"), "{folded}");
+        assert!(folded.contains("Ta question : pourquoi pas &lt;B&gt; ?"), "{folded}");
+        assert!(folded.contains(r#"data-act="reply" data-arg="cancel">Annuler ma demande</button>"#), "{folded}");
+        // No check, no cross, no Vu, no verdict: the clock only.
+        item.detail = Some(entry_detail(&e, false));
+        let open = card_html(&item, true, true, true, 10);
+        for gone in [r#"data-act="done""#, r#"data-act="dismiss""#, r#"data-arg="seen""#, r#"data-arg="go""#, r#"data-arg="nogo""#, "rz-t"] {
+            assert!(!open.contains(gone), "{gone} in {open}");
+        }
+        assert!(open.contains(r#"data-act="snooze""#));
+        assert_eq!(buttons(&item, true), []);
+        // No label: nothing after the state. `waiting: robin` with a stale ask: not asked.
+        let quiet = zone_entry("a-2", r#""gestures":["cancel"],"waiting":"agent","ask":{"text":"q","label":null}"#);
+        assert!(card_html(&from_attention(&quiet, None, false).unwrap(), true, true, true, 10).contains("<span>Attend l'agent</span>"));
+        let back = zone_entry("a-3", r#""gestures":["go"],"waiting":"robin","ask":{"text":"q"}"#);
+        assert_eq!(back.reply.asked, None);
+    }
+
+    #[test]
+    fn the_reply_zone_posts_from_its_buttons_only() {
+        let page = shell(false, "n");
+        // Enter in the zone's field is a new line: the instruct path leaves it alone.
+        assert!(page.contains("t.classList.contains('ins') && !t.classList.contains('rz-t')"));
+        // Demander follows the field; a question with nothing typed posts nothing.
+        assert!(page.contains("b.disabled = b.hasAttribute('data-lock') || !t.value.trim()"));
+        assert!(page.contains("if (!msg.text.trim()) { if (f) f.focus(); return; }"));
+        // Go, No go and Vu file the card at once; a question and its cancel keep it.
+        assert!(page.contains("} else if (msg.arg !== 'cancel') hide(card.dataset.key);"));
     }
 
     #[test]
@@ -3088,7 +3285,7 @@ mod shot_demo {
             kind: "test".into(), title: "CLA-10067 (skeleton du desktop) : avant / après".into(),
             needs: Some("Valider le visuel".into()), action: None, topic: None, scope: crate::attention::Scope::Pro,
             prio: Some(2), draft: None, body: None, detail: None, src: Vec::new(), before: Some(b), after: Some(a), label: None,
-            failed: None, uncertain: None, proof: None, plan: false,
+            failed: None, uncertain: None, proof: None, plan: false, reply: Default::default(),
         };
         let item = super::from_attention(&e, None, false).unwrap();
         let page = super::shell(false, "n").replace("<div id=\"list\"></div>", &format!("<div id=\"list\">{}</div>", super::card_html(&item, true, true, true, 10)));

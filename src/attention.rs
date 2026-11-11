@@ -152,6 +152,108 @@ pub struct Entry {
     /// An action plan the user says go or no go to: a `decision` posted by
     /// `PLAN_FROM` with the plan in its body.
     pub plan: bool,
+    /// The gestures the queue offers on the card and what the user asked
+    /// on it (`Reply`); empty for a queue that does not say: the card keeps
+    /// its former buttons.
+    pub reply: Reply,
+}
+
+/// One of the five gestures of a card's reply zone, as the queue names them
+/// (`act_command <id> <word>`). The queue lists the ones a card offers
+/// (`gestures`): Kova shows exactly those and deduces none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Gesture {
+    /// `go [--text=T] [--seen=<draft.seen>]`: the card is filed, its agent acts.
+    Go,
+    /// `nogo [--text=T]`: the card is filed, the task dropped.
+    NoGo,
+    /// `ask --text=T`: the card stays and waits for its agent.
+    Ask,
+    /// `seen`: the card is filed with no judgement.
+    Seen,
+    /// `cancel`: the question asked is withdrawn, the card waits for the user again.
+    Cancel,
+}
+
+impl Gesture {
+    pub const ALL: [Gesture; 5] = [Gesture::Go, Gesture::NoGo, Gesture::Ask, Gesture::Seen, Gesture::Cancel];
+
+    /// The word `act_command` receives, and the one the queue lists.
+    pub fn word(self) -> &'static str {
+        match self {
+            Gesture::Go => "go",
+            Gesture::NoGo => "nogo",
+            Gesture::Ask => "ask",
+            Gesture::Seen => "seen",
+            Gesture::Cancel => "cancel",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Gesture> {
+        Gesture::ALL.into_iter().find(|g| g.word() == word)
+    }
+
+    /// Whether the gesture files the card: it leaves the list at once.
+    pub fn files(self) -> bool {
+        matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Seen)
+    }
+
+    /// Whether the gesture carries the text typed in the card's field.
+    pub fn takes_text(self) -> bool {
+        matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Ask)
+    }
+}
+
+/// What the queue says of a card's reply zone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reply {
+    /// The buttons to show. Empty: the queue does not know gestures yet.
+    pub gestures: Vec<Gesture>,
+    /// `Go`, or `Go, envoyer` on a draft: the queue's own word.
+    pub go_label: Option<String>,
+    /// The question the user asked, while the card waits for its agent.
+    pub asked: Option<Asked>,
+}
+
+/// A question the user asked on a card (`Gesture::Ask`), as the queue's
+/// journal has it. Nothing here comes from Kova's own memory.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Asked {
+    pub text: String,
+    /// Epoch seconds it was asked; 0 when its date cannot be read.
+    pub since: u64,
+    /// The session it went to.
+    pub to: String,
+    /// Where its delivery stands, in the queue's words (`non remis`, `sera
+    /// lu à son prochain pas`): shown as it is. `None`: nothing to say.
+    pub label: Option<String>,
+}
+
+/// A card's reply zone from the queue's fields. `waiting: "agent"` with an
+/// `ask` is a question asked; a gesture Kova does not know is left out.
+fn reply_of(gestures: Option<serde_json::Value>, go_label: Option<String>, waiting: Option<String>, ask: Option<serde_json::Value>) -> Reply {
+    let gestures: Vec<Gesture> = match gestures {
+        Some(serde_json::Value::Array(list)) => {
+            let mut out = Vec::new();
+            for g in list.iter().filter_map(|v| v.as_str()).filter_map(Gesture::parse) {
+                if !out.contains(&g) {
+                    out.push(g);
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    };
+    let word = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+    let asked = ask.filter(|_| waiting.as_deref() == Some("agent")).and_then(|a| {
+        Some(Asked {
+            text: word(&a, "text")?,
+            since: word(&a, "ts").and_then(|ts| epoch_of(&ts)).unwrap_or(0),
+            to: word(&a, "to").unwrap_or_default(),
+            label: word(&a, "label").map(|l| l.chars().filter(|c| !c.is_control()).take(80).collect()),
+        })
+    });
+    Reply { gestures, go_label: go_label.map(|l| l.trim().chars().filter(|c| !c.is_control()).take(40).collect::<String>()).filter(|l| !l.is_empty()), asked }
 }
 
 /// The producer whose `decision` cards with a body are action plans.
@@ -213,6 +315,14 @@ struct Raw {
     uncertain: Option<String>,
     #[serde(default)]
     proof: Option<String>,
+    #[serde(default)]
+    gestures: Option<serde_json::Value>,
+    #[serde(default)]
+    go_label: Option<serde_json::Value>,
+    #[serde(default)]
+    waiting: Option<serde_json::Value>,
+    #[serde(default)]
+    ask: Option<serde_json::Value>,
 }
 
 /// Parse the CLI's answer. `None` when it is not a JSON array at all; an
@@ -229,8 +339,10 @@ pub fn parse(text: &str) -> Option<Vec<Entry>> {
             .filter_map(|raw| {
                 // An action plan: said by who posts it and what it is.
                 let plan = raw.kind == "decision" && raw.from == PLAN_FROM && raw.body.as_deref().is_some_and(|b| !b.trim().is_empty());
+                let as_word = |v: Option<serde_json::Value>| v.and_then(|v| v.as_str().map(str::to_string));
                 Some(Entry {
                     plan,
+                    reply: reply_of(raw.gestures.clone(), as_word(raw.go_label.clone()), as_word(raw.waiting.clone()), raw.ask.clone()),
                     failed: nonempty(raw.failed.clone()),
                     uncertain: nonempty(raw.uncertain.clone()),
                     proof: nonempty(raw.proof.clone()),
@@ -699,6 +811,112 @@ fn verb_argv_with(
     Some((bin.clone(), args))
 }
 
+/// The flag that names one click (`--client-id=<uuid>`): the queue notes a
+/// gesture once per id, so a click tried again after a failure is never noted
+/// twice.
+pub const CLIENT_ID: &str = "--client-id";
+
+/// The argv of a reply zone's gesture: `act_command --exit-codes
+/// --client-id=<uuid> <id> <word> [--text=<text>] [--seen=<fingerprint>]`.
+/// `None` without `act_command`, for an id Kova does not pass on, or for a
+/// question with nothing typed. The text and the fingerprint are one argv
+/// element each, so the CLI never reads them as options.
+pub fn gesture_argv(act: &[String], id: &str, gesture: Gesture, text: Option<&str>, seen: Option<&str>, client_id: &str) -> Option<(String, Vec<String>)> {
+    if !valid_id(id) || !valid_id(client_id) {
+        return None;
+    }
+    let (bin, words) = act.split_first()?;
+    let mut args: Vec<String> = words.to_vec();
+    args.extend([EXIT_CODES.to_string(), format!("{CLIENT_ID}={client_id}"), id.to_string(), gesture.word().to_string()]);
+    let text = text.map(str::trim).filter(|t| !t.is_empty()).filter(|_| gesture.takes_text());
+    if gesture == Gesture::Ask && text.is_none() {
+        return None;
+    }
+    if let Some(text) = text {
+        args.push(format!("--text={text}"));
+    }
+    if gesture == Gesture::Go
+        && let Some(seen) = seen.filter(|s| valid_seen(s))
+    {
+        args.push(format!("--seen={seen}"));
+    }
+    Some((bin.clone(), args))
+}
+
+/// The gesture that failed last on each entry and the id it went with: the
+/// same gesture with the same text, clicked again, reuses the id.
+static RETRIES: Mutex<Option<HashMap<String, (Gesture, String, String)>>> = Mutex::new(None);
+
+fn client_id_for(id: &str, gesture: Gesture, text: &str) -> String {
+    let mut guard = RETRIES.lock();
+    let map = guard.get_or_insert_with(HashMap::new);
+    match map.get(id) {
+        Some((g, t, cid)) if *g == gesture && t == text => cid.clone(),
+        _ => {
+            let cid = crate::ask::new_question_id();
+            map.insert(id.to_string(), (gesture, text.to_string(), cid.clone()));
+            cid
+        }
+    }
+}
+
+/// Run a reply zone's gesture on a background thread. Refused at once, like
+/// `perform_with`, for an entry gone from the last read, a click already
+/// running or no `act_command`.
+///
+/// What the card shows next comes from the queue, read again: a filed card
+/// is gone, a question asked is on the card with its delivery. A failure or a
+/// refusal (exit 4) leaves the command's own line on the card; a question
+/// that did not go is kept with it (`instructions`), since the field was
+/// cleared.
+pub fn perform_gesture(id: &str, gesture: Gesture, text: Option<&str>, seen: Option<&str>) -> Result<(), String> {
+    let text = text.map(clean_text).filter(|t| !t.trim().is_empty()).filter(|_| gesture.takes_text());
+    let known = CACHE.read().as_ref().is_some_and(|entries| entries.iter().any(|e| e.id == id));
+    if !known {
+        return Err(format!("attention: no open entry {id:?}"));
+    }
+    if matches!(OUTCOMES.lock().get_or_insert_with(HashMap::new).get(id), Some(Outcome::Running)) {
+        return Err(format!("attention: a click on {id} already runs"));
+    }
+    let client_id = client_id_for(id, gesture, text.as_deref().unwrap_or_default());
+    let (bin, args) = gesture_argv(&COMMANDS.read().act, id, gesture, text.as_deref(), seen, &client_id)
+        .ok_or_else(|| format!("attention: no command for {}", gesture.word()))?;
+    set_outcome(id, Outcome::Running);
+    if let Some(map) = INSTRUCTIONS.lock().as_mut() {
+        map.remove(id);
+    }
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        match run_click(&bin, &args) {
+            Ok(_) => {
+                if let Some(map) = RETRIES.lock().as_mut() {
+                    map.remove(&id);
+                }
+                if gesture.files() {
+                    set_outcome(&id, Outcome::Closed);
+                } else if let Some(map) = OUTCOMES.lock().as_mut() {
+                    // The card stays: the queue says what it shows now.
+                    map.remove(&id);
+                }
+            }
+            Err(words) => {
+                log::warn!("attention {} {id}: {words}", gesture.word());
+                match (gesture, text) {
+                    (Gesture::Ask, Some(text)) => {
+                        if let Some(map) = OUTCOMES.lock().as_mut() {
+                            map.remove(&id);
+                        }
+                        set_instructed(&id, &text, Outcome::Failed { words, until_ms: 0 });
+                    }
+                    _ => set_outcome(&id, Outcome::Failed { words, until_ms: now_ms() + FAILED_MS }),
+                }
+            }
+        }
+        refresh();
+    });
+    Ok(())
+}
+
 /// Run a card's button on a background thread, with the text a correction
 /// sends. Refused at once when the id is not in the last read, when a click
 /// on it already runs, or when the command is not configured; the card then
@@ -978,6 +1196,54 @@ mod tests {
     const FIXTURE: &str = include_str!("../tests/fixtures/attention/list.json");
 
     #[test]
+    fn a_gesture_runs_act_with_its_word_a_client_id_and_what_it_carries() {
+        let act: Vec<String> = ["/bin/attn", "act", "--by", "robin"].iter().map(|s| s.to_string()).collect();
+        let cid = "0b5c1c2e-1111-4222-8333-444455556666";
+        let argv = |g, text, seen| gesture_argv(&act, "a-1", g, text, seen, cid).map(|(_, a)| a.join(" "));
+        let head = format!("act --by robin --exit-codes --client-id={cid} a-1");
+        assert_eq!(argv(Gesture::Go, None, None), Some(format!("{head} go")));
+        assert_eq!(argv(Gesture::Go, Some("ok pour moi"), Some("0123456789abcdef")), Some(format!("{head} go --text=ok pour moi --seen=0123456789abcdef")));
+        assert_eq!(argv(Gesture::Go, None, Some("not hex")), Some(format!("{head} go")), "a fingerprint that does not read is not passed");
+        assert_eq!(argv(Gesture::NoGo, Some("trop tôt"), Some("0123456789abcdef")), Some(format!("{head} nogo --text=trop tôt")));
+        assert_eq!(argv(Gesture::Ask, Some("pourquoi ?"), None), Some(format!("{head} ask --text=pourquoi ?")));
+        assert_eq!(argv(Gesture::Ask, Some("  "), None), None, "a question needs its text");
+        assert_eq!(argv(Gesture::Seen, Some("ignored"), None), Some(format!("{head} seen")));
+        assert_eq!(argv(Gesture::Cancel, None, None), Some(format!("{head} cancel")));
+        // The text is one argv element: never read as an option.
+        let (_, args) = gesture_argv(&act, "a-1", Gesture::Ask, Some("--by evil"), None, cid).unwrap();
+        assert_eq!(args.last().map(String::as_str), Some("--text=--by evil"));
+        assert_eq!(gesture_argv(&[], "a-1", Gesture::Go, None, None, cid), None, "no act_command");
+        assert_eq!(gesture_argv(&act, "-x", Gesture::Go, None, None, cid), None);
+        for g in Gesture::ALL {
+            assert_eq!(Gesture::parse(g.word()), Some(g));
+        }
+        assert_eq!(Gesture::parse("Valider"), None);
+    }
+
+    #[test]
+    fn a_gesture_tried_again_keeps_its_client_id() {
+        let first = client_id_for("a-retry", Gesture::Go, "ok");
+        assert!(crate::ask::new_question_id().len() == first.len() && valid_id(&first));
+        assert_eq!(client_id_for("a-retry", Gesture::Go, "ok"), first, "the same gesture, clicked again after a failure");
+        assert_ne!(client_id_for("a-retry", Gesture::Go, "autre texte"), first, "another text is another gesture");
+        assert_ne!(client_id_for("a-retry", Gesture::NoGo, "autre texte"), first);
+    }
+
+    #[test]
+    fn the_queue_s_gestures_read_leniently() {
+        let list = parse(
+            r#"[{"id":"a-1","level":"now","title":"t","gestures":["go","dance","ask","go"],"go_label":"Go, envoyer","waiting":"robin","ask":null},
+                {"id":"a-2","level":"now","title":"t"},
+                {"id":"a-3","level":"now","title":"t","gestures":"go","go_label":7,"waiting":"agent","ask":{"text":" "}}]"#,
+        )
+        .unwrap();
+        assert_eq!(list[0].reply.gestures, [Gesture::Go, Gesture::Ask], "an unknown gesture is left out, a repeat too");
+        assert_eq!(list[0].reply.go_label.as_deref(), Some("Go, envoyer"));
+        assert_eq!(list[1].reply, Reply::default(), "an older queue: the former buttons");
+        assert_eq!(list[2].reply, Reply::default(), "fields that do not read are none; the entry still shows");
+    }
+
+    #[test]
     fn a_label_reads_with_its_color_and_a_color_that_does_not_read_is_gray() {
         let list = parse(r##"[{"id":"a-1","level":"now","title":"t","label":"QA","label_color":"#F59E0B"},
             {"id":"a-2","level":"now","title":"t","label":"Dev","label_color":"red;x"},{"id":"a-3","level":"now","title":"t","label":" "}]"##)
@@ -1134,7 +1400,8 @@ mod tests {
     /// The key goes with the user's own click only: `perform_with` is called
     /// by the Cockpit's and the chat's pages and by nothing else (no IPC
     /// command, no `kova` subcommand, no rendering), `run_click` by
-    /// `perform_with` only, and no test runs with a key file set.
+    /// `perform_with` and `perform_gesture` (the Cockpit's page) only, and no
+    /// test runs with a key file set.
     #[test]
     fn only_a_click_on_a_page_can_carry_the_key() {
         fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -1169,9 +1436,15 @@ mod tests {
         // In this file: the key is read in one place, used in one place.
         let own = code(&root.join("attention.rs"));
         assert_eq!(own.matches("click_key(&path)").count(), 1);
-        assert_eq!(own.matches("run_click(&bin, &args)").count(), 2, "the instruction and the other verbs, both inside perform_with");
+        assert_eq!(own.matches("run_click(&bin, &args)").count(), 3, "a gesture, the instruction and the other verbs");
         let perform = own.split("pub fn perform_with(").nth(1).unwrap().split("\nfn run_click(").next().unwrap();
         assert_eq!(perform.matches("run_click(&bin, &args)").count(), 2);
+        // A reply zone's gesture is the user's click too: run by the
+        // Cockpit's page only, through `perform_gesture`.
+        let gesture = own.split("pub fn perform_gesture(").nth(1).unwrap().split("\npub fn perform_with(").next().unwrap();
+        assert_eq!(gesture.matches("run_click(&bin, &args)").count(), 1);
+        let gesturing: Vec<String> = files.iter().filter(|p| code(p).contains("perform_gesture(")).map(|p| rel(p)).collect();
+        assert_eq!(gesturing, ["attention.rs", "window/cockpit_view.rs"], "who can run a gesture");
         // No test runs with a key file: the path is only set from the config.
         assert!(CLICK_KEY_FILE.read().is_none());
     }
