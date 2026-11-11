@@ -912,9 +912,12 @@ pub fn ink_on(fill: &str) -> &'static str {
     if 1.05 / (l + 0.05) >= (l + 0.05) / 0.056 { "#FFFFFF" } else { "#111111" }
 }
 
+/// A card's space (`Claap`, `Perso`): a pill filled with the space's color,
+/// like a label, its name in the ink that reads on it. No dot: the name says
+/// which space, nothing rests on the color alone.
 fn tag_html(scope: Scope) -> String {
     format!(
-        "<span class=\"tag\"><i class=\"{}\"></i>{}</span>",
+        "<span class=\"tag sp {}\">{}</span>",
         if scope == Scope::Perso { "perso" } else { "pro" },
         scope_label(scope)
     )
@@ -1560,7 +1563,13 @@ pub fn vars(light: bool) -> String {
         };
     }
     let set = if light { set!(light, light) } else { set!(dark, dark) };
-    set.iter().map(|(k, v)| format!("--{k}:{v};")).collect()
+    // The ink of a space's pill, read off its fill (`ink_on`).
+    let inks: String = set
+        .iter()
+        .filter(|(k, _)| matches!(*k, "tag-blue" | "tag-green"))
+        .map(|(k, v)| format!("--{k}-ink:{};", ink_on(v)))
+        .collect();
+    set.iter().map(|(k, v)| format!("--{k}:{v};")).collect::<String>() + &inks
 }
 
 /// The page's colours switched in place (`theme::restyle_script`).
@@ -1612,7 +1621,7 @@ button:disabled{opacity:.5;cursor:default}
 .src span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tag{height:18px;border-radius:4px;padding:0 6px;font-size:11px;font-weight:500;display:inline-flex;align-items:center;gap:5px;background:var(--bg-elev);color:var(--t2);flex:none}
 .tag i{width:6px;height:6px;border-radius:50%;display:block;background:var(--tag-blue)}
-.tag i.perso{background:var(--tag-green)}.tag.lb{font-weight:600;padding:0 8px;border-radius:9px}.fm-o i.ld{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
+.tag i.perso{background:var(--tag-green)}.tag.sp{font-weight:600;padding:0 8px;border-radius:9px;background:var(--tag-blue);color:var(--tag-blue-ink)}.tag.sp.perso{background:var(--tag-green);color:var(--tag-green-ink)}.tag.lb{font-weight:600;padding:0 8px;border-radius:9px}.fm-o i.ld{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
 .acts{display:flex;align-items:center;gap:14px;flex:none}
 .state{font-size:12px;color:var(--t3);margin-top:6px}
 .detail{margin-top:10px;border-top:1px solid var(--b3);padding-top:10px;font-size:13px;line-height:19px}

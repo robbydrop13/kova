@@ -194,6 +194,14 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
     // the Cockpit makes them (`from_need`, then `ask_title`).
     for file in a.all("--ask") {
         let q: crate::ask::Question = serde_json::from_str(&read(&file)?).map_err(|e| format!("--ask {file}: {e}"))?;
+        // As in the app: an entry that stands for this ask (`kova-sheet:<id>`,
+        // `kova-ask:<id>`) shows it, the ask's own tile is left out.
+        let stood_for = entries.iter().filter_map(|e| e.action.as_deref()).any(|act| {
+            ["kova-sheet:", "kova-ask:"].iter().any(|p| act.strip_prefix(p).is_some_and(|id| id == q.id))
+        });
+        if stood_for {
+            continue;
+        }
         let sheet = q.panel_link().is_some() && !q.is_long();
         let need = crate::window::needs::NeedItem {
             kind: crate::window::needs::NeedKind::Ask,

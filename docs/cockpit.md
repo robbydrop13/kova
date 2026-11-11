@@ -205,7 +205,8 @@ stopped turn `<pane> · tour arrêté`, a failed routine `Routine <name> · en
 échec`. A question's tile is the first line of its message. An attention
 card's title is its agent's words, shown as written.
 
-A label is a pill filled with its color, its name in near black or white,
+A card's space (`Claap`, `Perso`) and its label are pills filled with their
+color (no dot), its name in near black or white,
 whichever reads best on it (`cockpit::ink_on`, WCAG luminance): the name
 says what it is, nothing rests on the color alone.
 
