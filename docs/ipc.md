@@ -682,6 +682,20 @@ by this host`. See `docs/side-panel.md`.
 
 ---
 
+### `doctor` — who signed this Kova and what macOS trusts it for
+
+```json
+{ "cmd": "doctor" }
+```
+
+```json
+{ "ok": true, "data": { "pid": 1234, "version": "2.0.2", "exe": "/Applications/Kova.app/Contents/MacOS/kova",
+  "signing": { "sha1": "<SHA-1 of the signing certificate>", "name": "<its name>" },
+  "permissions": { "accessibility": true, "post_event": true, "listen_event": false, "screen_capture": true } } }
+```
+
+`signing` is the certificate the process runs under (`null` when unsigned or ad hoc). `permissions` are asked without prompting: `AXIsProcessTrusted`, `CGPreflightPostEventAccess`, `CGPreflightListenEventAccess`, `CGPreflightScreenCaptureAccess`. `kova doctor` prints this (README, Signing identity and macOS permissions).
+
 ### `reload-config` — re-read the config file without restarting
 
 ```json

@@ -1988,6 +1988,15 @@ fn discover_socket() -> Option<String> {
     found.into_iter().map(|(_, _, path)| path).next()
 }
 
+/// The running Kova's answer to `doctor` (`crate::doctor::report`), from
+/// `socket`, else `$KOVA_SOCKET`, else the running Kova.app. `None` when
+/// none answers, or one that does not know the command yet.
+pub fn doctor_report(socket: Option<String>) -> Option<serde_json::Value> {
+    let socket = socket.or_else(|| std::env::var("KOVA_SOCKET").ok().filter(|s| !s.is_empty())).or_else(discover_socket)?;
+    let reply = request(&socket, serde_json::json!({"cmd": "doctor"}), Duration::from_secs(10))?;
+    reply.get("data").filter(|d| d.get("permissions").is_some()).cloned()
+}
+
 const WITHDRAW_USAGE: &str = "kova ask --withdraw [--session <id> | --session -] [--socket <path>]
 
 Take back the questions a Claude Code conversation still has on the card, because the user answered

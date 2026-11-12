@@ -16,6 +16,7 @@ mod ask;
 mod ask_card;
 mod handoff;
 mod decision_sheet;
+mod doctor;
 mod bookmarks;
 mod chat;
 mod claude_history;
@@ -63,6 +64,11 @@ mod window;
 /// `kova ask …` (see `ask::USAGE`): returns the exit code.
 pub fn ask_cli(args: &[String]) -> i32 {
     ask::run_cli(args)
+}
+
+/// `kova doctor` (see `doctor::USAGE`): returns the exit code.
+pub fn doctor_cli(args: &[String]) -> i32 {
+    doctor::run_cli(args)
 }
 
 /// `kova render …` (see `render_cli::USAGE`): returns the exit code.

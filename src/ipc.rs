@@ -51,6 +51,8 @@ pub enum IpcCommand {
     },
     /// List all panes across all windows.
     ListPanes,
+    /// Who signed this process and what macOS trusts it for (`crate::doctor`).
+    Doctor,
     /// Close a pane by its ID.
     ClosePaneById(u32),
     /// Write text to a pane's PTY.
@@ -681,6 +683,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
     Some(match cmd {
         "split" => &["direction", "command", "cwd", "pane_id"],
         "list-panes" => &[],
+        "doctor" => &[],
         "close-pane" => &["pane_id"],
         "send-keys" => &["pane_id", "text"],
         "focus-pane" => &["pane_id"],
@@ -839,6 +842,7 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
             })
         }
         "list-panes" => Ok(IpcCommand::ListPanes),
+        "doctor" => Ok(IpcCommand::Doctor),
         "close-pane" => {
             let pane_id = required_u32(&v, "pane_id")?;
             Ok(IpcCommand::ClosePaneById(pane_id))

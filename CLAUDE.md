@@ -43,7 +43,7 @@ Nos ajouts propres à garder par-dessus sa base : file drag-and-drop, `cmd+1..9`
 - Le target directory Cargo est **global** : `~/.cargo/target` (pas `./target`)
 - Le binaire release se trouve donc dans `~/.cargo/target/release/kova`
 - **Build** : **toujours** utiliser `./build.sh`, même pour vérifier que le code compile. Ne jamais lancer `cargo build` directement — le binaire ne serait pas copié dans le bundle `/Applications/Kova.app` et l'app ne serait pas mise à jour.
-- `build.sh` fait : cargo build → copie du binaire + Info.plist dans le bundle → codesign du bundle entier (nécessaire pour que macOS conserve les permissions TCC entre les builds).
+- `build.sh` fait : cargo build → copie du binaire + Info.plist dans le bundle → codesign du bundle entier (nécessaire pour que macOS conserve les permissions TCC entre les builds). L'identité de signature ne change jamais seule : celle du dernier build (`~/.config/kova/sign-identity`), sinon arrêt avec code 3 ; `KOVA_SIGN_IDENTITY` pour en changer exprès. `kova doctor` montre la signature et les autorisations du Kova qui tourne (README, « Signing identity and macOS permissions »).
 - **Le Kova qui tourne a-t-il le dernier build ?** Comparer son heure de lancement avec celle du binaire : `ps -axo pid=,lstart=,comm= | /usr/bin/grep Kova.app/Contents/MacOS/kova` et `ls -lT /Applications/Kova.app/Contents/MacOS/kova`. Ne pas passer par `pgrep` : depuis un appel Bash de Claude Code, `pgrep -l kova` n'a rien affiché alors que Kova tournait, et le `ps -p $(pgrep …)` qui suit échoue sur un argument vide. Même chose pour une app hôte qui lie la bibliothèque : elle ne reçoit un correctif qu'une fois son addon reconstruit contre `~/.cargo/target/release/libkova.a` et l'app relancée.
 
 ## Installation

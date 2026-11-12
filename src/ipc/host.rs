@@ -150,6 +150,7 @@ pub fn dispatch(host: &impl IpcHost, cmd: IpcCommand) -> Result<Disposition, Ipc
             return Ok(wait_for_completion(host, pane_id, timeout_ms));
         }
         IpcCommand::ListPanes => list_panes(host),
+        IpcCommand::Doctor => IpcResponse::Ok { data: Some(crate::doctor::report()) },
         IpcCommand::ClosePaneById(pane_id) => close_pane(host, pane_id),
         IpcCommand::SendKeys { pane_id, text } => send_keys(host, pane_id, &text),
         IpcCommand::FocusPane(pane_id) => focus_pane(host, pane_id),

@@ -1116,6 +1116,7 @@ fn handle_ipc_command_sync(
         // Run by `crate::ipc::host::dispatch` before this dispatcher. Reaching
         // here means that routing was lost in a refactor.
         IpcCommand::ListPanes
+        | IpcCommand::Doctor
         | IpcCommand::ClosePaneById(_)
         | IpcCommand::SendKeys { .. }
         | IpcCommand::FocusPane(_)

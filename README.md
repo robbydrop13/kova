@@ -174,6 +174,33 @@ cp assets/kova.icns /Applications/Kova.app/Contents/Resources/
 
 Always use `./build.sh` — it builds the binary, copies it into the `.app` bundle, and codesigns the bundle. Don't use `cargo build --release` alone as the app won't be updated.
 
+### Signing identity and macOS permissions
+
+macOS ties what you grant Kova in System Settings > Privacy & Security (Accessibility, Input Monitoring, Screen Recording) to the certificate that signed it. A build signed with another certificate keeps its switch ON and loses the grant all the same: nothing warns you, things just stop working.
+
+So `build.sh` never changes identity by itself:
+
+- It signs with the identity of the last build, recorded in `~/.config/kova/sign-identity` (SHA-1 and name), or read from the bundle's own signature when that file does not exist yet.
+- A certificate that appears in the keychain later is named and not used. Tooling creates some without telling you: a mobile build chain, an Apple Development certificate created through an API.
+- If the recorded identity is gone (removed, expired), nothing is built and the script exits 3, naming what is there. An Apple Development certificate lasts one year.
+- To change identity on purpose: `KOVA_SIGN_IDENTITY="<name or SHA-1>" ./build.sh`. It warns that the grants are void; afterwards remove Kova from each list of Privacy & Security and add it again.
+- `./build.sh --identity` prints the identity it would sign with and builds nothing.
+- With no signing identity at all, the build is left unsigned and macOS keeps no grant across builds.
+
+`kova doctor` shows what the running Kova is signed with and what macOS trusts it for, as that process sees it (the switch in System Settings proves nothing):
+
+```
+$ /Applications/Kova.app/Contents/MacOS/kova doctor
+Kova 2.0.2 (pid 1234) /Applications/Kova.app/Contents/MacOS/kova
+signed by   <SHA-1> "<certificate name>"
+accessibility   trusted      (Accessibility)
+post_event      trusted      (Accessibility, posting events (keys, clicks))
+listen_event    NOT TRUSTED  (Input Monitoring)
+screen_capture  trusted      (Screen & System Audio Recording)
+```
+
+It also says when the bundle on disk, or the identity `build.sh` will use, is not the one the running Kova was started with. Exit 0 when everything is trusted, 1 when something is not, 2 when no running Kova answered. `--json` prints the raw answer of the `doctor` IPC command.
+
 ## Non-goals
 
 - Cross-platform support
