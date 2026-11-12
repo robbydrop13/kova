@@ -768,10 +768,12 @@ impl KovaView {
             ) => {
                 let Some(id) = attention_id else { return };
                 let (verb, text) = match button {
-                    Button::Done => (Verb::Resolve, None),
-                    Button::Dismiss => (Verb::Dismiss, None),
+                    // The text left in the card's field goes with the button
+                    // that files the card (`attention::perform_with`).
+                    Button::Done => (Verb::Resolve, text),
+                    Button::Dismiss => (Verb::Dismiss, text),
                     // A plan turned down: its agent learns a no go, not "not relevant".
-                    Button::NoGo => (Verb::NoGo, None),
+                    Button::NoGo => (Verb::NoGo, text),
                     // A send nobody knows the end of, settled by the user.
                     Button::Left => (Verb::Left, None),
                     Button::Resend => (Verb::Resend, None),
@@ -792,6 +794,12 @@ impl KovaView {
                     // Refused before it ran: the card stays and says why.
                     Err(why) => {
                         log::warn!("cockpit: {why}");
+                        // The page emptied the field: the card keeps the text.
+                        if let Some(text) = text.filter(|t| !t.trim().is_empty())
+                            && matches!(verb, Verb::Resolve | Verb::Dismiss | Verb::NoGo)
+                        {
+                            crate::attention::instruction_refused(id, text, "Kova n'a pas pu la transmettre");
+                        }
                         crate::attention::click_refused(id, &why);
                     }
                 }
@@ -865,6 +873,9 @@ impl KovaView {
             Ok(()) => {}
             Err(why) => {
                 log::warn!("cockpit: {why}");
+                if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
+                    crate::attention::instruction_refused(id, text, "Kova n'a pas pu la transmettre");
+                }
                 crate::attention::click_refused(id, &why);
             }
         }

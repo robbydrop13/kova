@@ -198,9 +198,12 @@ impl Gesture {
         matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Seen)
     }
 
-    /// Whether the gesture carries the text typed in the card's field.
+    /// Whether the gesture carries the text typed in the card's field: every
+    /// one that can find a text there. A text typed is never left behind by
+    /// the button that files the card, `Vu` included; the queue takes it or
+    /// refuses the click, and the card then keeps it.
     pub fn takes_text(self) -> bool {
-        matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Ask)
+        matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Ask | Gesture::Seen)
     }
 }
 
@@ -795,10 +798,11 @@ fn verb_argv_with(
             args.extend([verb.label().to_string(), format!("--text={text}")]);
         }
         Verb::Resolve => args.extend(["--reason".to_string(), "done".to_string()]),
-        Verb::NoGo => args.extend(["--reason".to_string(), "nogo".to_string()]),
-        Verb::Dismiss => {
-            args.extend(["--reason".to_string(), "dismissed".to_string()]);
-            // Refuser's reason, when one was typed: one argv element.
+        Verb::NoGo | Verb::Dismiss => {
+            let reason = if verb == Verb::NoGo { "nogo" } else { "dismissed" };
+            args.extend(["--reason".to_string(), reason.to_string()]);
+            // Refuser's reason, or the text left in the card's field: one
+            // argv element, which the queue hands to the card's agent.
             if let Some(why) = text.map(str::trim).filter(|t| !t.is_empty()) {
                 args.push(format!("--note={why}"));
             }
@@ -926,7 +930,13 @@ pub fn perform_gesture(id: &str, gesture: Gesture, text: Option<&str>, seen: Opt
                         }
                         set_instructed(&id, &text, Outcome::Failed { words, until_ms: 0 });
                     }
-                    _ => set_outcome(&id, Outcome::Failed { words, until_ms: now_ms() + FAILED_MS }),
+                    (_, text) => {
+                        // The click emptied the field: the card keeps the text.
+                        if let Some(text) = text {
+                            set_instructed(&id, &text, Outcome::Failed { words: words.clone(), until_ms: 0 });
+                        }
+                        set_outcome(&id, Outcome::Failed { words, until_ms: now_ms() + FAILED_MS });
+                    }
                 }
             }
         }
@@ -958,6 +968,11 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>
     }
     .ok_or_else(|| format!("attention: no command for {}", verb.label()))?;
     let args = with_seen(args, verb, seen);
+    // The check on a card whose field holds a text: the text goes first, as
+    // an instruction to the card's agent, and the card is filed only once it
+    // went. `close --reason done` hands no note to anyone.
+    let typed = text.clone().filter(|t| !t.trim().is_empty()).filter(|_| matches!(verb, Verb::Resolve | Verb::Dismiss | Verb::NoGo));
+    let first = text_first(&COMMANDS.read().act, id, verb, typed.as_deref())?;
     if verb == Verb::Instruct {
         let text = text.unwrap_or_default();
         {
@@ -995,7 +1010,7 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>
     }
     let id = id.to_string();
     std::thread::spawn(move || {
-        match run_click(&bin, &args) {
+        match in_turn(first.as_ref(), &(bin, args), &|bin, args| run_click(bin, args)) {
             Ok(delivery) => set_outcome(
                 &id,
                 match (verb, delivery) {
@@ -1009,12 +1024,43 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>
             ),
             Err(words) => {
                 log::warn!("attention {} {id}: {words}", verb.label());
+                // The field was emptied by the click: the card keeps the
+                // text that did not go, until the next instruction.
+                if let Some(text) = &typed {
+                    set_instructed(&id, text, Outcome::Failed { words: words.clone(), until_ms: 0 });
+                }
                 set_outcome(&id, Outcome::Failed { words, until_ms: now_ms() + FAILED_MS });
             }
         }
         refresh();
     });
     Ok(())
+}
+
+/// A click's command: the binary and its arguments.
+type Argv = (String, Vec<String>);
+
+/// What runs before the check (`Verb::Resolve`) on a card whose field holds
+/// a text: the text as an instruction to the card's agent, since a card
+/// closed as done hands no note to anyone. The x and No go carry theirs as
+/// `--note=` on the close itself. An error when no `act_command` can carry
+/// the text: the card is then not closed.
+pub fn text_first(act: &[String], id: &str, verb: Verb, text: Option<&str>) -> Result<Option<Argv>, String> {
+    match text.filter(|t| !t.trim().is_empty()) {
+        Some(text) if verb == Verb::Resolve => verb_argv_with(act, &[], &[], id, Verb::Instruct, Some(text))
+            .map(Some)
+            .ok_or_else(|| "attention: no command to carry the text typed".to_string()),
+        _ => Ok(None),
+    }
+}
+
+/// Run `first`, when there is one, then `last`: `last` only once `first`
+/// went, so a text that did not leave never loses its card.
+pub fn in_turn(first: Option<&Argv>, last: &Argv, run: &dyn Fn(&str, &[String]) -> Result<Delivery, String>) -> Result<Delivery, String> {
+    if let Some((bin, args)) = first {
+        run(bin, args)?;
+    }
+    run(&last.0, &last.1)
 }
 
 /// The flag that makes `act_command` say how far a click went by its exit
@@ -1225,7 +1271,10 @@ mod tests {
         assert_eq!(argv(Gesture::NoGo, Some("trop tôt"), Some("0123456789abcdef")), Some(format!("{head} nogo --text=trop tôt")));
         assert_eq!(argv(Gesture::Ask, Some("pourquoi ?"), None), Some(format!("{head} ask --text=pourquoi ?")));
         assert_eq!(argv(Gesture::Ask, Some("  "), None), None, "a question needs its text");
-        assert_eq!(argv(Gesture::Seen, Some("ignored"), None), Some(format!("{head} seen")));
+        // A text left in the field goes with Vu too: never dropped by the button that files the card.
+        assert_eq!(argv(Gesture::Seen, Some("lu, vois avec Paul"), None), Some(format!("{head} seen --text=lu, vois avec Paul")));
+        assert_eq!(argv(Gesture::Seen, Some(" "), None), Some(format!("{head} seen")));
+        assert_eq!(argv(Gesture::Cancel, Some("x"), None), Some(format!("{head} cancel")));
         assert_eq!(argv(Gesture::Cancel, None, None), Some(format!("{head} cancel")));
         // The text is one argv element: never read as an option.
         // A draft the user rewrote goes with the go, and with no other gesture.
@@ -1345,6 +1394,13 @@ mod tests {
             Some(vec!["--reason".to_string(), "dismissed".to_string(), "--note=--by evil\npas maintenant".to_string()])
         );
         assert_eq!(verb_argv(&act, &close, "a-1", Verb::Dismiss, Some("  ")).map(|(_, a)| a.len()), Some(6));
+        // No go carries the text left in the field the same way.
+        assert_eq!(
+            verb_argv(&act, &close, "a-1", Verb::NoGo, Some("pas avant lundi")).map(|(_, a)| a[4..].to_vec()),
+            Some(vec!["--reason".to_string(), "nogo".to_string(), "--note=pas avant lundi".to_string()])
+        );
+        // The check takes no note: its text goes first, as an instruction (`text_first`).
+        assert_eq!(verb_argv(&act, &close, "a-1", Verb::Resolve, Some("vois avec Paul")).map(|(_, a)| a.len()), Some(6));
         let snooze = or_close_bin(&[], &close, "snooze");
         assert_eq!(snooze, ["/bin/attn", "snooze"]);
         assert_eq!(
@@ -1458,9 +1514,11 @@ mod tests {
         // In this file: the key is read in one place, used in one place.
         let own = code(&root.join("attention.rs"));
         assert_eq!(own.matches("click_key(&path)").count(), 1);
-        assert_eq!(own.matches("run_click(&bin, &args)").count(), 3, "a gesture, the instruction and the other verbs");
+        assert_eq!(own.matches("run_click(&bin, &args)").count(), 2, "a gesture and the instruction");
+        assert_eq!(own.matches("run_click(bin, args)").count(), 1, "the other verbs, after the text a check carries");
+        assert_eq!(own.matches("run_click(").count(), 4, "those three and the function");
         let perform = own.split("pub fn perform_with(").nth(1).unwrap().split("\nfn run_click(").next().unwrap();
-        assert_eq!(perform.matches("run_click(&bin, &args)").count(), 2);
+        assert_eq!(perform.matches("run_click(").count(), 2);
         // A reply zone's gesture is the user's click too: run by the
         // Cockpit's page only, through `perform_gesture`.
         let gesture = own.split("pub fn perform_gesture(").nth(1).unwrap().split("\npub fn perform_with(").next().unwrap();
@@ -1469,6 +1527,41 @@ mod tests {
         assert_eq!(gesturing, ["attention.rs", "window/cockpit_view.rs"], "who can run a gesture");
         // No test runs with a key file: the path is only set from the config.
         assert!(CLICK_KEY_FILE.read().is_none());
+    }
+
+    #[test]
+    fn a_text_left_in_the_field_goes_before_the_check_and_keeps_the_card_if_it_fails() {
+        let act: Vec<String> = ["/bin/attn", "act", "--by", "robin"].iter().map(|s| s.to_string()).collect();
+        let first = text_first(&act, "a-1", Verb::Resolve, Some("vois avec Paul\n--by evil")).unwrap().unwrap();
+        assert_eq!(first.0, "/bin/attn");
+        assert_eq!(first.1, ["act", "--by", "robin", EXIT_CODES, "a-1", "instruct", "--text=vois avec Paul\n--by evil"]);
+        // Nothing typed: the check alone. The x and No go carry their own note.
+        assert_eq!(text_first(&act, "a-1", Verb::Resolve, Some(" \n")), Ok(None));
+        assert_eq!(text_first(&act, "a-1", Verb::Resolve, None), Ok(None));
+        assert_eq!(text_first(&act, "a-1", Verb::Dismiss, Some("x")), Ok(None));
+        assert_eq!(text_first(&act, "a-1", Verb::NoGo, Some("x")), Ok(None));
+        // No command to carry it: an error, so the card is not closed over the text.
+        assert!(text_first(&[], "a-1", Verb::Resolve, Some("x")).is_err());
+
+        let last: Argv = ("/bin/attn".into(), vec!["close".into(), "a-1".into()]);
+        let ran = std::cell::RefCell::new(Vec::new());
+        let ok = |_: &str, args: &[String]| {
+            ran.borrow_mut().push(args[0].clone());
+            Ok(Delivery::Delivered)
+        };
+        assert_eq!(in_turn(Some(&first), &last, &ok), Ok(Delivery::Delivered));
+        assert_eq!(*ran.borrow(), ["act", "close"], "the text, then the close");
+        ran.borrow_mut().clear();
+        assert_eq!(in_turn(None, &last, &ok), Ok(Delivery::Delivered));
+        assert_eq!(*ran.borrow(), ["close"]);
+        // The text did not go: the card is not closed.
+        ran.borrow_mut().clear();
+        let fails = |_: &str, args: &[String]| {
+            ran.borrow_mut().push(args[0].clone());
+            Err("boom".to_string())
+        };
+        assert_eq!(in_turn(Some(&first), &last, &fails), Err("boom".to_string()));
+        assert_eq!(*ran.borrow(), ["act"]);
     }
 
     #[test]

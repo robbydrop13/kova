@@ -317,6 +317,7 @@ is gone is dropped.
   path may hold spaces and words may follow it) is a link named by the file,
   its full path as the tooltip, never a dead path; other sources stay words.
 - Every opened attention card, button or not, ends with a `Consigne` field (`Une consigne pour cette carte`): Enter runs `act_command ID instruct --text=<text>` (one argv element, `attention::clean_text`), which hands it to the chief of the card's scope; Shift+Enter is a new line, nothing typed sends nothing. The field clears and the card shows `Consigne envoyée` with the text sent; on a draft it sits under the draft's actions, apart from the correction, and never marks the draft sent. A typed instruction survives the refresh.
+- A text typed in that field and not sent leaves with the button that files the card: the check runs `act_command ID instruct --text=<text>` first and closes the card only once it went, the x and `No go` carry it as `--note=<text>` on the close (after `Refuser`'s reason, if any). A card folded or out of the list for a while keeps its text for when it is back, and a folded card's check sends it too. If the text did not go, the card comes back with it (`Consigne non envoyée`).
 - Decision sheet: its card's text (the decisions); `Décider` opens it.
 - Question: its text and its answers as buttons (a free answer brings a
   field), checked with `ask::accepts_external_answer` and queued like the
@@ -332,7 +333,7 @@ When the queue lists `gestures` on a card (`attn list --open --json`), the card 
 
 - One field, `Ta réponse`, and the gestures listed, each a worded button with an icon: `No go` (outlined, a cross), `Demander` (a link, a bubble), `Go` (filled, a check; the queue's `go_label`, `Go, envoyer` on a draft). Only the gestures listed show.
 - `Go` and `No go` send the text typed, if any, and file the card. `Demander` needs a text: the button is disabled while the field is empty. Nothing is posted from the keyboard: Enter is a new line.
-- `Vu` sits at the card's head, where the check and the cross were: filed with no judgement. The clock stays.
+- `Vu` sits at the card's head, where the check and the cross were: filed with no judgement. The clock stays. A text left in the field goes with it (`seen --text=<text>`), as with `Go` and `No go`: the queue takes it or refuses the click, and the card then comes back with the text under its field.
 - A card with a draft shows its zone at once. `Go` carries the draft's fingerprint (`--seen`). The draft can be rewritten in place: its header then reads `Modifié par toi` with `Rétablir le brouillon`, and `Go` carries the user's text (`--draft=<text>`); an untouched draft sends none.
 - Another card shows its zone once opened. Folded, a card that waits on a go carries `Go` (one click) next to `Répondre`, which opens the zone; where a bare go says nothing (`Décider`, `Tester`, `Brief`), the one button opens the zone.
 - While the field is empty, `Écris ta question pour demander` says under it why `Demander` is off (also its tooltip).

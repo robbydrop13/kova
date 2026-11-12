@@ -2055,6 +2055,21 @@ function syncReply(card) {
   const h = card.querySelector('.rz .hint');
   if (t && h) h.hidden = !!t.value.trim();
 }
+// What is typed in a card's field and not sent yet, by card: kept while the
+// card is folded or out of the list, and sent with the button that files
+// the card. Never dropped without a word.
+const typed = {};
+function fieldText(card) {
+  const f = card.querySelector('textarea.ins');
+  return f ? f.value : (typed[card.dataset.key] || '');
+}
+// The text leaves with a click: the field and the memory are emptied.
+function takeText(card) {
+  const text = fieldText(card), f = card.querySelector('textarea.ins');
+  if (f) f.value = '';
+  delete typed[card.dataset.key];
+  return text;
+}
 // The list is replaced whole; a draft being rewritten keeps its text, its
 // caret and the keyboard.
 function setList(html) {
@@ -2069,11 +2084,12 @@ function setList(html) {
   // An opened card's own state: its folds, its scrolled boxes, a typed answer.
   const inner = {};
   document.querySelectorAll('.card').forEach(card => {
+    const f = card.querySelector('textarea.ins');
+    if (f && f.value) typed[card.dataset.key] = f.value; else if (f) delete typed[card.dataset.key];
     inner[card.dataset.key] = {
       open: [...card.querySelectorAll('details')].map(d => d.open),
       scroll: [...card.querySelectorAll('pre.scroll')].map(p => p.scrollTop),
       ans: (card.querySelector('textarea.ans') || {}).value || '',
-      ins: (card.querySelector('textarea.ins') || {}).value || '',
       why: card.querySelector('div.why:not([hidden]) input.why')
     };
   });
@@ -2092,17 +2108,15 @@ function setList(html) {
     if (card.dataset.key === focusKey && !t.readOnly) { t.focus(); t.setSelectionRange(sel[0], sel[1]); }
   });
   document.querySelectorAll('.card').forEach(card => {
+    const ins = card.querySelector('textarea.ins');
+    if (ins && typed[card.dataset.key]) ins.value = typed[card.dataset.key];
+    if (ins && card.dataset.key === insFocus) { ins.focus(); ins.setSelectionRange(insSel[0], insSel[1]); }
     const k = inner[card.dataset.key];
     if (!k) return;
     card.querySelectorAll('details').forEach((d, i) => { if (k.open[i]) d.open = true; });
     card.querySelectorAll('pre.scroll').forEach((p, i) => { if (k.scroll[i]) p.scrollTop = k.scroll[i]; });
     const ans = card.querySelector('textarea.ans');
     if (ans) { ans.value = k.ans; if (card.dataset.key === ansFocus) ans.focus(); }
-    const ins = card.querySelector('textarea.ins');
-    if (ins) {
-      ins.value = k.ins;
-      if (card.dataset.key === insFocus) { ins.focus(); ins.setSelectionRange(insSel[0], insSel[1]); }
-    }
     // A reason being typed for Refuser stays open with its text.
     const why = card.querySelector('input.why');
     if (why && k.why) {
@@ -2279,11 +2293,12 @@ document.addEventListener('click', e => {
     const f = card.querySelector('textarea.rz-t');
     // A draft rewritten in place goes with the go, as the user's own text.
     if (msg.arg === 'go' && t && edited(t)) msg.draft = t.value;
-    msg.text = f && msg.arg !== 'seen' && msg.arg !== 'cancel' ? f.value : '';
-    if (msg.arg === 'ask') {
-      if (!msg.text.trim()) { if (f) f.focus(); return; }
-      f.value = '';
-    } else if (msg.arg !== 'cancel') hide(card.dataset.key);
+    // The text typed leaves with Go, No go and Vu alike; a folded card
+    // sends the one typed while it was open.
+    msg.text = msg.arg !== 'cancel' ? fieldText(card) : '';
+    if (msg.arg === 'ask' && !msg.text.trim()) { if (f) f.focus(); return; }
+    if (msg.arg !== 'cancel') takeText(card);
+    if (msg.arg !== 'ask' && msg.arg !== 'cancel') hide(card.dataset.key);
     card.querySelectorAll('[data-act=reply]').forEach(x => x.disabled = true);
     return post(msg);
   }
@@ -2302,6 +2317,12 @@ document.addEventListener('click', e => {
     const now = new Date(Date.now() + 3600e3);
     $('snzAt').value = iso(now).slice(0, 16);
     return;
+  }
+  // The check, the x and No go file the card: a text typed in its field and
+  // not sent goes with them, to the card's agent.
+  if (act === 'dismiss' || act === 'done' || act === 'nogo') {
+    const text = takeText(card);
+    if (text.trim()) msg.text = text;
   }
   if (act === 'dismiss' || act === 'done') { hide(card.dataset.key); return post(msg); }
   if (act === 'refuse') {
@@ -2327,8 +2348,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && t.classList && t.classList.contains('ins') && !t.classList.contains('rz-t')) {
     e.preventDefault();
     if (t.readOnly || !t.value.trim()) return;
-    post({ type: 'act', key: t.closest('.card').dataset.key, act: 'instruct', text: t.value });
-    t.value = '';
+    post({ type: 'act', key: t.closest('.card').dataset.key, act: 'instruct', text: takeText(t.closest('.card')) });
     return;
   }
   // Refuser's reason: Enter closes the entry with it (or none), Escape
@@ -2337,8 +2357,10 @@ document.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.isComposing) {
       e.preventDefault();
       const key = t.closest('.card').dataset.key;
+      // The reason, then what the card's field still held.
+      const text = [t.value, takeText(t.closest('.card'))].filter(x => x.trim()).join('\n');
       hide(key);
-      post({ type: 'act', key, act: 'refuse', text: t.value });
+      post({ type: 'act', key, act: 'refuse', text });
       return;
     }
     if (e.key === 'Escape') { e.preventDefault(); t.value = ''; t.parentNode.hidden = true; t.blur(); return; }
@@ -2499,9 +2521,25 @@ mod tests {
         // Demander follows the field; a question with nothing typed posts nothing.
         assert!(page.contains("b.disabled = b.hasAttribute('data-lock') || !t.value.trim()"));
         assert!(page.contains("if (t && h) h.hidden = !!t.value.trim();"), "the hint goes once something is typed");
-        assert!(page.contains("if (!msg.text.trim()) { if (f) f.focus(); return; }"));
+        assert!(page.contains("if (msg.arg === 'ask' && !msg.text.trim()) { if (f) f.focus(); return; }"));
         // Go, No go and Vu file the card at once; a question and its cancel keep it.
-        assert!(page.contains("} else if (msg.arg !== 'cancel') hide(card.dataset.key);"));
+        assert!(page.contains("if (msg.arg !== 'ask' && msg.arg !== 'cancel') hide(card.dataset.key);"));
+    }
+
+    #[test]
+    fn a_text_typed_in_a_card_leaves_with_the_button_that_files_it() {
+        let page = shell(false, "n");
+        // The zone: Go, No go and Vu alike take what the field holds.
+        assert!(page.contains("msg.text = msg.arg !== 'cancel' ? fieldText(card) : '';"));
+        assert!(!page.contains("msg.arg !== 'seen'"), "Vu drops no text");
+        // A card without a zone: the check, the x and No go carry the instruction not sent.
+        assert!(page.contains("if (act === 'dismiss' || act === 'done' || act === 'nogo') {\n    const text = takeText(card);\n    if (text.trim()) msg.text = text;"));
+        // Refuser's reason, then the field.
+        assert!(page.contains("[t.value, takeText(t.closest('.card'))].filter(x => x.trim()).join('\\n')"));
+        // Folded or pushed out of the list, the card keeps its text for when it is back.
+        assert!(page.contains("if (f && f.value) typed[card.dataset.key] = f.value; else if (f) delete typed[card.dataset.key];"));
+        assert!(page.contains("if (ins && typed[card.dataset.key]) ins.value = typed[card.dataset.key];"));
+        assert!(page.contains("return f ? f.value : (typed[card.dataset.key] || '');"));
     }
 
     #[test]
