@@ -1259,6 +1259,86 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../tests/fixtures/attention/list.json");
 
+    /// The gesture contract the queue's own tests read too, so a name changed
+    /// on one side breaks both. Its path comes from `KOVA_GESTURES_CONTRACT`
+    /// (the queue's `tests/fixtures/gestures-contract.json`); without it the
+    /// test checks nothing.
+    #[test]
+    fn the_gestures_are_the_ones_of_the_queue_s_contract() {
+        let Some(path) = std::env::var_os("KOVA_GESTURES_CONTRACT") else { return };
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        let contract: serde_json::Value = serde_json::from_str(&text).expect("the contract is JSON");
+        let strings = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default()
+        };
+        // The same five words on both sides.
+        let gestures = contract["gestures"].as_object().expect("gestures");
+        let mut theirs: Vec<&str> = gestures.keys().map(String::as_str).collect();
+        let mut ours: Vec<&str> = Gesture::ALL.iter().map(|g| g.word()).collect();
+        theirs.sort();
+        ours.sort();
+        assert_eq!(ours, theirs, "the gestures Kova knows and the ones the queue takes");
+        let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
+        let cid = "0b5c1c2e-1111-4222-8333-444455556666";
+        let seen = "0123456789abcdef";
+        for g in Gesture::ALL {
+            let spec = &gestures[g.word()];
+            let argv = |text, draft| gesture_argv(&act, "a-1", g, text, Some(seen), draft, cid).map(|(_, a)| a);
+            // The flags every click carries, then the card and the word, in the contract's order.
+            let full = argv(Some("un texte"), Some("un brouillon")).unwrap_or_else(|| panic!("{} has an argv", g.word()));
+            for flag in strings(&contract["always"]) {
+                assert!(full.iter().any(|a| a == &flag || a.starts_with(&format!("{flag}="))), "{} carries {flag}", g.word());
+            }
+            let positional: Vec<&str> = full.iter().map(String::as_str).filter(|a| !a.starts_with("--")).collect();
+            let wanted: Vec<String> = strings(&spec["argv"]).into_iter().map(|w| if w == "<card>" { "a-1".to_string() } else { w }).collect();
+            assert_eq!(positional, wanted, "{}", g.word());
+            // The text: carried where it is taken, never where it is refused, needed where required.
+            let texted = full.iter().any(|a| a.starts_with("--text="));
+            match spec["text"].as_str() {
+                Some("none") => assert!(!texted && !g.takes_text(), "{} takes no text", g.word()),
+                Some("optional") => {
+                    assert!(texted && g.takes_text(), "{} carries a text", g.word());
+                    assert!(argv(None, None).is_some(), "{} goes without a text", g.word());
+                }
+                Some("required") => {
+                    assert!(texted && g.takes_text(), "{} carries a text", g.word());
+                    assert_eq!(argv(None, None), None, "{} needs its text", g.word());
+                }
+                other => panic!("{}: text {other:?} is not a case Kova knows", g.word()),
+            }
+            // `--seen` and `--draft` only on the gestures that list them.
+            let options = strings(&spec["options"]);
+            for flag in ["--seen", "--draft"] {
+                assert_eq!(full.iter().any(|a| a.starts_with(&format!("{flag}="))), options.iter().any(|o| o == flag), "{} and {flag}", g.word());
+            }
+            assert_eq!(Some(g.files()), spec["closes_card"].as_bool(), "{} files the card", g.word());
+        }
+        // The exit codes Kova tells apart.
+        let codes = contract["exit_codes"].as_object().expect("exit_codes");
+        assert!(codes.contains_key("0") && codes.contains_key(&EXIT_NOTED.to_string()) && codes.contains_key("4"), "{codes:?}");
+        // A card's fields, read under the names the contract gives them.
+        let fields = &contract["card_fields"];
+        for name in ["gestures", "go_label", "waiting", "ask"] {
+            assert!(fields.get(name).is_some(), "the contract names {name}");
+        }
+        let ask_fields = strings(&fields["ask"]["fields"]);
+        for name in ["text", "ts", "to", "label"] {
+            assert!(ask_fields.iter().any(|f| f == name), "ask.{name}");
+        }
+        assert!(strings(&fields["waiting"]).iter().any(|w| w == "agent"));
+        let card = serde_json::json!({"gestures": contract["gestures_by_waiting"]["agent"], "ask": {"text": "q", "ts": "2026-11-12T09:14:02+01:00", "to": "s", "label": "non remis"}});
+        let reply = reply_of(Some(card["gestures"].clone()), None, Some("agent".into()), Some(card["ask"].clone()));
+        assert_eq!(reply.gestures, [Gesture::Cancel]);
+        assert_eq!(reply.asked.map(|a| (a.text, a.to, a.label)), Some(("q".into(), "s".into(), Some("non remis".into()))));
+        let robin: Vec<Gesture> = strings(&contract["gestures_by_waiting"]["robin"]).iter().filter_map(|w| Gesture::parse(w)).collect();
+        assert_eq!(robin.len(), strings(&contract["gestures_by_waiting"]["robin"]).len(), "every gesture offered is one Kova shows");
+        // The former buttons Kova still sends, as the contract reads them.
+        let legacy = contract["legacy"].as_object().expect("legacy");
+        for word in [Verb::Validate.label(), Verb::Correct.label(), Verb::Instruct.label(), "close --reason done", "close --reason nogo", "close --reason dismissed"] {
+            assert!(legacy.contains_key(word), "the contract reads the former {word}");
+        }
+    }
+
     #[test]
     fn a_gesture_runs_act_with_its_word_a_client_id_and_what_it_carries() {
         let act: Vec<String> = ["/bin/attn", "act", "--by", "robin"].iter().map(|s| s.to_string()).collect();

@@ -339,6 +339,7 @@ When the queue lists `gestures` on a card (`attn list --open --json`), the card 
 - While the field is empty, `Écris ta question pour demander` says under it why `Demander` is off (also its tooltip).
 - A card that waits for its agent (`waiting: "agent"`, `ask`) says so at its head, folded or not: `Attend l'agent`, the delivery in the queue's own words (`non remis`, `sera lu à son prochain pas`), the question asked, and `Annuler ma demande` when `cancel` is listed. It has no check, no cross and no `Vu`.
 - Each gesture runs `act_command --exit-codes --client-id=<uuid> <id> <go|nogo|ask|seen|cancel> [--text=<text>] [--seen=<fingerprint>] [--draft=<text>]` (`attention::gesture_argv`). The id is new per click and kept when the same gesture is clicked again after a failure. What the card shows next is read from the queue; a failure or a refusal leaves the command's line on the card, and a question that did not go is kept under the field.
+- The queue's contract is a JSON file its own tests read (`tests/fixtures/gestures-contract.json` in the queue's repository). `KOVA_GESTURES_CONTRACT=<that file> cargo test the_gestures_are` checks Kova against it: the five words, what each carries, which ones file the card, the card's fields. Without the variable the test checks nothing.
 - `En cours` shows a click's `label` from `attn inflight --json` (`non remis`, `sans réponse`, `sera lu à son prochain pas`) as it is.
 
 ## Chat
