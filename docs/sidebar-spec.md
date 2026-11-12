@@ -102,8 +102,13 @@ The sidebar spans the window's full height, under its title bar: the top row
 is where macOS draws the traffic lights, and the switcher shares it at the
 right end rather than sitting on a row of its own.
 
-No footer: the way back to the tab bar is View > Show Tab Bar and ⌥⌘S
-(section 7); the version label stays in the tab bar of tabs mode.
+No footer: the way back to the tab bar is View > Show Tab Bar, ⌥⌘S
+(section 7) or a click on the selected `sidebar` icon of the switcher
+(3.7.1); the version label stays in the tab bar of tabs mode. In tabs mode a
+`sidebar.left` button sits right of the traffic lights (`place_sidebar_button`,
+centred on the zoom light, hidden while the sidebar shows, tooltip "Show
+sidebar (⌥⌘S)") and brings the sidebar back; the tab bar's left inset
+makes room for it.
 
 ### 3.3 Typography (`sidebar_view::Style`, `fonts::inter_name`, `NSFont::fontWithName_size`)
 
@@ -317,7 +322,9 @@ traffic lights' own row: 26 pt each, 2 apart, radius 6 (`SWITCH_LISTS`).
 one sits on `SEL_BG` in `SEL_TEXT`, the others are `TEXT_TERTIARY` and take
 a 10 % white ground under the mouse (16 % while pressed). A press on a
 button switches lists; the rest of the row still drags the window.
-Clicking the selected icon does nothing, like a segmented control.
+Clicking the selected `users` or `clock` icon does nothing, like a
+segmented control. Clicking `sidebar` while the panes already show hides the
+sidebar (`switch_click`, same as ⌥⌘S).
 
 Two badges, both hung on the icon's top right corner (4 pt in from its
 right edge, 5 pt above its top) with a 2 pt ring of the sidebar ground:
@@ -609,7 +616,7 @@ says `waiting 4m · Answer` on the subtitle instead: the age in `warn.text`,
 | Restored `Resume`          | resume (4.4)                                           |                    | tile menu    |
 | Next pill                  | `do_focus_next_attention()` (not when `nothing`)       |                    |              |
 | Sort toggle                | kova <-> activity (Panes list only)                     |                    |              |
-| View switcher              | show that list (`sidebar_show_list`)                   |                    |              |
+| View switcher              | show that list (`sidebar_show_list`); `sidebar` on the Panes list hides the sidebar |                    |              |
 | Section header             | fold or unfold that section (`sidebar_sched_section`)  |                    |              |
 | Routine row                | open it, or close it when it is open (`sidebar_toggle_routine`); a click also closes an open confirmation | | |
 | Routine hover/body buttons | `Run now` / `Pause` / `Resume`: `routines::run_action` (background, queued result); `Open log` / `Edit prompt`: argv `open`, path-guarded; `Delete`: the inline confirmation | | |

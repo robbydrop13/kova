@@ -286,10 +286,20 @@ impl KovaView {
                         .map(|btn| {
                             let frame = btn.frame();
                             let right_edge = (frame.origin.x + frame.size.width) as f32;
-                            (right_edge + 8.0) * scale
+                            // The sidebar button sits right of the lights while the sidebar is hidden.
+                            let bar_h = unsafe { btn.superview() }.map_or(frame.origin.y + frame.size.height, |v| v.frame().size.height);
+                            let button = if self.sidebar_active() { 0.0 } else { self.place_sidebar_button(&frame, bar_h) };
+                            (right_edge + 8.0 + button) * scale
                         })
                 })
                 .unwrap_or(140.0);
+            if self.sidebar_active() {
+                if let Some(b) = ivars.sidebar_button.get() {
+                    if !b.isHidden() {
+                        b.setHidden(true);
+                    }
+                }
+            }
             ivars.tab_bar_left_inset.set(inset);
             inset
         };

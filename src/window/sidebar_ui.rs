@@ -762,6 +762,63 @@ impl KovaView {
 
     /// The view switcher: show `list`. Clicking the selected icon is a no-op,
     /// like a segmented control.
+    pub(super) fn sidebar_list(&self) -> SidebarList {
+        self.ivars().sidebar.borrow().list
+    }
+
+    /// The tab bar's sidebar button, made on first use and laid right of the
+    /// zoom light, centred on it. `lights` is the zoom light's frame in its
+    /// titlebar view, `bar_h` that view's height (both from the window's
+    /// top). Returns the width it takes, in points.
+    pub(super) fn place_sidebar_button(&self, lights: &objc2_core_foundation::CGRect, bar_h: f64) -> f32 {
+        const SIDE: f64 = 22.0;
+        let mtm = objc2::MainThreadMarker::from(self);
+        let Some(container) = (unsafe { self.superview() }) else { return 0.0 };
+        let button = self.ivars().sidebar_button.get_or_init(|| {
+            let image = objc2_app_kit::NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &objc2_foundation::NSString::from_str("sidebar.left"),
+                Some(&objc2_foundation::NSString::from_str("Show sidebar")),
+            );
+            let b = objc2_app_kit::NSButton::new(mtm);
+            b.setBordered(false);
+            if let Some(image) = image {
+                b.setImage(Some(&image));
+            }
+            unsafe {
+                b.setTarget(Some(self));
+                b.setAction(Some(objc2::sel!(showSidebar:)));
+            }
+            let keys = self.ivars().config.get().map(|c| c.keys.toggle_sidebar.clone()).unwrap_or_default();
+            let tip = format!("Show sidebar ({})", crate::cockpit::shortcut_label(&keys));
+            b.setToolTip(Some(&objc2_foundation::NSString::from_str(&tip)));
+            container.addSubview(&b);
+            b
+        });
+        let h = container.bounds().size.height;
+        let x = lights.origin.x + lights.size.width + 8.0;
+        // The light's centre, measured from the window's top, then in the
+        // container's bottom-up coordinates.
+        let from_top = bar_h - (lights.origin.y + lights.size.height / 2.0);
+        let y = h - from_top - SIDE / 2.0;
+        let y = y.max(0.0);
+        let frame = objc2_core_foundation::CGRect::new(
+            objc2_core_foundation::CGPoint::new(x, y),
+            objc2_core_foundation::CGSize::new(SIDE, SIDE),
+        );
+        if !rect_eq(button.frame(), frame) {
+            button.setFrame(frame);
+        }
+        if button.isHidden() {
+            button.setHidden(false);
+        }
+        // Above the Metal view and its web views.
+        let on_top = container.subviews().lastObject().is_some_and(|v| std::ptr::eq(&*v, button.as_ref() as &objc2_app_kit::NSView));
+        if !on_top {
+            container.addSubview_positioned_relativeTo(button, objc2_app_kit::NSWindowOrderingMode::Above, None);
+        }
+        (SIDE + 6.0) as f32
+    }
+
     pub(super) fn sidebar_show_list(&self, list: SidebarList) {
         self.ivars().sidebar.borrow_mut().list = list;
     }

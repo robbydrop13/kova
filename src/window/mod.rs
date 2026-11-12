@@ -110,6 +110,9 @@ pub struct KovaViewIvars {
     rename_pane: RefCell<Option<RenamePaneState>>,
     /// Left inset (pixels) for tab bar, cached from traffic light button positions.
     tab_bar_left_inset: Cell<f32>,
+    /// The tab bar's sidebar button, right of the traffic lights: shown only
+    /// while the sidebar is hidden, it brings it back (`showSidebar:`).
+    sidebar_button: OnceCell<Retained<objc2_app_kit::NSButton>>,
     /// Tab index targeted by right-click color menu.
     color_menu_tab: Cell<usize>,
     /// Subject (its tab, its name) targeted by the strip's right-click color menu.
@@ -1019,6 +1022,12 @@ define_class!(
             }
         }
 
+        /// The tab bar's sidebar button: the sidebar comes back.
+        #[unsafe(method(showSidebar:))]
+        fn show_sidebar_button(&self, _sender: &objc2::runtime::AnyObject) {
+            self.set_layout_mode(crate::config::LayoutMode::Sidebar);
+        }
+
         /// View menu: "Show Tab Bar" / "Show Sidebar" (tag = mode).
         #[unsafe(method(setLayoutMode:))]
         fn set_layout_mode_from_menu(&self, sender: &objc2_app_kit::NSMenuItem) {
@@ -1242,6 +1251,7 @@ impl KovaView {
             rename_tab: RefCell::new(None),
             rename_pane: RefCell::new(None),
             tab_bar_left_inset: Cell::new(0.0),
+            sidebar_button: OnceCell::new(),
             color_menu_tab: Cell::new(0),
             color_menu_subject: RefCell::new(None),
             drag_tab: Cell::new(None),

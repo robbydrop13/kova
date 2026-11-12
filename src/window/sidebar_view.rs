@@ -1421,7 +1421,10 @@ define_class!(
                     if let Some(kova) = kova_of(self) {
                         match pressed {
                             ChromeHit::SortToggle => kova.sidebar_toggle_sort(),
-                            ChromeHit::ViewSwitch(list) => kova.sidebar_show_list(list),
+                            ChromeHit::ViewSwitch(list) => match switch_click(kova.sidebar_list(), list) {
+                                SwitchClick::Show(list) => kova.sidebar_show_list(list),
+                                SwitchClick::HideSidebar => kova.toggle_layout_mode(),
+                            },
                             ChromeHit::NextPill => kova.sidebar_next_pill_clicked(),
                             _ => {}
                         }
@@ -1432,6 +1435,41 @@ define_class!(
         }
     }
 );
+
+/// What a click on a switcher icon does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchClick {
+    Show(SidebarList),
+    /// The sidebar icon (Panes) clicked while Panes shows: the sidebar folds,
+    /// as Cmd+Option+S does. The tab bar's own sidebar button brings it back.
+    HideSidebar,
+}
+
+pub fn switch_click(current: SidebarList, clicked: SidebarList) -> SwitchClick {
+    if clicked == SidebarList::Panes && current == SidebarList::Panes {
+        SwitchClick::HideSidebar
+    } else {
+        SwitchClick::Show(clicked)
+    }
+}
+
+/// The inks of a tab header: its title (and `+`), the chevron, the count.
+/// The active tab's header sits on the raised card (`tile`), white in the
+/// light theme: its text is the theme's primary ink, never a fixed white,
+/// which left the title white on white (12/11).
+pub struct HeaderInk {
+    pub title: [f32; 3],
+    pub muted: ([f32; 3], f64),
+    pub number: ([f32; 3], f64),
+}
+
+pub fn header_ink(selected: bool, t: &tokens::Palette) -> HeaderInk {
+    if selected {
+        HeaderInk { title: t.text_primary, muted: (t.text_primary, 0.72), number: (t.text_primary, 0.72) }
+    } else {
+        HeaderInk { title: t.text_primary, muted: (t.text_secondary, 1.0), number: (t.text_muted, 1.0) }
+    }
+}
 
 /// One tracking area over the whole view: hover and exit.
 fn install_tracking_area(view: &NSView) {
@@ -2438,8 +2476,9 @@ impl SidebarListView {
         } else if row_hovered {
             fill_round(frame, HEADER_RADIUS, tokens::get().white, 0.05 * alpha);
         }
-        let (muted, muted_alpha) = if selected { (tokens::get().white, 0.72) } else { (tokens::get().text_secondary, 1.0) };
-        let (number_fg, number_alpha) = if selected { (tokens::get().white, 0.72) } else { (tokens::get().text_muted, 1.0) };
+        let ink = header_ink(selected, tokens::get());
+        let (muted, muted_alpha) = ink.muted;
+        let (number_fg, number_alpha) = ink.number;
         let cy = frame.y + frame.h / 2.0;
         let chevron = if g.collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
         stroke_icon(chevron, &ListLayout::header_chevron(frame), CHEVRON_D, muted, muted_alpha * alpha);
@@ -2463,7 +2502,7 @@ impl SidebarListView {
             } else if add_hovered {
                 fill_round(&add, ADD_RADIUS, tokens::get().white, 0.14 * alpha);
             }
-            let plus_fg = if selected { tokens::get().white } else { tokens::get().text_primary };
+            let plus_fg = ink.title;
             stroke_icon(Icon::Plus, &add, ICON_D, plus_fg, alpha);
         }
         let count_right = add.right();
@@ -2486,7 +2525,7 @@ impl SidebarListView {
                 }
             }
         }
-        let title_fg = if selected { tokens::get().white } else { tokens::get().text_primary };
+        let title_fg = ink.title;
         draw_text(sh, &g.title, &Rect::new(x, frame.y, (right - x).max(0.0), frame.h), Style::Title, title_fg, alpha, Align::Left, g.renaming);
     }
 
@@ -2649,6 +2688,32 @@ impl SidebarListView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sidebar_icon_folds_the_sidebar_when_panes_already_shows() {
+        use super::{switch_click, SwitchClick};
+        assert_eq!(switch_click(SidebarList::Panes, SidebarList::Panes), SwitchClick::HideSidebar);
+        assert_eq!(switch_click(SidebarList::Agents, SidebarList::Panes), SwitchClick::Show(SidebarList::Panes));
+        assert_eq!(switch_click(SidebarList::Panes, SidebarList::Scheduled), SwitchClick::Show(SidebarList::Scheduled));
+    }
+
+    #[test]
+    fn the_active_tab_title_reads_on_its_card_in_both_themes() {
+        use super::header_ink;
+        // WCAG relative luminance contrast, at least 4.5:1 on the card.
+        let lum = |c: [f32; 3]| {
+            let f = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+            0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
+        };
+        let ratio = |a: [f32; 3], b: [f32; 3]| {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        for p in [&tokens::LIGHT, &tokens::DARK] {
+            let ink = header_ink(true, p);
+            assert!(ratio(ink.title, p.tile) >= 4.5, "title on the active card: {}", ratio(ink.title, p.tile));
+        }
+    }
+
     use super::*;
     use super::super::sidebar::{CollapsedSummary, PaneFlags, UnreadKind};
 
