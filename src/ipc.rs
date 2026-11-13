@@ -55,8 +55,9 @@ pub enum IpcCommand {
     Doctor,
     /// Close a pane by its ID.
     ClosePaneById(u32),
-    /// Write text to a pane's PTY.
-    SendKeys { pane_id: u32, text: String },
+    /// Write text to a pane's PTY. `caller` is the process at the other end
+    /// of the connection, filled in by the connection handler.
+    SendKeys { pane_id: u32, text: String, caller: crate::typed_keys::Caller },
     /// Focus a pane by its ID (switching tab/window if needed).
     FocusPane(u32),
     /// Resume the agent a launch restore left asleep in a pane, without
@@ -517,6 +518,9 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, tx: mpsc::Sender<Ip
     // Set a read timeout so a misbehaving client doesn't block the thread forever
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
 
+    // Who is asking, read once: the journal of `send-keys` names it.
+    let caller = crate::typed_keys::Caller::of(&stream);
+
     let mut reader = BufReader::new(&stream);
     let mut writer = &stream;
 
@@ -580,6 +584,9 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, tx: mpsc::Sender<Ip
             Ok(IpcCommand::Ask(question)) => {
                 serve_ask(&stream, &tx, *question);
                 return;
+            }
+            Ok(IpcCommand::SendKeys { pane_id, text, .. }) => {
+                dispatch(&tx, IpcCommand::SendKeys { pane_id, text, caller: caller.clone() })
             }
             Ok(cmd) => dispatch(&tx, cmd),
             Err(msg) => IpcResponse::Error { message: msg },
@@ -854,7 +861,7 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .and_then(|t| t.as_str())
                 .ok_or_else(|| "missing \"text\" field".to_string())?
                 .to_string();
-            Ok(IpcCommand::SendKeys { pane_id, text })
+            Ok(IpcCommand::SendKeys { pane_id, text, caller: Default::default() })
         }
         "focus-pane" => {
             let pane_id = required_u32(&v, "pane_id")?;
@@ -1801,7 +1808,7 @@ mod tests {
             Ok(IpcCommand::FocusPane(4))
         ));
         match parse_command(r#"{"cmd":"send-keys","pane_id":4,"text":"ls\r"}"#) {
-            Ok(IpcCommand::SendKeys { pane_id: 4, text }) => assert_eq!(text, "ls\r"),
+            Ok(IpcCommand::SendKeys { pane_id: 4, text, .. }) => assert_eq!(text, "ls\r"),
             _ => panic!("send-keys"),
         }
         assert_eq!(

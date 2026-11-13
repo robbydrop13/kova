@@ -96,6 +96,9 @@ pub trait IpcHost {
     fn collect_pane_ids(&self, out: &mut Vec<PaneId>);
     /// `send-keys`: write `text` to the pane with `send_keys_to`.
     fn send_keys(&self, pane_id: PaneId, text: &str) -> bool;
+    /// What runs in the pane a `send-keys` names (`typing_target_of`): the
+    /// journal describes it and the tag rule only holds for Claude Code.
+    fn typing_target(&self, pane_id: PaneId) -> Option<crate::typed_keys::Target>;
     /// One `get-pane-content` entry, built with `pane_text_entry`.
     fn dump_pane_text(&self, pane_id: PaneId, mode: DumpMode, trim: bool) -> Option<serde_json::Value>;
     /// `(chars, bytes)` of that entry's text, from `measure_pane_text`.
@@ -152,7 +155,7 @@ pub fn dispatch(host: &impl IpcHost, cmd: IpcCommand) -> Result<Disposition, Ipc
         IpcCommand::ListPanes => list_panes(host),
         IpcCommand::Doctor => IpcResponse::Ok { data: Some(crate::doctor::report()) },
         IpcCommand::ClosePaneById(pane_id) => close_pane(host, pane_id),
-        IpcCommand::SendKeys { pane_id, text } => send_keys(host, pane_id, &text),
+        IpcCommand::SendKeys { pane_id, text, caller } => send_keys(host, pane_id, &text, &caller),
         IpcCommand::FocusPane(pane_id) => focus_pane(host, pane_id),
         IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines } => {
             get_pane_content(host, panes, &mode, trim_trailing_blank_lines)
@@ -205,8 +208,45 @@ pub fn close_pane(host: &impl IpcHost, pane_id: PaneId) -> IpcResponse {
     }
 }
 
-/// `send-keys`.
-pub fn send_keys(host: &impl IpcHost, pane_id: PaneId, text: &str) -> IpcResponse {
+/// `send-keys`, under the policy in force (`crate::typed_keys`).
+pub fn send_keys(host: &impl IpcHost, pane_id: PaneId, text: &str, caller: &crate::typed_keys::Caller) -> IpcResponse {
+    send_keys_under(host, pane_id, text, caller, &crate::typed_keys::policy())
+}
+
+/// `send-keys` under `policy`: every send to an existing pane is journaled,
+/// and untagged text to a pane running Claude Code is typed, flagged or
+/// refused as the mode says.
+pub fn send_keys_under(
+    host: &impl IpcHost,
+    pane_id: PaneId,
+    text: &str,
+    caller: &crate::typed_keys::Caller,
+    policy: &crate::typed_keys::Policy,
+) -> IpcResponse {
+    use crate::typed_keys::{self, Verdict};
+    let Some(target) = host.typing_target(pane_id) else {
+        return not_found(pane_id);
+    };
+    let typed = typed_keys::read(text);
+    let verdict = typed_keys::verdict(policy.mode, typed.kind, target.claude);
+    if let Some(journal) = &policy.journal {
+        let line = typed_keys::entry(&typed_keys::now_utc(), pane_id, &target, text, &typed, policy.mode, verdict, caller);
+        typed_keys::append(journal, &line);
+    }
+    if verdict != Verdict::Accepted {
+        // Never the text: a pane line may be private.
+        log::warn!(
+            "IPC send-keys: untagged text ({} bytes) to pane {} running Claude Code, from pid {:?} ({}): {}",
+            text.len(),
+            pane_id,
+            caller.pid,
+            caller.name.as_deref().unwrap_or("unknown"),
+            verdict.as_str()
+        );
+    }
+    if verdict == Verdict::Refused {
+        return IpcResponse::Error { message: typed_keys::REFUSAL.to_string() };
+    }
     found_or_not(host.send_keys(pane_id, text), pane_id)
 }
 
@@ -372,6 +412,20 @@ pub fn poll_pending_waits(host: &impl IpcHost, waits: &mut Vec<PendingWait>) {
 
 // ─── What a command does to one pane ────────────────────────────────────────
 
+/// What a `send-keys` to this pane would type into.
+pub fn typing_target_of(surface: &Surface) -> crate::typed_keys::Target {
+    let agent = surface.agent_kind();
+    crate::typed_keys::Target {
+        agent: agent.map(|a| a.as_str().to_string()),
+        // A `claude` process that has not reported its session yet already
+        // reads what is typed.
+        claude: agent == Some(crate::agent_session::Agent::Claude)
+            || (agent.is_none() && surface.fg_process().is_some_and(|p| p.name == "claude")),
+        session: surface.agent_session_name(),
+        session_id: surface.agent_session_id(),
+    }
+}
+
 /// `send-keys` on one pane: write `text` to its PTY as is.
 pub fn send_keys_to(surface: &Surface, text: &str) {
     // Same rule as a keystroke: someone answered this pane.
@@ -526,6 +580,15 @@ mod tests {
             self.log(format!("send_keys {pane_id} {text:?}"));
             PANES.contains(&pane_id)
         }
+        fn typing_target(&self, pane_id: PaneId) -> Option<crate::typed_keys::Target> {
+            // Pane 1 runs Claude Code as session `chief`, pane 2 is a shell.
+            PANES.contains(&pane_id).then(|| crate::typed_keys::Target {
+                agent: (pane_id == 1).then(|| "claude".to_string()),
+                claude: pane_id == 1,
+                session: (pane_id == 1).then(|| "chief".to_string()),
+                session_id: (pane_id == 1).then(|| "s-1".to_string()),
+            })
+        }
         fn dump_pane_text(&self, pane_id: PaneId, mode: DumpMode, trim: bool) -> Option<serde_json::Value> {
             self.log(format!("dump {pane_id} {mode:?} {trim}"));
             PANES.contains(&pane_id).then(|| serde_json::json!({"id": pane_id, "text": "hi\n"}))
@@ -618,7 +681,92 @@ mod tests {
             reply(&host, r#"{"cmd":"send-keys","pane_id":9,"text":"x"}"#),
             r#"{"error":"pane 9 not found","ok":false}"#
         );
-        assert_eq!(host.calls(), ["send_keys 2 \"ls\\r\"", "send_keys 9 \"x\""]);
+        assert_eq!(host.calls(), ["send_keys 2 \"ls\\r\""], "a pane that does not exist is never written to");
+    }
+
+    /// The three cases of the tag rule, replayed against the journal: a tagged
+    /// line, a bare line to Claude Code, a shell command to a shell.
+    #[test]
+    fn send_keys_journals_every_send_and_holds_untagged_text_to_claude_code() {
+        use crate::typed_keys::{Caller, Mode, Policy, REFUSAL};
+        let dir = std::env::temp_dir().join(format!("kova-send-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal = dir.join("send-keys.jsonl");
+        let caller = Caller { pid: Some(4242), name: Some("python3".into()) };
+        let ok = IpcResponse::Ok { data: None }.to_json().to_string();
+        let send = |host: &FakeHost, mode: Mode, pane: PaneId, text: &str| {
+            let policy = Policy { mode, journal: Some(journal.clone()) };
+            send_keys_under(host, pane, text, &caller, &policy).to_json().to_string()
+        };
+        let lines = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&journal)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
+                .collect()
+        };
+        const CLAUDE: PaneId = 1;
+        const SHELL: PaneId = 2;
+
+        // 1. A tagged line to Claude Code: typed and journaled, in every mode.
+        let host = FakeHost::default();
+        for mode in [Mode::Off, Mode::Warn, Mode::Enforce] {
+            assert_eq!(send(&host, mode, CLAUDE, "[gardien] reprends"), ok);
+        }
+        assert_eq!(host.calls().len(), 3);
+        let l = lines();
+        assert_eq!(l.len(), 3);
+        assert_eq!(l[2]["verdict"], "accepted");
+        assert_eq!(l[2]["kind"], "tagged");
+        assert_eq!(l[2]["tag"], "gardien");
+        assert_eq!(l[2]["mode"], "enforce");
+        assert_eq!(l[2]["pane_id"], 1);
+        assert_eq!(l[2]["session"], "chief");
+        assert_eq!(l[2]["agent"], "claude");
+        assert_eq!(l[2]["caller_pid"], 4242);
+        assert_eq!(l[2]["sha256"], crate::typed_keys::sha256_hex(b"[gardien] reprends"));
+
+        // 2. A bare line to Claude Code: typed and flagged in warn, refused
+        // and not typed in enforce, plain in off.
+        let host = FakeHost::default();
+        assert_eq!(send(&host, Mode::Warn, CLAUDE, "ok envoie"), ok);
+        assert_eq!(host.calls(), ["send_keys 1 \"ok envoie\""]);
+        let refused = send(&host, Mode::Enforce, CLAUDE, "ok envoie");
+        assert_eq!(refused, IpcResponse::Error { message: REFUSAL.to_string() }.to_json().to_string());
+        assert_eq!(host.calls().len(), 1, "a refused text never reaches the pane");
+        assert_eq!(send(&host, Mode::Off, CLAUDE, "ok envoie"), ok);
+        let l = lines();
+        let verdicts: Vec<&str> = l[3..].iter().map(|e| e["verdict"].as_str().unwrap()).collect();
+        assert_eq!(verdicts, ["would_refuse", "refused", "accepted"]);
+        assert!(l[3..].iter().all(|e| e["kind"] == "untagged" && e["tag"].is_null()));
+        assert!(!std::fs::read_to_string(&journal).unwrap().contains("envoie"), "the text itself is never journaled");
+
+        // 3. A shell command to a pane without Claude Code: typed, in enforce too.
+        let host = FakeHost::default();
+        assert_eq!(send(&host, Mode::Enforce, SHELL, "claude --resume abc\r"), ok);
+        assert_eq!(host.calls().len(), 1);
+        let l = lines();
+        let last = l.last().unwrap();
+        assert_eq!((last["verdict"].as_str(), last["kind"].as_str(), last["claude"].as_bool()), (Some("accepted"), Some("untagged"), Some(false)));
+        assert!(last["agent"].is_null());
+
+        // Always typed into Claude Code: keys alone and `/` lines. Both are
+        // journaled: an Esc or a Ctrl+U after a tagged line must leave a trace.
+        let host = FakeHost::default();
+        for keys in ["\r", "\u{1b}", "\u{15}", "/rename lead"] {
+            assert_eq!(send(&host, Mode::Enforce, CLAUDE, keys), ok, "{keys:?}");
+        }
+        assert_eq!(host.calls().len(), 4);
+        let l = lines();
+        let tail: Vec<(&str, bool)> = l[l.len() - 4..].iter().map(|e| (e["kind"].as_str().unwrap(), e["edits"].as_bool().unwrap())).collect();
+        assert_eq!(tail, [("control", false), ("control", true), ("control", true), ("slash", false)]);
+        assert_eq!(l.last().unwrap()["slash"], "/rename");
+
+        // A pane that does not exist: an error, nothing typed, nothing journaled.
+        let before = lines().len();
+        assert_eq!(send(&host, Mode::Enforce, 9, "x"), r#"{"error":"pane 9 not found","ok":false}"#);
+        assert_eq!(lines().len(), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

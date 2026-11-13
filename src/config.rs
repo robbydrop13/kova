@@ -22,6 +22,31 @@ pub struct Config {
     pub chat: ChatConfig,
     pub links: LinksConfig,
     pub session: SessionConfig,
+    pub ipc: IpcConfig,
+}
+
+/// What the socket accepts (`docs/ipc.md`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IpcConfig {
+    /// What `send-keys` does with printable text that does not start with a
+    /// `[name] ` tag when the pane runs Claude Code: `"off"` types it,
+    /// `"warn"` types it and journals it as `would_refuse`, `"enforce"`
+    /// refuses it. Every send is journaled in
+    /// `~/Library/Logs/Kova/send-keys.jsonl` whatever the value.
+    pub untagged_send_keys: String,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self {
+        IpcConfig { untagged_send_keys: "warn".to_string() }
+    }
+}
+
+impl IpcConfig {
+    pub fn untagged_mode(&self) -> crate::typed_keys::Mode {
+        crate::typed_keys::Mode::from_config(&self.untagged_send_keys)
+    }
 }
 
 /// What a launch does with the agents it restores asleep (`launch_wake`).
@@ -553,6 +578,7 @@ impl Default for Config {
             chat: ChatConfig::default(),
             links: LinksConfig::default(),
             session: SessionConfig::default(),
+            ipc: IpcConfig::default(),
         }
     }
 }

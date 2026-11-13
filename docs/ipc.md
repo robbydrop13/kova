@@ -1000,6 +1000,49 @@ Sends raw bytes to the shell's stdin. Use `\n` to submit a command line. Control
 
 Response: `{ "ok": true }`.
 
+**Say who types.** In an agent's transcript a line typed through `send-keys` is indistinguishable from a line the user typed at the keyboard. So printable text sent to a pane that runs Claude Code must start with a tag naming the sender, `[name] ` (an opening bracket, 1 to 40 characters without brackets, a closing bracket, a space): `[my-tool] the build is green`. Always typed as is: control keys alone (`\r`, Esc, Ctrl+U, an arrow), text whose every piece starts with `/` (`/rename x`), and anything sent to a pane that does not run Claude Code (a shell, Codex, Pi, omp). A pane runs Claude Code when `list-panes` gives it `"agent": "claude"`, or when its foreground process is `claude` and no session is reported yet.
+
+The text is read as the prompt will take it: each stretch of printable characters between two keys that submit, erase or move (Enter, Ctrl+U, Esc, an arrow, any control character but newline and tab, any escape sequence but the bracketed-paste marks) is a piece of its own and must carry its own tag or `/`. `[a] x`, Ctrl+U, `go` is untagged.
+
+What happens to untagged text is a setting, read at launch and on `reload-config`:
+
+```toml
+[ipc]
+untagged_send_keys = "warn"   # "off" | "warn" (default) | "enforce"
+```
+
+| Value | Untagged text to a Claude Code pane |
+|---|---|
+| `off` | typed |
+| `warn` | typed, journaled with `"verdict": "would_refuse"`, one warning line in `kova.log` (no text) |
+| `enforce` | not typed, journaled with `"verdict": "refused"`, response `{ "ok": false, "error": "send-keys refused: text typed into a pane running Claude Code must start with a \"[name] \" tag …" }` |
+
+Any other value is read as `warn`.
+
+**Journal.** Every `send-keys` that names an existing pane, whatever the setting and whatever the pane runs, appends one JSON object on one line to `~/Library/Logs/Kova/send-keys.jsonl` (mode 0600; past 8 MB the file becomes `send-keys.jsonl.1`, replacing the previous one, and a new one starts). The text itself is never written. A `send-keys` to an unknown pane is not journaled. Keys typed by the user in the app, and what Kova types by itself without the socket (the Cockpit chat box, a click on a native prompt, a file dropped on a pane), do not go through `send-keys` and are not in the journal.
+
+```json
+{"ts":"2026-11-13T08:41:07.123Z","pane_id":42,"session":"harness-lead","session_id":"0b6f…","agent":"claude","claude":true,"kind":"tagged","tag":"gardien","slash":null,"edits":false,"len":61,"chars":58,"sha256":"…","text_sha256":"…","mode":"warn","verdict":"accepted","caller_pid":5123,"caller":"python3.12"}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts` | when Kova handled the send, UTC, milliseconds (the shape of a transcript's `timestamp`) |
+| `pane_id` | the pane written to |
+| `session`, `session_id` | name and id of the agent conversation in the pane, `null` at a shell |
+| `agent` | `claude`, `codex`, `pi`, `omp`, or `null` |
+| `claude` | the tag rule applied to this pane (see above) |
+| `kind` | `control` (no printable character), `slash` (every piece starts with `/`), `tagged` (every piece starts with a tag or `/`, at least one tag), `untagged` |
+| `tag` | the name inside the first tag, else `null` |
+| `slash` | the first `/command` word, else `null` |
+| `edits` | the text holds a key other than Enter, newline, tab and the bracketed-paste marks: Esc, Ctrl+U, backspace, an arrow… A tagged line followed, in the same send or a later one, by keys that erase its tag shows here |
+| `len`, `chars` | bytes and characters of `text` |
+| `sha256` | SHA-256 of `text` exactly as received (UTF-8), lowercase hex |
+| `text_sha256` | SHA-256 of the printable text alone: escape sequences and control characters removed, each piece trimmed, pieces joined by `\n`. Equals the hash of a transcript line when one send typed the whole line. `null` when `kind` is `control` |
+| `mode` | the setting when the send was handled |
+| `verdict` | `accepted`, `would_refuse` (typed), `refused` (not typed) |
+| `caller_pid`, `caller` | pid and executable name of the process at the other end of the socket (`LOCAL_PEERPID`), `null` when it could not be read. Kova's own late `ask` answers show Kova's pid and are tagged `[Kova] ` |
+
 ---
 
 ### `set-tab-title` — override the auto-derived tab title

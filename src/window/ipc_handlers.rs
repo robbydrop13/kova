@@ -119,6 +119,11 @@ pub fn collect_panes_in(
     }
 }
 
+/// What a `send-keys` to `pane_id` would type into, `None` when no tab holds it.
+pub fn typing_target_in(tabs: &[Tab], pane_id: PaneId) -> Option<crate::typed_keys::Target> {
+    tabs.iter().find_map(|tab| tab.pane(pane_id)).map(|pane| crate::ipc::host::typing_target_of(pane))
+}
+
 /// `send-keys`: write `text` to the pane's PTY as is. Returns false when no tab
 /// holds the pane.
 pub fn send_keys_in(tabs: &[Tab], pane_id: PaneId, text: &str) -> bool {
@@ -614,6 +619,11 @@ impl KovaView {
     /// IPC: write text to a pane's PTY. Returns true if the pane was found.
     pub fn ipc_send_keys(&self, pane_id: PaneId, text: &str) -> bool {
         send_keys_in(&self.ivars().tabs.borrow(), pane_id, text)
+    }
+
+    /// IPC: what a `send-keys` to this pane would type into.
+    pub fn ipc_typing_target(&self, pane_id: PaneId) -> Option<crate::typed_keys::Target> {
+        typing_target_in(&self.ivars().tabs.borrow(), pane_id)
     }
 
     /// IPC: take a new anchor list into this window. The status bars repaint,
@@ -1362,6 +1372,9 @@ mod tests {
         }
         fn send_keys(&self, pane_id: PaneId, text: &str) -> bool {
             send_keys_in(&self.tabs, pane_id, text)
+        }
+        fn typing_target(&self, pane_id: PaneId) -> Option<crate::typed_keys::Target> {
+            typing_target_in(&self.tabs, pane_id)
         }
         fn dump_pane_text(&self, pane_id: PaneId, mode: DumpMode, trim: bool) -> Option<serde_json::Value> {
             dump_pane_text_in(&self.tabs, pane_id, mode, trim)

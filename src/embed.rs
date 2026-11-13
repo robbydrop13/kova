@@ -131,6 +131,8 @@ fn host() -> Rc<Host> {
             // defaults, whatever the machine's config says.
             #[cfg(not(test))]
             let config = Config::load();
+            #[cfg(not(test))]
+            crate::typed_keys::configure(config.ipc.untagged_mode(), Some(crate::typed_keys::default_journal()));
             #[cfg(test)]
             let config = Config::default();
             let keybindings = Keybindings::from_config(&config.keys);
@@ -1457,6 +1459,10 @@ impl IpcHost for LibHost {
 
     fn send_keys(&self, pane_id: PaneId, text: &str) -> bool {
         find(pane_id).map(|p| ipc_host::send_keys_to(&p.surface, text)).is_some()
+    }
+
+    fn typing_target(&self, pane_id: PaneId) -> Option<crate::typed_keys::Target> {
+        find(pane_id).map(|p| ipc_host::typing_target_of(&p.surface))
     }
 
     fn dump_pane_text(&self, pane_id: PaneId, mode: DumpMode, trim: bool) -> Option<serde_json::Value> {

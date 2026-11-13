@@ -113,6 +113,7 @@ define_class!(
     crate::attention::set_click_key_file(config.attention.click_key_path());
             crate::catchup::set_commands(&config.attention.catchup_commands());
             crate::inflight::set_command(&config.attention.inflight_command());
+            crate::typed_keys::configure(config.ipc.untagged_mode(), Some(crate::typed_keys::default_journal()));
             setup_menu(mtm, config);
 
             // Restore session (all windows) or create a single fresh window
@@ -947,6 +948,10 @@ impl IpcHost for KovaAppHost<'_> {
 
     fn send_keys(&self, pane_id: u32, text: &str) -> bool {
         self.find_map(|view| view.ipc_send_keys(pane_id, text).then_some(())).is_some()
+    }
+
+    fn typing_target(&self, pane_id: u32) -> Option<crate::typed_keys::Target> {
+        self.find_map(|view| view.ipc_typing_target(pane_id))
     }
 
     fn dump_pane_text(
@@ -1895,6 +1900,7 @@ fn handle_ipc_reload_config(
     crate::attention::set_click_key_file(config.attention.click_key_path());
     crate::catchup::set_commands(&config.attention.catchup_commands());
     crate::inflight::set_command(&config.attention.inflight_command());
+    crate::typed_keys::configure(config.ipc.untagged_mode(), Some(crate::typed_keys::default_journal()));
     let mut applied = 0usize;
     for win in windows.borrow().iter() {
         if let Some(view) = kova_view(win) {
