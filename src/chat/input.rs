@@ -59,9 +59,12 @@ pub fn composer(visible: &str) -> Composer {
     let after = line[COMPOSER_PREFIX.len_utf8()..]
         .trim_end_matches(|c: char| c.is_whitespace() || ('\u{2500}'..='\u{257f}').contains(&c))
         .trim();
-    // An AskUserQuestion's marker sits in the first column: `❯ 1. Red`.
+    // An AskUserQuestion's marker sits in the first column too: `❯ 1. Red`.
+    // A draft that starts with `1. ` reads the same, but the composer has
+    // its top rule right above it and a menu's first option never does.
     let digits = after.bytes().take_while(u8::is_ascii_digit).count();
-    if digits > 0 && after[digits..].starts_with(". ") {
+    let framed = i > 0 && lines[i - 1].trim_start().starts_with('\u{2500}');
+    if digits > 0 && after[digits..].starts_with(". ") && !framed {
         return Composer::Unreadable;
     }
     if !after.is_empty() && !after.starts_with(PLACEHOLDER_PREFIX) {
@@ -316,6 +319,11 @@ mod tests {
         assert_eq!(composer("❯ \n Do you want to proceed?\n ❯ 1. Yes\n   2. No"), Composer::Unreadable, "a menu is no composer");
         assert_eq!(composer("❯ Try \"refactor <filepath>\""), Composer::Empty, "the start hint is not a draft");
         assert_eq!(composer("~/src $ "), Composer::Unreadable);
+        // A message that starts like a menu option is still a draft (13/11:
+        // `1. …` typed from the chat never got its Enter).
+        assert_eq!(composer("answer\n───\n❯ 1. yes 2. no\n───\n  ? for shortcuts"), Composer::Typed, "a numbered draft");
+        assert_eq!(composer("answer\n───\n❯ 1. yes\n  2. no\n───\n  ? for shortcuts"), Composer::Typed, "a numbered draft on two lines");
+        assert_eq!(composer("───\nWhich color?\n\n❯ 1. Red\n  2. Blue\n───\n  3. Chat about this"), Composer::Unreadable, "a menu under a rule");
         // The last ❯ is the composer, not an echoed one above it.
         assert_eq!(composer("❯ earlier message\nanswer\n❯ "), Composer::Empty);
     }
