@@ -1151,13 +1151,21 @@ pub fn click_key(path: &std::path::Path) -> Option<String> {
     sound.then(|| key.to_string())
 }
 
+/// The click key, read now, for checking a signed `send-keys`
+/// (`crate::typed_keys`): the key that proves a click also proves that a
+/// typed line is the user's. `None` when no file is configured or it holds
+/// no key. Never kept, never logged.
+pub fn signing_key() -> Option<String> {
+    CLICK_KEY_FILE.read().clone().and_then(|path| click_key(&path))
+}
+
 /// Run a click's argv: how far it went, or `Err` with the first line of its
 /// stderr on a failure. Only the user's own clicks come here
 /// (`perform_with`, called by the Cockpit's and the chat's pages, never by
 /// the IPC nor the command line): the command gets the click key in its
 /// environment, never in its argv, which any process can read.
 fn run_click(bin: &str, args: &[String]) -> Result<Delivery, String> {
-    let key = CLICK_KEY_FILE.read().clone().and_then(|path| click_key(&path));
+    let key = signing_key();
     run_click_with(bin, args, key.as_deref())
 }
 
@@ -1594,6 +1602,13 @@ mod tests {
         // In this file: the key is read in one place, used in one place.
         let own = code(&root.join("attention.rs"));
         assert_eq!(own.matches("click_key(&path)").count(), 1);
+        // Read for two uses only: a click here, and checking the signature
+        // of a `send-keys`, which compares and never hands the key on.
+        assert_eq!(own.matches("signing_key()").count(), 2, "the function and the click");
+        let mut checking: Vec<String> = files.iter().filter(|p| code(p).contains("signing_key()")).map(|p| rel(p)).collect();
+        checking.sort();
+        assert_eq!(checking, ["attention.rs", "typed_keys.rs"], "who can read the key");
+        assert_eq!(code(&root.join("typed_keys.rs")).matches("signing_key()").count(), 1);
         assert_eq!(own.matches("run_click(&bin, &args)").count(), 2, "a gesture and the instruction");
         assert_eq!(own.matches("run_click(bin, args)").count(), 1, "the other verbs, after the text a check carries");
         assert_eq!(own.matches("run_click(").count(), 4, "those three and the function");

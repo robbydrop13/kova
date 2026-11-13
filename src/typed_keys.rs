@@ -13,8 +13,10 @@
 //!   happens to the rest: `off` (nothing), `warn` (typed, journaled as
 //!   `would_refuse`), `enforce` (refused, journaled as `refused`).
 //!
-//! Always typed: control keys alone, lines starting with `/`, and anything
-//! sent to a pane that does not run Claude Code.
+//! Always typed: control keys alone, the three commands of `FREE_SLASH`,
+//! anything sent to a pane that does not run Claude Code, and a send signed
+//! with the user's click key (`Signature`): his own words, relayed by his
+//! phone.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -57,9 +59,10 @@ impl Mode {
 pub enum Kind {
     /// No printable character: Enter, Esc, Ctrl+U, an arrow key.
     Control,
-    /// Every piece of text starts with `/`.
+    /// Every piece of text is one of the `FREE_SLASH` commands.
     Slash,
-    /// Every piece of text starts with a `[name] ` tag (or with `/`).
+    /// Every piece of text starts with a `[name] ` tag (or is one of the
+    /// `FREE_SLASH` commands).
     Tagged,
     /// Some piece of text starts with neither.
     Untagged,
@@ -96,6 +99,15 @@ pub struct Typed {
 
 /// Longest name a tag may hold, in chars.
 const TAG_MAX: usize = 40;
+
+/// The `/` commands typed without a tag: they manage the conversation and
+/// ask the agent for nothing. Any other `/` line is a prompt (`/skill do
+/// this`) and is judged like text.
+pub const FREE_SLASH: [&str; 3] = ["/rename", "/compact", "/clear"];
+
+fn is_free_slash(piece: &str) -> bool {
+    piece.split_whitespace().next().is_some_and(|word| FREE_SLASH.contains(&word))
+}
 
 /// The name of the `[name] ` tag `piece` starts with.
 fn tag_of(piece: &str) -> Option<&str> {
@@ -180,7 +192,7 @@ pub fn read(text: &str) -> Typed {
         .map(|p| p.split_whitespace().next().unwrap_or("/").chars().take(TAG_MAX).collect::<String>());
     let kind = if pieces.is_empty() {
         Kind::Control
-    } else if pieces.iter().any(|p| tag_of(p).is_none() && !p.starts_with('/')) {
+    } else if pieces.iter().any(|p| tag_of(p).is_none() && !is_free_slash(p)) {
         Kind::Untagged
     } else if tag.is_some() {
         Kind::Tagged
@@ -211,9 +223,10 @@ impl Verdict {
     }
 }
 
-/// The rule: only untagged text to a pane running Claude Code is ever held.
-pub fn verdict(mode: Mode, kind: Kind, claude: bool) -> Verdict {
-    match (kind, claude, mode) {
+/// The rule: only untagged text to a pane running Claude Code is ever held,
+/// and never when the send carries a good signature.
+pub fn verdict(mode: Mode, kind: Kind, claude: bool, signed: bool) -> Verdict {
+    match (kind, claude && !signed, mode) {
         (Kind::Untagged, true, Mode::Warn) => Verdict::WouldRefuse,
         (Kind::Untagged, true, Mode::Enforce) => Verdict::Refused,
         _ => Verdict::Accepted,
@@ -221,7 +234,114 @@ pub fn verdict(mode: Mode, kind: Kind, claude: bool) -> Verdict {
 }
 
 /// What the client of a refused `send-keys` reads.
-pub const REFUSAL: &str = "send-keys refused: text typed into a pane running Claude Code must start with a \"[name] \" tag saying who types it, e.g. \"[my-tool] done\". Control keys alone and lines starting with \"/\" are typed as is. See docs/ipc.md, send-keys";
+pub const REFUSAL: &str = "send-keys refused: text typed into a pane running Claude Code must start with a \"[name] \" tag saying who types it, e.g. \"[my-tool] done\". Control keys alone and /rename, /compact, /clear are typed as is. See docs/ipc.md, send-keys";
+
+/// The optional `sig` of a `send-keys`: proof that the text comes from the
+/// user through an app holding his click key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    /// Which app signed (`kovalink`): 1 to 40 chars of `a-z`, `0-9`, `-`.
+    pub by: String,
+    /// When it signed, in milliseconds since the Unix epoch.
+    pub ts: u64,
+    /// HMAC-SHA256 of `signed_message`, keyed by the click key, lowercase hex.
+    pub mac: String,
+}
+
+/// A signature is good for this long around its `ts`, and only once.
+pub const SIGNATURE_WINDOW_MS: u64 = 30_000;
+
+/// The exact bytes a `send-keys` signature covers: five lines joined by
+/// `\n`, no trailing newline. The text enters by its SHA-256 (of the bytes
+/// received, UTF-8), so the message is one printable line per part whatever
+/// the text holds.
+pub fn signed_message(by: &str, pane_id: u32, ts: u64, text: &str) -> String {
+    format!("kova-send-keys-v1\n{}\n{}\n{}\n{}", by, pane_id, ts, sha256_hex(text.as_bytes()))
+}
+
+/// Why a signature does not count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureError {
+    /// Kova has no click key to check it against.
+    NoKey,
+    /// `ts` is more than `SIGNATURE_WINDOW_MS` away from now.
+    Stale,
+    /// The MAC is not the one of this pane, text, time and key.
+    Bad,
+    /// This very signature was already used.
+    Replayed,
+}
+
+impl SignatureError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignatureError::NoKey => "no_key",
+            SignatureError::Stale => "stale",
+            SignatureError::Bad => "bad_signature",
+            SignatureError::Replayed => "replayed",
+        }
+    }
+}
+
+/// The signatures accepted during the current window: `(ts, mac)`.
+pub type Seen = Vec<(u64, String)>;
+
+/// Whether `sig` proves this send. A good one is remembered in `seen` until
+/// its window closes, so it cannot type the same text twice.
+pub fn check_signature(
+    sig: &Signature,
+    pane_id: u32,
+    text: &str,
+    key: Option<&str>,
+    now_ms: u64,
+    seen: &mut Seen,
+) -> Result<(), SignatureError> {
+    let key = key.ok_or(SignatureError::NoKey)?;
+    if now_ms.abs_diff(sig.ts) > SIGNATURE_WINDOW_MS {
+        return Err(SignatureError::Stale);
+    }
+    let expected = hmac_sha256_hex(key.as_bytes(), signed_message(&sig.by, pane_id, sig.ts, text).as_bytes());
+    if !same_bytes(expected.as_bytes(), sig.mac.to_ascii_lowercase().as_bytes()) {
+        return Err(SignatureError::Bad);
+    }
+    seen.retain(|(ts, _)| now_ms.abs_diff(*ts) <= SIGNATURE_WINDOW_MS);
+    if seen.iter().any(|(_, mac)| *mac == expected) {
+        return Err(SignatureError::Replayed);
+    }
+    seen.push((sig.ts, expected));
+    Ok(())
+}
+
+/// Equality that takes the same time wherever the first difference is.
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+/// What the signature of a send came to, for the journal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Signed {
+    /// The app whose signature was good.
+    pub by: Option<String>,
+    /// Why the signature presented did not count.
+    pub error: Option<&'static str>,
+}
+
+/// Check the signature of a live `send-keys` against the click key read now
+/// and the signatures this process already took.
+pub fn signed_now(sig: Option<&Signature>, pane_id: u32, text: &str) -> Signed {
+    static SEEN: Mutex<Seen> = Mutex::new(Vec::new());
+    let Some(sig) = sig else { return Signed::default() };
+    let key = crate::attention::signing_key();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    match check_signature(sig, pane_id, text, key.as_deref(), now_ms, &mut seen) {
+        Ok(()) => Signed { by: Some(sig.by.clone()), error: None },
+        Err(e) => Signed { by: None, error: Some(e.as_str()) },
+    }
+}
 
 /// The pane a `send-keys` names, as the journal describes it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -331,6 +451,7 @@ pub fn entry(
     mode: Mode,
     verdict: Verdict,
     caller: &Caller,
+    signed: &Signed,
 ) -> serde_json::Value {
     serde_json::json!({
         "ts": ts,
@@ -349,6 +470,8 @@ pub fn entry(
         "text_sha256": (!typed.printable.is_empty()).then(|| sha256_hex(typed.printable.as_bytes())),
         "mode": mode.as_str(),
         "verdict": verdict.as_str(),
+        "signed": signed.by,
+        "sig_error": signed.error,
         "caller_pid": caller.pid,
         "caller": caller.name,
     })
@@ -408,6 +531,28 @@ fn utc(secs: i64, millis: u32) -> String {
 unsafe extern "C" {
     /// CommonCrypto, part of libSystem.
     fn CC_SHA256(data: *const libc::c_void, len: u32, md: *mut u8) -> *mut u8;
+    fn CCHmac(
+        algorithm: u32,
+        key: *const libc::c_void,
+        key_len: usize,
+        data: *const libc::c_void,
+        data_len: usize,
+        mac_out: *mut libc::c_void,
+    );
+}
+
+/// `kCCHmacAlgSHA256`.
+const CC_HMAC_SHA256: u32 = 2;
+
+/// HMAC-SHA256 of `data` under `key`, in lowercase hex.
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    let mut mac = [0u8; 32];
+    // SAFETY: each pointer goes with its own length, and `mac` holds the 32
+    // bytes an HMAC-SHA256 writes.
+    unsafe {
+        CCHmac(CC_HMAC_SHA256, key.as_ptr().cast(), key.len(), data.as_ptr().cast(), data.len(), mac.as_mut_ptr().cast())
+    };
+    mac.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// SHA-256 of `data`, in lowercase hex.
@@ -455,6 +600,15 @@ mod tests {
         assert_eq!(read("[x] hello\rok go\r").kind, Kind::Untagged);
         assert_eq!(read("[x] hello\x1b[Hok go").kind, Kind::Untagged);
         assert_eq!(read("/rename a\rok go\r").kind, Kind::Untagged);
+        // Only three commands go untagged: any other `/` line is a prompt.
+        for free in ["/rename a", "/compact garde ton role", "/clear", "/clear\r"] {
+            assert_eq!(read(free).kind, Kind::Slash, "{free:?}");
+        }
+        for prompt in ["/loop envoie le mail", "/update", "/renamed x", "/ rename x", "/rename a\r/loop go\r"] {
+            let t = read(prompt);
+            assert_eq!(t.kind, Kind::Untagged, "{prompt:?}");
+            assert!(t.slash.is_some(), "the journal still names the command");
+        }
         // Two tagged lines, a tagged line then a command: all named.
         assert_eq!(read("[x] one\r[y] two\r").kind, Kind::Tagged);
         assert_eq!(read("[x] one\r/compact\r").kind, Kind::Tagged);
@@ -480,13 +634,95 @@ mod tests {
     fn only_untagged_text_to_a_claude_pane_is_held() {
         for mode in [Mode::Off, Mode::Warn, Mode::Enforce] {
             for kind in [Kind::Control, Kind::Slash, Kind::Tagged] {
-                assert_eq!(verdict(mode, kind, true), Verdict::Accepted);
+                assert_eq!(verdict(mode, kind, true, false), Verdict::Accepted);
             }
-            assert_eq!(verdict(mode, Kind::Untagged, false), Verdict::Accepted, "a shell takes anything");
+            assert_eq!(verdict(mode, Kind::Untagged, false, false), Verdict::Accepted, "a shell takes anything");
+            assert_eq!(verdict(mode, Kind::Untagged, true, true), Verdict::Accepted, "a signed send is the user's");
         }
-        assert_eq!(verdict(Mode::Off, Kind::Untagged, true), Verdict::Accepted);
-        assert_eq!(verdict(Mode::Warn, Kind::Untagged, true), Verdict::WouldRefuse);
-        assert_eq!(verdict(Mode::Enforce, Kind::Untagged, true), Verdict::Refused);
+        assert_eq!(verdict(Mode::Off, Kind::Untagged, true, false), Verdict::Accepted);
+        assert_eq!(verdict(Mode::Warn, Kind::Untagged, true, false), Verdict::WouldRefuse);
+        assert_eq!(verdict(Mode::Enforce, Kind::Untagged, true, false), Verdict::Refused);
+    }
+
+    /// A made-up key: the real one is never in a test.
+    const TEST_KEY: &str = "test-key-0123456789abcdef";
+
+    fn sign(by: &str, pane_id: u32, ts: u64, text: &str, key: &str) -> Signature {
+        Signature { by: by.into(), ts, mac: hmac_sha256_hex(key.as_bytes(), signed_message(by, pane_id, ts, text).as_bytes()) }
+    }
+
+    #[test]
+    fn the_signed_bytes_and_the_mac_are_the_documented_ones() {
+        // RFC 4231, test case 2.
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // The vector of docs/ipc.md: another implementation must find the same.
+        let message = signed_message("kovalink", 42, 1_794_559_267_123, "ok envoie\r");
+        assert_eq!(
+            message,
+            "kova-send-keys-v1\nkovalink\n42\n1794559267123\n76862c0e9525051b4ae0c88ab25d0ee38e7c5a75e8e78c5d56e445c03618a950"
+        );
+        assert_eq!(hmac_sha256_hex(TEST_KEY.as_bytes(), message.as_bytes()), "f3f75f48803ed7f589cfd31bce3a396766849a5d667213aec47164031fe407e9");
+    }
+
+    #[test]
+    fn a_good_signature_counts_once_within_its_window() {
+        let now = 1_794_559_267_123u64;
+        let mut seen = Seen::new();
+        let sig = sign("kovalink", 42, now, "ok envoie\r", TEST_KEY);
+        assert_eq!(check_signature(&sig, 42, "ok envoie\r", Some(TEST_KEY), now + 800, &mut seen), Ok(()));
+        // The same signature again is a replay.
+        assert_eq!(check_signature(&sig, 42, "ok envoie\r", Some(TEST_KEY), now + 900, &mut seen), Err(SignatureError::Replayed));
+        // Uppercase hex is the same MAC.
+        let upper = Signature { mac: sign("kovalink", 42, now + 1, "x", TEST_KEY).mac.to_uppercase(), ..sign("kovalink", 42, now + 1, "x", TEST_KEY) };
+        assert_eq!(check_signature(&upper, 42, "x", Some(TEST_KEY), now, &mut seen), Ok(()));
+        // The edge of the window is still inside it, in the past or the future.
+        for ts in [now - SIGNATURE_WINDOW_MS, now + SIGNATURE_WINDOW_MS] {
+            let edge = sign("kovalink", 42, ts, "edge", TEST_KEY);
+            assert_eq!(check_signature(&edge, 42, "edge", Some(TEST_KEY), now, &mut seen), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_signature_for_something_else_or_by_another_key_is_bad() {
+        let now = 1_794_559_267_123u64;
+        let mut seen = Seen::new();
+        let sig = sign("kovalink", 42, now, "ok envoie\r", TEST_KEY);
+        let bad = |pane: u32, text: &str, sig: &Signature, key: &str, seen: &mut Seen| check_signature(sig, pane, text, Some(key), now, seen);
+        assert_eq!(bad(43, "ok envoie\r", &sig, TEST_KEY, &mut seen), Err(SignatureError::Bad), "another pane");
+        assert_eq!(bad(42, "ok envoie tout\r", &sig, TEST_KEY, &mut seen), Err(SignatureError::Bad), "another text");
+        assert_eq!(bad(42, "ok envoie\r", &sig, "another-key-0123456789", &mut seen), Err(SignatureError::Bad), "another key");
+        let renamed = Signature { by: "watch".into(), ..sig.clone() };
+        assert_eq!(bad(42, "ok envoie\r", &renamed, TEST_KEY, &mut seen), Err(SignatureError::Bad), "another signer");
+        let moved = Signature { ts: now + 1, ..sig.clone() };
+        assert_eq!(bad(42, "ok envoie\r", &moved, TEST_KEY, &mut seen), Err(SignatureError::Bad), "another time");
+        for mac in ["", "00", &"0".repeat(64)] {
+            let forged = Signature { mac: mac.to_string(), ..sig.clone() };
+            assert_eq!(bad(42, "ok envoie\r", &forged, TEST_KEY, &mut seen), Err(SignatureError::Bad));
+        }
+        assert!(seen.is_empty(), "a bad signature uses nothing up");
+        // None of those spoiled the good one.
+        assert_eq!(bad(42, "ok envoie\r", &sig, TEST_KEY, &mut seen), Ok(()));
+    }
+
+    #[test]
+    fn a_stale_signature_or_one_kova_cannot_check_does_not_count() {
+        let now = 1_794_559_267_123u64;
+        let mut seen = Seen::new();
+        for ts in [now - SIGNATURE_WINDOW_MS - 1, now + SIGNATURE_WINDOW_MS + 1, 0] {
+            let old = sign("kovalink", 42, ts, "ok", TEST_KEY);
+            assert_eq!(check_signature(&old, 42, "ok", Some(TEST_KEY), now, &mut seen), Err(SignatureError::Stale));
+        }
+        let sig = sign("kovalink", 42, now, "ok", TEST_KEY);
+        assert_eq!(check_signature(&sig, 42, "ok", None, now, &mut seen), Err(SignatureError::NoKey));
+        // A signature taken long ago is forgotten, and stale by then anyway.
+        assert_eq!(check_signature(&sig, 42, "ok", Some(TEST_KEY), now, &mut seen), Ok(()));
+        let later = now + 2 * SIGNATURE_WINDOW_MS;
+        let fresh = sign("kovalink", 42, later, "ok", TEST_KEY);
+        assert_eq!(check_signature(&fresh, 42, "ok", Some(TEST_KEY), later, &mut seen), Ok(()));
+        assert_eq!(seen.len(), 1, "the old one left the memory");
     }
 
     #[test]
@@ -523,7 +759,7 @@ mod tests {
         let typed = read(text);
         let target = Target { agent: Some("claude".into()), claude: true, session: Some("chief".into()), session_id: Some("abc".into()) };
         let caller = Caller { pid: Some(42), name: Some("python3".into()) };
-        let line = entry("2026-11-13T08:41:07.123Z", 7, &target, text, &typed, Mode::Warn, Verdict::Accepted, &caller);
+        let line = entry("2026-11-13T08:41:07.123Z", 7, &target, text, &typed, Mode::Warn, Verdict::Accepted, &caller, &Signed::default());
         append(&path, &line);
         append(&path, &line);
         let written = std::fs::read_to_string(&path).unwrap();
@@ -538,6 +774,7 @@ mod tests {
         assert_eq!(back["len"], text.len());
         assert_eq!(back["sha256"], sha256_hex(text.as_bytes()));
         assert_eq!(back["text_sha256"], sha256_hex(b"[gardien] secret words"));
+        assert!(back["signed"].is_null() && back["sig_error"].is_null());
         assert_eq!(back["caller_pid"], 42);
         assert_eq!(back["caller"], "python3");
         use std::os::unix::fs::PermissionsExt;

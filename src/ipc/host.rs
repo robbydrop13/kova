@@ -155,7 +155,7 @@ pub fn dispatch(host: &impl IpcHost, cmd: IpcCommand) -> Result<Disposition, Ipc
         IpcCommand::ListPanes => list_panes(host),
         IpcCommand::Doctor => IpcResponse::Ok { data: Some(crate::doctor::report()) },
         IpcCommand::ClosePaneById(pane_id) => close_pane(host, pane_id),
-        IpcCommand::SendKeys { pane_id, text, caller } => send_keys(host, pane_id, &text, &caller),
+        IpcCommand::SendKeys { pane_id, text, caller, sig } => send_keys(host, pane_id, &text, &caller, sig.as_ref()),
         IpcCommand::FocusPane(pane_id) => focus_pane(host, pane_id),
         IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines } => {
             get_pane_content(host, panes, &mode, trim_trailing_blank_lines)
@@ -209,18 +209,28 @@ pub fn close_pane(host: &impl IpcHost, pane_id: PaneId) -> IpcResponse {
 }
 
 /// `send-keys`, under the policy in force (`crate::typed_keys`).
-pub fn send_keys(host: &impl IpcHost, pane_id: PaneId, text: &str, caller: &crate::typed_keys::Caller) -> IpcResponse {
-    send_keys_under(host, pane_id, text, caller, &crate::typed_keys::policy())
+pub fn send_keys(
+    host: &impl IpcHost,
+    pane_id: PaneId,
+    text: &str,
+    caller: &crate::typed_keys::Caller,
+    sig: Option<&crate::typed_keys::Signature>,
+) -> IpcResponse {
+    let signed = crate::typed_keys::signed_now(sig, pane_id, text);
+    send_keys_under(host, pane_id, text, caller, &signed, &crate::typed_keys::policy())
 }
 
 /// `send-keys` under `policy`: every send to an existing pane is journaled,
 /// and untagged text to a pane running Claude Code is typed, flagged or
-/// refused as the mode says.
+/// refused as the mode says. `signed` is what the send's signature came to:
+/// a good one is the user's own words and is never held; one that does not
+/// count leaves the send exactly as if it carried none.
 pub fn send_keys_under(
     host: &impl IpcHost,
     pane_id: PaneId,
     text: &str,
     caller: &crate::typed_keys::Caller,
+    signed: &crate::typed_keys::Signed,
     policy: &crate::typed_keys::Policy,
 ) -> IpcResponse {
     use crate::typed_keys::{self, Verdict};
@@ -228,9 +238,17 @@ pub fn send_keys_under(
         return not_found(pane_id);
     };
     let typed = typed_keys::read(text);
-    let verdict = typed_keys::verdict(policy.mode, typed.kind, target.claude);
+    let verdict = typed_keys::verdict(policy.mode, typed.kind, target.claude, signed.by.is_some());
+    if let Some(error) = signed.error {
+        log::warn!(
+            "IPC send-keys: the signature of a send to pane {} from pid {:?} does not count ({})",
+            pane_id,
+            caller.pid,
+            error
+        );
+    }
     if let Some(journal) = &policy.journal {
-        let line = typed_keys::entry(&typed_keys::now_utc(), pane_id, &target, text, &typed, policy.mode, verdict, caller);
+        let line = typed_keys::entry(&typed_keys::now_utc(), pane_id, &target, text, &typed, policy.mode, verdict, caller, signed);
         typed_keys::append(journal, &line);
     }
     if verdict != Verdict::Accepted {
@@ -688,7 +706,9 @@ mod tests {
     /// line, a bare line to Claude Code, a shell command to a shell.
     #[test]
     fn send_keys_journals_every_send_and_holds_untagged_text_to_claude_code() {
-        use crate::typed_keys::{Caller, Mode, Policy, REFUSAL};
+        const CLAUDE: PaneId = 1;
+        const SHELL: PaneId = 2;
+        use crate::typed_keys::{Caller, Mode, Policy, Signed, REFUSAL};
         let dir = std::env::temp_dir().join(format!("kova-send-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let journal = dir.join("send-keys.jsonl");
@@ -696,7 +716,11 @@ mod tests {
         let ok = IpcResponse::Ok { data: None }.to_json().to_string();
         let send = |host: &FakeHost, mode: Mode, pane: PaneId, text: &str| {
             let policy = Policy { mode, journal: Some(journal.clone()) };
-            send_keys_under(host, pane, text, &caller, &policy).to_json().to_string()
+            send_keys_under(host, pane, text, &caller, &Signed::default(), &policy).to_json().to_string()
+        };
+        let send_signed = |host: &FakeHost, signed: Signed, text: &str| {
+            let policy = Policy { mode: Mode::Enforce, journal: Some(journal.clone()) };
+            send_keys_under(host, CLAUDE, text, &caller, &signed, &policy).to_json().to_string()
         };
         let lines = || -> Vec<serde_json::Value> {
             std::fs::read_to_string(&journal)
@@ -705,9 +729,6 @@ mod tests {
                 .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
                 .collect()
         };
-        const CLAUDE: PaneId = 1;
-        const SHELL: PaneId = 2;
-
         // 1. A tagged line to Claude Code: typed and journaled, in every mode.
         let host = FakeHost::default();
         for mode in [Mode::Off, Mode::Warn, Mode::Enforce] {
@@ -761,6 +782,37 @@ mod tests {
         let tail: Vec<(&str, bool)> = l[l.len() - 4..].iter().map(|e| (e["kind"].as_str().unwrap(), e["edits"].as_bool().unwrap())).collect();
         assert_eq!(tail, [("control", false), ("control", true), ("control", true), ("slash", false)]);
         assert_eq!(l.last().unwrap()["slash"], "/rename");
+
+        // Any other `/` line is a prompt: held like text.
+        let host = FakeHost::default();
+        assert_eq!(send(&host, Mode::Enforce, CLAUDE, "/loop envoie le mail"), IpcResponse::Error { message: REFUSAL.to_string() }.to_json().to_string());
+        assert!(host.calls().is_empty());
+        let l = lines();
+        let last = l.last().unwrap();
+        assert_eq!((last["kind"].as_str(), last["slash"].as_str(), last["verdict"].as_str()), (Some("untagged"), Some("/loop"), Some("refused")));
+
+        // Signed with the user's key: his own words from his phone, typed in
+        // enforce without a tag, and journaled under the signer's name.
+        let host = FakeHost::default();
+        assert_eq!(send_signed(&host, Signed { by: Some("kovalink".into()), error: None }, "ok envoie"), ok);
+        assert_eq!(host.calls().len(), 1);
+        let l = lines();
+        let last = l.last().unwrap();
+        assert_eq!((last["signed"].as_str(), last["verdict"].as_str(), last["kind"].as_str()), (Some("kovalink"), Some("accepted"), Some("untagged")));
+        assert!(last["sig_error"].is_null());
+        // A signature that does not count changes nothing: refused like any
+        // untagged text, and the journal says why it did not count.
+        for error in ["bad_signature", "stale", "replayed", "no_key"] {
+            let refused = send_signed(&host, Signed { by: None, error: Some(error) }, "ok envoie");
+            assert_eq!(refused, IpcResponse::Error { message: REFUSAL.to_string() }.to_json().to_string());
+            let l = lines();
+            let last = l.last().unwrap();
+            assert_eq!((last["sig_error"].as_str(), last["verdict"].as_str()), (Some(error), Some("refused")));
+            assert!(last["signed"].is_null());
+        }
+        assert_eq!(host.calls().len(), 1, "none of them reached the pane");
+        // ...and a tagged line with a bad signature is still a tagged line.
+        assert_eq!(send_signed(&host, Signed { by: None, error: Some("stale") }, "[gardien] reprends"), ok);
 
         // A pane that does not exist: an error, nothing typed, nothing journaled.
         let before = lines().len();

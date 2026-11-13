@@ -1000,7 +1000,7 @@ Sends raw bytes to the shell's stdin. Use `\n` to submit a command line. Control
 
 Response: `{ "ok": true }`.
 
-**Say who types.** In an agent's transcript a line typed through `send-keys` is indistinguishable from a line the user typed at the keyboard. So printable text sent to a pane that runs Claude Code must start with a tag naming the sender, `[name] ` (an opening bracket, 1 to 40 characters without brackets, a closing bracket, a space): `[my-tool] the build is green`. Always typed as is: control keys alone (`\r`, Esc, Ctrl+U, an arrow), text whose every piece starts with `/` (`/rename x`), and anything sent to a pane that does not run Claude Code (a shell, Codex, Pi, omp). A pane runs Claude Code when `list-panes` gives it `"agent": "claude"`, or when its foreground process is `claude` and no session is reported yet.
+**Say who types.** In an agent's transcript a line typed through `send-keys` is indistinguishable from a line the user typed at the keyboard. So printable text sent to a pane that runs Claude Code must start with a tag naming the sender, `[name] ` (an opening bracket, 1 to 40 characters without brackets, a closing bracket, a space): `[my-tool] the build is green`. Always typed as is: control keys alone (`\r`, Esc, Ctrl+U, an arrow), the three commands `/rename`, `/compact` and `/clear` (any other `/` line is a prompt, `/some-skill do this`, and is judged like text), anything sent to a pane that does not run Claude Code (a shell, Codex, Pi, omp), and a send signed with the user's click key (below). A pane runs Claude Code when `list-panes` gives it `"agent": "claude"`, or when its foreground process is `claude` and no session is reported yet.
 
 The text is read as the prompt will take it: each stretch of printable characters between two keys that submit, erase or move (Enter, Ctrl+U, Esc, an arrow, any control character but newline and tab, any escape sequence but the bracketed-paste marks) is a piece of its own and must carry its own tag or `/`. `[a] x`, Ctrl+U, `go` is untagged.
 
@@ -1019,10 +1019,33 @@ untagged_send_keys = "warn"   # "off" | "warn" (default) | "enforce"
 
 Any other value is read as `warn`.
 
+**Signed send: the user's own words through an app.** An app that relays what the user typed elsewhere (KovaLink: phone, watch, Slack) holds the user's click key, the one that proves his clicks to the attention queue (`[attention] click_key_file`). It proves a typed line the same way, with an optional `sig` on `send-keys`:
+
+```json
+{ "cmd": "send-keys", "pane_id": 42, "text": "ok envoie\r",
+  "sig": { "by": "kovalink", "ts": 1794559267123, "mac": "f3f75f48…07e9" } }
+```
+
+- `by`: the signing app, 1 to 40 characters of `a-z`, `0-9`, `-`.
+- `ts`: when it signed, integer milliseconds since the Unix epoch.
+- `mac`: HMAC-SHA256, 64 hex characters (either case), keyed by the click key (the file's one line, trimmed, as UTF-8 bytes), over these exact bytes, five parts joined by a line feed (`0x0a`), no trailing line feed:
+
+```
+kova-send-keys-v1
+<by>
+<pane_id, decimal>
+<ts, decimal>
+<SHA-256 of the UTF-8 bytes of text exactly as sent, lowercase hex>
+```
+
+Test vector: key `test-key-0123456789abcdef`, `by` `kovalink`, `pane_id` 42, `ts` 1794559267123, `text` `ok envoie` followed by a carriage return (10 bytes) → text hash `76862c0e9525051b4ae0c88ab25d0ee38e7c5a75e8e78c5d56e445c03618a950`, `mac` `f3f75f48803ed7f589cfd31bce3a396766849a5d667213aec47164031fe407e9`.
+
+Kova reads the key at each signed send, compares, and keeps nothing; the key is never written to a log, an error or the journal. A signature counts when the MAC matches, `ts` is within 30 seconds of Kova's clock (either side), and this very signature was not already used: sign each send, one `ts` each. A send whose signature counts is typed whatever its text and whatever the setting, and journaled with `"signed": "<by>"`. A signature that does not count is not an error of its own: the send is judged exactly as if it carried none (so typed in `warn`, refused in `enforce` when untagged), and the journal's `sig_error` says why: `bad_signature`, `stale`, `replayed`, or `no_key` (Kova has no click key to check against). A `sig` of the wrong shape is a request error (`"sig" must be {…}`) and nothing is typed.
+
 **Journal.** Every `send-keys` that names an existing pane, whatever the setting and whatever the pane runs, appends one JSON object on one line to `~/Library/Logs/Kova/send-keys.jsonl` (mode 0600; past 8 MB the file becomes `send-keys.jsonl.1`, replacing the previous one, and a new one starts). The text itself is never written. A `send-keys` to an unknown pane is not journaled. Keys typed by the user in the app, and what Kova types by itself without the socket (the Cockpit chat box, a click on a native prompt, a file dropped on a pane), do not go through `send-keys` and are not in the journal.
 
 ```json
-{"ts":"2026-11-13T08:41:07.123Z","pane_id":42,"session":"harness-lead","session_id":"0b6f…","agent":"claude","claude":true,"kind":"tagged","tag":"gardien","slash":null,"edits":false,"len":61,"chars":58,"sha256":"…","text_sha256":"…","mode":"warn","verdict":"accepted","caller_pid":5123,"caller":"python3.12"}
+{"ts":"2026-11-13T08:41:07.123Z","pane_id":42,"session":"harness-lead","session_id":"0b6f…","agent":"claude","claude":true,"kind":"tagged","tag":"gardien","slash":null,"edits":false,"len":61,"chars":58,"sha256":"…","text_sha256":"…","mode":"warn","verdict":"accepted","signed":null,"sig_error":null,"caller_pid":5123,"caller":"python3.12"}
 ```
 
 | Field | Meaning |
@@ -1032,15 +1055,17 @@ Any other value is read as `warn`.
 | `session`, `session_id` | name and id of the agent conversation in the pane, `null` at a shell |
 | `agent` | `claude`, `codex`, `pi`, `omp`, or `null` |
 | `claude` | the tag rule applied to this pane (see above) |
-| `kind` | `control` (no printable character), `slash` (every piece starts with `/`), `tagged` (every piece starts with a tag or `/`, at least one tag), `untagged` |
+| `kind` | `control` (no printable character), `slash` (every piece is `/rename`, `/compact` or `/clear`), `tagged` (every piece starts with a tag or is one of those three, at least one tag), `untagged` |
 | `tag` | the name inside the first tag, else `null` |
-| `slash` | the first `/command` word, else `null` |
+| `slash` | the first `/command` word, whatever the command, else `null` |
 | `edits` | the text holds a key other than Enter, newline, tab and the bracketed-paste marks: Esc, Ctrl+U, backspace, an arrow… A tagged line followed, in the same send or a later one, by keys that erase its tag shows here |
 | `len`, `chars` | bytes and characters of `text` |
 | `sha256` | SHA-256 of `text` exactly as received (UTF-8), lowercase hex |
 | `text_sha256` | SHA-256 of the printable text alone: escape sequences and control characters removed, each piece trimmed, pieces joined by `\n`. Equals the hash of a transcript line when one send typed the whole line. `null` when `kind` is `control` |
 | `mode` | the setting when the send was handled |
 | `verdict` | `accepted`, `would_refuse` (typed), `refused` (not typed) |
+| `signed` | the `by` of a signature that counted: the text is the user's own, relayed by that app. `null` otherwise |
+| `sig_error` | why a signature presented did not count (`bad_signature`, `stale`, `replayed`, `no_key`), `null` when none was presented or it counted |
 | `caller_pid`, `caller` | pid and executable name of the process at the other end of the socket (`LOCAL_PEERPID`), `null` when it could not be read. Kova's own late `ask` answers show Kova's pid and are tagged `[Kova] ` |
 
 ---

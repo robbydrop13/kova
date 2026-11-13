@@ -57,7 +57,8 @@ pub enum IpcCommand {
     ClosePaneById(u32),
     /// Write text to a pane's PTY. `caller` is the process at the other end
     /// of the connection, filled in by the connection handler.
-    SendKeys { pane_id: u32, text: String, caller: crate::typed_keys::Caller },
+    /// `sig`: the optional signature that makes the text the user's own.
+    SendKeys { pane_id: u32, text: String, caller: crate::typed_keys::Caller, sig: Option<crate::typed_keys::Signature> },
     /// Focus a pane by its ID (switching tab/window if needed).
     FocusPane(u32),
     /// Resume the agent a launch restore left asleep in a pane, without
@@ -585,8 +586,8 @@ fn handle_connection(stream: std::os::unix::net::UnixStream, tx: mpsc::Sender<Ip
                 serve_ask(&stream, &tx, *question);
                 return;
             }
-            Ok(IpcCommand::SendKeys { pane_id, text, .. }) => {
-                dispatch(&tx, IpcCommand::SendKeys { pane_id, text, caller: caller.clone() })
+            Ok(IpcCommand::SendKeys { pane_id, text, sig, .. }) => {
+                dispatch(&tx, IpcCommand::SendKeys { pane_id, text, caller: caller.clone(), sig })
             }
             Ok(cmd) => dispatch(&tx, cmd),
             Err(msg) => IpcResponse::Error { message: msg },
@@ -692,7 +693,7 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "list-panes" => &[],
         "doctor" => &[],
         "close-pane" => &["pane_id"],
-        "send-keys" => &["pane_id", "text"],
+        "send-keys" => &["pane_id", "text", "sig"],
         "focus-pane" => &["pane_id"],
         "wake-pane" => &["pane_id"],
         "new-tab" => &["cwd", "command"],
@@ -744,6 +745,24 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
 /// A required id field. Absent is "missing"; present but not a u32 (a string,
 /// a negative, a float, or a number past u32::MAX that `as` would wrap onto
 /// another pane) says so instead of pretending the field was not sent.
+/// The `sig` object of a `send-keys`: its shape only, the MAC is checked
+/// when the command runs.
+fn send_keys_signature(v: &serde_json::Value) -> Result<crate::typed_keys::Signature, String> {
+    const SHAPE: &str = "\"sig\" must be {\"by\": name, \"ts\": milliseconds, \"mac\": 64 hex chars}";
+    let fields = v.as_object().ok_or(SHAPE)?;
+    if fields.keys().any(|k| !["by", "ts", "mac"].contains(&k.as_str())) {
+        return Err(SHAPE.to_string());
+    }
+    let by = fields.get("by").and_then(|b| b.as_str()).ok_or(SHAPE)?;
+    let ts = fields.get("ts").and_then(|t| t.as_u64()).ok_or(SHAPE)?;
+    let mac = fields.get("mac").and_then(|m| m.as_str()).ok_or(SHAPE)?;
+    let named = (1..=40).contains(&by.len()) && by.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !named || mac.len() != 64 || !mac.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(SHAPE.to_string());
+    }
+    Ok(crate::typed_keys::Signature { by: by.to_string(), ts, mac: mac.to_string() })
+}
+
 fn required_u32(v: &serde_json::Value, key: &str) -> Result<u32, String> {
     optional_u32(v, key)?.ok_or_else(|| format!("missing \"{key}\" field"))
 }
@@ -861,7 +880,11 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
                 .and_then(|t| t.as_str())
                 .ok_or_else(|| "missing \"text\" field".to_string())?
                 .to_string();
-            Ok(IpcCommand::SendKeys { pane_id, text, caller: Default::default() })
+            let sig = match v.get("sig") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(sig) => Some(send_keys_signature(sig)?),
+            };
+            Ok(IpcCommand::SendKeys { pane_id, text, caller: Default::default(), sig })
         }
         "focus-pane" => {
             let pane_id = required_u32(&v, "pane_id")?;
@@ -1808,8 +1831,25 @@ mod tests {
             Ok(IpcCommand::FocusPane(4))
         ));
         match parse_command(r#"{"cmd":"send-keys","pane_id":4,"text":"ls\r"}"#) {
-            Ok(IpcCommand::SendKeys { pane_id: 4, text, .. }) => assert_eq!(text, "ls\r"),
+            Ok(IpcCommand::SendKeys { pane_id: 4, text, sig: None, .. }) => assert_eq!(text, "ls\r"),
             _ => panic!("send-keys"),
+        }
+        let mac = "ab".repeat(32);
+        match parse_command(&format!(r#"{{"cmd":"send-keys","pane_id":4,"text":"go","sig":{{"by":"kovalink","ts":1794559267123,"mac":"{mac}"}}}}"#)) {
+            Ok(IpcCommand::SendKeys { sig: Some(sig), .. }) => {
+                assert_eq!((sig.by.as_str(), sig.ts, sig.mac), ("kovalink", 1_794_559_267_123, mac.clone()));
+            }
+            _ => panic!("signed send-keys"),
+        }
+        for odd in [
+            r#""kovalink""#.to_string(),
+            format!(r#"{{"by":"Kova Link","ts":1,"mac":"{mac}"}}"#),
+            format!(r#"{{"by":"kovalink","ts":"1","mac":"{mac}"}}"#),
+            r#"{"by":"kovalink","ts":1,"mac":"abcd"}"#.to_string(),
+            format!(r#"{{"by":"kovalink","ts":1,"mac":"{mac}","key":"x"}}"#),
+            format!(r#"{{"ts":1,"mac":"{mac}"}}"#),
+        ] {
+            assert!(err(&format!(r#"{{"cmd":"send-keys","pane_id":4,"text":"go","sig":{odd}}}"#)).starts_with("\"sig\" must be"), "{odd}");
         }
         assert_eq!(
             err(r#"{"cmd":"send-keys","pane_id":4}"#),
