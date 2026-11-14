@@ -120,6 +120,10 @@ pub struct Entry {
     /// `decision`, `review`, `test`, `would`... The buttons depend on it.
     pub kind: String,
     pub title: String,
+    /// The queue's fingerprint of the card as listed (`card_seen`): sent back
+    /// with a gesture (`--card-seen`), so a click never lands on a card that
+    /// is not the one the page showed. Opaque here, never computed by Kova.
+    pub card_seen: Option<String>,
     /// What is expected of the user, when the entry says.
     pub needs: Option<String>,
     /// A URL, a file path (with an optional `#anchor`), or plain words.
@@ -326,6 +330,8 @@ struct Raw {
     waiting: Option<serde_json::Value>,
     #[serde(default)]
     ask: Option<serde_json::Value>,
+    #[serde(default)]
+    card_seen: Option<serde_json::Value>,
 }
 
 /// Parse the CLI's answer. `None` when it is not a JSON array at all; an
@@ -345,6 +351,7 @@ pub fn parse(text: &str) -> Option<Vec<Entry>> {
                 let as_word = |v: Option<serde_json::Value>| v.and_then(|v| v.as_str().map(str::to_string));
                 Some(Entry {
                     plan,
+                    card_seen: as_word(raw.card_seen.clone()).filter(|s| valid_seen(s)),
                     reply: reply_of(raw.gestures.clone(), as_word(raw.go_label.clone()), as_word(raw.waiting.clone()), raw.ask.clone()),
                     failed: nonempty(raw.failed.clone()),
                     uncertain: nonempty(raw.uncertain.clone()),
@@ -835,13 +842,20 @@ pub fn gesture_argv(
     seen: Option<&str>,
     draft: Option<&str>,
     client_id: &str,
+    card_seen: Option<&str>,
 ) -> Option<(String, Vec<String>)> {
     if !valid_id(id) || !valid_id(client_id) {
         return None;
     }
     let (bin, words) = act.split_first()?;
     let mut args: Vec<String> = words.to_vec();
-    args.extend([EXIT_CODES.to_string(), format!("{CLIENT_ID}={client_id}"), id.to_string(), gesture.word().to_string()]);
+    args.extend([EXIT_CODES.to_string(), format!("{CLIENT_ID}={client_id}")]);
+    // The card as the page showed it: the queue refuses the gesture when it
+    // is no longer that card (`EXIT_CARD_CHANGED`).
+    if let Some(card) = card_seen.filter(|s| valid_seen(s)) {
+        args.push(format!("{CARD_SEEN}={card}"));
+    }
+    args.extend([id.to_string(), gesture.word().to_string()]);
     let text = text.map(str::trim).filter(|t| !t.is_empty()).filter(|_| gesture.takes_text());
     if gesture == Gesture::Ask && text.is_none() {
         return None;
@@ -888,7 +902,14 @@ fn client_id_for(id: &str, gesture: Gesture, text: &str) -> String {
 /// refusal (exit 4) leaves the command's own line on the card; a question
 /// that did not go is kept with it (`instructions`), since the field was
 /// cleared.
-pub fn perform_gesture(id: &str, gesture: Gesture, text: Option<&str>, seen: Option<&str>, draft: Option<&str>) -> Result<(), String> {
+pub fn perform_gesture(
+    id: &str,
+    gesture: Gesture,
+    text: Option<&str>,
+    seen: Option<&str>,
+    draft: Option<&str>,
+    card_seen: Option<&str>,
+) -> Result<(), String> {
     let text = text.map(clean_text).filter(|t| !t.trim().is_empty()).filter(|_| gesture.takes_text());
     let known = CACHE.read().as_ref().is_some_and(|entries| entries.iter().any(|e| e.id == id));
     if !known {
@@ -901,7 +922,7 @@ pub fn perform_gesture(id: &str, gesture: Gesture, text: Option<&str>, seen: Opt
     // The same gesture is the same text on the same draft.
     let same = format!("{}\u{0}{}", text.as_deref().unwrap_or_default(), draft.as_deref().unwrap_or_default());
     let client_id = client_id_for(id, gesture, &same);
-    let (bin, args) = gesture_argv(&COMMANDS.read().act, id, gesture, text.as_deref(), seen, draft.as_deref(), &client_id)
+    let (bin, args) = gesture_argv(&COMMANDS.read().act, id, gesture, text.as_deref(), seen, draft.as_deref(), &client_id, card_seen)
         .ok_or_else(|| format!("attention: no command for {}", gesture.word()))?;
     set_outcome(id, Outcome::Running);
     if let Some(map) = INSTRUCTIONS.lock().as_mut() {
@@ -1108,6 +1129,14 @@ pub fn said_line(stdout: &str) -> Option<Delivery> {
 /// What a click's exit says: `code` is `None` when a signal ended it.
 /// `exit_codes` is whether the command was asked for them; without the
 /// flag, 3 is a failure like any other.
+/// The flag that carries a card's fingerprint (`Entry::card_seen`).
+pub const CARD_SEEN: &str = "--card-seen";
+/// The queue's exit code when the card is no longer the one shown: nothing
+/// was noted, closed or handed over.
+pub const EXIT_CARD_CHANGED: i32 = 5;
+/// What the card says then, after `Non transmis :`.
+pub const CARD_CHANGED: &str = "la carte a changé depuis son affichage, relis-la : rien n'est noté ni fermé";
+
 pub fn delivery_of(code: Option<i32>, exit_codes: bool) -> Option<Delivery> {
     match code {
         Some(0) => Some(Delivery::Delivered),
@@ -1184,6 +1213,8 @@ fn run_click_with(bin: &str, args: &[String], key: Option<&str>) -> Result<Deliv
                 (Delivery::Delivered, Some(said)) => said,
                 (delivery, _) => delivery,
             })
+        } else if exit_codes && out.status.code() == Some(EXIT_CARD_CHANGED) {
+            Err(CARD_CHANGED.to_string())
         } else {
             let err = String::from_utf8_lossy(&out.stderr);
             let line: String = err.lines().next().unwrap_or("").trim().chars().take(140).collect();
@@ -1289,9 +1320,10 @@ mod tests {
         let act: Vec<String> = ["/bin/attn", "act"].iter().map(|s| s.to_string()).collect();
         let cid = "0b5c1c2e-1111-4222-8333-444455556666";
         let seen = "0123456789abcdef";
+        let card_fp = "fedcba9876543210";
         for g in Gesture::ALL {
             let spec = &gestures[g.word()];
-            let argv = |text, draft| gesture_argv(&act, "a-1", g, text, Some(seen), draft, cid).map(|(_, a)| a);
+            let argv = |text, draft| gesture_argv(&act, "a-1", g, text, Some(seen), draft, cid, Some(card_fp)).map(|(_, a)| a);
             // The flags every click carries, then the card and the word, in the contract's order.
             let full = argv(Some("un texte"), Some("un brouillon")).unwrap_or_else(|| panic!("{} has an argv", g.word()));
             for flag in strings(&contract["always"]) {
@@ -1324,6 +1356,17 @@ mod tests {
         // The exit codes Kova tells apart.
         let codes = contract["exit_codes"].as_object().expect("exit_codes");
         assert!(codes.contains_key("0") && codes.contains_key(&EXIT_NOTED.to_string()) && codes.contains_key("4"), "{codes:?}");
+        // The card's fingerprint, once the contract names it: its flag on every
+        // gesture, its exit code, its field.
+        if let Some(card) = contract.get("card_seen") {
+            assert_eq!(card["flag"].as_str(), Some(CARD_SEEN));
+            assert_eq!(card["field"].as_str(), Some("card_seen"));
+            assert_eq!(card["refused_exit_code"].as_i64(), Some(i64::from(EXIT_CARD_CHANGED)));
+            for g in Gesture::ALL {
+                let (_, full) = gesture_argv(&act, "a-1", g, Some("un texte"), None, None, cid, Some(card_fp)).unwrap();
+                assert!(full.contains(&format!("{CARD_SEEN}={card_fp}")), "{} carries the card's fingerprint", g.word());
+            }
+        }
         // A card's fields, read under the names the contract gives them.
         let fields = &contract["card_fields"];
         for name in ["gestures", "go_label", "waiting", "ask"] {
@@ -1351,7 +1394,7 @@ mod tests {
     fn a_gesture_runs_act_with_its_word_a_client_id_and_what_it_carries() {
         let act: Vec<String> = ["/bin/attn", "act", "--by", "robin"].iter().map(|s| s.to_string()).collect();
         let cid = "0b5c1c2e-1111-4222-8333-444455556666";
-        let argv = |g, text, seen| gesture_argv(&act, "a-1", g, text, seen, None, cid).map(|(_, a)| a.join(" "));
+        let argv = |g, text, seen| gesture_argv(&act, "a-1", g, text, seen, None, cid, None).map(|(_, a)| a.join(" "));
         let head = format!("act --by robin --exit-codes --client-id={cid} a-1");
         assert_eq!(argv(Gesture::Go, None, None), Some(format!("{head} go")));
         assert_eq!(argv(Gesture::Go, Some("ok pour moi"), Some("0123456789abcdef")), Some(format!("{head} go --text=ok pour moi --seen=0123456789abcdef")));
@@ -1366,13 +1409,21 @@ mod tests {
         assert_eq!(argv(Gesture::Cancel, None, None), Some(format!("{head} cancel")));
         // The text is one argv element: never read as an option.
         // A draft the user rewrote goes with the go, and with no other gesture.
-        let with_draft = |g| gesture_argv(&act, "a-1", g, None, Some("0123456789abcdef"), Some("Salut,\n--by evil"), cid).unwrap().1;
+        let with_draft = |g| gesture_argv(&act, "a-1", g, None, Some("0123456789abcdef"), Some("Salut,\n--by evil"), cid, None).unwrap().1;
         assert_eq!(with_draft(Gesture::Go)[7..], ["--seen=0123456789abcdef".to_string(), "--draft=Salut,\n--by evil".to_string()]);
         assert!(!with_draft(Gesture::NoGo).iter().any(|a| a.starts_with("--draft")));
-        let (_, args) = gesture_argv(&act, "a-1", Gesture::Ask, Some("--by evil"), None, None, cid).unwrap();
+        let (_, args) = gesture_argv(&act, "a-1", Gesture::Ask, Some("--by evil"), None, None, cid, None).unwrap();
         assert_eq!(args.last().map(String::as_str), Some("--text=--by evil"));
-        assert_eq!(gesture_argv(&[], "a-1", Gesture::Go, None, None, None, cid), None, "no act_command");
-        assert_eq!(gesture_argv(&act, "-x", Gesture::Go, None, None, None, cid), None);
+        assert_eq!(gesture_argv(&[], "a-1", Gesture::Go, None, None, None, cid, None), None, "no act_command");
+        assert_eq!(gesture_argv(&act, "-x", Gesture::Go, None, None, None, cid, None), None);
+        // The card's fingerprint goes before the card, on every gesture; a
+        // value that is not one is left out, never passed as a flag.
+        for g in Gesture::ALL {
+            let (_, args) = gesture_argv(&act, "a-1", g, Some("t"), None, None, cid, Some("fedcba9876543210")).unwrap();
+            assert_eq!(args[..8].join(" "), format!("act --by robin --exit-codes --client-id={cid} --card-seen=fedcba9876543210 a-1 {}", g.word()));
+        }
+        let (_, args) = gesture_argv(&act, "a-1", Gesture::Go, None, None, None, cid, Some("--by=robin")).unwrap();
+        assert!(!args.iter().any(|a| a.contains("by=robin") || a.starts_with(CARD_SEEN)), "{args:?}");
         for g in Gesture::ALL {
             assert_eq!(Gesture::parse(g.word()), Some(g));
         }
@@ -1666,6 +1717,13 @@ mod tests {
         assert_eq!(delivery_of(Some(1), true), None);
         assert_eq!(delivery_of(Some(2), true), None);
         assert_eq!(delivery_of(None, true), None, "killed by a signal");
+        // The card is no longer the one shown: a refusal, never a delivery.
+        assert_eq!(delivery_of(Some(EXIT_CARD_CHANGED), true), None);
+        let refused = run_click_with("/bin/sh", &["-c".to_string(), "echo attn: autre carte >&2; exit 5".to_string(), EXIT_CODES.to_string()], None);
+        assert_eq!(refused, Err(CARD_CHANGED.to_string()), "its own words, shown after Non transmis");
+        // The queue's fingerprint is read as given, or not at all.
+        let cards = parse(r#"[{"id":"a-1","level":"now","title":"t","card_seen":"fedcba9876543210"},{"id":"a-2","level":"now","title":"t","card_seen":"--by=robin"},{"id":"a-3","level":"now","title":"t"}]"#).unwrap();
+        assert_eq!(cards.iter().map(|c| c.card_seen.as_deref()).collect::<Vec<_>>(), [Some("fedcba9876543210"), None, None]);
         // The command sends the message itself and says so: its line, as it is.
         assert_eq!(said_line("envoi par le code (slack à U0BJ301TJNM)\nmore\n"), Some(Delivery::ByCode("envoi par le code (slack à U0BJ301TJNM)".into())));
         assert_eq!(said_line("remis à claap-agent\n"), None);

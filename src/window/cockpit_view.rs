@@ -86,6 +86,9 @@ pub struct CockpitSlot {
     /// Entries removed, done or snoozed from here, by key, with when (ms):
     /// hidden until the queue drops them, back if the command failed.
     hidden: RefCell<HashMap<String, u64>>,
+    /// The card filed last, shown as its receipt in its place until the
+    /// next gesture or until the page closes.
+    receipt: RefCell<Option<Item>>,
     /// The catch-up band: folded with its chevron, every row shown after
     /// `Voir plus`, the project rows opened in place.
     band_folded: Cell<bool>,
@@ -329,6 +332,7 @@ impl KovaView {
         let frame = if slot.open.get() && !self.metal_overlay_open() { self.cockpit_frame() } else { None };
         let Some(frame) = frame else {
             slot.chat_target.set(None);
+            slot.receipt.replace(None);
             self.hide_cockpit();
             return;
         };
@@ -393,6 +397,18 @@ impl KovaView {
             // A command that failed brings its card back, with its words.
             hidden.retain(|k, _| !items.iter().any(|i| &i.key == k && matches!(i.state, State::Failed(_))));
             items.retain(|i| !hidden.contains_key(&i.key));
+        }
+        {
+            // The receipt of the last card filed, where the card was. A card
+            // back in the list (its gesture failed) shows itself instead.
+            let mut receipt = slot.receipt.borrow_mut();
+            if receipt.as_ref().is_some_and(|r| items.iter().any(|i| i.key == r.key)) {
+                *receipt = None;
+            }
+            if let Some(r) = receipt.as_ref() {
+                items.push(r.clone());
+                cockpit::sort(&mut items);
+            }
         }
         self.cockpit_fill(&mut items);
         let mut page = slot.page.borrow_mut();
@@ -789,6 +805,13 @@ impl KovaView {
                     // Gone from the page at once; the next read drops it.
                     Ok(()) if matches!(verb, Verb::Resolve | Verb::Dismiss | Verb::NoGo | Verb::Snooze) => {
                         slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
+                        let words = match verb {
+                            Verb::Resolve => "Fait : carte rangée",
+                            Verb::NoGo => "No go noté",
+                            Verb::Snooze => "Carte reportée",
+                            _ => "Carte écartée",
+                        };
+                        self.cockpit_receipt(&item, words, text.filter(|_| verb != Verb::Snooze));
                     }
                     Ok(()) => {}
                     // Refused before it ran: the card stays and says why.
@@ -866,9 +889,15 @@ impl KovaView {
         let seen = item.draft.as_ref().and_then(|d| d.seen.clone());
         // A rewritten draft only where the card shows one.
         let draft = draft.filter(|_| item.draft.is_some());
-        match crate::attention::perform_gesture(id, gesture, text, seen.as_deref(), draft) {
+        match crate::attention::perform_gesture(id, gesture, text, seen.as_deref(), draft, item.card_seen.as_deref()) {
             Ok(()) if gesture.files() => {
                 slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
+                let words = match gesture {
+                    Gesture::Go => "Go noté",
+                    Gesture::NoGo => "No go noté",
+                    _ => "Vu : carte rangée",
+                };
+                self.cockpit_receipt(&item, words, text.filter(|_| gesture.takes_text()));
             }
             Ok(()) => {}
             Err(why) => {
@@ -880,6 +909,13 @@ impl KovaView {
             }
         }
         self.mark_dirty();
+    }
+
+    /// The card just filed becomes its receipt (`cockpit::receipt_html`).
+    fn cockpit_receipt(&self, item: &Item, words: &'static str, text: Option<&str>) {
+        let text = text.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        let filed = cockpit::Filed { words, text };
+        self.ivars().cockpit.receipt.replace(Some(Item { filed: Some(filed), detail: None, draft: None, ..item.clone() }));
     }
 
     /// An instruction typed on an opened attention card: `act_command ID

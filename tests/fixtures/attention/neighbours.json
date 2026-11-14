@@ -1,0 +1,14 @@
+[
+  {"id": "a-cccc03", "ts": "2026-11-14T00:29:22+01:00", "from": "dev-settings", "level": "point", "kind": "test",
+   "title": "Open settings per app on the conflict card", "needs": "Look at the before and after",
+   "body": "Test plan: open the card, press the shortcut.", "before": "/nonexistent/kova-replay/before.png", "after": "/nonexistent/kova-replay/after.png",
+   "scope": "pro", "gestures": ["go", "nogo", "ask", "seen"], "waiting": "robin", "go_label": "Go", "ask": null, "card_seen": "cccccccccccc0003"},
+  {"id": "a-aaaa01", "ts": "2026-11-14T01:07:53+01:00", "from": "dev-people", "level": "point", "kind": "test",
+   "title": "People popover groups, visuals to validate", "needs": "OK on the captures and the test plan",
+   "body": "Test plan: open the popover, check the three groups.\nSecond line.\nThird line.", "before": "/nonexistent/kova-replay/b2.png", "after": "/nonexistent/kova-replay/a2.png",
+   "scope": "pro", "gestures": ["go", "nogo", "ask", "seen"], "waiting": "robin", "go_label": "Go", "ask": null, "card_seen": "aaaaaaaaaaaa0001"},
+  {"id": "a-bbbb02", "ts": "2026-11-14T09:14:05+01:00", "from": "hiring", "level": "point", "kind": "ask",
+   "title": "Candidate Doe, refusal to validate", "needs": "Validate the refusal message",
+   "draft": {"to": "Jane Doe", "channel": "linkedin", "text": "Hello Jane, thank you for your time.", "seen": "938fd1db96aac267"},
+   "scope": "pro", "gestures": ["go", "nogo", "ask", "seen"], "waiting": "robin", "go_label": "Go, envoyer", "ask": null, "card_seen": "bbbbbbbbbbbb0002"}
+]

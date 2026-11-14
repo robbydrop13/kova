@@ -21,6 +21,7 @@ kova render: write Kova's pages as HTML files, without a window
   kova render cockpit --list <json> --out <dir>
         [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
         [--state <card id>=delivered|noted|running|failed:<why>]... [--refs <json>]
+        [--filed <card id>=go|nogo|seen[:<text>]]...
         [--journal <file.md>] [--ask <question.json>]...
       <json> files hold what the `[attention]` commands print: `attn list --open --json`,
       `attn inflight --json`, `attn catchup --json`; panes: [[\"session\", working], ...].
@@ -190,6 +191,19 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
         states.insert(id.to_string(), outcome);
     }
     let mut items: Vec<cockpit::Item> = entries.iter().filter_map(|e| cockpit::from_attention(e, states.get(&e.id), true)).collect();
+    // A card just filed, as its receipt in its place (the page's last gesture).
+    for f in a.all("--filed") {
+        let (id, what) = f.split_once('=').ok_or("--filed: <card id>=go|nogo|seen[:<text>]")?;
+        let (word, text) = what.split_once(':').map_or((what, None), |(w, t)| (w, Some(t.to_string())));
+        let words = match word {
+            "go" => "Go noté",
+            "nogo" => "No go noté",
+            "seen" => "Vu : carte rangée",
+            other => return Err(format!("--filed: '{other}' is not go, nogo or seen")),
+        };
+        let item = items.iter_mut().find(|i| i.key == format!("attention:{id}")).ok_or_else(|| format!("--filed: no card {id} in the list"))?;
+        item.filed = Some(cockpit::Filed { words, text });
+    }
     // Waiting asks, each from its file of the board's store: their tiles as
     // the Cockpit makes them (`from_need`, then `ask_title`).
     for file in a.all("--ask") {

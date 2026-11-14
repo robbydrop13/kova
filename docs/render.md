@@ -16,6 +16,7 @@ to the work, without asking the user to launch anything. Code:
 kova render cockpit --list <json> --out <dir>
       [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
       [--state <card id>=delivered|noted|running|failed:<why>]... [--refs <json>]
+      [--filed <card id>=go|nogo|seen[:<text>]]...
       [--journal <file.md>] [--ask <question.json>]...
 kova render chat --transcript <jsonl> --out <file.html>
       [--markers "a|b"] [--base <the pane's folder>] [--exchanges N] [--unfold] [--light]
@@ -36,7 +37,7 @@ reason on stderr, nothing written).
 
 | Page | Reads | Writes |
 |---|---|---|
-| `cockpit` | what the `[attention]` commands print, saved to files: the queue (`command`, e.g. `attn list --open --json --scope all`), the clicks in flight (`inflight_command`), the catch-up (`catchup_command`); `--panes` is `[["session name", working], ...]` | `default.html` (the cards), `menu.html` (the filter menu open), `chips.html` (one space, En cours), `en-cours.html`, `fait.html`, and `card.html` (the card `--open` names, opened with its detail). With `--catchup`, the band is on every page, unfolded, every project opened. `--state` shows a card as a click left it (handed to the agent, recorded, running, failed with its reason); `--ask` adds a waiting `kova ask` (a sheet or a question) from its file of the board's store (`~/.config/kova/ask/questions/<id>.json`); a state that starts with `envoi par le code` is the line of a send by the command itself |
+| `cockpit` | what the `[attention]` commands print, saved to files: the queue (`command`, e.g. `attn list --open --json --scope all`), the clicks in flight (`inflight_command`), the catch-up (`catchup_command`); `--panes` is `[["session name", working], ...]` | `default.html` (the cards), `menu.html` (the filter menu open), `chips.html` (one space, En cours), `en-cours.html`, `fait.html`, and `card.html` (the card `--open` names, opened with its detail). With `--catchup`, the band is on every page, unfolded, every project opened. `--filed` shows a card as its receipt, the gesture just filed with the text that left with it; `--state` shows a card as a click left it (handed to the agent, recorded, running, failed with its reason); `--ask` adds a waiting `kova ask` (a sheet or a question) from its file of the board's store (`~/.config/kova/ask/questions/<id>.json`); a state that starts with `envoi par le code` is the line of a send by the command itself |
 | `chat` | a Claude transcript, read as the chat reads it (the window from the end, widened until it holds the exchanges shown) | the thread. `--markers` is `[chat] rewrite_markers`, `--base` the folder relative paths are read against, `--unfold` opens the `Version précédente` rows. Prints what it read; exit 1 when a text the assistant wrote in the exchanges shown is not on the page |
 | `sheet` | a decision sheet file (`kova ask --decisions`) | the sheet as the side panel shows it, unanswered |
 | `question` | a long `kova ask` message | the question as the side panel shows it |

@@ -171,6 +171,11 @@ pub struct Item {
     pub shots: Vec<(String, String)>,
     /// Its label, a colored tag next to its space (`attn labels`).
     pub label: Option<crate::attention::Label>,
+    /// The queue's fingerprint of the card as rendered (`Entry::card_seen`):
+    /// it goes back with every gesture clicked on it.
+    pub card_seen: Option<String>,
+    /// The user just filed it: the card is its receipt, in its place.
+    pub filed: Option<Filed>,
     /// An attention entry's reply zone as the queue gives it (`zoned`).
     pub reply: crate::attention::Reply,
 }
@@ -338,7 +343,11 @@ fn level_prio(level: Level) -> Option<u8> {
 pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) -> Option<Item> {
     let default = level_prio(entry.level)?;
     let state = match outcome {
-        Some(Outcome::Closed) => return None,
+        // Closed from here: gone until the queue drops it. A card the queue
+        // sent back (`attn fail`, a send in doubt) is a new wait, shown with
+        // its reason whatever this app remembers of the click.
+        Some(Outcome::Closed) if entry.failed.is_none() && entry.uncertain.is_none() => return None,
+        Some(Outcome::Closed) => State::Idle,
         Some(Outcome::Running) => State::Running,
         Some(Outcome::Sent) => State::Sent,
         Some(Outcome::SentByCode(line)) => State::SentByCode(line.clone()),
@@ -374,6 +383,8 @@ pub fn from_attention(entry: &Entry, outcome: Option<&Outcome>, openable: bool) 
             .filter_map(|(label, path)| path.clone().map(|p| (label.to_string(), p)))
             .collect(),
         label: entry.label.clone(),
+        card_seen: entry.card_seen.clone(),
+        filed: None,
     })
 }
 
@@ -511,6 +522,8 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
         instruction: None,
         shots: Vec::new(),
         label: None,
+        card_seen: None,
+        filed: None,
     })
 }
 
@@ -1029,8 +1042,43 @@ fn state_html(state: &State) -> String {
     }
 }
 
+/// What the user just did to a card, said in its place once it is filed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Filed {
+    /// `Go noté`, `No go noté`, `Vu : carte rangée`…
+    pub words: &'static str,
+    /// The text that left with the gesture.
+    pub text: Option<String>,
+}
+
+/// The receipt of a filed card: what was done, on which card, with which
+/// text. It takes the card's place, so the card that slides up is never
+/// taken for the one just answered (14/11/2026: a text typed for one card
+/// left on its neighbour). No button: it goes with the next gesture.
+pub fn receipt_html(item: &Item, filed: &Filed, now: u64) -> String {
+    let text = filed
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("<p class=\"msg sent\">Ton texte, parti avec : {}</p>", esc(t)))
+        .unwrap_or_default();
+    format!(
+        "<article class=\"card filed\" data-key=\"{}\"><div class=\"row\"><div class=\"txt\">\
+         <div class=\"state ok top\">{ICON_CHECK}<span>{} sur cette carte</span></div>\
+         <div class=\"t\">{}</div>{}{text}</div></div></article>",
+        esc(&item.key),
+        filed.words,
+        esc(&item.title),
+        source_html(item, now),
+    )
+}
+
 /// One card.
 pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, now: u64) -> String {
+    if let Some(filed) = &item.filed {
+        return receipt_html(item, filed, now);
+    }
     // `Refuser` closes the entry: no close command, no `Refuser`.
     let list: Vec<Button> = buttons(item, can_act).into_iter().filter(|&b| can_close || b != Button::Refuse).collect();
     let icon_list = if zoned(item, can_act) { zone_icons(item, can_snooze) } else { icons(item, can_close, can_snooze) };
@@ -1082,12 +1130,15 @@ fn reply_zone_html(item: &Item, running: bool) -> String {
         _ => String::new(),
     };
     format!(
-        "<div class=\"instr rz\"><div class=\"lbl\">Ta réponse</div>\
+        "<div class=\"instr rz\"><div class=\"lbl\">Ta réponse sur <b>{on}</b></div>\
          <textarea class=\"ins rz-t\" rows=\"2\" spellcheck=\"true\" placeholder=\"{REPLY_PLACEHOLDER}\"{}></textarea>\
          <div class=\"rz-a\">{hint}{buttons}</div>{failed}</div>",
         if running { " readonly" } else { "" },
         // Why Demander is off, in words: shown while the field is empty.
         hint = if has(Gesture::Ask) { format!("<span class=\"hint\">{ASK_HINT}</span>") } else { String::new() },
+        // The zone names its card: the field under a neighbour's screenshots
+        // is never taken for that neighbour's.
+        on = esc(&item.title),
     )
 }
 
@@ -1133,8 +1184,10 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     // the draft's actions when it has a draft.
     let zone = zoned(item, can_act);
     if zone {
-        // A draft is shown whole, so its zone is too; else once opened.
-        if item.draft.is_some() || item.detail.is_some() {
+        // A draft is shown whole, so its zone is too, and so is the zone of a
+        // card that shows its screenshots: what is judged on sight is
+        // answered on the same card. Else once opened.
+        if item.draft.is_some() || item.detail.is_some() || !item.shots.is_empty() {
             detail.push_str(&reply_zone_html(item, running));
         }
     } else if item.kind == Kind::Attention && item.detail.is_some() && can_act {
@@ -1833,6 +1886,9 @@ textarea.ans:focus{border-color:var(--accent);outline:0}
 textarea.ins{display:block;width:100%;margin-top:4px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;line-height:19px;padding:6px 10px;resize:vertical}
 textarea.ins:focus{border-color:var(--accent);outline:0}
 .msg.sent{margin-top:4px;font-size:12px;color:var(--t2)}
+.card.going{opacity:.45;pointer-events:none}
+.card.filed{cursor:default;border-style:dashed}.card.filed .state{display:flex;align-items:center;gap:6px}.card.filed .t{color:var(--t2)}.card.filed .msg.sent{white-space:pre-wrap}
+.rz .lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.rz .lbl b{font-weight:600;color:var(--t2)}
 div.why{margin-top:8px;cursor:auto}div.why[hidden]{display:none}
 input.why{display:block;width:100%;height:28px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:0 10px}
 input.why:focus{border-color:var(--accent);outline:0}
@@ -2198,8 +2254,25 @@ function fmOpen(b) {
   m.style.top = (r.bottom + 4) + 'px';
   m.style.left = Math.max(8, Math.min(r.left, window.innerWidth - m.offsetWidth - 8)) + 'px';
 }
-function hide(key) { const c = document.querySelector('.card[data-key="' + CSS.escape(key) + '"]'); if (c) c.style.display = 'none'; }
+// A card just filed stays where it is, dimmed and out of reach, until the
+// list comes back with its receipt in its place. The cards below then move
+// up: for a moment, and until the pointer has moved, no button acts, so a
+// second click never lands on what slid under the pointer.
+let filedAt = 0, still = null, lastClick = null;
+const GUARD_MS = 700;
+function guarded() { return Date.now() - filedAt < GUARD_MS || still !== null; }
+document.addEventListener('mousemove', e => {
+  if (still && Math.hypot(e.clientX - still[0], e.clientY - still[1]) > 6) still = null;
+});
+function hide(key) {
+  filedAt = Date.now();
+  still = lastClick;
+  const c = document.querySelector('.card[data-key="' + CSS.escape(key) + '"]');
+  if (c) c.classList.add('going');
+}
 document.addEventListener('click', e => {
+  // Where a real pointer clicked (a click from the keyboard has no place).
+  lastClick = e.detail > 0 ? [e.clientX, e.clientY] : null;
   // A link inside a text (a card, En cours, Fait, the band): the side
   // panel, never this page, and not the card or the row under it.
   const a = e.target.closest('a');
@@ -2258,7 +2331,7 @@ document.addEventListener('click', e => {
   // A click on a card's body, not on a button or a field: it opens or folds.
   if (!b) {
     const card = e.target.closest('.card');
-    if (!card || e.target.closest('textarea, input, a, .detail, .instr, .why')) return;
+    if (!card || card.classList.contains('filed') || e.target.closest('textarea, input, a, .detail, .instr, .why')) return;
     if (String(window.getSelection()).trim()) return;
     return post({ type: 'act', key: card.dataset.key, act: 'expand' });
   }
@@ -2272,6 +2345,8 @@ document.addEventListener('click', e => {
   if (b.dataset.theme) return post({ type: 'theme' });
   const card = b.closest('.card');
   if (!card || !b.dataset.act) return;
+  // Right after a card was filed, a button that files, sends or answers waits.
+  if (guarded() && !['expand', 'open', 'link', 'pane'].includes(b.dataset.act)) return;
   const t = card.querySelector('textarea.bd');
   let act = b.dataset.act;
   // Corriger, text untouched: the card opens on its instruction field, sent to
@@ -2385,6 +2460,7 @@ mod tests {
 
     fn entry(id: &str, level: Level, prio: Option<u8>, since: u64) -> Entry {
         Entry {
+            card_seen: None,
             id: id.into(),
             since,
             from: "claap-agent".into(),
@@ -2416,6 +2492,44 @@ mod tests {
         list.into_iter().next().unwrap()
     }
 
+    /// 14/11/2026: a text typed for one card left with a No go on its
+    /// neighbour. Every gesture was bound to its card's id; the text had been
+    /// typed in the neighbour's field. After a card is filed the next one
+    /// slid into its place, and a folded card showed its screenshots with no
+    /// field, so the only `Ta réponse` in sight was another card's.
+    #[test]
+    fn a_filed_card_leaves_a_receipt_and_a_field_names_its_card() {
+        let gestures = r#""gestures":["go","nogo","ask","seen"],"go_label":"Go","waiting":"robin","ask":null,"card_seen":"fedcba9876543210""#;
+        // The fingerprint the queue listed is the one the card sends back.
+        let mut shown = from_attention(&zone_entry("a-1", &format!(r#"{gestures},"kind":"test","title":"Open settings <b>""#).replace(r#""kind":"would","title":"T","#, "")), None, false).unwrap();
+        assert_eq!(shown.card_seen.as_deref(), Some("fedcba9876543210"));
+        // A card that shows its screenshots shows its own field, folded.
+        assert!(!card_html(&shown, true, true, true, 10).contains("rz-t"), "no screenshot, folded: no field");
+        shown.shots = vec![("Avant".into(), "/nonexistent/before.png".into())];
+        let folded = card_html(&shown, true, true, true, 10);
+        assert!(shown.detail.is_none() && folded.contains("class=\"ins rz-t\"") && folded.contains(r#"data-arg="nogo""#), "{folded}");
+        // The field says which card it answers, escaped.
+        assert!(folded.contains("<div class=\"lbl\">Ta réponse sur <b>Open settings &lt;b&gt;</b></div>"), "{folded}");
+        // Filed: the receipt, under the same key, with the text that left and no button.
+        shown.filed = Some(Filed { words: "No go noté", text: Some("le bleu <pâle>\nne va pas".into()) });
+        let receipt = card_html(&shown, true, true, true, 10);
+        assert!(receipt.starts_with("<article class=\"card filed\" data-key=\"attention:a-1\">"), "{receipt}");
+        assert!(receipt.contains("<span>No go noté sur cette carte</span>") && receipt.contains("Open settings &lt;b&gt;"), "{receipt}");
+        assert!(receipt.contains("Ton texte, parti avec : le bleu &lt;pâle&gt;\nne va pas"), "{receipt}");
+        assert!(!receipt.contains("<button") && !receipt.contains("<textarea") && !receipt.contains("<img"), "{receipt}");
+        shown.filed = Some(Filed { words: "Vu : carte rangée", text: None });
+        assert!(!card_html(&shown, true, true, true, 10).contains("Ton texte"));
+        // The page: a filed card is dimmed in place, never removed by the
+        // script, its receipt does not open, and a button waits a moment
+        // after a filing so a second click does not file what slid under it.
+        let page = shell(false, "n");
+        assert!(page.contains("if (c) c.classList.add('going');") && !page.contains("c.style.display = 'none'"));
+        assert!(page.contains(".card.going{opacity:.45;pointer-events:none}"));
+        assert!(page.contains("if (!card || card.classList.contains('filed') ||"));
+        assert!(page.contains("if (guarded() && !['expand', 'open', 'link', 'pane'].includes(b.dataset.act)) return;"));
+        assert!(page.contains("function guarded() { return Date.now() - filedAt < GUARD_MS || still !== null; }") && page.contains("still = lastClick;"));
+    }
+
     #[test]
     fn a_card_the_queue_lists_gestures_for_answers_in_its_reply_zone() {
         use crate::attention::Gesture;
@@ -2440,7 +2554,7 @@ mod tests {
         // disabled until something is typed; the former verbs are gone.
         item.detail = Some(entry_detail(&e, false));
         let open = card_html(&item, true, true, true, 10);
-        assert!(open.contains("<div class=\"lbl\">Ta réponse</div>") && open.contains("class=\"ins rz-t\""), "{open}");
+        assert!(open.contains("<div class=\"lbl\">Ta réponse sur <b>T</b></div>") && open.contains("class=\"ins rz-t\""), "{open}");
         let at = |w: &str| open.find(w).unwrap_or_else(|| panic!("{w} in {open}"));
         let ask = r#"data-arg="ask" title="Écris ta question pour demander" disabled"#;
         assert!(at(r#"data-arg="nogo""#) < at(ask) && at(ask) < at(r#"data-arg="go""#));
@@ -2900,6 +3014,14 @@ mod tests {
         assert_eq!(from_attention(&entry("a-4", Level::Point, Some(1), 10), None, false).map(|i| i.prio), Some(1));
         // Closed from here: gone until the queue drops it.
         assert!(from_attention(&entry("a-5", Level::Now, None, 10), Some(&Outcome::Closed), false).is_none());
+        // 14/11/2026: a go held back by the chief (`attn fail`) comes back,
+        // even if the click's memory was not dropped in between.
+        let back = Entry { failed: Some("Clic tenu : go à reconfirmer".into()), ..entry("a-5", Level::Now, None, 10) };
+        let card = from_attention(&back, Some(&Outcome::Closed), false).expect("a card sent back shows again");
+        assert_eq!(card.state, State::Idle);
+        assert!(card_html(&card, true, true, true, 10).contains("Échec : Clic tenu : go à reconfirmer"));
+        let unsure = Entry { uncertain: Some("timeout".into()), ..entry("a-5", Level::Now, None, 10) };
+        assert!(from_attention(&unsure, Some(&Outcome::Closed), false).is_some());
     }
 
     #[test]
@@ -3378,6 +3500,7 @@ mod shot_demo {
         let Ok(out) = std::env::var("KOVA_SHOT_DEMO") else { return };
         let (b, a) = (std::env::var("KOVA_SHOT_B").unwrap(), std::env::var("KOVA_SHOT_A").unwrap());
         let e = crate::attention::Entry {
+            card_seen: None,
             id: "a-demo".into(), since: 1, from: "groom-priorisation".into(), level: crate::attention::Level::Now,
             kind: "test".into(), title: "CLA-10067 (skeleton du desktop) : avant / après".into(),
             needs: Some("Valider le visuel".into()), action: None, topic: None, scope: crate::attention::Scope::Pro,
