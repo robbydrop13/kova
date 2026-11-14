@@ -331,6 +331,10 @@ pub struct Signed {
 pub fn signed_now(sig: Option<&Signature>, pane_id: u32, text: &str) -> Signed {
     static SEEN: Mutex<Seen> = Mutex::new(Vec::new());
     let Some(sig) = sig else { return Signed::default() };
+    // The chat box's own mark is not a name a signature may carry.
+    if sig.by == CHAT {
+        return Signed { by: None, error: Some(SignatureError::Bad.as_str()) };
+    }
     let key = crate::attention::signing_key();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -475,6 +479,49 @@ pub fn entry(
         "caller_pid": caller.pid,
         "caller": caller.name,
     })
+}
+
+/// `signed` of a message the user typed in Kova's own chat box: his words,
+/// typed by Kova itself, never through the socket. No signature may claim it.
+pub const CHAT: &str = "kova-chat";
+
+/// How the Enter of a chat message ended (`enter` in its journal line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enter {
+    /// Written: the message left.
+    Written,
+    /// Not written: a dialog came up, or the prompt never showed the text.
+    /// The text waits in the terminal's prompt.
+    Held,
+    /// Not written: its tick came too late. The text waits in the prompt.
+    Dropped,
+}
+
+impl Enter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Enter::Written => "written",
+            Enter::Held => "held",
+            Enter::Dropped => "dropped",
+        }
+    }
+}
+
+/// One journal line for a message pasted by Kova's chat box: the shape of a
+/// `send-keys` line, `signed` and `caller` saying it is Kova's own chat,
+/// plus `enter`, `null` until `chat_entered` fills it. `ts` is the paste.
+pub fn chat_entry(ts: &str, pane_id: u32, target: &Target, text: &str, mode: Mode) -> serde_json::Value {
+    let caller = Caller { pid: Some(std::process::id() as i32), name: Some("kova".into()) };
+    let signed = Signed { by: Some(CHAT.to_string()), error: None };
+    let mut line = entry(ts, pane_id, target, text, &read(text), mode, Verdict::Accepted, &caller, &signed);
+    line["enter"] = serde_json::Value::Null;
+    line
+}
+
+/// The chat line `line` with how its Enter ended.
+pub fn chat_entered(mut line: serde_json::Value, enter: Enter) -> serde_json::Value {
+    line["enter"] = enter.as_str().into();
+    line
 }
 
 /// Append one line to the journal. A journal that cannot be written is said
@@ -748,6 +795,29 @@ mod tests {
         assert_eq!(caller.pid, Some(std::process::id() as i32));
         assert!(caller.name.is_some_and(|n| n.starts_with("kova")));
         drop(theirs);
+    }
+
+    #[test]
+    fn a_chat_message_is_journaled_as_the_user_s_own_with_how_its_enter_ended() {
+        let target = Target { agent: Some("claude".into()), claude: true, session: Some("chief".into()), session_id: Some("abc".into()) };
+        let text = "secret words, untagged";
+        let line = chat_entry("2026-11-14T13:39:56.000Z", 1, &target, text, Mode::Enforce);
+        assert_eq!(line["signed"], CHAT);
+        assert_eq!(line["verdict"], "accepted", "the user's own words are never held by the tag rule");
+        assert_eq!(line["kind"], "untagged");
+        assert_eq!(line["caller"], "kova");
+        assert_eq!(line["caller_pid"], std::process::id());
+        assert_eq!(line["len"], text.len());
+        assert_eq!(line["sha256"], sha256_hex(text.as_bytes()));
+        assert_eq!(line["enter"], serde_json::Value::Null);
+        for (enter, word) in [(Enter::Written, "written"), (Enter::Held, "held"), (Enter::Dropped, "dropped")] {
+            let done = chat_entered(line.clone(), enter);
+            assert_eq!(done["enter"], word);
+            assert!(!done.to_string().contains("secret"));
+        }
+        // Nobody signs as the chat box through the socket.
+        let sig = Signature { by: CHAT.into(), ts: 0, mac: "00".into() };
+        assert_eq!(signed_now(Some(&sig), 1, text), Signed { by: None, error: Some("bad_signature") });
     }
 
     #[test]

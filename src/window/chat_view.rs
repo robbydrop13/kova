@@ -105,6 +105,9 @@ struct ChatState {
     first: bool,
     focus: bool,
     outbox: input::Outbox,
+    /// The journal line of the message pasted and waiting for its Enter
+    /// (`typed_keys::chat_entry`): written once the Enter is decided.
+    sending: Option<Value>,
     /// Why the queue waits, as the gate said last.
     queue_reason: &'static str,
     note: Option<String>,
@@ -158,6 +161,7 @@ impl ChatState {
             first: true,
             focus: false,
             outbox: input::Outbox::default(),
+            sending: None,
             queue_reason: "",
             note: None,
             restore: None,
@@ -465,7 +469,7 @@ impl KovaView {
                     // Through the queue: the poll this same tick decides on
                     // the state read now, not the last poll's.
                     Ok(text) => match st.outbox.submit(text, input::Verdict::Wait(""), crate::surface::monotonic_ms()) {
-                        input::Step::Type(text) => type_into(pane, &text),
+                        input::Step::Type(text) => st.sending = Some(type_into(pane, &text)),
                         input::Step::Queued(reason) => {
                             if !reason.is_empty() {
                                 st.queue_reason = reason;
@@ -693,11 +697,26 @@ enum Reply {
     Open(super::side_panel::PanelTarget),
 }
 
-/// Paste `text` into the pane, bracketed when the app asked for it.
-fn type_into(pane: &Pane, text: &str) {
+/// Paste `text` into the pane, bracketed when the app asked for it. Returns
+/// its journal line, to write once its Enter is decided (`journal_send`).
+fn type_into(pane: &Pane, text: &str) -> Value {
     let bracketed = pane.terminal.read().bracketed_paste;
     log::info!("pane {}: chat typed {} bytes", pane.id, text.len());
-    pane.paste(&input::typed(text, bracketed));
+    let typed = input::typed(text, bracketed);
+    let target = crate::ipc::host::typing_target_of(pane);
+    let line = crate::typed_keys::chat_entry(&crate::typed_keys::now_utc(), pane.id, &target, &typed, crate::typed_keys::policy().mode);
+    pane.paste(&typed);
+    line
+}
+
+/// The message typed last goes to the send-keys journal with how its Enter
+/// ended: what the user typed himself in the chat is on record like what a
+/// tool typed through the socket, without its text.
+fn journal_send(st: &mut ChatState, enter: crate::typed_keys::Enter) {
+    let Some(line) = st.sending.take() else { return };
+    if let Some(journal) = crate::typed_keys::policy().journal {
+        crate::typed_keys::append(&journal, &crate::typed_keys::chat_entered(line, enter));
+    }
 }
 
 /// The pane's screen as text, and whether its input line holds only greyed
@@ -1054,7 +1073,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         st.queue_reason = reason;
     }
     match st.outbox.poll(verdict, crate::surface::monotonic_ms()) {
-        input::Step::Type(text) => type_into(pane, &text),
+        input::Step::Type(text) => st.sending = Some(type_into(pane, &text)),
         input::Step::Enter => {
             // Only onto the text just pasted: the prompt still holds it and
             // nothing else came up meanwhile (a permission prompt, a menu).
@@ -1068,6 +1087,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
                 pane.pty.write(b"\r");
                 pane.clear_awaiting();
                 log::info!("pane {}: chat Enter written", pane.id);
+                journal_send(st, crate::typed_keys::Enter::Written);
             } else if !prompt && composer == input::Composer::Empty && st.outbox.not_shown(now) {
                 // The paste is not drawn yet (a greyed suggestion is not it):
                 // the Enter waits for it, `ENTER_STALE_MS` at most.
@@ -1075,11 +1095,13 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
                 st.outbox.stuck();
                 st.note = Some(NOT_ENTERED.to_string());
                 log::warn!("pane {}: chat Enter held (dialog: {prompt}, composer: {composer:?})", pane.id);
+                journal_send(st, crate::typed_keys::Enter::Held);
             }
         }
         input::Step::Stale => {
             st.note = Some(NOT_ENTERED.to_string());
             log::warn!("pane {}: chat Enter dropped, too late", pane.id);
+            journal_send(st, crate::typed_keys::Enter::Dropped);
         }
         input::Step::Queued(_) | input::Step::Nothing => {}
     }
