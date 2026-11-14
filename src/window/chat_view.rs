@@ -700,11 +700,18 @@ fn type_into(pane: &Pane, text: &str) {
     pane.paste(&input::typed(text, bracketed));
 }
 
+/// The pane's screen as text, and whether its input line holds only greyed
+/// text (`TerminalState::prompt`): what `input::composer` reads.
+fn screen(pane: &Pane) -> (String, bool) {
+    let term = pane.terminal.read();
+    (term.dump_text(crate::terminal::DumpMode::Visible, true).text, term.prompt().is_some_and(|p| p.ghost))
+}
+
 /// Whether the pane's prompt takes a message now (`chat::input::gate`).
 /// `ended`: Stop ran since the last prompt (`banner::turn_ended`), so a busy
 /// pane is only waiting for its background agents.
 fn gate(pane: &Pane, status: banner::Banner, ended: bool) -> input::Verdict {
-    let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+    let (visible, ghost) = screen(pane);
     // A permission prompt that came up since the last poll waits too.
     let prompt = pane.has_permission_prompt()
         || crate::prompt_preview::parse_permission_prompt(&visible).is_some()
@@ -720,7 +727,7 @@ fn gate(pane: &Pane, status: banner::Banner, ended: bool) -> input::Verdict {
         } else {
             status
         },
-        composer: input::composer(&visible),
+        composer: input::composer(&visible, ghost),
     })
 }
 
@@ -984,8 +991,8 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
     let question = st.conv.question_pending();
     let asked = question || st.hook.is_some_and(|h| h.turn == banner::Turn::Waiting);
     let prompt_line = !(asked && !spinner) || {
-        let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
-        input::composer(&visible) != input::Composer::Unreadable
+        let (visible, ghost) = screen(pane);
+        input::composer(&visible, ghost) != input::Composer::Unreadable
     };
     let status_input = banner::BannerInput {
         has_session: pane.claude_session_id().is_some(),
@@ -1024,11 +1031,12 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
     }
 
     // A text left in the terminal's prompt went (the turn started) or was
-    // cleared there: the queue goes on.
+    // cleared there: the queue goes on. Claude Code's greyed suggestion in
+    // the emptied prompt is no text left.
     if st.outbox.is_stuck()
         && (working || {
-            let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
-            input::composer(&visible) == input::Composer::Empty
+            let (visible, ghost) = screen(pane);
+            input::composer(&visible, ghost) == input::Composer::Empty
         })
     {
         st.outbox.unstick();
@@ -1050,19 +1058,29 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         input::Step::Enter => {
             // Only onto the text just pasted: the prompt still holds it and
             // nothing else came up meanwhile (a permission prompt, a menu).
-            let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
+            let (visible, ghost) = screen(pane);
             let prompt = pane.has_permission_prompt()
-        || crate::prompt_preview::parse_permission_prompt(&visible).is_some()
-        || crate::prompt_preview::parse_menu(&visible).is_some();
-            if !prompt && input::composer(&visible) == input::Composer::Typed {
+                || crate::prompt_preview::parse_permission_prompt(&visible).is_some()
+                || crate::prompt_preview::parse_menu(&visible).is_some();
+            let composer = input::composer(&visible, ghost);
+            let now = crate::surface::monotonic_ms();
+            if !prompt && composer == input::Composer::Typed {
                 pane.pty.write(b"\r");
                 pane.clear_awaiting();
+                log::info!("pane {}: chat Enter written", pane.id);
+            } else if !prompt && composer == input::Composer::Empty && st.outbox.not_shown(now) {
+                // The paste is not drawn yet (a greyed suggestion is not it):
+                // the Enter waits for it, `ENTER_STALE_MS` at most.
             } else {
                 st.outbox.stuck();
                 st.note = Some(NOT_ENTERED.to_string());
+                log::warn!("pane {}: chat Enter held (dialog: {prompt}, composer: {composer:?})", pane.id);
             }
         }
-        input::Step::Stale => st.note = Some(NOT_ENTERED.to_string()),
+        input::Step::Stale => {
+            st.note = Some(NOT_ENTERED.to_string());
+            log::warn!("pane {}: chat Enter dropped, too late", pane.id);
+        }
         input::Step::Queued(_) | input::Step::Nothing => {}
     }
 

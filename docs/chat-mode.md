@@ -152,10 +152,12 @@ Enter sends, Shift+Enter is a new line, at any time: the box never refuses
 a message. The text goes to the pane's PTY as a paste (bracketed when
 Claude Code asked for it), then Enter on its own 300 ms later, only when
 Claude is the pane's foreground process and its turn is over (`Prêt`,
-`chat::input::gate`). The Enter is written only while the prompt still
-shows the pasted text and no permission prompt came up, and not at all when
-it is more than 2 s late: the text then waits in the terminal's prompt, with
-a note.
+`chat::input::gate`). The Enter is written once the prompt shows a typed
+text and no permission prompt came up. A paste not drawn yet 300 ms later
+(a loaded machine, Kova just launched) is waited for, 8 s at most
+(`ENTER_STALE_MS`); past that, or when a dialog came up, the Enter is not
+written: the text then waits in the terminal's prompt, with a note, and
+`kova.log` says which (`chat Enter written`, `held`, `dropped`).
 
 | The pane | The message |
 |---|---|
@@ -180,7 +182,9 @@ Claude Code. Only a file Kova wrote for this page's paste goes along
 Control characters are removed (tab and newline
 kept), 32 KB at most (a 20 minute dictation). The empty prompt is read off the screen like KovaLink's
 daemon does (`composerIsEmpty`); Claude Code's start hint (`Try "…"`) counts
-as empty.
+as empty, and so does its greyed suggestion of a next message (the screen's
+dim bit, `TerminalState::prompt`): the Enter is never written onto it, and a
+late `kova ask` answer (`ask::prompt_ready`) does not wait for it to go.
 
 ## Dictation
 

@@ -745,7 +745,8 @@ impl KovaView {
                     && pane.agent_session_id().is_some()
                     && (pane.is_working() || {
                         let visible = pane.terminal.read().dump_text(crate::terminal::DumpMode::Visible, true).text;
-                        crate::chat::input::composer(&visible) != crate::chat::input::Composer::Unreadable
+                        // Any prompt line will do: greyed or not is not asked.
+                        crate::chat::input::composer(&visible, false) != crate::chat::input::Composer::Unreadable
                     });
                 let names = crate::launch_wake::names(&titles);
                 out.push(crate::launch_wake::PaneInfo { pane_id: pane.id, dormant, live, rank, names, ready });

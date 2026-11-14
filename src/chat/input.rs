@@ -18,9 +18,12 @@
 pub const TEXT_MAX: usize = 32 * 1024;
 /// Between the pasted text and its Enter.
 pub const ENTER_DELAY_MS: u64 = 300;
-/// An Enter not written this long after it was due (the chat was out of
-/// sight meanwhile) is dropped: the screen it was meant for is gone.
-pub const ENTER_STALE_MS: u64 = 2_000;
+/// An Enter not written this long after it was due is dropped: the chat was
+/// out of sight meanwhile, or the pasted text never showed in the prompt.
+/// Until then the Enter waits for the text to show: a loaded machine (Kova
+/// just launched, sixty sessions resuming) draws a paste seconds late, and
+/// the Enter held at 300 ms left the message in the terminal (14/11/2026).
+pub const ENTER_STALE_MS: u64 = 8_000;
 
 /// What Claude Code's input line shows, read off the pane's screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +50,11 @@ const PLACEHOLDER_PREFIX: &str = "Try \"";
 /// than KovaLink's: the `❯` must sit in the first column. A menu or a
 /// dialog (a permission prompt's `❯ 1. Yes`, the trust dialog's
 /// `❯ No, exit`) indents its marker, and is no composer to type into.
-pub fn composer(visible: &str) -> Composer {
+///
+/// `ghost`: the screen says all the text of the input is greyed
+/// (`TerminalState::prompt`): Claude Code's suggested next message, which
+/// reads as a draft in plain text. Nobody typed it: the composer is empty.
+pub fn composer(visible: &str, ghost: bool) -> Composer {
     let lines: Vec<&str> = visible.lines().collect();
     let Some(i) = lines.iter().rposition(|l| l.trim_start().starts_with(COMPOSER_PREFIX)) else {
         return Composer::Unreadable;
@@ -66,6 +73,9 @@ pub fn composer(visible: &str) -> Composer {
     let framed = i > 0 && lines[i - 1].trim_start().starts_with('\u{2500}');
     if digits > 0 && after[digits..].starts_with(". ") && !framed {
         return Composer::Unreadable;
+    }
+    if ghost {
+        return Composer::Empty;
     }
     if !after.is_empty() && !after.starts_with(PLACEHOLDER_PREFIX) {
         return Composer::Typed;
@@ -96,8 +106,8 @@ pub enum Verdict {
 }
 
 /// A draft in the terminal's prompt does not bounce the message: the text is
-/// pasted after it and both leave together (Claude Code's own grey prompt
-/// suggestion reads as text too, and a paste replaces it).
+/// pasted after it and both leave together (a paste replaces Claude Code's
+/// own grey prompt suggestion).
 pub fn gate(input: GateInput) -> Verdict {
     use super::banner::Banner;
     if !input.has_session {
@@ -180,6 +190,8 @@ pub struct Outbox {
     enter_due: Option<u64>,
     /// When the last Enter went: the next message waits `SETTLE_MS`.
     entered_at: Option<u64>,
+    /// When the Enter `poll` last handed out was due: `not_shown` waits from it.
+    last_due: Option<u64>,
     /// The last Enter was not written: its text waits in the terminal's
     /// prompt and the queue holds until it is sent or cleared there.
     stuck: bool,
@@ -223,6 +235,24 @@ impl Outbox {
         self.stuck
     }
 
+    /// The Enter `poll` just handed out was not written: the prompt does not
+    /// show the pasted text yet. True while it is worth waiting: `poll` hands
+    /// the Enter out again on the next tick. False once `ENTER_STALE_MS`
+    /// passed: the queue holds, as after `Step::Stale`.
+    pub fn not_shown(&mut self, now: u64) -> bool {
+        match self.last_due {
+            Some(due) if now.saturating_sub(due) <= ENTER_STALE_MS => {
+                self.enter_due = Some(due);
+                self.entered_at = None;
+                true
+            }
+            _ => {
+                self.stuck = true;
+                false
+            }
+        }
+    }
+
     /// The text left the terminal's prompt (sent or cleared there).
     pub fn unstick(&mut self) {
         self.stuck = false;
@@ -252,6 +282,7 @@ impl Outbox {
             }
             self.enter_due = None;
             self.entered_at = Some(now);
+            self.last_due = Some(due);
             if now - due > ENTER_STALE_MS {
                 self.stuck = true;
                 return Step::Stale;
@@ -290,7 +321,7 @@ mod tests {
     #[test]
     fn an_ask_user_question_menu_is_no_composer() {
         let screen = include_str!("../../tests/fixtures/prompt/ask-user-question.txt");
-        assert_eq!(composer(screen), Composer::Unreadable);
+        assert_eq!(composer(screen, false), Composer::Unreadable);
     }
 
     #[test]
@@ -311,21 +342,21 @@ mod tests {
 
     #[test]
     fn the_composer_is_read_off_the_screen() {
-        assert_eq!(composer("output\n───\n❯ \n───\n  ? for shortcuts"), Composer::Empty);
-        assert_eq!(composer("❯ fix the bug\n"), Composer::Typed);
-        assert_eq!(composer("❯ \n  [Pasted text #2 +11 lines]"), Composer::Typed);
-        assert_eq!(composer("───\n❯ \n  second line of a draft\n───\n  ? for shortcuts"), Composer::Typed, "a draft starting with a new line");
-        assert_eq!(composer("❯ │"), Composer::Empty, "the frame's box drawing is not text");
-        assert_eq!(composer("❯ \n Do you want to proceed?\n ❯ 1. Yes\n   2. No"), Composer::Unreadable, "a menu is no composer");
-        assert_eq!(composer("❯ Try \"refactor <filepath>\""), Composer::Empty, "the start hint is not a draft");
-        assert_eq!(composer("~/src $ "), Composer::Unreadable);
+        assert_eq!(composer("output\n───\n❯ \n───\n  ? for shortcuts", false), Composer::Empty);
+        assert_eq!(composer("❯ fix the bug\n", false), Composer::Typed);
+        assert_eq!(composer("❯ \n  [Pasted text #2 +11 lines]", false), Composer::Typed);
+        assert_eq!(composer("───\n❯ \n  second line of a draft\n───\n  ? for shortcuts", false), Composer::Typed, "a draft starting with a new line");
+        assert_eq!(composer("❯ │", false), Composer::Empty, "the frame's box drawing is not text");
+        assert_eq!(composer("❯ \n Do you want to proceed?\n ❯ 1. Yes\n   2. No", false), Composer::Unreadable, "a menu is no composer");
+        assert_eq!(composer("❯ Try \"refactor <filepath>\"", false), Composer::Empty, "the start hint is not a draft");
+        assert_eq!(composer("~/src $ ", false), Composer::Unreadable);
         // A message that starts like a menu option is still a draft (13/11:
         // `1. …` typed from the chat never got its Enter).
-        assert_eq!(composer("answer\n───\n❯ 1. yes 2. no\n───\n  ? for shortcuts"), Composer::Typed, "a numbered draft");
-        assert_eq!(composer("answer\n───\n❯ 1. yes\n  2. no\n───\n  ? for shortcuts"), Composer::Typed, "a numbered draft on two lines");
-        assert_eq!(composer("───\nWhich color?\n\n❯ 1. Red\n  2. Blue\n───\n  3. Chat about this"), Composer::Unreadable, "a menu under a rule");
+        assert_eq!(composer("answer\n───\n❯ 1. yes 2. no\n───\n  ? for shortcuts", false), Composer::Typed, "a numbered draft");
+        assert_eq!(composer("answer\n───\n❯ 1. yes\n  2. no\n───\n  ? for shortcuts", false), Composer::Typed, "a numbered draft on two lines");
+        assert_eq!(composer("───\nWhich color?\n\n❯ 1. Red\n  2. Blue\n───\n  3. Chat about this", false), Composer::Unreadable, "a menu under a rule");
         // The last ❯ is the composer, not an echoed one above it.
-        assert_eq!(composer("❯ earlier message\nanswer\n❯ "), Composer::Empty);
+        assert_eq!(composer("❯ earlier message\nanswer\n❯ ", false), Composer::Empty);
     }
 
     #[test]
@@ -357,6 +388,47 @@ mod tests {
         assert_eq!(out.submit("again".into(), Verdict::Send, 1100), Step::Queued("part après le message précédent"), "queued, never refused");
         assert_eq!(out.poll(Verdict::Wait("busy"), 1000 + ENTER_DELAY_MS), Step::Enter, "the Enter of a typed text always follows");
         assert_eq!(out.queue().len(), 1);
+    }
+
+    /// 14/11/2026, 22 s after Kova's launch: the paste was not drawn 300 ms
+    /// later and the Enter was held for good, the message left in the
+    /// terminal. The Enter now waits for the text to show.
+    #[test]
+    fn the_enter_waits_for_the_pasted_text_to_show() {
+        let mut out = Outbox::default();
+        out.submit("hi".into(), Verdict::Send, 0);
+        out.submit("next".into(), Verdict::Send, 1);
+        assert_eq!(out.poll(Verdict::Send, ENTER_DELAY_MS), Step::Enter);
+        assert!(out.not_shown(ENTER_DELAY_MS), "not drawn yet: wait");
+        assert!(out.enter_pending() && !out.is_stuck());
+        assert_eq!(out.poll(Verdict::Send, 3_000), Step::Enter, "handed out again, nothing typed meanwhile");
+        assert!(out.not_shown(3_000));
+        assert_eq!(out.poll(Verdict::Send, 5_000), Step::Enter);
+        // Written this time: the next message waits for the turn to show.
+        assert_eq!(out.poll(Verdict::Send, 5_000 + SETTLE_MS - 1), Step::Nothing);
+        assert_eq!(out.poll(Verdict::Send, 5_000 + SETTLE_MS), Step::Type("next".into()));
+        // Never shown: after the wait the queue holds.
+        let typed = 5_000 + SETTLE_MS;
+        assert_eq!(out.poll(Verdict::Send, typed + ENTER_DELAY_MS + ENTER_STALE_MS), Step::Enter);
+        assert!(out.not_shown(typed + ENTER_DELAY_MS + ENTER_STALE_MS));
+        assert_eq!(out.poll(Verdict::Send, typed + ENTER_DELAY_MS + ENTER_STALE_MS + 1), Step::Stale);
+        assert!(out.is_stuck());
+        let mut out = Outbox::default();
+        out.submit("hi".into(), Verdict::Send, 0);
+        assert_eq!(out.poll(Verdict::Send, ENTER_DELAY_MS + ENTER_STALE_MS), Step::Enter);
+        assert!(!out.not_shown(ENTER_DELAY_MS + ENTER_STALE_MS + 1), "the wait is over");
+        assert!(out.is_stuck());
+    }
+
+    /// Claude Code's greyed suggestion reads as a draft in plain text; the
+    /// screen's dim bit says nobody typed it.
+    #[test]
+    fn a_greyed_suggestion_is_an_empty_composer() {
+        let screen = "answer\n───\n❯ continue with the tests\n───\n  ? for shortcuts";
+        assert_eq!(composer(screen, false), Composer::Typed);
+        assert_eq!(composer(screen, true), Composer::Empty);
+        assert_eq!(composer("───\n❯ a long suggestion that\n  wraps\n───\n  ? for shortcuts", true), Composer::Empty, "wrapped");
+        assert_eq!(composer("Which color?\n\n❯ 1. Red\n  2. Blue", true), Composer::Unreadable, "a menu stays a menu");
     }
 
     #[test]

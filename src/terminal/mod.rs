@@ -130,6 +130,16 @@ bitflags::bitflags! {
     }
 }
 
+/// Rows under the `❯` a wrapped input may take (`chat::input`'s
+/// `COMPOSER_TAIL_LINES` reads as many).
+const PROMPT_WRAP_ROWS: usize = 6;
+
+/// A row's cells as trimmed text.
+fn row_text(cells: &[Cell]) -> String {
+    let text: String = cells.iter().map(|c| c.cluster.as_deref().map(str::to_string).unwrap_or_else(|| c.c.to_string())).collect();
+    text.replace('\0', " ").trim().to_string()
+}
+
 /// The input line of Claude Code as the screen shows it (`TerminalState::prompt`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prompt {
@@ -643,13 +653,25 @@ impl TerminalState {
     /// the last `❯` that starts a row, and whether all of it is greyed (SGR 2).
     /// Greyed, it is the suggested next message Claude Code shows in an empty
     /// prompt, or its start hint: nobody typed it and Enter would not send a
-    /// user's words. `None` when no row starts with `❯`.
+    /// user's words. A text wrapped onto the next rows is read whole, its
+    /// rows joined by a space. `None` when no row starts with `❯`.
     pub fn prompt(&self) -> Option<Prompt> {
-        let row = self.grid.iter().rev().find(|r| r.cells.first().is_some_and(|c| c.c == '\u{276f}'))?;
-        let after = &row.cells[1..];
-        let text: String = after.iter().map(|c| c.cluster.as_deref().map(str::to_string).unwrap_or_else(|| c.c.to_string())).collect();
-        let text = text.replace('\0', " ").trim().to_string();
-        let ghost = !text.is_empty() && after.iter().filter(|c| !c.is_blank() && !c.c.is_whitespace()).all(|c| c.attrs.contains(CellAttrs::DIM));
+        let at = self.grid.iter().rposition(|r| r.cells.first().is_some_and(|c| c.c == '\u{276f}'))?;
+        // The rows a long text wraps onto: those under the mark, down to the
+        // input's bottom rule. Without a rule in sight, the marked row alone.
+        let rule = |r: &Row| r.cells.iter().find(|c| !c.is_blank() && !c.c.is_whitespace()).is_some_and(|c| ('\u{2500}'..='\u{257f}').contains(&c.c));
+        let below = &self.grid[at + 1..self.grid.len().min(at + 1 + PROMPT_WRAP_ROWS)];
+        let wrapped = below.iter().position(rule).map_or(&below[..0], |end| &below[..end]);
+        let mut cells: Vec<&Cell> = self.grid[at].cells[1..].iter().collect();
+        let mut text = row_text(&self.grid[at].cells[1..]);
+        for row in wrapped {
+            let more = row_text(&row.cells);
+            if !more.is_empty() {
+                text = format!("{text} {more}").trim().to_string();
+                cells.extend(row.cells.iter());
+            }
+        }
+        let ghost = !text.is_empty() && cells.iter().filter(|c| !c.is_blank() && !c.c.is_whitespace()).all(|c| c.attrs.contains(CellAttrs::DIM));
         Some(Prompt { text, ghost })
     }
 

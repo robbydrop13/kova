@@ -896,20 +896,29 @@ fn prompt_ready(socket: &str, pane_id: u32) -> bool {
     if working {
         return false;
     }
-    let reply = request(
-        socket,
-        serde_json::json!({"cmd": "get-pane-content", "panes": [pane_id], "mode": "visible", "trim_trailing_blank_lines": true}),
-        Duration::from_secs(3),
-    );
-    let text = reply
-        .as_ref()
-        .and_then(|r| r.get("data"))
-        .and_then(|d| d.get("panes"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or_default();
-    shows_empty_prompt(text)
+    // The input line is asked for too: Claude Code's greyed suggestion reads
+    // as a typed text in the plain text. A Kova built before 14/11/2026
+    // refuses the field and is asked again without it.
+    let ask = |prompt: bool| {
+        let mut body = serde_json::json!({"cmd": "get-pane-content", "panes": [pane_id], "mode": "visible", "trim_trailing_blank_lines": true});
+        if prompt {
+            body["prompt"] = true.into();
+        }
+        request(socket, body, Duration::from_secs(3)).filter(|r| r.get("ok").and_then(|v| v.as_bool()) == Some(true))
+    };
+    let reply = ask(true).or_else(|| ask(false));
+    reply.as_ref().and_then(|r| r.get("data")).and_then(|d| d.get("panes")).and_then(|p| p.get(0)).is_some_and(pane_shows_empty_prompt)
+}
+
+/// One pane of a `get-pane-content` answer shows an empty input line: its
+/// `prompt` (asked with `"prompt": true`) is empty or all greyed, or, without
+/// one (an older Kova, an agent whose prompt is `>`), its text says so.
+fn pane_shows_empty_prompt(pane: &serde_json::Value) -> bool {
+    if let Some(prompt) = pane.get("prompt").filter(|p| !p.is_null()) {
+        return prompt.get("ghost").and_then(|v| v.as_bool()) == Some(true)
+            || prompt.get("text").and_then(|v| v.as_str()).is_some_and(|t| t.trim().is_empty());
+    }
+    shows_empty_prompt(pane.get("text").and_then(|t| t.as_str()).unwrap_or_default())
 }
 
 /// The last input line on screen is empty: `❯` (Claude Code) or `>` alone.
@@ -2282,6 +2291,13 @@ mod tests {
         assert!(super::shows_empty_prompt("hello\n\u{276f} \n  bypass permissions on"));
         assert!(!super::shows_empty_prompt("hello\n\u{276f} half typed\n"));
         assert!(!super::shows_empty_prompt("Resuming conversation..."));
+        // The greyed suggestion of Claude Code is an empty prompt, whatever the text reads.
+        let pane = |prompt: serde_json::Value| serde_json::json!({"text": "hello\n\u{276f} continue\n", "prompt": prompt});
+        assert!(super::pane_shows_empty_prompt(&pane(serde_json::json!({"text": "continue", "ghost": true}))));
+        assert!(!super::pane_shows_empty_prompt(&pane(serde_json::json!({"text": "continue", "ghost": false}))));
+        assert!(super::pane_shows_empty_prompt(&pane(serde_json::json!({"text": "", "ghost": false}))));
+        assert!(!super::pane_shows_empty_prompt(&pane(serde_json::Value::Null)), "no prompt read: the text decides");
+        assert!(super::pane_shows_empty_prompt(&serde_json::json!({"text": "hello\n\u{276f} \n"})), "an older Kova");
     }
 
     use super::*;

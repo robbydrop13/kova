@@ -1135,7 +1135,7 @@ With `"prompt": true`, each pane entry carries:
 "prompt": { "text": "continue", "ghost": true }
 ```
 
-- `text`: what follows the last `❯` that starts a row of the live screen, trimmed. Empty when the input line is empty.
+- `text`: what follows the last `❯` that starts a row of the live screen, trimmed. A text wrapped onto the next rows (down to the input's bottom rule, 6 rows at most) is read whole, its rows joined by a space. Empty when the input line is empty.
 - `ghost`: `true` when all of that text is greyed (written under SGR 2). That is the next message Claude Code suggests in an empty input line, or its start hint (`Try "..."`): nobody typed it, and the line is empty for whoever wants to type into it. `false` for a typed text, an empty line, or a text only partly greyed.
 - `"prompt": null` when no row starts with `❯` (a shell, a menu, a dialog).
 

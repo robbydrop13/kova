@@ -1288,6 +1288,59 @@ mod tests {
         assert!(cell(&t, 0, 0).attrs.contains(CellAttrs::DIM) && !cell(&t, 0, 1).attrs.contains(CellAttrs::DIM));
     }
 
+    /// A suggestion longer than the pane is wide wraps under the mark, down
+    /// to the input's bottom rule: still a suggestion, read whole.
+    #[test]
+    fn a_wrapped_greyed_suggestion_is_still_a_suggestion() {
+        use crate::terminal::Prompt;
+        let prompt = |text: &str| drive(24, 8, &[text.as_bytes()]).read().prompt();
+        let rule = "\u{2500}".repeat(24);
+        let ghost = format!("{rule}\r\n\u{276f}\u{a0}\x1b[2mrun the tests and\x1b[22m\r\n  \x1b[2mpush\x1b[22m\r\n{rule}\r\n  ? for shortcuts");
+        assert_eq!(prompt(&ghost), Some(Prompt { text: "run the tests and push".into(), ghost: true }));
+        // A typed text with a second line is typed, and what sits under the rule is not the input.
+        let typed = format!("{rule}\r\n\u{276f}\u{a0}\x1b[2mgrey\x1b[22m\r\n  typed below\r\n{rule}\r\n  \x1b[2m? for shortcuts\x1b[22m");
+        assert_eq!(prompt(&typed), Some(Prompt { text: "grey typed below".into(), ghost: false }));
+        let alone = format!("{rule}\r\n\u{276f}\u{a0}\x1b[2mcontinue\x1b[22m\r\n{rule}\r\n  not the input");
+        assert_eq!(prompt(&alone), Some(Prompt { text: "continue".into(), ghost: true }));
+    }
+
+    /// The 14/11/2026 send from the chat, replayed on the screen's bytes: the
+    /// prompt holds Claude Code's greyed suggestion, the message is pasted,
+    /// and 300 ms later the paste is not drawn yet. The Enter waits (it used
+    /// to be held for good when the prompt read empty, and to be written
+    /// onto the suggestion when it read as text), then goes once the text
+    /// shows. Afterwards the suggestion back in the prompt is no text left.
+    #[test]
+    fn the_chat_enter_waits_for_the_paste_under_a_greyed_suggestion() {
+        use crate::chat::input::{self, Composer, Outbox, Step, Verdict};
+        let rule = "\u{2500}".repeat(40);
+        let read = |line: &str| {
+            let bytes = format!("answer\r\n{rule}\r\n\u{276f}\u{a0}{line}\r\n{rule}\r\n  ? for shortcuts");
+            let term = drive(40, 8, &[bytes.as_bytes()]);
+            let term = term.read();
+            let ghost = term.prompt().is_some_and(|p| p.ghost);
+            (input::composer(&term.dump_text(crate::terminal::DumpMode::Visible, true).text, ghost), ghost)
+        };
+        let suggestion = "\x1b[2mcontinue with the tests\x1b[22m";
+        let (before, ghost) = read(suggestion);
+        assert!(ghost);
+        assert_eq!(before, Composer::Empty, "a suggestion is an empty prompt");
+        assert_eq!(input::composer("\u{2500}\n\u{276f}\u{a0}continue with the tests\n\u{2500}\n", false), Composer::Typed, "what the plain text alone says");
+
+        let mut out = Outbox::default();
+        assert_eq!(out.submit("ship it".into(), Verdict::Send, 0), Step::Type("ship it".into()));
+        // 300 ms later the screen has not changed: no Enter onto the suggestion.
+        assert_eq!(out.poll(Verdict::Send, input::ENTER_DELAY_MS), Step::Enter);
+        assert_eq!(read(suggestion).0, Composer::Empty);
+        assert!(out.not_shown(input::ENTER_DELAY_MS));
+        assert!(!out.is_stuck(), "nothing is held: the Enter waits");
+        // The paste shows, two seconds late: the Enter goes.
+        assert_eq!(out.poll(Verdict::Send, 2_300), Step::Enter);
+        assert_eq!(read("\x1b[39mship it").0, Composer::Typed);
+        // The turn over, the next suggestion is not a text left in the prompt.
+        assert_eq!(read("\x1b[2mnow push\x1b[22m").0, Composer::Empty);
+    }
+
     #[test]
     fn sgr_colon_underline_off_does_not_reset_colors() {
         // 4:0 (underline off, ITU form) must not be misread as SGR 0
