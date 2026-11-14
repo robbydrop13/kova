@@ -1261,6 +1261,33 @@ mod tests {
         term.read().visible_lines()[row][col].clone()
     }
 
+    /// The bytes are the ones Claude Code writes (read in a pane's raw
+    /// capture, 14/11/2026): a suggested next message is greyed, SGR 2,
+    /// right after the prompt mark; a typed text is not.
+    #[test]
+    fn the_prompt_tells_a_greyed_suggestion_from_a_typed_text() {
+        use crate::terminal::Prompt;
+        let prompt = |bytes: &[u8]| drive(60, 6, &[bytes]).read().prompt();
+        let ghost = "answer\r\n\u{276f}\u{a0}\x1b[2mcontinue\x1b[22m\r\n  ? for shortcuts";
+        assert_eq!(prompt(ghost.as_bytes()), Some(Prompt { text: "continue".into(), ghost: true }));
+        let typed = "\u{276f}\u{a0}\x1b[39mok vas-y\r\n  ? for shortcuts";
+        assert_eq!(prompt(typed.as_bytes()), Some(Prompt { text: "ok vas-y".into(), ghost: false }));
+        let white = "\u{276f}\u{a0}\x1b[38;2;255;255;255mok\x1b[39m";
+        assert_eq!(prompt(white.as_bytes()), Some(Prompt { text: "ok".into(), ghost: false }));
+        // A typed start followed by a greyed completion is a typed text.
+        let mixed = "\u{276f}\u{a0}con\x1b[2mtinue\x1b[22m";
+        assert_eq!(prompt(mixed.as_bytes()), Some(Prompt { text: "continue".into(), ghost: false }));
+        // An empty prompt is empty, not a suggestion; the last prompt row wins.
+        let empty = "\u{276f}\u{a0}earlier\r\nanswer\r\n\u{276f}\u{a0}";
+        assert_eq!(prompt(empty.as_bytes()), Some(Prompt { text: String::new(), ghost: false }));
+        // No row starts with the mark: a shell, a menu whose marker is indented.
+        assert_eq!(prompt("~/src $ ls\r\n \u{276f} 1. Yes".as_bytes()), None);
+        // The bit is on the cell, and only there.
+        use crate::terminal::CellAttrs;
+        let t = drive(20, 2, &[b"\x1b[2mA\x1b[22mB"]);
+        assert!(cell(&t, 0, 0).attrs.contains(CellAttrs::DIM) && !cell(&t, 0, 1).attrs.contains(CellAttrs::DIM));
+    }
+
     #[test]
     fn sgr_colon_underline_off_does_not_reset_colors() {
         // 4:0 (underline off, ITU form) must not be misread as SGR 0

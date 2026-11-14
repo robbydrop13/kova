@@ -1444,9 +1444,13 @@ mod tests {
         assert_eq!(r.to_string(), r#"{"ok":true}"#);
         assert_eq!(drain(&fa), b"ls\r");
 
-        let r = reply(&host, r#"{"cmd":"get-pane-content"}"#);
+        // The prompt comes on request only: the default answer has no such key.
+        let r = reply(&host, r#"{"cmd":"get-pane-content","prompt":true}"#);
         let entry = |id: PaneId| dump_pane_text_in(&host.tabs, id, DumpMode::Visible, true).unwrap();
         assert_eq!(r["data"], serde_json::json!({"panes": [entry(a_id), entry(b_id)]}));
+        assert!(r["data"]["panes"][0]["prompt"].is_null(), "a shell has no prompt line");
+        let r = reply(&host, r#"{"cmd":"get-pane-content"}"#);
+        assert!(r["data"]["panes"][0].get("prompt").is_none() && r["data"]["panes"][0]["cols"] == 20);
         assert_eq!(r["data"]["panes"][0]["text"], "hello\n");
 
         let r = reply(&host, &format!(r#"{{"cmd":"count-pane-content","panes":[{b_id},999999]}}"#));

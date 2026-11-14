@@ -80,6 +80,8 @@ pub enum IpcCommand {
         panes: PaneFilter,
         mode: String,
         trim_trailing_blank_lines: bool,
+        /// Add each pane's `prompt` (`TerminalState::prompt`) to the answer.
+        prompt: bool,
     },
     /// Return the size (chars + bytes) the equivalent `GetPaneContent` would produce.
     /// Lets the caller decide whether the payload is worth fetching — no cap is enforced.
@@ -699,9 +701,8 @@ fn allowed_fields(cmd: &str) -> Option<&'static [&'static str]> {
         "new-tab" => &["cwd", "command"],
         "set-tab-title" => &["pane_id", "title"],
         "set-tab-color" => &["pane_id", "color"],
-        "get-pane-content" | "count-pane-content" => {
-            &["panes", "mode", "trim_trailing_blank_lines"]
-        }
+        "get-pane-content" => &["panes", "mode", "trim_trailing_blank_lines", "prompt"],
+        "count-pane-content" => &["panes", "mode", "trim_trailing_blank_lines"],
         "wait-for-completion" => &["pane_id", "timeout_ms"],
         "list-tabs" => &[],
         "close-tab" => &["tab_id"],
@@ -930,10 +931,16 @@ pub(crate) fn parse_command(line: &str) -> Result<IpcCommand, String> {
         }
         "get-pane-content" => {
             let (panes, mode, trim) = parse_pane_content_args(&v)?;
+            let prompt = match v.get("prompt") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => return Err("\"prompt\" must be a boolean".to_string()),
+            };
             Ok(IpcCommand::GetPaneContent {
                 panes,
                 mode,
                 trim_trailing_blank_lines: trim,
+                prompt,
             })
         }
         "count-pane-content" => {
@@ -1866,11 +1873,16 @@ mod tests {
                 panes: PaneFilter::All,
                 mode,
                 trim_trailing_blank_lines: true,
+                prompt: false,
             }) => {
                 assert_eq!(mode, "visible")
             }
             _ => panic!("defaults"),
         }
+        // The prompt is asked for, never given by default; count takes no such field.
+        assert!(matches!(parse_command(r#"{"cmd":"get-pane-content","prompt":true}"#), Ok(IpcCommand::GetPaneContent { prompt: true, .. })));
+        assert_eq!(err(r#"{"cmd":"get-pane-content","prompt":"yes"}"#), "\"prompt\" must be a boolean");
+        assert_eq!(err(r#"{"cmd":"count-pane-content","prompt":true}"#), "unknown field \"prompt\" for command \"count-pane-content\"");
         match parse_command(
             r#"{"cmd":"count-pane-content","panes":[3,1,3],"mode":"scrollback","trim_trailing_blank_lines":false}"#,
         ) {

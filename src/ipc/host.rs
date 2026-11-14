@@ -157,8 +157,8 @@ pub fn dispatch(host: &impl IpcHost, cmd: IpcCommand) -> Result<Disposition, Ipc
         IpcCommand::ClosePaneById(pane_id) => close_pane(host, pane_id),
         IpcCommand::SendKeys { pane_id, text, caller, sig } => send_keys(host, pane_id, &text, &caller, sig.as_ref()),
         IpcCommand::FocusPane(pane_id) => focus_pane(host, pane_id),
-        IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines } => {
-            get_pane_content(host, panes, &mode, trim_trailing_blank_lines)
+        IpcCommand::GetPaneContent { panes, mode, trim_trailing_blank_lines, prompt } => {
+            get_pane_content(host, panes, &mode, trim_trailing_blank_lines, prompt)
         }
         IpcCommand::CountPaneContent { panes, mode, trim_trailing_blank_lines } => {
             count_pane_content(host, panes, &mode, trim_trailing_blank_lines)
@@ -346,10 +346,13 @@ fn resolve_pane_filter(host: &impl IpcHost, filter: PaneFilter) -> Vec<PaneId> {
 }
 
 /// `get-pane-content`: the rendered text of the requested panes.
-pub fn get_pane_content(host: &impl IpcHost, filter: PaneFilter, mode_str: &str, trim: bool) -> IpcResponse {
+pub fn get_pane_content(host: &impl IpcHost, filter: PaneFilter, mode_str: &str, trim: bool, prompt: bool) -> IpcResponse {
     let mode = parse_dump_mode(mode_str);
     let ids = resolve_pane_filter(host, filter);
-    pane_content_response(ids, |pane_id| host.dump_pane_text(pane_id, mode, trim))
+    pane_content_response(ids, |pane_id| {
+        let entry = host.dump_pane_text(pane_id, mode, trim)?;
+        Some(if prompt { entry } else { without_prompt(entry) })
+    })
 }
 
 /// `count-pane-content`: only the size (chars/bytes) of what `get-pane-content`
@@ -540,7 +543,18 @@ pub fn pane_text_entry(pane_id: PaneId, surface: &Surface, mode: DumpMode, trim:
         "cols": dump.cols,
         "rows": dump.rows,
         "cursor": { "row": dump.cursor_row, "col": dump.cursor_col },
+        // Left out of the answer unless the request asks for it (`with_prompt`).
+        "prompt": term.prompt().map(|p| serde_json::json!({ "text": p.text, "ghost": p.ghost })),
     })
+}
+
+/// `get-pane-content` without `"prompt": true`: the answer is the one it
+/// always was, with no `prompt` key.
+fn without_prompt(mut entry: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = entry.as_object_mut() {
+        map.remove("prompt");
+    }
+    entry
 }
 
 /// `(chars, bytes)` of the text `pane_text_entry` would return.
@@ -609,7 +623,11 @@ mod tests {
         }
         fn dump_pane_text(&self, pane_id: PaneId, mode: DumpMode, trim: bool) -> Option<serde_json::Value> {
             self.log(format!("dump {pane_id} {mode:?} {trim}"));
-            PANES.contains(&pane_id).then(|| serde_json::json!({"id": pane_id, "text": "hi\n"}))
+            PANES.contains(&pane_id).then(|| {
+                // Pane 1 shows a greyed suggestion, pane 2 no prompt line.
+                let prompt = (pane_id == 1).then(|| serde_json::json!({"text": "continue", "ghost": true}));
+                serde_json::json!({"id": pane_id, "text": "hi\n", "prompt": prompt})
+            })
         }
         fn measure_pane_text(&self, pane_id: PaneId, mode: DumpMode, trim: bool) -> Option<(usize, usize)> {
             self.log(format!("measure {pane_id} {mode:?} {trim}"));
@@ -854,6 +872,21 @@ mod tests {
         assert_eq!(
             host.calls(),
             ["dump 1 Visible true", "dump 2 Visible true", "dump 2 Scrollback false", "dump 9 Scrollback false"]
+        );
+    }
+
+    /// 14/11/2026: clicks were not delivered to idle sessions, "prompt not
+    /// empty", over a text nobody typed: Claude Code's greyed suggestion.
+    #[test]
+    fn get_pane_content_tells_a_greyed_prompt_on_request_only() {
+        let host = FakeHost::default();
+        assert_eq!(
+            reply(&host, r#"{"cmd":"get-pane-content","prompt":true}"#),
+            r#"{"data":{"panes":[{"id":1,"prompt":{"ghost":true,"text":"continue"},"text":"hi\n"},{"id":2,"prompt":null,"text":"hi\n"}]},"ok":true}"#
+        );
+        assert_eq!(
+            reply(&host, r#"{"cmd":"get-pane-content","prompt":false,"panes":[1,9]}"#),
+            r#"{"data":{"panes":[{"id":1,"text":"hi\n"},{"error":"not found","id":9}]},"ok":true}"#
         );
     }
 

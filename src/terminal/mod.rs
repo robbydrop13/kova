@@ -123,7 +123,20 @@ bitflags::bitflags! {
         const ITALIC        = 1 << 1;
         const UNDERLINE     = 1 << 2;
         const STRIKETHROUGH = 1 << 3;
+        /// SGR 2 was on when the cell was written. Its color effect is baked
+        /// into `fg`; the bit is kept so a reader can tell a greyed text (Claude
+        /// Code's suggested next message) from a typed one (`prompt`).
+        const DIM           = 1 << 4;
     }
+}
+
+/// The input line of Claude Code as the screen shows it (`TerminalState::prompt`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Prompt {
+    /// The text after the `❯`, trimmed.
+    pub text: String,
+    /// All of it is greyed: a suggestion, not something typed.
+    pub ghost: bool,
 }
 
 /// Terminal cell — kept compact to minimize scrollback RAM usage.
@@ -626,6 +639,20 @@ impl TerminalState {
         }
     }
 
+    /// What Claude Code's input line holds on the live screen: the text after
+    /// the last `❯` that starts a row, and whether all of it is greyed (SGR 2).
+    /// Greyed, it is the suggested next message Claude Code shows in an empty
+    /// prompt, or its start hint: nobody typed it and Enter would not send a
+    /// user's words. `None` when no row starts with `❯`.
+    pub fn prompt(&self) -> Option<Prompt> {
+        let row = self.grid.iter().rev().find(|r| r.cells.first().is_some_and(|c| c.c == '\u{276f}'))?;
+        let after = &row.cells[1..];
+        let text: String = after.iter().map(|c| c.cluster.as_deref().map(str::to_string).unwrap_or_else(|| c.c.to_string())).collect();
+        let text = text.replace('\0', " ").trim().to_string();
+        let ghost = !text.is_empty() && after.iter().filter(|c| !c.is_blank() && !c.c.is_whitespace()).all(|c| c.attrs.contains(CellAttrs::DIM));
+        Some(Prompt { text, ghost })
+    }
+
     /// Return `(chars, bytes)` that `dump_text` would produce with the same args.
     /// Builds the text and measures it — same code path as `dump_text` to keep the
     /// totals exact. The temporary string is dropped immediately.
@@ -807,6 +834,7 @@ impl TerminalState {
         a.set(CellAttrs::ITALIC, self.italic);
         a.set(CellAttrs::UNDERLINE, self.underline);
         a.set(CellAttrs::STRIKETHROUGH, self.strikethrough);
+        a.set(CellAttrs::DIM, self.dim);
         a
     }
 

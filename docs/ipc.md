@@ -1103,7 +1103,8 @@ Response: `{ "ok": true }`.
 { "cmd": "get-pane-content",
   "panes": "all" | [42, 43, ...],
   "mode": "visible" | "scrollback" | "all",
-  "trim_trailing_blank_lines": true }
+  "trim_trailing_blank_lines": true,
+  "prompt": false }
 ```
 
 | Field | Default | Meaning |
@@ -1111,6 +1112,7 @@ Response: `{ "ok": true }`.
 | `panes` | `"all"` | which panes to dump (string `"all"`, integer array, or omitted) |
 | `mode` | `"visible"` | `visible` = current grid only; `scrollback` = scrollback only; `all` = scrollback + grid |
 | `trim_trailing_blank_lines` | `true` | drop fully-blank lines at the very end of each pane's output |
+| `prompt` | `false` | add each pane's `prompt` to the answer (below) |
 
 Per-line trailing whitespace from grid padding is always stripped. Wrapped grid lines (long output rewrapped at column boundary) are reassembled into a single logical line.
 
@@ -1124,6 +1126,20 @@ Response:
 ```
 
 `cols` and `rows` are the pane's terminal size. A pane scrolled entirely off-screen (a tab wider than the window) keeps the size it had until it is on screen again: a window resize does not reach it, so it does not redraw for nothing.
+
+#### `prompt`: is the text in Claude Code's input line typed, or a greyed suggestion?
+
+With `"prompt": true`, each pane entry carries:
+
+```json
+"prompt": { "text": "continue", "ghost": true }
+```
+
+- `text`: what follows the last `❯` that starts a row of the live screen, trimmed. Empty when the input line is empty.
+- `ghost`: `true` when all of that text is greyed (written under SGR 2). That is the next message Claude Code suggests in an empty input line, or its start hint (`Try "..."`): nobody typed it, and the line is empty for whoever wants to type into it. `false` for a typed text, an empty line, or a text only partly greyed.
+- `"prompt": null` when no row starts with `❯` (a shell, a menu, a dialog).
+
+The plain `text` of the pane cannot tell the two apart: a suggestion reads there as `❯ continue`, exactly like a typed line. Without `"prompt": true` the answer has no `prompt` key and is unchanged. The greyed bit is recorded when a cell is written, so it is known for what was drawn since this Kova started.
 
 Per-pane errors don't fail the whole request — missing IDs come back as `{ "id": ..., "error": "not found" }` entries inside the array.
 
