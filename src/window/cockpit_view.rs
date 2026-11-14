@@ -59,6 +59,16 @@ const HIDDEN_MS: u64 = 60_000;
 /// A frame in the container's coordinates (points, y up).
 type Frame = (f64, f64, f64, f64);
 
+/// A card whose command runs (`CockpitSlot::filing`).
+#[derive(Clone)]
+struct Filing {
+    /// The card's key on the page, and its entry's id in the queue.
+    key: String,
+    id: String,
+    title: String,
+    filed: cockpit::Filed,
+}
+
 /// The window's Cockpit: its web view and what the page holds.
 #[derive(Default)]
 pub struct CockpitSlot {
@@ -86,9 +96,12 @@ pub struct CockpitSlot {
     /// Entries removed, done or snoozed from here, by key, with when (ms):
     /// hidden until the queue drops them, back if the command failed.
     hidden: RefCell<HashMap<String, u64>>,
-    /// The card filed last, shown as its receipt in its place until the
-    /// next gesture or until the page closes.
-    receipt: RefCell<Option<Item>>,
+    /// The cards being filed: each keeps its place, dimmed, while its
+    /// command runs, then leaves a toast saying what it came to.
+    filing: RefCell<Vec<Filing>>,
+    /// The toasts the page has not been sent yet.
+    toasts: RefCell<Vec<cockpit::Toast>>,
+    toast_seq: Cell<u64>,
     /// The catch-up band: folded with its chevron, every row shown after
     /// `Voir plus`, the project rows opened in place.
     band_folded: Cell<bool>,
@@ -332,7 +345,10 @@ impl KovaView {
         let frame = if slot.open.get() && !self.metal_overlay_open() { self.cockpit_frame() } else { None };
         let Some(frame) = frame else {
             slot.chat_target.set(None);
-            slot.receipt.replace(None);
+            // Nobody to tell: what ended meanwhile is not announced later.
+            let outcomes = crate::attention::outcomes();
+            slot.filing.borrow_mut().retain(|f| matches!(outcomes.get(&f.id), Some(crate::attention::Outcome::Running)));
+            slot.toasts.borrow_mut().clear();
             self.hide_cockpit();
             return;
         };
@@ -391,24 +407,46 @@ impl KovaView {
         }
         let mut items = self.cockpit_items(&|p: &Path| p.is_file());
         {
+            // The cards being filed: still running, the card stays, dimmed.
+            // Ended: a toast says what it came to, never a success for a
+            // gesture that failed (its card is then back whole).
+            let outcomes = crate::attention::outcomes();
+            let mut ended = Vec::new();
+            slot.filing.borrow_mut().retain(|f| match outcomes.get(&f.id) {
+                Some(crate::attention::Outcome::Running) => true,
+                Some(crate::attention::Outcome::Failed { words, .. }) => {
+                    ended.push((f.clone(), Some(words.clone())));
+                    false
+                }
+                _ => {
+                    ended.push((f.clone(), None));
+                    false
+                }
+            });
+            for (f, failed) in ended {
+                let id = self.next_toast_id();
+                slot.toasts.borrow_mut().push(match failed {
+                    Some(why) => cockpit::Toast::failed(id, &f.title, &why, f.filed.text.is_some()),
+                    None => {
+                        // Gone from the page at once; the next read drops it.
+                        slot.hidden.borrow_mut().insert(f.key.clone(), now_ms());
+                        cockpit::Toast::filed(id, &f.title, &f.filed)
+                    }
+                });
+            }
+            for f in slot.filing.borrow().iter() {
+                if let Some(item) = items.iter_mut().find(|i| i.key == f.key) {
+                    item.filed = Some(f.filed.clone());
+                }
+            }
+        }
+        {
             let now = now_ms();
             let mut hidden = slot.hidden.borrow_mut();
             hidden.retain(|k, at| now.saturating_sub(*at) < HIDDEN_MS && items.iter().any(|i| &i.key == k));
             // A command that failed brings its card back, with its words.
             hidden.retain(|k, _| !items.iter().any(|i| &i.key == k && matches!(i.state, State::Failed(_))));
             items.retain(|i| !hidden.contains_key(&i.key));
-        }
-        {
-            // The receipt of the last card filed, where the card was. A card
-            // back in the list (its gesture failed) shows itself instead.
-            let mut receipt = slot.receipt.borrow_mut();
-            if receipt.as_ref().is_some_and(|r| items.iter().any(|i| i.key == r.key)) {
-                *receipt = None;
-            }
-            if let Some(r) = receipt.as_ref() {
-                items.push(r.clone());
-                cockpit::sort(&mut items);
-            }
         }
         self.cockpit_fill(&mut items);
         let mut page = slot.page.borrow_mut();
@@ -484,6 +522,7 @@ impl KovaView {
             chat: (fresh || shown.2 != parts.2).then(|| parts.2.clone()),
             focus: false,
             reveal: slot.reveal.borrow_mut().take(),
+            toasts: std::mem::take(&mut *slot.toasts.borrow_mut()),
         };
         page.shown = Some(parts);
         drop(page);
@@ -804,14 +843,13 @@ impl KovaView {
                 match crate::attention::perform_with(id, verb, text, seen.as_deref()) {
                     // Gone from the page at once; the next read drops it.
                     Ok(()) if matches!(verb, Verb::Resolve | Verb::Dismiss | Verb::NoGo | Verb::Snooze) => {
-                        slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
                         let words = match verb {
                             Verb::Resolve => "Fait : carte rangée",
                             Verb::NoGo => "No go noté",
                             Verb::Snooze => "Carte reportée",
                             _ => "Carte écartée",
                         };
-                        self.cockpit_receipt(&item, words, text.filter(|_| verb != Verb::Snooze));
+                        self.cockpit_filing(&item, id, words, text.filter(|_| verb != Verb::Snooze));
                     }
                     Ok(()) => {}
                     // Refused before it ran: the card stays and says why.
@@ -824,6 +862,7 @@ impl KovaView {
                             crate::attention::instruction_refused(id, text, "Kova n'a pas pu la transmettre");
                         }
                         crate::attention::click_refused(id, &why);
+                        self.cockpit_refused(&item, &why, text);
                     }
                 }
             }
@@ -891,13 +930,12 @@ impl KovaView {
         let draft = draft.filter(|_| item.draft.is_some());
         match crate::attention::perform_gesture(id, gesture, text, seen.as_deref(), draft, item.card_seen.as_deref()) {
             Ok(()) if gesture.files() => {
-                slot.hidden.borrow_mut().insert(key.to_string(), now_ms());
                 let words = match gesture {
                     Gesture::Go => "Go noté",
                     Gesture::NoGo => "No go noté",
                     _ => "Vu : carte rangée",
                 };
-                self.cockpit_receipt(&item, words, text.filter(|_| gesture.takes_text()));
+                self.cockpit_filing(&item, id, words, text.filter(|_| gesture.takes_text()));
             }
             Ok(()) => {}
             Err(why) => {
@@ -906,16 +944,35 @@ impl KovaView {
                     crate::attention::instruction_refused(id, text, "Kova n'a pas pu la transmettre");
                 }
                 crate::attention::click_refused(id, &why);
+                self.cockpit_refused(&item, &why, text);
             }
         }
         self.mark_dirty();
     }
 
-    /// The card just filed becomes its receipt (`cockpit::receipt_html`).
-    fn cockpit_receipt(&self, item: &Item, words: &'static str, text: Option<&str>) {
+    /// The card's command runs: it keeps its place, dimmed, until the tick
+    /// reads what the command came to and says it in a toast.
+    fn cockpit_filing(&self, item: &Item, id: &str, words: &'static str, text: Option<&str>) {
         let text = text.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
-        let filed = cockpit::Filed { words, text };
-        self.ivars().cockpit.receipt.replace(Some(Item { filed: Some(filed), detail: None, draft: None, ..item.clone() }));
+        let filing = Filing { key: item.key.clone(), id: id.to_string(), title: item.title.clone(), filed: cockpit::Filed { words, text } };
+        let mut list = self.ivars().cockpit.filing.borrow_mut();
+        list.retain(|f| f.key != filing.key);
+        list.push(filing);
+    }
+
+    /// A click refused before its command ran: the card stays and says why,
+    /// and so does a toast.
+    fn cockpit_refused(&self, item: &Item, why: &str, text: Option<&str>) {
+        let why = why.strip_prefix("attention: ").unwrap_or(why);
+        let id = self.next_toast_id();
+        let toast = cockpit::Toast::failed(id, &item.title, why, text.is_some_and(|t| !t.trim().is_empty()));
+        self.ivars().cockpit.toasts.borrow_mut().push(toast);
+    }
+
+    fn next_toast_id(&self) -> u64 {
+        let seq = &self.ivars().cockpit.toast_seq;
+        seq.set(seq.get() + 1);
+        seq.get()
     }
 
     /// An instruction typed on an opened attention card: `act_command ID

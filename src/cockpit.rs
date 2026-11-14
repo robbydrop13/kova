@@ -174,7 +174,8 @@ pub struct Item {
     /// The queue's fingerprint of the card as rendered (`Entry::card_seen`):
     /// it goes back with every gesture clicked on it.
     pub card_seen: Option<String>,
-    /// The user just filed it: the card is its receipt, in its place.
+    /// The user just filed it and its command runs: the card keeps its
+    /// place, dimmed (`going`), until a toast says what it came to.
     pub filed: Option<Filed>,
     /// An attention entry's reply zone as the queue gives it (`zoned`).
     pub reply: crate::attention::Reply,
@@ -1049,7 +1050,7 @@ fn state_html(state: &State) -> String {
     }
 }
 
-/// What the user just did to a card, said in its place once it is filed.
+/// What the user just did to a card: said in a toast once the command ends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Filed {
     /// `Go noté`, `No go noté`, `Vu : carte rangée`…
@@ -1058,38 +1059,63 @@ pub struct Filed {
     pub text: Option<String>,
 }
 
-/// The receipt of a filed card: what was done, on which card, with which
-/// text. It takes the card's place, so the card that slides up is never
-/// taken for the one just answered (14/11/2026: a text typed for one card
-/// left on its neighbour). No button: it goes with the next gesture.
-pub fn receipt_html(item: &Item, filed: &Filed, now: u64) -> String {
-    let text = filed
-        .text
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("<p class=\"msg sent\">Ton texte, parti avec : {}</p>", esc(t)))
-        .unwrap_or_default();
-    format!(
-        "<article class=\"card filed\" data-key=\"{}\"><div class=\"row\"><div class=\"txt\">\
-         <div class=\"state ok top\">{ICON_CHECK}<span>{} sur cette carte</span></div>\
-         <div class=\"t\">{}</div>{}{text}</div></div></article>",
-        esc(&item.key),
-        filed.words,
-        esc(&item.title),
-        source_html(item, now),
-    )
+/// A toast of the page (`Update::toasts`): what a gesture came to, on which
+/// card, with which text. The look and the timing are the Claap app's toast
+/// (`packages/ui/src/common/hooks/useToast.tsx`): bottom left, 5 s, an icon
+/// and words, never the color alone. The page shows each `id` once.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Toast {
+    pub id: u64,
+    /// The gesture went through. False: nothing was noted, the card is back.
+    pub ok: bool,
+    /// `Go noté`, or `Non transmis`.
+    pub head: String,
+    /// The card's title.
+    pub title: String,
+    /// Under the title: the text that left, or why the gesture failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more: Option<String>,
+}
+
+/// The words of a toast's text line never run long: the card has it whole.
+const TOAST_TEXT_MAX: usize = 180;
+
+fn clipped(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= TOAST_TEXT_MAX {
+        return flat;
+    }
+    let cut: String = flat.chars().take(TOAST_TEXT_MAX).collect();
+    format!("{}…", cut.trim_end())
+}
+
+impl Toast {
+    /// The gesture went through: what was done, the card, the text that
+    /// left with it. This is how the user sees which card his text went to
+    /// (14/11/2026: a text typed for one card left on its neighbour).
+    pub fn filed(id: u64, title: &str, filed: &Filed) -> Toast {
+        let more = filed.text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("Ton texte, parti avec : {}", clipped(t)));
+        Toast { id, ok: true, head: filed.words.to_string(), title: title.to_string(), more }
+    }
+
+    /// The gesture did not go through: never the words of a success. The
+    /// card is back in the list, with the text typed when there was one.
+    pub fn failed(id: u64, title: &str, why: &str, text: bool) -> Toast {
+        let kept = if text { " Ton texte est resté sur la carte." } else { "" };
+        let more = format!("{}.{kept}", clipped(why).trim_end_matches('.'));
+        Toast { id, ok: false, head: "Non transmis".to_string(), title: title.to_string(), more: Some(more) }
+    }
 }
 
 /// One card.
 pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, now: u64) -> String {
-    if let Some(filed) = &item.filed {
-        return receipt_html(item, filed, now);
-    }
     // `Refuser` closes the entry: no close command, no `Refuser`.
     let list: Vec<Button> = buttons(item, can_act).into_iter().filter(|&b| can_close || b != Button::Refuse).collect();
     let icon_list = if zoned(item, can_act) { zone_icons(item, can_snooze) } else { icons(item, can_close, can_snooze) };
-    card_html_with(item, &list, &icon_list, can_act, now)
+    let html = card_html_with(item, &list, &icon_list, can_act, now);
+    // Being filed: the card keeps its place, dimmed and out of reach, until
+    // its command ends. Nothing slides under the pointer meanwhile.
+    if item.filed.is_some() { html.replacen("<article class=\"card", "<article class=\"card going", 1) } else { html }
 }
 
 const ICON_NOGO: &str = r#"<svg class="i" width="13" height="13" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>"#;
@@ -1750,11 +1776,15 @@ pub struct Update {
     /// Scroll to this card and light it, once the list is in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reveal: Option<String>,
+    /// What the last gestures came to. Sent until Kova forgets them: the
+    /// page shows each id once.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub toasts: Vec<Toast>,
 }
 
 impl Update {
     pub fn is_empty(&self) -> bool {
-        self.head.is_none() && self.list.is_none() && self.chat.is_none() && !self.focus && self.reveal.is_none()
+        self.head.is_none() && self.list.is_none() && self.chat.is_none() && !self.focus && self.reveal.is_none() && self.toasts.is_empty()
     }
 }
 
@@ -1905,7 +1935,6 @@ textarea.ins{display:block;width:100%;margin-top:4px;background:var(--bg-input);
 textarea.ins:focus{border-color:var(--accent);outline:0}
 .msg.sent{margin-top:4px;font-size:12px;color:var(--t2)}
 .card.going{opacity:.45;pointer-events:none}
-.card.filed{cursor:default;border:1px dashed var(--t3)}.card.filed .state{display:flex;align-items:center;gap:6px;color:var(--t1);font-weight:600}.card.filed .t{color:var(--t2)}.card.filed .msg.sent{white-space:pre-wrap}
 .rz .lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.rz .lbl b{font-weight:600;color:var(--t2)}
 div.why{margin-top:8px;cursor:auto}div.why[hidden]{display:none}
 input.why{display:block;width:100%;height:28px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:0 10px}
@@ -2094,9 +2123,21 @@ body.chat-on .chat{display:flex}
 .cu-more{padding:6px 16px 2px;border-top:1px solid var(--b3)}
 .card.flash{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 35%,transparent);transition:box-shadow .3s}
 .none{font-size:13px;color:var(--t3)}
+#toasts{position:fixed;left:8px;bottom:8px;z-index:30;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{pointer-events:auto;box-sizing:border-box;width:350px;max-width:calc(100vw - 16px);padding:14px 16px;display:flex;flex-direction:column;gap:8px;background:light-dark(#f3f3f3,#3a3a3a);border:1px solid light-dark(#dbdbdb,#464646);border-radius:6px;box-shadow:0 4px 4px -1px rgba(0,0,0,.06);color:light-dark(#242424,#fff);font-size:14px;line-height:20px;animation:toast-in .2s ease-out;transition:opacity .2s,transform .2s}
+@keyframes toast-in{from{opacity:0;transform:translateY(8px)}}
+.toast.out{opacity:0;transform:translateY(8px)}
+.toast .tr{display:flex;align-items:center;gap:16px}.toast .ti{flex:none;width:20px;height:20px}
+.toast.ok .ti{color:light-dark(#008734,#00BE4C)}.toast.ko .ti{color:light-dark(#CC2314,#FF6551)}
+.toast .th{flex:1 1 auto;min-width:0;font-weight:500}
+.toast .tx{flex:none;width:16px;height:16px;padding:0;border:0;background:none;color:light-dark(#6c6c6c,#bebebe);cursor:pointer;display:inline-flex}.toast .tx:hover{color:light-dark(#525252,#fff)}
+.toast .ts{padding-left:36px;display:flex;flex-direction:column;gap:2px;color:light-dark(#525252,#dbdbdb);font-size:13px;line-height:18px;min-width:0}
+.toast .tt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:light-dark(#242424,#fff)}
+.toast .tm{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
 </style></head><body>
 <section class="chat" id="chat"></section>
 <section class="page"><div class="inner"><div id="head"></div><div id="list"></div></div></section>
+<div id="toasts" role="status" aria-live="polite"></div>
 {snooze_html}
 <div class="snz fm" id="fm" hidden></div>
 <div id="zoom" hidden><img alt=""><span></span></div>
@@ -2240,10 +2281,16 @@ window.kova = {
     if (u.list !== undefined) {
       // A folded section the user opened (done, dropped) stays open.
       const open = [...document.querySelectorAll('details[data-tk][open]')].map(d => d.dataset.tk);
+      // A card being filed that leaves the list: the cards below move up
+      // now, so the buttons wait again, and until the pointer has moved.
+      const going = [...document.querySelectorAll('.card.going')].map(c => c.dataset.key);
       apply('list', u.list);
+      if (held.list === undefined && going.some(k => !document.querySelector('.card[data-key="' + CSS.escape(k) + '"]'))) { filedAt = Date.now(); still = pointer || lastClick; }
       open.forEach(k => { const d = document.querySelector('details[data-tk="' + k + '"]'); if (d) d.open = true; });
     }
     if (u.chat !== undefined) { apply('chat', u.chat); document.body.classList.toggle('chat-on', u.chat !== ''); }
+    if (u.toasts) u.toasts.forEach(toast);
+    if (u.chat !== undefined || u.toasts) placeToasts();
     if (u.focus && !(document.activeElement && /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName))) window.focus();
     if (u.reveal) {
       // The card to light must be in the list, held or not.
@@ -2272,16 +2319,49 @@ function fmOpen(b) {
   m.style.top = (r.bottom + 4) + 'px';
   m.style.left = Math.max(8, Math.min(r.left, window.innerWidth - m.offsetWidth - 8)) + 'px';
 }
-// A card just filed stays where it is, dimmed and out of reach, until the
-// list comes back with its receipt in its place. The cards below then move
-// up: for a moment, and until the pointer has moved, no button acts, so a
-// second click never lands on what slid under the pointer.
-let filedAt = 0, still = null, lastClick = null;
+// A card just filed stays where it is, dimmed and out of reach, until its
+// command ends and the list comes back without it (a toast then says what
+// it came to). The cards below then move up: for a moment, and until the
+// pointer has moved, no button acts, so a click never lands on what slid
+// under the pointer.
+let filedAt = 0, still = null, lastClick = null, pointer = null;
 const GUARD_MS = 700;
 function guarded() { return Date.now() - filedAt < GUARD_MS || still !== null; }
 document.addEventListener('mousemove', e => {
+  pointer = [e.clientX, e.clientY];
   if (still && Math.hypot(e.clientX - still[0], e.clientY - still[1]) > 6) still = null;
 });
+// Toasts: what a gesture came to, bottom left of the list's column, as in
+// the Claap app: 5 s each, held while the pointer is on it, stacked, the
+// newest last. An icon and words say the outcome, never the color alone.
+const TOAST_MS = 5000, toasted = new Set();
+const TOAST_OK = '<svg class="ti" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="8.33" fill="currentColor" stroke="currentColor" stroke-width="1.25"/><path d="M14 7L8.5 12.5L6 10" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const TOAST_KO = '<svg class="ti" viewBox="0 0 20 20" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" clip-rule="evenodd" d="M18.3333 10C18.3333 14.6024 14.6024 18.3334 10 18.3334C5.39763 18.3334 1.66667 14.6024 1.66667 10C1.66667 5.39765 5.39763 1.66669 10 1.66669C14.6024 1.66669 18.3333 5.39765 18.3333 10ZM10 5.66669C10.5523 5.66669 11 6.1144 11 6.66669V10C11 10.5523 10.5523 11 10 11C9.44772 11 9 10.5523 9 10V6.66669C9 6.1144 9.44772 5.66669 10 5.66669ZM9 13.3333C9 12.781 9.44772 12.3333 10 12.3333H10.0083C10.5606 12.3333 11.0083 12.781 11.0083 13.3333C11.0083 13.8856 10.5606 14.3333 10.0083 14.3333H10C9.44772 14.3333 9 13.8856 9 13.3333Z"/></svg>';
+const TOAST_X = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+function placeToasts() {
+  const p = document.querySelector('.page');
+  if (p) document.getElementById('toasts').style.left = (p.getBoundingClientRect().left + 8) + 'px';
+}
+window.addEventListener('resize', placeToasts);
+function toast(t) {
+  if (toasted.has(t.id)) return;
+  toasted.add(t.id);
+  const el = document.createElement('div');
+  el.className = 'toast ' + (t.ok ? 'ok' : 'ko');
+  el.dataset.id = t.id;
+  el.innerHTML = '<div class="tr">' + (t.ok ? TOAST_OK : TOAST_KO) + '<span class="th"></span><button class="tx" type="button" aria-label="Fermer">' + TOAST_X + '</button></div><div class="ts"><span class="tt"></span></div>';
+  el.querySelector('.th').textContent = t.head;
+  el.querySelector('.tt').textContent = t.title;
+  if (t.more) { const m = document.createElement('span'); m.className = 'tm'; m.textContent = t.more; el.querySelector('.ts').appendChild(m); }
+  let left = TOAST_MS, since = 0, timer = null;
+  const close = () => { clearTimeout(timer); el.classList.add('out'); setTimeout(() => el.remove(), 200); };
+  const run = () => { since = Date.now(); timer = setTimeout(close, left); };
+  el.addEventListener('mouseenter', () => { clearTimeout(timer); left = Math.max(1000, left - (Date.now() - since)); });
+  el.addEventListener('mouseleave', run);
+  el.querySelector('.tx').addEventListener('click', e => { e.stopPropagation(); close(); });
+  document.getElementById('toasts').appendChild(el);
+  run();
+}
 function hide(key) {
   filedAt = Date.now();
   still = lastClick;
@@ -2349,7 +2429,7 @@ document.addEventListener('click', e => {
   // A click on a card's body, not on a button or a field: it opens or folds.
   if (!b) {
     const card = e.target.closest('.card');
-    if (!card || card.classList.contains('filed') || e.target.closest('textarea, input, a, .detail, .instr, .why')) return;
+    if (!card || card.classList.contains('going') || e.target.closest('textarea, input, a, .detail, .instr, .why')) return;
     if (String(window.getSelection()).trim()) return;
     return post({ type: 'act', key: card.dataset.key, act: 'expand' });
   }
@@ -2516,7 +2596,7 @@ mod tests {
     /// slid into its place, and a folded card showed its screenshots with no
     /// field, so the only `Ta réponse` in sight was another card's.
     #[test]
-    fn a_filed_card_leaves_a_receipt_and_a_field_names_its_card() {
+    fn a_filed_card_leaves_a_toast_and_a_field_names_its_card() {
         let gestures = r#""gestures":["go","nogo","ask","seen"],"go_label":"Go","waiting":"robin","ask":null,"card_seen":"fedcba9876543210""#;
         // The fingerprint the queue listed is the one the card sends back.
         let mut shown = from_attention(&zone_entry("a-1", &format!(r#"{gestures},"kind":"test","title":"Open settings <b>""#).replace(r#""kind":"would","title":"T","#, "")), None, false).unwrap();
@@ -2536,26 +2616,43 @@ mod tests {
         let bare = Item { shots: Vec::new(), ..shown.clone() };
         let bare_html = card_html(&bare, true, true, true, 10);
         assert!(!zone_shown(&bare, true) && bare_html.matches(seen).count() == 1 && !bare_html.contains("class=\"instr rz\""), "{bare_html}");
-        // The receipt's words and check are in the text color: nothing rests on green.
-        assert!(shell(false, "n").contains(".card.filed .state{display:flex;align-items:center;gap:6px;color:var(--t1);font-weight:600}"));
         // The field says which card it answers, escaped.
         assert!(folded.contains("<div class=\"lbl\">Ta réponse sur <b>Open settings &lt;b&gt;</b></div>"), "{folded}");
-        // Filed: the receipt, under the same key, with the text that left and no button.
+        // Being filed: the same card under the same key, dimmed and out of
+        // reach until its command ends. No receipt stays in the list.
         shown.filed = Some(Filed { words: "No go noté", text: Some("le bleu <pâle>\nne va pas".into()) });
-        let receipt = card_html(&shown, true, true, true, 10);
-        assert!(receipt.starts_with("<article class=\"card filed\" data-key=\"attention:a-1\">"), "{receipt}");
-        assert!(receipt.contains("<span>No go noté sur cette carte</span>") && receipt.contains("Open settings &lt;b&gt;"), "{receipt}");
-        assert!(receipt.contains("Ton texte, parti avec : le bleu &lt;pâle&gt;\nne va pas"), "{receipt}");
-        assert!(!receipt.contains("<button") && !receipt.contains("<textarea") && !receipt.contains("<img"), "{receipt}");
-        shown.filed = Some(Filed { words: "Vu : carte rangée", text: None });
-        assert!(!card_html(&shown, true, true, true, 10).contains("Ton texte"));
-        // The page: a filed card is dimmed in place, never removed by the
-        // script, its receipt does not open, and a button waits a moment
-        // after a filing so a second click does not file what slid under it.
+        let going = card_html(&shown, true, true, true, 10);
+        assert!(going.starts_with("<article class=\"card going"), "{going}");
+        assert_eq!(going.replacen("card going", "card", 1), folded);
+        // Then the toast: the gesture, the card, the text that left with it.
+        let toast = Toast::filed(7, &shown.title, shown.filed.as_ref().unwrap());
+        assert_eq!(toast, Toast { id: 7, ok: true, head: "No go noté".into(), title: "Open settings <b>".into(), more: Some("Ton texte, parti avec : le bleu <pâle> ne va pas".into()) });
+        assert_eq!(Toast::filed(8, "T", &Filed { words: "Vu : carte rangée", text: None }).more, None);
+        let long = Toast::filed(9, "T", &Filed { words: "Go noté", text: Some("mot ".repeat(100)) }).more.unwrap();
+        assert!(long.ends_with("mot…") && long.chars().count() < 210, "{long}");
+        // A gesture that failed never reads as done.
+        let failed = Toast::failed(10, "T", "la carte a changé depuis son affichage, relis-la : rien n'est noté ni fermé", true);
+        assert!(!failed.ok && failed.head == "Non transmis");
+        assert_eq!(failed.more.as_deref(), Some("la carte a changé depuis son affichage, relis-la : rien n'est noté ni fermé. Ton texte est resté sur la carte."));
+        // Sent as data, set as text by the page: a title is never markup.
+        let u = Update { toasts: vec![toast], ..Default::default() };
+        assert!(!u.is_empty());
+        assert!(update_script(&u).contains(r#""toasts":[{"id":7,"ok":true,"head":"No go noté","title":"Open settings <b>","more":"Ton texte, parti avec : le bleu <pâle> ne va pas"}]"#), "{}", update_script(&u));
+        // The page: a card being filed is dimmed in place, never removed by
+        // the script, does not open, and a button waits a moment after a
+        // filing, and again when the card leaves the list, so a click does
+        // not file what slid under the pointer.
         let page = shell(false, "n");
         assert!(page.contains("if (c) c.classList.add('going');") && !page.contains("c.style.display = 'none'"));
         assert!(page.contains(".card.going{opacity:.45;pointer-events:none}"));
-        assert!(page.contains("if (!card || card.classList.contains('filed') ||"));
+        assert!(page.contains("if (!card || card.classList.contains('going') ||"));
+        assert!(page.contains("{ filedAt = Date.now(); still = pointer || lastClick; }"), "the guard starts again when the card leaves");
+        // The toast: Claap's, 5 s, held under the pointer, shown once per id,
+        // its words set as text; a check or an alert sign, never the color alone.
+        assert!(page.contains("<div id=\"toasts\" role=\"status\" aria-live=\"polite\"></div>") && !page.contains(".card.filed"));
+        assert!(page.contains("const TOAST_MS = 5000") && page.contains("if (toasted.has(t.id)) return;"));
+        assert!(page.contains("el.addEventListener('mouseenter', () => { clearTimeout(timer);") && page.contains("el.addEventListener('mouseleave', run);"));
+        assert!(page.contains("el.querySelector('.th').textContent = t.head;") && page.contains("(t.ok ? TOAST_OK : TOAST_KO)"));
         assert!(page.contains("if (guarded() && !['expand', 'open', 'link', 'pane'].includes(b.dataset.act)) return;"));
         assert!(page.contains("function guarded() { return Date.now() - filedAt < GUARD_MS || still !== null; }") && page.contains("still = lastClick;"));
     }

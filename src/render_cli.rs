@@ -21,7 +21,8 @@ kova render: write Kova's pages as HTML files, without a window
   kova render cockpit --list <json> --out <dir>
         [--inflight <json>] [--panes <json>] [--catchup <json>] [--open <card id>] [--light]
         [--state <card id>=delivered|noted|running|failed:<why>]... [--refs <json>]
-        [--filed <card id>=go|nogo|seen[:<text>]]...
+        [--filed <card id>=go|nogo|seen[:<text>]]... [--toast <card id>=go|nogo|seen[:<text>]]...
+        [--toast-failed <card id>=<why>]...
         [--journal <file.md>] [--ask <question.json>]...
       <json> files hold what the `[attention]` commands print: `attn list --open --json`,
       `attn inflight --json`, `attn catchup --json`; panes: [[\"session\", working], ...].
@@ -191,18 +192,38 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
         states.insert(id.to_string(), outcome);
     }
     let mut items: Vec<cockpit::Item> = entries.iter().filter_map(|e| cockpit::from_attention(e, states.get(&e.id), true)).collect();
-    // A card just filed, as its receipt in its place (the page's last gesture).
-    for f in a.all("--filed") {
-        let (id, what) = f.split_once('=').ok_or("--filed: <card id>=go|nogo|seen[:<text>]")?;
+    // A gesture's words and text: `go`, `nogo:<text>`, `seen`.
+    let filed_of = |flag: &str, what: &str| -> Result<cockpit::Filed, String> {
         let (word, text) = what.split_once(':').map_or((what, None), |(w, t)| (w, Some(t.to_string())));
         let words = match word {
             "go" => "Go noté",
             "nogo" => "No go noté",
             "seen" => "Vu : carte rangée",
-            other => return Err(format!("--filed: '{other}' is not go, nogo or seen")),
+            other => return Err(format!("{flag}: '{other}' is not go, nogo or seen")),
         };
+        Ok(cockpit::Filed { words, text })
+    };
+    // A card being filed: in its place, dimmed, while its command runs.
+    for f in a.all("--filed") {
+        let (id, what) = f.split_once('=').ok_or("--filed: <card id>=go|nogo|seen[:<text>]")?;
+        let filed = filed_of("--filed", what)?;
         let item = items.iter_mut().find(|i| i.key == format!("attention:{id}")).ok_or_else(|| format!("--filed: no card {id} in the list"))?;
-        item.filed = Some(cockpit::Filed { words, text });
+        item.filed = Some(filed);
+    }
+    // The toasts of gestures that ended: the card left the list (`--toast`)
+    // or came back whole (`--toast-failed`).
+    let mut toasts = Vec::new();
+    for f in a.all("--toast") {
+        let (id, what) = f.split_once('=').ok_or("--toast: <card id>=go|nogo|seen[:<text>]")?;
+        let filed = filed_of("--toast", what)?;
+        let at = items.iter().position(|i| i.key == format!("attention:{id}")).ok_or_else(|| format!("--toast: no card {id} in the list"))?;
+        let item = items.remove(at);
+        toasts.push(cockpit::Toast::filed(toasts.len() as u64 + 1, &item.title, &filed));
+    }
+    for f in a.all("--toast-failed") {
+        let (id, why) = f.split_once('=').ok_or("--toast-failed: <card id>=<why>")?;
+        let item = items.iter().find(|i| i.key == format!("attention:{id}")).ok_or_else(|| format!("--toast-failed: no card {id} in the list"))?;
+        toasts.push(cockpit::Toast::failed(toasts.len() as u64 + 1, &item.title, why, false));
     }
     // Waiting asks, each from its file of the board's store: their tiles as
     // the Cockpit makes them (`from_need`, then `ask_title`).
@@ -281,7 +302,7 @@ fn render_cockpit(a: &Args) -> Result<i32, String> {
             label: None,
         };
         let (head, body, chat) = cockpit::parts(&view);
-        let update = cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None };
+        let update = cockpit::Update { head: Some(head), list: Some(body), chat: Some(chat), focus: false, reveal: None, toasts: toasts.clone() };
         let html = cockpit::shell(light, "render")
             .replace("</body>", &format!("<script nonce=\"render\">{}{script}</script></body>", cockpit::update_script(&update)));
         write(&dir.join(name), &html)

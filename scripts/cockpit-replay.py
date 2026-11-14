@@ -7,6 +7,9 @@ sent to Kova. It replays the case of 14/11/2026: a card is filed, then the
 user answers the card whose screenshots are under his eye. Before the fix
 the only field in sight was the neighbour's and the text left with the
 neighbour's No go.
+A card filed keeps its place while its command runs, then leaves the list
+and a toast says what was done, on which card, with which text; a gesture
+that failed brings the card back and its toast says so.
 
   scripts/cockpit-replay.py [--kova <binary>] [--list <queue json>] [--keep <dir>]
 
@@ -21,41 +24,53 @@ MARK = '<script nonce="render">window.kova && window.kova.update('
 
 SCENARIO = r"""
 const [C, A, B] = DATA.order;
-const state = { open: new Set(), gone: new Set(), filed: null, tick: 0 };
+const state = { open: new Set(), gone: new Set(), going: new Set(), tick: 0 };
 function listHtml() {
-  const body = DATA.order.filter(k => !state.gone.has(k) || state.filed === k)
-    .map(k => state.filed === k ? DATA.filed[k] : ((state.open.has(k) && DATA.opened[k]) || DATA.folded[k])).join('');
+  const body = DATA.order.filter(k => !state.gone.has(k))
+    .map(k => state.going.has(k) ? DATA.going[k] : ((state.open.has(k) && DATA.opened[k]) || DATA.folded[k])).join('');
   return DATA.frame[0] + body + DATA.frame[1] + '<!--' + (state.tick++) + '-->';
 }
-function push() { window.kova.update({ list: listHtml() }); }
-// Kova's side: a card filed becomes the one receipt, in its place.
+function push(toasts) { window.kova.update(toasts ? { list: listHtml(), toasts } : { list: listHtml() }); }
+// Kova's side: a card filed keeps its place, dimmed, while its command runs.
 function drain() {
   const got = window.posted.splice(0).filter(m => m.type === 'act');
   for (const m of got) {
     if (m.act === 'expand') { state.open.has(m.key) ? state.open.delete(m.key) : state.open.add(m.key); }
-    if (m.act === 'reply' && ['go', 'nogo', 'seen'].includes(m.arg)) { state.gone.add(m.key); state.filed = m.key; }
+    if (m.act === 'reply' && ['go', 'nogo', 'seen'].includes(m.arg)) state.going.add(m.key);
   }
   push();
   return got.filter(m => m.act !== 'expand').map(m => ({ key: m.key, arg: m.arg, text: m.text || '' }));
 }
+// The command ended: the card leaves the list, or comes back whole, and a toast says which.
+function settle(key, toast, ok) {
+  state.going.delete(key);
+  if (ok) state.gone.add(key);
+  push([toast]);
+}
 const card = k => document.querySelector('.card[data-key="' + k + '"]');
+const toasts = () => [...document.querySelectorAll('#toasts .toast')];
 const wait = ms => new Promise(r => setTimeout(r, ms));
 function center(el) { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; }
 function under(x, y) {
   const el = document.elementFromPoint(x, y), c = el && el.closest('.card'), b = el && el.closest('button, textarea');
-  return { card: c ? c.dataset.key : null, receipt: !!(c && c.classList.contains('filed')), control: b ? b.tagName.toLowerCase() : null };
+  return { card: c ? c.dataset.key : null, control: b ? b.tagName.toLowerCase() : null };
 }
+const move = (x, y) => document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x, clientY: y }));
+const acts = () => window.posted.filter(m => m.type === 'act' && m.act !== 'expand').length;
 const checks = [];
 const check = (name, ok, detail) => checks.push({ name, ok: !!ok, detail: detail === undefined ? null : detail });
 function done() { document.getElementById('out').textContent = JSON.stringify(checks); }
 window.addEventListener('load', async () => { try {
   state.open = new Set([A]); push(); await wait(60);
+  const title = k => card(k).querySelector('.t').textContent;
+  const titles = { A: title(A), B: title(B), C: title(C) };
   const go = card(A).querySelector('[data-arg=go]');
   go.scrollIntoView({ block: 'center' }); await wait(40);
   const [x, y] = center(go);
   const clickAt = (px, py) => document.elementFromPoint(px, py).dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1, clientX: px, clientY: py }));
+  move(x, y);
   clickAt(x, y);
-  check('a filed card stays in place, out of reach, until its receipt comes',
+  check('a filed card stays in place, out of reach, while its command runs',
     card(A) && getComputedStyle(card(A)).display !== 'none' && card(A).classList.contains('going'));
   const sent = window.posted.length;
   card(B).querySelector('[data-arg=nogo]').click();
@@ -64,21 +79,28 @@ window.addEventListener('load', async () => { try {
   const first = drain();
   check('the Go went to the card clicked, alone', first.length === 1 && first[0].key === A && first[0].arg === 'go', first);
   await wait(60);
-  check('the filed card is its receipt, in the list', card(A) && card(A).classList.contains('filed') && /Go noté sur cette carte/.test(card(A).textContent));
-  // The cards below moved up: whatever is under the pointer now, a click
-  // there does nothing until the pointer has moved.
+  check('while the command runs the card keeps its place: nothing slid under the pointer, no toast yet',
+    card(A) && card(A).classList.contains('going') && under(x, y).control === null && toasts().length === 0, under(x, y));
+  // The command ended: the card leaves, a toast says what was done and on which card.
+  settle(A, DATA.toasts.go, true);
+  await wait(60);
+  check('no receipt stays in the list: the card is gone', !card(A) && !document.querySelector('.card.filed, .card.going'));
+  const t1 = toasts()[0];
+  check('a toast says the gesture and names the card, with a sign and a close button',
+    toasts().length === 1 && t1.classList.contains('ok') && t1.querySelector('.th').textContent === 'Go noté' && t1.querySelector('.tt').textContent === titles.A
+      && t1.querySelector('svg.ti') && t1.querySelector('button.tx'), t1 && t1.textContent);
+  // The cards below moved up now: whatever is under the pointer, a click
+  // there does nothing until the pointer has moved, however long it waits.
   await wait(800);
-  // (Opening or folding a card is not a gesture: it is not held.)
-  const acts = () => window.posted.filter(m => m.type === 'act' && m.act !== 'expand').length;
   const u = under(x, y), n = acts();
   clickAt(x, y);
   card(B).querySelector('[data-arg=nogo]').dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1, clientX: x, clientY: y }));
   check('a click where the pointer stayed never acts on what slid under it', acts() === n, u);
-  window.posted.splice(0).forEach(m => { if (m.type === 'act' && m.act === 'expand') { /* dropped: the replay keeps its cards as they are */ } });
-  document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x + 40, clientY: y + 40 }));
+  window.posted.splice(0);
+  move(x + 40, y + 40);
   const field = card(C).querySelector('textarea.rz-t'), label = c => (card(c).querySelector('.rz .lbl') || {}).textContent || '';
   check('a card that shows screenshots shows its own field, folded', field && !card(C).classList.contains('open'));
-  check('each field names its card', label(C).includes(card(C).querySelector('.t').textContent) && label(B).includes(card(B).querySelector('.t').textContent), [label(C), label(B)]);
+  check('each field names its card', label(C).includes(titles.C) && label(B).includes(titles.B), [label(C), label(B)]);
   field.focus(); field.value = 'the pale blue is wrong'; field.dispatchEvent(new Event('input', { bubbles: true }));
   push();
   check('a refresh while typing keeps the text in its card', card(C).querySelector('textarea.rz-t').value === 'the pale blue is wrong' && card(B).querySelector('textarea.rz-t').value === '');
@@ -86,9 +108,34 @@ window.addEventListener('load', async () => { try {
   const second = drain();
   check("the text typed under a card's screenshots leaves with that card's No go",
     second.length === 1 && second[0].key === C && second[0].arg === 'nogo' && second[0].text === 'the pale blue is wrong', second);
+  settle(C, DATA.toasts.nogo, true);
   await wait(60);
-  check('one receipt at a time, the last gesture', document.querySelectorAll('.card.filed').length === 1 && card(C).classList.contains('filed') && !card(A));
-  check('the neighbour was not touched', card(B) && !card(B).classList.contains('filed') && card(B).querySelector('textarea.rz-t').value === '');
+  const t2 = toasts()[1];
+  check('the second toast stacks under the first and says which card the text left with',
+    toasts().length === 2 && t2.querySelector('.th').textContent === 'No go noté' && t2.querySelector('.tt').textContent === titles.C
+      && t2.querySelector('.tm').textContent === 'Ton texte, parti avec : the pale blue is wrong', toasts().map(t => t.textContent));
+  check('the neighbour was not touched', card(B) && !card(B).classList.contains('going') && card(B).querySelector('textarea.rz-t').value === '');
+  push([DATA.toasts.go, DATA.toasts.nogo]);
+  check('a toast sent again is shown once', toasts().length === 2);
+  // A gesture that fails: the card comes back whole and the toast says so.
+  await wait(800); move(x + 80, y + 80);
+  card(B).querySelector('[data-arg=seen]').click();
+  const third = drain();
+  check('a gesture after the guard goes to its card', third.length === 1 && third[0].key === B && third[0].arg === 'seen', third);
+  settle(B, DATA.toasts.failed, false);
+  await wait(60);
+  const t3 = toasts()[2];
+  check('a failed gesture brings the card back whole and its toast never says done',
+    card(B) && !card(B).classList.contains('going') && card(B).querySelector('[data-arg=seen]') && t3 && t3.classList.contains('ko')
+      && t3.querySelector('.th').textContent.startsWith('Non transmis') && !/^(Go|No go) noté|carte rangée/.test(t3.querySelector('.th').textContent)
+      && t3.querySelector('.tt').textContent === titles.B, t3 && t3.textContent);
+  // 5 s each, held while the pointer is on it.
+  t3.dispatchEvent(new MouseEvent('mouseenter'));
+  await wait(5600);
+  check('a toast leaves by itself after 5 s, the one under the pointer stays', toasts().length === 1 && toasts()[0] === t3, toasts().map(t => t.textContent));
+  t3.dispatchEvent(new MouseEvent('mouseleave'));
+  await wait(5600);
+  check('it leaves once the pointer is off it', toasts().length === 0);
   done();
 } catch (e) { check('the replay ran', false, String(e && e.stack || e)); done(); }
 });
@@ -130,17 +177,30 @@ def main():
     shell, upd = split((render("folded") / "default.html").read_text())
     folded = cards(upd["list"])
     order = list(folded)
-    opened, filed = {}, {}
+    opened, going = {}, {}
     for i in ids:
         opened.update(cards(split((render(f"open-{i}", "--open", i) / "card.html").read_text())[1]["list"]))
-        for word in ("go", "nogo"):
-            got = cards(split((render(f"filed-{i}-{word}", "--filed", f"{i}={word}:the pale blue is wrong" if word == "nogo" else f"{i}={word}") / "default.html").read_text())[1]["list"])
-            key = f"attention:{i}"
-            if 'class="card filed"' in got.get(key, "") and (word == "go") == (key == order[1]):
-                filed[key] = got[key]
+        got = cards(split((render(f"going-{i}", "--filed", f"{i}=go") / "default.html").read_text())[1]["list"])
+        key = f"attention:{i}"
+        if 'class="card going' in got.get(key, ""):
+            going[key] = got[key]
+    # The toasts Kova sends: C's No go with its text, A's Go, B's failed Vu.
+    c, a_id, b = (k.split(":", 1)[1] for k in order)
+    def toast(name, *flags):
+        got = split((render(name, *flags) / "default.html").read_text())[1].get("toasts")
+        if not got:
+            print("FAIL  this Kova sends no toast: a gesture leaves nothing that says which card it went to", file=sys.stderr)
+            sys.exit(1)
+        return got[0]
+
+    toasts = {
+        "go": dict(toast("toast-go", "--toast", f"{a_id}=go"), id=1),
+        "nogo": dict(toast("toast-nogo", "--toast", f"{c}=nogo:the pale blue is wrong"), id=2),
+        "failed": dict(toast("toast-failed", "--toast-failed", f"{b}=la carte a changé depuis son affichage, relis-la"), id=3),
+    }
     first = upd["list"].index(folded[order[0]])
     last = upd["list"].index(folded[order[-1]]) + len(folded[order[-1]])
-    data = {"order": order, "folded": folded, "opened": opened, "filed": filed, "frame": [upd["list"][:first], upd["list"][last:]]}
+    data = {"order": order, "folded": folded, "opened": opened, "going": going, "toasts": toasts, "frame": [upd["list"][:first], upd["list"][last:]]}
     stub = '<script nonce="render">window.posted=[];window.webkit={messageHandlers:new Proxy({},{get:()=>({postMessage:m=>window.posted.push(JSON.parse(m))})})};</script>'
     page = stub + shell + '<pre id="out" hidden></pre><script nonce="render">const DATA=' + json.dumps(data).replace("</", "<\\/") + ";" + SCENARIO + "</script></body></html>"
     (tmp / "replay.html").write_text(page)
