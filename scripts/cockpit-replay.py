@@ -68,9 +68,13 @@ window.addEventListener('load', async () => { try {
   // The cards below moved up: whatever is under the pointer now, a click
   // there does nothing until the pointer has moved.
   await wait(800);
-  const u = under(x, y), n = window.posted.length;
+  // (Opening or folding a card is not a gesture: it is not held.)
+  const acts = () => window.posted.filter(m => m.type === 'act' && m.act !== 'expand').length;
+  const u = under(x, y), n = acts();
   clickAt(x, y);
-  check('a click where the pointer stayed never acts on what slid under it', window.posted.length === n, u);
+  card(B).querySelector('[data-arg=nogo]').dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1, clientX: x, clientY: y }));
+  check('a click where the pointer stayed never acts on what slid under it', acts() === n, u);
+  window.posted.splice(0).forEach(m => { if (m.type === 'act' && m.act === 'expand') { /* dropped: the replay keeps its cards as they are */ } });
   document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: x + 40, clientY: y + 40 }));
   const field = card(C).querySelector('textarea.rz-t'), label = c => (card(c).querySelector('.rz .lbl') || {}).textContent || '';
   check('a card that shows screenshots shows its own field, folded', field && !card(C).classList.contains('open'));

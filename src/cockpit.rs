@@ -721,6 +721,13 @@ pub fn zoned(item: &Item, can_act: bool) -> bool {
     item.kind == Kind::Attention && can_act && item.ask.is_none() && !item.reply.gestures.is_empty()
 }
 
+/// Whether the card shows its reply zone now. A draft is shown whole, so
+/// its zone is too, and so is the zone of a card that shows its screenshots:
+/// what is judged on sight is answered on the same card. Else once opened.
+pub fn zone_shown(item: &Item, can_act: bool) -> bool {
+    zoned(item, can_act) && answers(item) && (item.draft.is_some() || item.detail.is_some() || !item.shots.is_empty())
+}
+
 /// Whether a folded zoned card offers `Go` in one click: it waits on the
 /// user's go (`validates`), the queue offers the gesture, and its send is not
 /// in doubt.
@@ -939,7 +946,7 @@ fn icons_html(list: &[Button], disabled: bool) -> String {
         .map(|&b| {
             if b == Button::Seen {
                 return format!(
-                    "<button type=\"button\" class=\"link vu\" data-act=\"reply\" data-arg=\"seen\" title=\"Ranger la carte, sans go ni no go\"{}>{ICON_CHECK}<span>Vu</span></button>",
+                    "<button type=\"button\" class=\"link vu\" data-act=\"reply\" data-arg=\"seen\" title=\"{SEEN_HINT}\"{}>{ICON_CHECK}<span>Vu</span></button>",
                     if disabled { " disabled" } else { "" }
                 );
             }
@@ -1088,6 +1095,9 @@ pub fn card_html(item: &Item, can_act: bool, can_close: bool, can_snooze: bool, 
 const ICON_NOGO: &str = r#"<svg class="i" width="13" height="13" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>"#;
 const ICON_Q: &str = r#"<svg class="i" width="13" height="13" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>"#;
 
+/// What `Vu` does, in its tooltip.
+pub const SEEN_HINT: &str = "Ranger la carte, sans go ni no go";
+
 /// Why `Demander` is disabled, said under the empty field and in its tooltip.
 pub const ASK_HINT: &str = "Écris ta question pour demander";
 
@@ -1109,6 +1119,14 @@ fn reply_zone_html(item: &Item, running: bool) -> String {
     let has = |g: Gesture| item.reply.gestures.contains(&g);
     let lock = if running { " disabled data-lock" } else { "" };
     let mut buttons = String::new();
+    // `Vu` files the card with no judgement: in the row, left of `No go`,
+    // not alone at the card's head where the next card's own would slide
+    // under the pointer.
+    if has(Gesture::Seen) {
+        buttons.push_str(&format!(
+            "<button type=\"button\" class=\"link vu\" data-act=\"reply\" data-arg=\"seen\" title=\"{SEEN_HINT}\"{lock}>{ICON_CHECK}<span>Vu</span></button>"
+        ));
+    }
     if has(Gesture::NoGo) {
         buttons.push_str(&format!("<button type=\"button\" class=\"btn out\" data-act=\"reply\" data-arg=\"nogo\"{lock}>{ICON_NOGO}<span>No go</span></button>"));
     }
@@ -1172,7 +1190,10 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     let main = primary(item, can_act);
     let acts: String = list.iter().map(|&b| button_html(b, running, Some(b) == main)).collect();
     let acts = format!("<div class=\"acts\">{acts}</div>");
-    let icons = icons_html(icon_list, running);
+    // The reply zone shows (`zone_shown`): `Vu` is in its row, not at the head.
+    let zone_shown = zone_shown(item, can_act);
+    let head_icons: Vec<Button> = icon_list.iter().copied().filter(|&b| !(zone_shown && b == Button::Seen)).collect();
+    let icons = icons_html(&head_icons, running);
     let mut detail = item.detail.as_ref().map(|d| detail_html(d, running)).unwrap_or_default();
     // Before and after, in the card itself: validated without opening anything.
     detail.insert_str(0, &shots_html(&item.shots, &shot_src));
@@ -1184,10 +1205,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     // the draft's actions when it has a draft.
     let zone = zoned(item, can_act);
     if zone {
-        // A draft is shown whole, so its zone is too, and so is the zone of a
-        // card that shows its screenshots: what is judged on sight is
-        // answered on the same card. Else once opened.
-        if item.draft.is_some() || item.detail.is_some() || !item.shots.is_empty() {
+        if zone_shown {
             detail.push_str(&reply_zone_html(item, running));
         }
     } else if item.kind == Kind::Attention && item.detail.is_some() && can_act {
@@ -1877,7 +1895,7 @@ textarea.ans:focus{border-color:var(--accent);outline:0}
 .rz .btn,.rz .link,.icons .vu,.asked .state{display:inline-flex;align-items:center;gap:6px}
 .rz .btn.out{background:none;border:1px solid var(--b2);color:var(--t1);height:28px;padding:0 12px;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer}
 .rz button:disabled{opacity:.45;cursor:default}
-.icons .vu{font-size:12.5px;margin-left:6px}
+.icons .vu{font-size:12.5px;margin-left:6px}.rz-a .vu{font-size:12.5px}
 .asked{margin:0 0 8px}.asked .msg.sent{margin:2px 0 0}
 .asked .undo{display:block;margin-top:4px;font-size:12px;font-weight:400;color:var(--t3);text-decoration:underline}
 .state.top{margin:0 0 6px}.jr{margin:18px 0 6px;font-size:12px;color:var(--t3)}.jr a{color:var(--t3);text-decoration:underline}
@@ -1887,7 +1905,7 @@ textarea.ins{display:block;width:100%;margin-top:4px;background:var(--bg-input);
 textarea.ins:focus{border-color:var(--accent);outline:0}
 .msg.sent{margin-top:4px;font-size:12px;color:var(--t2)}
 .card.going{opacity:.45;pointer-events:none}
-.card.filed{cursor:default;border-style:dashed}.card.filed .state{display:flex;align-items:center;gap:6px}.card.filed .t{color:var(--t2)}.card.filed .msg.sent{white-space:pre-wrap}
+.card.filed{cursor:default;border:1px dashed var(--t3)}.card.filed .state{display:flex;align-items:center;gap:6px;color:var(--t1);font-weight:600}.card.filed .t{color:var(--t2)}.card.filed .msg.sent{white-space:pre-wrap}
 .rz .lbl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.rz .lbl b{font-weight:600;color:var(--t2)}
 div.why{margin-top:8px;cursor:auto}div.why[hidden]{display:none}
 input.why{display:block;width:100%;height:28px;background:var(--bg-input);border:1px solid var(--b2);border-radius:6px;color:var(--t1);font:inherit;font-size:13px;padding:0 10px}
@@ -2508,6 +2526,18 @@ mod tests {
         shown.shots = vec![("Avant".into(), "/nonexistent/before.png".into())];
         let folded = card_html(&shown, true, true, true, 10);
         assert!(shown.detail.is_none() && folded.contains("class=\"ins rz-t\"") && folded.contains(r#"data-arg="nogo""#), "{folded}");
+        // `Vu` is in the zone's row, left of `No go`, and no longer at the
+        // head; a folded card without a zone keeps it at its head, by the clock.
+        let seen = r#"class="link vu" data-act="reply" data-arg="seen" title="Ranger la carte, sans go ni no go""#;
+        let (zone_at, head) = (folded.find("class=\"instr rz\"").unwrap(), folded.find("class=\"icons\"").unwrap());
+        assert_eq!(folded.matches(seen).count(), 1, "{folded}");
+        assert!(head < zone_at && zone_at < folded.find(seen).unwrap() && folded.find(seen).unwrap() < folded.find(r#"data-arg="nogo""#).unwrap(), "{folded}");
+        assert!(folded[head..zone_at].contains(r#"data-act="snooze""#), "the clock stays at the head");
+        let bare = Item { shots: Vec::new(), ..shown.clone() };
+        let bare_html = card_html(&bare, true, true, true, 10);
+        assert!(!zone_shown(&bare, true) && bare_html.matches(seen).count() == 1 && !bare_html.contains("class=\"instr rz\""), "{bare_html}");
+        // The receipt's words and check are in the text color: nothing rests on green.
+        assert!(shell(false, "n").contains(".card.filed .state{display:flex;align-items:center;gap:6px;color:var(--t1);font-weight:600}"));
         // The field says which card it answers, escaped.
         assert!(folded.contains("<div class=\"lbl\">Ta réponse sur <b>Open settings &lt;b&gt;</b></div>"), "{folded}");
         // Filed: the receipt, under the same key, with the text that left and no button.
