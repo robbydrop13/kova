@@ -179,6 +179,17 @@ before the text of the next message, as the terminal hands an image to
 Claude Code. Only a file Kova wrote for this page's paste goes along
 (`chat::input::with_images`). Text pastes as usual.
 
+No typing help from macOS, in this box and in every text field Kova draws
+(`src/typing_assist.rs`): no completion or inline prediction, no automatic
+correction, no text replacement, no smart quotes or dashes, no automatic
+capital, no period on a double space. Each field of a page carries
+`autocomplete="off" autocorrect="off" autocapitalize="off"`, and the
+matching macOS defaults are set to false for Kova's process at launch, in
+the argument domain (never written to disk, the user's other apps keep
+their settings). The chat box has no spelling underline either; the
+Cockpit's reply, instruction and draft fields keep theirs, which inserts
+nothing.
+
 Control characters are removed (tab and newline
 kept), 32 KB at most (a 20 minute dictation). The empty prompt is read off the screen like KovaLink's
 daemon does (`composerIsEmpty`); Claude Code's start hint (`Try "…"`) counts

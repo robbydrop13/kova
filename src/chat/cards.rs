@@ -518,7 +518,7 @@ mod tests {
         // A plain question: its answers and its field, opened.
         let html = ask_card_html(&question("a", Some(4), None), None, None, true, crate::attention::Scope::Pro, 100);
         assert!(html.contains("data-act=\"answer\" data-arg=\"No\"") && html.contains("data-arg=\"Other\" data-text=\"1\""));
-        assert!(html.contains("textarea class=\"ans\"") && html.contains("Répondre à la question"));
+        assert!(html.contains("textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"ans\"") && html.contains("Répondre à la question"));
 
         // A sheet an attention entry stands for: the Cockpit's opened card, with
         // its instruction field, keyed by the ask.
@@ -569,7 +569,7 @@ mod tests {
         let html = menu_card_html(&m, None, 100);
         assert!(html.contains(&format!("data-key=\"{}\"", menu_id(&m))));
         assert!(html.contains("Which color do you prefer?") && html.contains("data-arg=\"Green\""));
-        assert!(html.contains("data-arg=\"Type something.\" data-text=\"1\"") && html.contains("textarea class=\"ans\""));
+        assert!(html.contains("data-arg=\"Type something.\" data-text=\"1\"") && html.contains("textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"ans\""));
         assert!(!html.contains("Red : Red"), "a description that repeats its label is left out");
 
         // A plain option: its digit, nothing typed after.

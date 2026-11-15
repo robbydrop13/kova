@@ -100,6 +100,8 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let mtm = MainThreadMarker::from(self);
+            // Before any text field exists: no typing help from macOS.
+            crate::typing_assist::turn_off();
             let config = self.ivars().config.get().expect("config must be set before applicationDidFinishLaunching");
             log::debug!("Config loaded: {}x{} cols/rows, {} scrollback", config.terminal.columns, config.terminal.rows, config.terminal.scrollback);
             window::sidebar::init(&config.layout);

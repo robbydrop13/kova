@@ -1175,7 +1175,7 @@ fn reply_zone_html(item: &Item, running: bool) -> String {
     };
     format!(
         "<div class=\"instr rz\"><div class=\"lbl\">Ta réponse sur <b>{on}</b></div>\
-         <textarea class=\"ins rz-t\" rows=\"2\" spellcheck=\"true\" placeholder=\"{REPLY_PLACEHOLDER}\"{}></textarea>\
+         <textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"ins rz-t\" rows=\"2\" spellcheck=\"true\" placeholder=\"{REPLY_PLACEHOLDER}\"{}></textarea>\
          <div class=\"rz-a\">{hint}{buttons}</div>{failed}</div>",
         if running { " readonly" } else { "" },
         // Why Demander is off, in words: shown while the field is empty.
@@ -1225,7 +1225,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
     detail.insert_str(0, &shots_html(&item.shots, &shot_src));
     // `Refuser` opens this field first: Enter confirms, Escape cancels.
     if list.contains(&Button::Refuse) {
-        detail.insert_str(0, &format!("<div class=\"why\" hidden><input type=\"text\" class=\"why\" placeholder=\"{REFUSE_PLACEHOLDER}\" maxlength=\"500\"></div>"));
+        detail.insert_str(0, &format!("<div class=\"why\" hidden><input type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"why\" placeholder=\"{REFUSE_PLACEHOLDER}\" maxlength=\"500\"></div>"));
     }
     // An opened attention card takes an instruction, action or not, under
     // the draft's actions when it has a draft.
@@ -1287,7 +1287,7 @@ pub fn card_html_with(item: &Item, list: &[Button], icon_list: &[Button], can_ac
             format!(
                 "<div class=\"row\"><div class=\"txt\">{head}</div>{icons}</div>\
                  <div class=\"draft\"><div class=\"hd\">{to}{channel}{subject}{edit}</div>\
-                 <textarea class=\"bd\" spellcheck=\"true\" data-orig=\"{orig}\"{ro}>\n{text}</textarea></div>\
+                 <textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"bd\" spellcheck=\"true\" data-orig=\"{orig}\"{ro}>\n{text}</textarea></div>\
                  <div class=\"draft-foot\">{src}{acts}</div>{detail}{state}",
                 orig = esc(&draft.text),
                 text = esc(&draft.text),
@@ -1418,7 +1418,7 @@ fn instruct_html(last: Option<&Instructed>) -> String {
     };
     format!(
         "<div class=\"instr\"><div class=\"lbl\">Consigne</div>\
-         <textarea class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{INSTRUCT_PLACEHOLDER}\"{}></textarea>{note}</div>",
+         <textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{INSTRUCT_PLACEHOLDER}\"{}></textarea>{note}</div>",
         if running { " readonly" } else { "" }
     )
 }
@@ -1460,7 +1460,7 @@ pub fn detail_html(detail: &Detail, running: bool) -> String {
         }
         Detail::Ask { message, answers, input } => {
             let field = if *input || answers.iter().any(|(_, t)| *t) {
-                "<textarea class=\"ans\" rows=\"2\" placeholder=\"Ta réponse\"></textarea>"
+                "<textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"ans\" rows=\"2\" placeholder=\"Ta réponse\"></textarea>"
             } else {
                 ""
             };
@@ -2883,7 +2883,7 @@ mod tests {
         );
         assert!(ask.contains("data-arg=\"Oui\" disabled"));
         assert!(ask.contains("data-arg=\"Autre &quot;x&quot;\" data-text=\"1\""));
-        assert!(ask.contains("textarea class=\"ans\""), "an answer that needs text brings the field");
+        assert!(ask.contains("textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"ans\""), "an answer that needs text brings the field");
         let plain = detail_html(&Detail::Ask { message: "Ok?".into(), answers: vec![("Oui".into(), false)], input: false }, false);
         assert!(!plain.contains("textarea"));
     }
@@ -3334,7 +3334,7 @@ mod tests {
         assert!(html.contains("<button type=\"button\" class=\"link\" data-act=\"refuse\">Refuser</button>"), "{html}");
         assert!(html.contains("class=\"btn acc\" data-act=\"validate\">"), "{html}");
         assert!(html.contains("data-act=\"snooze\"") && html.contains("data-act=\"dismiss\"") && html.contains("data-act=\"done\""));
-        assert!(html.contains("<div class=\"why\" hidden><input type=\"text\" class=\"why\" placeholder=\"Pourquoi ? (facultatif)\""), "{html}");
+        assert!(html.contains("<div class=\"why\" hidden><input type=\"text\" autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"why\" placeholder=\"Pourquoi ? (facultatif)\""), "{html}");
         // Refuser closes the entry: without a close command it is left out.
         let no_close = card_html(&item, true, false, true, 10);
         assert!(!no_close.contains("data-act=\"refuse\"") && !no_close.contains("class=\"why\""), "{no_close}");
@@ -3478,7 +3478,7 @@ mod tests {
         let bare = Entry { needs: None, kind: "info".into(), ..entry("a-1", Level::Point, None, 1) };
         let mut item = from_attention(&bare, None, false).unwrap();
         assert!(buttons(&item, true).is_empty());
-        let field = format!("<textarea class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{INSTRUCT_PLACEHOLDER}\">");
+        let field = format!("<textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" class=\"ins\" rows=\"2\" spellcheck=\"true\" placeholder=\"{INSTRUCT_PLACEHOLDER}\">");
         assert!(!card_html(&item, true, true, true, 10).contains("class=\"ins\""), "folded: no field");
         item.detail = Some(entry_detail(&bare, false));
         let html = card_html(&item, true, true, true, 10);

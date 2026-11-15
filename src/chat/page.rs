@@ -441,7 +441,7 @@ fn tool_group(tools: &[&Tool], working: bool, at: usize) -> Entry {
 pub fn card_html(card: &super::cards::Card) -> String {
     use super::cards::Act;
     let detail = card.detail.as_deref().map(|d| format!(r#"<pre class="cdet">{}</pre>"#, escape(d))).unwrap_or_default();
-    let field = if card.input { r#"<textarea class="cfield" rows="1" placeholder="Answer"></textarea>"# } else { "" };
+    let field = if card.input { r#"<textarea autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" class="cfield" rows="1" placeholder="Answer"></textarea>"# } else { "" };
     let buttons: String = card
         .buttons
         .iter()
@@ -726,7 +726,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
 <div id="foot"><div id="chips"></div><div id="banner"><span class="dot"></span><span id="state">…</span></div>
 <div id="pill"><span class="bars"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></span><span id="pline"></span><button class="pbtn" data-act="vcancel" title="Annuler">✕</button><button class="pbtn ok" data-act="vfinish" title="Terminer">✓</button></div>
 <div id="vhist"></div>
-<div id="inrow"><textarea id="box" rows="1" placeholder="Message à Claude"></textarea><button id="hist" class="mic" data-act="vhist" title="Dictées récentes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button><button id="mic" class="mic" title="Dictée : maintenir ⌘⇧M pour parler, toucher pour continuer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button></div><div id="note"></div></div>
+<div id="inrow"><textarea autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" id="box" rows="1" placeholder="Message à Claude"></textarea><button id="hist" class="mic" data-act="vhist" title="Dictées récentes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button><button id="mic" class="mic" title="Dictée : maintenir ⌘⇧M pour parler, toucher pour continuer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button></div><div id="note"></div></div>
 <script nonce="{nonce}">
 (function () {{
   // Each message carries this load's nonce: Kova drops one from another load.

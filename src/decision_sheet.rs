@@ -697,7 +697,7 @@ pub fn render(sheet: &Sheet, answers: &SheetAnswers, from: &str, palette: &token
         }
         let context = d.context.as_deref().filter(|t| !t.trim().is_empty()).map(|t| format!("<div class=\"context\">{}</div>", rich(t))).unwrap_or_default();
         cards.push_str(&format!(
-            "<article class=\"card{answered}\" data-id=\"{id}\"><div class=\"head\"><span class=\"num\">{id}</span><h3>{title}</h3></div>{context}<div class=\"opts\">{opts}</div><textarea rows=\"1\" placeholder=\"Add to it, change it or propose something else\" aria-label=\"Note on {id}\">{note}</textarea></article>\n",
+            "<article class=\"card{answered}\" data-id=\"{id}\"><div class=\"head\"><span class=\"num\">{id}</span><h3>{title}</h3></div>{context}<div class=\"opts\">{opts}</div><textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" rows=\"1\" placeholder=\"Add to it, change it or propose something else\" aria-label=\"Note on {id}\">{note}</textarea></article>\n",
             answered = if a.is_some() { " answered" } else { "" },
             id = esc(&d.id),
             title = inline(&d.title),
@@ -781,7 +781,7 @@ pub fn render_question(from: &str, message: &str, buttons: &[String], input: boo
         .map(|(i, b)| format!("<button type=\"button\" class=\"{}\" data-action=\"{}\">{}</button>", if i == 0 { "primary" } else { "" }, esc(b), esc(b)))
         .collect();
     let note = if input {
-        "<textarea id=\"note\" rows=\"3\" placeholder=\"Add a note to your answer\"></textarea>"
+        "<textarea autocomplete=\"off\" autocorrect=\"off\" autocapitalize=\"off\" id=\"note\" rows=\"3\" placeholder=\"Add a note to your answer\"></textarea>"
     } else {
         ""
     };
@@ -904,7 +904,7 @@ textarea:focus { border-color: {accent}; outline: none; }
 <section class="end">
 <div class="row" id="recoBox"></div>
 <h2><label for="general">Anything else?</label></h2>
-<textarea id="general" rows="3" placeholder="A default to challenge, a missing decision, an instruction for what comes next">@@NOTE@@</textarea>
+<textarea autocomplete="off" autocorrect="off" autocapitalize="off" id="general" rows="3" placeholder="A default to challenge, a missing decision, an instruction for what comes next">@@NOTE@@</textarea>
 <div class="row"><button class="primary" id="done" type="button">Done</button><span class="hint" id="hint">Saved as you go</span></div>
 </section></div>
 <div class="lightbox" id="lightbox" hidden><img id="lbImg" alt=""><span id="lbCap"></span></div>

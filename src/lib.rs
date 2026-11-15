@@ -51,6 +51,7 @@ mod update_check;
 mod team;
 mod text_links;
 mod typed_keys;
+mod typing_assist;
 mod voice;
 mod voice_io;
 mod attention;
