@@ -169,4 +169,5 @@ if [ -n "$PIN_DR" ] && [ "$NOW_DR" != "$PIN_DR" ]; then
 fi
 mkdir -p "$(dirname "$SIGN_STATE")"
 printf '%s %s\ndr %s\n' "$SIGN_SHA" "$(name_of "$SIGN_SHA")" "$NOW_DR" > "$SIGN_STATE"
-echo "Build + codesign ($WHAT) done, signed by \"$(name_of "$SIGN_SHA")\", requirement unchanged"
+if [ -n "$PIN_DR" ]; then note="requirement unchanged"; else note="requirement recorded"; fi
+echo "Build + codesign ($WHAT) done, signed by \"$(name_of "$SIGN_SHA")\", $note"
