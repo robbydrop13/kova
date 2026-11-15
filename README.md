@@ -178,14 +178,15 @@ Always use `./build.sh` — it builds the binary, copies it into the `.app` bund
 
 macOS ties what you grant Kova in System Settings > Privacy & Security (Accessibility, Input Monitoring, Screen Recording) to the certificate that signed it. A build signed with another certificate keeps its switch ON and loses the grant all the same: nothing warns you, things just stop working.
 
-So `build.sh` never changes identity by itself:
+So `build.sh` signs with ONE pinned identity, and nothing changes it by accident:
 
-- It signs with the identity of the last build, recorded in `~/.config/kova/sign-identity` (SHA-1 and name), or read from the bundle's own signature when that file does not exist yet.
-- A certificate that appears in the keychain later is named and not used. Tooling creates some without telling you: a mobile build chain, an Apple Development certificate created through an API.
-- If the recorded identity is gone (removed, expired), nothing is built and the script exits 3, naming what is there. An Apple Development certificate lasts one year.
-- To change identity on purpose: `KOVA_SIGN_IDENTITY="<name or SHA-1>" ./build.sh`. It warns that the grants are void; afterwards remove Kova from each list of Privacy & Security and add it again.
-- `./build.sh --identity` prints the identity it would sign with and builds nothing.
-- With no signing identity at all, the build is left unsigned and macOS keeps no grant across builds.
+- The pin is `~/.config/kova/sign-identity`: the identity's SHA-1 and name, then the designated requirement of the builds signed with it. Set it once with `./build.sh --pin "<name or SHA-1>"`, which builds nothing.
+- With no pin, nothing is built (exit 3). There is no ad hoc fallback and the signature the bundle happens to carry is not followed. A machine with no certificate at all builds unsigned with `KOVA_UNSIGNED=1 ./build.sh`, and macOS then keeps no grant across builds.
+- A certificate that appears in the keychain later is not used. Tooling creates some without telling you: a mobile build chain, an Apple Development certificate created through an API. `KOVA_SIGN_IDENTITY` no longer chooses anything: set, it stops the build.
+- If the pinned identity is gone (removed, expired), nothing is built and the script exits 3, naming what is there. Prefer a certificate that does not expire soon and that no tool re-creates: an Apple Development certificate lasts one year, a self-signed code signing certificate of your own lasts as long as you made it.
+- After signing, the script reads the designated requirement of the result, checks it carries the bundle id `com.micktaiwan.kova`, and compares it with the one recorded for the pin. A difference fails the build (exit 4): macOS would not apply the existing grants to it.
+- To change identity on purpose: `./build.sh --pin "<name or SHA-1>"`. It warns that the grants are void; afterwards remove Kova from each list of Privacy & Security and add it again, unless `kova doctor` already shows them trusted.
+- `./build.sh --identity` prints the pin and builds nothing.
 
 `kova doctor` shows what the running Kova is signed with and what macOS trusts it for, as that process sees it (the switch in System Settings proves nothing):
 
