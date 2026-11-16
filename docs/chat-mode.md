@@ -117,8 +117,11 @@ Readability, KovaLink's (`link/docs/13-chat-lisibilite.md`):
   apply) leaves both answers and its line;
 - while Claude works with no call running, a `Réflexion` line ends the
   thread, a light sweeping across it (still under `prefers-reduced-motion`);
-  a click unfolds the reasoning when the transcript holds it (it often keeps
-  only its signature);
+- a reasoning the transcript holds the text of (Claude Code's summary, the
+  terminal's `· summary`; most keep only their signature and show nothing)
+  is text the agent wrote: in full, where it was written, under a quiet
+  `Réflexion` mark, never folded (Robin, 16/11/2026: every text of the
+  agent shows in full);
 - the thread scrolls down only, never sideways (Robin, 11/11/2026): text,
   paths and code blocks wrap, a table too wide scrolls inside its own block,
   and a long row label (another session's message, a finished task) is cut

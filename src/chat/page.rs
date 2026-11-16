@@ -185,9 +185,13 @@ pub fn markdown_using(source: &str, lookup: &dyn Fn(&str) -> Option<crate::refs:
 /// KovaLink's way: everything the transcript holds, in its order, nothing
 /// hidden and nothing guessed. Every text the assistant wrote shows in
 /// full, once; consecutive tool calls make one group (folded past five);
-/// notes, another session's message, a finished task and a reasoning with
-/// its text are one-line rows. While the agent works with no call running,
-/// a `Réflexion` line ends the thread.
+/// notes, another session's message and a finished task are one-line rows.
+/// A reasoning the transcript holds the text of (Claude Code's summary,
+/// what the terminal marks `· summary`) is the assistant's text too: in
+/// full, where it was written, marked `Réflexion` (Robin, 16/11: it was a
+/// folded row, drawn after the call it came before, and read as a missing
+/// answer). While the agent works with no call running, a `Réflexion` line
+/// ends the thread.
 ///
 /// One exception, read off the transcript's structure (`superseded`): an
 /// answer a Stop hook sent back for a rewrite, once rewritten, is a
@@ -202,8 +206,6 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
     let (drafts, absorbed) = superseded(shown);
     let mut out = Vec::new();
     let mut tools: Vec<&Tool> = Vec::new();
-    // The reasoning that came last, while nothing followed it yet.
-    let mut thought: Option<(String, &str)> = None;
     let flush = |tools: &mut Vec<&Tool>, out: &mut Vec<Entry>, current: bool| {
         if !tools.is_empty() {
             out.push(tool_group(tools, working && current, out.len()));
@@ -214,9 +216,6 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
         let current = last_user.is_none_or(|u| n > u);
         let Item::Assistant { id, blocks, .. } = item else {
             flush(&mut tools, &mut out, current);
-            if let Some((key, text)) = thought.take() {
-                out.push(fold_entry(&key, "Réflexion", text));
-            }
             // The hook's line is inside its draft's `Version précédente` row.
             if absorbed.contains(&n) {
                 continue;
@@ -242,9 +241,6 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
                 continue;
             }
             flush(&mut tools, &mut out, current);
-            if let Some((key, text)) = thought.take() {
-                out.push(fold_entry(&key, "Réflexion", text));
-            }
             match &block.kind {
                 BlockKind::Text(text) if drafts.contains_key(&(n, k)) => {
                     let why = match &shown[drafts[&(n, k)]] {
@@ -255,20 +251,15 @@ pub fn entries(conv: &Conversation, exchanges: usize, working: bool) -> (Vec<Ent
                 }
                 BlockKind::Text(text) => out.push(Entry { id: format!("t:{id}:{k}"), html: format!(r#"<div class="asst">{}</div>"#, markdown(text)) }),
                 BlockKind::Image => out.push(Entry { id: format!("i:{id}:{k}"), html: r#"<div class="note">image</div>"#.to_string() }),
-                BlockKind::Thinking(text) => thought = Some((format!("k:{id}:{k}"), text)),
+                BlockKind::Thinking(text) => out.push(thought_entry(&format!("k:{id}:{k}"), text)),
                 BlockKind::Tool(_) => {}
             }
         }
     }
     let running = working && tools.iter().any(|t| t.result.is_none());
     flush(&mut tools, &mut out, true);
-    // The reasoning going on is on the Réflexion line, not a row of its own.
-    let live = if working && !running { thought.take().map_or("", |(_, text)| text) } else { "" };
-    if let Some((key, text)) = thought {
-        out.push(fold_entry(&key, "Réflexion", text));
-    }
     if working && !running {
-        out.push(thinking_entry(live));
+        out.push(thinking_entry());
     }
     (out, start > 0)
 }
@@ -344,18 +335,15 @@ fn fold_row(key: &str, label: &str, text: &str) -> String {
     )
 }
 
-/// `Réflexion` while the model thinks, a light sweeping across it; its text
-/// unfolds on a click when the transcript has it.
-fn thinking_entry(text: &str) -> Entry {
-    let html = if text.is_empty() {
-        r#"<div class="think"><span class="shimmer">Réflexion</span></div>"#.to_string()
-    } else {
-        format!(
-            r#"<div class="think" data-id="r:live"><button class="trow thead" data-act="fold"><span class="shimmer">Réflexion</span></button><div class="fold"><pre class="tres">{}</pre></div></div>"#,
-            escape(text)
-        )
-    };
-    Entry { id: "r:live".to_string(), html }
+/// `Réflexion` while the model thinks, a light sweeping across it.
+fn thinking_entry() -> Entry {
+    Entry { id: "r:live".to_string(), html: r#"<div class="think"><span class="shimmer">Réflexion</span></div>"#.to_string() }
+}
+
+/// A reasoning with its text: the text in full, as an answer is, under a
+/// quiet `Réflexion` mark (a word, not a colour alone).
+fn thought_entry(key: &str, text: &str) -> Entry {
+    Entry { id: key.to_string(), html: format!(r#"<div class="asst thought"><div class="mark">Réflexion</div>{}</div>"#, markdown(text)) }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -618,6 +606,7 @@ body {{ display: flex; flex-direction: column; overflow-x: hidden; }}
 .asst blockquote {{ margin: .6em 0; padding: 0 12px; border-left: 3px solid var(--b2); color: var(--t3); }}
 #log > :last-child.asst.streaming::after {{ content: ""; display: inline-block; width: 7px; height: 7px; margin-left: 4px;
   border-radius: 50%; background: var(--working); animation: pulse 1.2s ease-in-out infinite; }}
+.thought .mark {{ font-size: 12px; color: var(--t3); margin-bottom: -.2em; }}
 .note {{ margin: 10px 0; text-align: center; font-size: 12px; color: var(--t3); }}
 .tools {{ margin: 4px 0; min-width: 0; }} .tool {{ min-width: 0; }}
 .trow {{ display: flex; align-items: center; gap: 8px; width: 100%; height: 26px; padding: 0 6px; margin: 0;
@@ -1261,17 +1250,39 @@ mod tests {
     }
 
     #[test]
-    fn reflexion_unfolds_its_text_only_when_the_transcript_has_it() {
+    fn a_reasoning_with_its_text_shows_in_full_where_it_was_written() {
+        // Robin, 16/11: calls, a reasoning the transcript has the text of
+        // (the terminal's `· summary`), one more call, then the answer. The
+        // reasoning was a folded `Réflexion` row drawn after that last call.
+        let think = |id: &str, t: &str| json!({"type": "assistant", "requestId": id, "apiBlockIndex": 0, "uuid": format!("{id}k"), "message": {"content": [{"type": "thinking", "thinking": t}]}});
+        let lines = vec![
+            user("u1", "go"),
+            think("r1", ""),
+            tool("r1", 1, "a"),
+            result("a", "ra", false),
+            think("r2", "Granola also reads the page.\n\nSo I pass the idea <on>."),
+            tool("r2", 1, "b"),
+            result("b", "rb", false),
+            text("r3", 0, "Next step."),
+        ];
+        let (e, _) = entries(&conv(lines), EXCHANGES_STEP, false);
+        assert_eq!(ids(&e), ["u:u1", "g:a", "k:r2:0", "g:b", "t:r3:0"], "in the transcript's order, before the call it came before");
+        let thought = &e[2].html;
+        assert!(thought.contains("Granola also reads the page.") && thought.contains("So I pass the idea &lt;on&gt;."), "all of it");
+        assert!(thought.contains(r#"class="asst thought""#) && thought.contains("Réflexion"), "marked by a word");
+        assert!(!thought.contains("data-act") && !thought.contains("fold"), "nothing folded, nothing to click");
+    }
+
+    #[test]
+    fn the_reflexion_line_ends_the_thread_only_while_the_model_thinks() {
         let think = |t: &str| json!({"type": "assistant", "requestId": "k", "uuid": format!("k{t}"), "message": {"content": [{"type": "thinking", "thinking": t}]}});
         let (e, _) = entries(&conv(vec![user("u1", "go"), think("")]), EXCHANGES_STEP, true);
-        let last = e.last().unwrap();
-        assert!(last.html.contains("shimmer") && !last.html.contains("data-act"), "nothing to unfold");
-        let (e, _) = entries(&conv(vec![user("u1", "go"), think("weigh <both>")]), EXCHANGES_STEP, true);
-        let last = e.last().unwrap();
-        assert!(last.html.contains(r#"data-act="fold""#) && last.html.contains("weigh &lt;both&gt;"));
-        assert_eq!(ids(&e), ["u:u1", "r:live"], "the reasoning going on is not also a row of its own");
+        assert_eq!(ids(&e), ["u:u1", "r:live"], "a reasoning without its text is nothing but the line");
+        assert!(e[1].html.contains("shimmer") && !e[1].html.contains("data-act"));
+        let (e, _) = entries(&conv(vec![user("u1", "go"), think("weigh both")]), EXCHANGES_STEP, true);
+        assert_eq!(ids(&e), ["u:u1", "k:k:0", "r:live"], "its text shows as it comes, the line after it");
         let (e, _) = entries(&conv(vec![user("u1", "go"), think("x")]), EXCHANGES_STEP, false);
-        assert!(!e.iter().any(|x| x.id == "r:live"), "idle: no Réflexion");
+        assert_eq!(ids(&e), ["u:u1", "k:k:0"], "idle: no Réflexion line, the text stays");
     }
 
     #[test]
