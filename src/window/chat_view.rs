@@ -125,6 +125,9 @@ struct ChatState {
     /// The last lookup of a transcript not written yet (a scan of every
     /// project folder when the cwd is unknown): once a second at most.
     looked: Option<std::time::Instant>,
+    /// The chat is out of sight and this state is only what it still owes:
+    /// the messages waiting to leave (`ChatState::parked`). No page listens.
+    parked: bool,
 }
 
 impl ChatState {
@@ -172,7 +175,55 @@ impl ChatState {
             last_poll: None,
             load,
             looked: None,
+            parked: false,
         }
+    }
+
+    /// A message was sent from the box and has not left yet: it waits in
+    /// the queue, or it is pasted and waits for its Enter.
+    fn owes(&self) -> bool {
+        !self.outbox.queue().is_empty() || self.outbox.enter_pending() || self.sending.is_some()
+    }
+
+    /// What stays of a chat that goes out of sight (the Cockpit left for a
+    /// tab, the column closed, an overlay over it): nothing when no message
+    /// waits, else a bare state that keeps the queue, the message being
+    /// sent and what was said about them. The page, the conversation read
+    /// and the microphone go: the page comes back fresh. Before 16/11 the
+    /// whole state went, and a message sent while the chief worked was
+    /// dropped the moment Robin looked at a tab: never typed, and gone from
+    /// the chat when he came back.
+    fn parked(self) -> Option<ChatState> {
+        if !self.owes() {
+            return None;
+        }
+        let mut kept = ChatState::new(self.pane_id, String::new());
+        kept.parked = true;
+        kept.owed_from(self);
+        Some(kept)
+    }
+
+    /// Take from `old` what its unsent messages need: the queue, the
+    /// message pasted, what was said about them, and the busy signal's
+    /// history the gate reads to tell a turn that ended.
+    fn owed_from(&mut self, old: ChatState) {
+        self.outbox = old.outbox;
+        self.sending = old.sending;
+        self.queue_reason = old.queue_reason;
+        self.note = old.note;
+        self.spinner = old.spinner;
+        self.spinner_on_at = old.spinner_on_at;
+        self.spinner_off_at = old.spinner_off_at;
+    }
+
+    /// The chat shows again on `pane_id`: a fresh state for the fresh page,
+    /// with what a parked one still owed to that pane.
+    fn resumed(parked: Option<ChatState>, pane_id: PaneId, load: String) -> ChatState {
+        let mut st = ChatState::new(pane_id, load);
+        if let Some(old) = parked.filter(|old| old.pane_id == pane_id && old.owes()) {
+            st.owed_from(old);
+        }
+        st
     }
 
     /// Forget what the page holds: the next update carries everything.
@@ -264,27 +315,35 @@ impl KovaView {
                 web.setHidden(true);
             }
             // Out of sight (the column closed, or an overlay over it), the
-            // state goes: the page comes back fresh and takes the keyboard,
-            // and dropping it cancels what the mic hears.
-            if slot.state.borrow().is_some() {
-                slot.state.replace(None);
+            // page goes: it comes back fresh and takes the keyboard, and
+            // dropping its state cancels what the mic hears. A message
+            // that has not left yet stays (`ChatState::parked`) and still
+            // leaves when the chief's turn ends, page or no page.
+            let showing = slot.state.borrow().as_ref().is_some_and(|st| !st.parked);
+            if showing {
+                let old = slot.state.borrow_mut().take();
+                slot.state.replace(old.and_then(ChatState::parked));
                 if let Some(web) = slot.web.get() {
                     unsafe { web.loadHTMLString_baseURL(&NSString::from_str(""), None) };
                 }
             }
+            self.tick_parked_chat();
             return;
         };
         let mtm = MainThreadMarker::from(self);
         let web = self.chat_web_view(mtm);
         if slot.delegate.get().is_some_and(|d| d.ivars().crashed.take()) {
-            slot.state.replace(None);
+            // The page's process died: a new page, and the queue stays.
+            let old = slot.state.borrow_mut().take();
+            slot.state.replace(old.and_then(ChatState::parked));
         }
         let generation = crate::theme::generation();
-        let fresh = slot.state.borrow().as_ref().is_none_or(|st| st.pane_id != pane_id);
+        let fresh = slot.state.borrow().as_ref().is_none_or(|st| st.parked || st.pane_id != pane_id);
         if fresh {
             slot.theme.set(generation);
             let nonce = crate::ask::new_question_id().replace('-', "");
-            slot.state.replace(Some(ChatState::new(pane_id, nonce.clone())));
+            let parked = slot.state.borrow_mut().take();
+            slot.state.replace(Some(ChatState::resumed(parked, pane_id, nonce.clone())));
             let title = self.with_pane(pane_id, |p| p.display_title("Chat")).unwrap_or_default();
             let html = page::shell(&theme(), &title, &nonce);
             unsafe { web.loadHTMLString_baseURL(&NSString::from_str(&html), None) };
@@ -353,6 +412,29 @@ impl KovaView {
         // Outside the borrow of the tabs above (crash of 06/11: RefCell already borrowed in side_panel_pins).
         for t in open {
             self.open_in_side_panel(t);
+        }
+    }
+
+    /// The chat is out of sight and still owes a message: the queue goes on
+    /// at the poll's pace, with no page to tell. Once nothing is owed, or
+    /// the pane is gone, the state goes.
+    fn tick_parked_chat(&self) {
+        let slot = &self.ivars().chat;
+        let tabs = self.ivars().tabs.borrow();
+        let mut state = slot.state.borrow_mut();
+        let Some(st) = state.as_mut() else { return };
+        let Some(pane) = tabs.iter().find_map(|t| t.pane(st.pane_id)) else {
+            *state = None;
+            return;
+        };
+        if st.last_poll.is_none_or(|t| t.elapsed().as_millis() >= POLL_MS) {
+            st.last_poll = Some(std::time::Instant::now());
+            let files = st.watch.as_ref().is_some_and(Watch::fired);
+            // Never ready: nothing is pushed, the queue alone moves.
+            chat_poll(st, pane, files);
+        }
+        if !st.owes() {
+            *state = None;
         }
     }
 
@@ -634,7 +716,7 @@ impl KovaView {
     /// so the box pastes text as usual.
     pub(super) fn chat_paste_image(&self) -> bool {
         let mut state = self.ivars().chat.state.borrow_mut();
-        let Some(st) = state.as_mut() else { return false };
+        let Some(st) = state.as_mut().filter(|st| !st.parked) else { return false };
         let done = attach_pasted_image(st);
         if done {
             st.last_poll = None;
@@ -1254,6 +1336,43 @@ define_class!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn waiting(pane: PaneId, text: &str) -> ChatState {
+        let mut st = ChatState::new(pane, "load-1".into());
+        st.ready = true;
+        st.outbox.submit(text.to_string(), input::Verdict::Wait("part à la fin du tour"), 1_000);
+        st.queue_reason = "part à la fin du tour";
+        st
+    }
+
+    #[test]
+    fn a_message_waiting_survives_leaving_the_cockpit_and_shows_again() {
+        // Robin, 16/11: a message sent while the chief works vanished when
+        // he went to a tab and came back.
+        let st = waiting(7, "relance les tests");
+        let parked = st.parked().expect("the message waiting keeps a state");
+        assert!(parked.parked && !parked.ready, "no page listens while parked");
+        assert_eq!(parked.outbox.queue().len(), 1);
+
+        let back = ChatState::resumed(Some(parked), 7, "load-2".into());
+        assert!(!back.parked && back.first && back.load == "load-2", "a fresh page");
+        let queue: Vec<&str> = back.outbox.queue().iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(queue, ["relance les tests"]);
+        assert_eq!(back.queue_reason, "part à la fin du tour");
+        assert!(back.shown_queued.is_none(), "the fresh page is told about the queue");
+    }
+
+    #[test]
+    fn a_chat_that_owes_nothing_leaves_no_state_behind() {
+        assert!(ChatState::new(7, "load-1".into()).parked().is_none());
+    }
+
+    #[test]
+    fn a_parked_message_never_reaches_another_pane() {
+        let parked = waiting(7, "pour le chef 7").parked();
+        let other = ChatState::resumed(parked, 8, "load-2".into());
+        assert!(other.outbox.queue().is_empty());
+    }
 
     #[test]
     fn the_chat_page_takes_the_light_tokens_in_light_mode() {
