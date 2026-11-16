@@ -75,7 +75,11 @@ pub struct PaneNeed {
     pub detail: Option<String>,
 }
 
-/// A scheduled routine's last run, if it failed.
+/// A failed routine's line when routinectl named no gesture.
+pub const ROUTINE_FAILED: &str = "Routine failed";
+
+/// A scheduled routine's last run, if it failed and the failure is Robin's
+/// to see: one routinectl tries again, or handed to an agent, is not here.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineNeed {
@@ -85,6 +89,9 @@ pub struct RoutineNeed {
     /// Switched off on purpose: a failure from before does not count.
     #[serde(default)]
     pub paused: bool,
+    /// The gesture the failure asks of Robin, when routinectl named it.
+    #[serde(default)]
+    pub gesture: Option<String>,
 }
 
 /// A `kova ask` question, as the board reports it.
@@ -176,7 +183,7 @@ pub fn need_items(input: &NeedInput) -> Vec<NeedItem> {
                 pane_id: None,
                 since,
                 title: routine.name.clone(),
-                detail: "Routine failed".to_string(),
+                detail: routine.gesture.clone().unwrap_or_else(|| ROUTINE_FAILED.to_string()),
             })
         })
         .collect();
@@ -369,6 +376,20 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_routine_names_the_gesture_routinectl_asked() {
+        let one = |gesture: Option<&str>| {
+            let input: NeedInput = serde_json::from_value(serde_json::json!({
+                "routines": [{"name": "release-client-alert", "failed_at": 5, "gesture": gesture}],
+                "now": 10,
+            }))
+            .expect("the input");
+            need_items(&input).into_iter().find(|i| i.kind == NeedKind::FailedRoutine).map(|i| i.detail)
+        };
+        assert_eq!(one(None).as_deref(), Some(ROUTINE_FAILED));
+        assert_eq!(one(Some("Quota hebdo atteint, reprise à 20:00")).as_deref(), Some("Quota hebdo atteint, reprise à 20:00"));
+    }
+
+    #[test]
     fn every_shared_case_holds() {
         let text =
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/waits_on_you.json"));
@@ -402,6 +423,7 @@ mod tests {
                 name: "nightly".into(),
                 failed_at: Some(5),
                 paused: false,
+                gesture: None,
             }],
             asks: Vec::new(),
             attention: Vec::new(),
@@ -457,7 +479,7 @@ mod tests {
                 PaneNeed { id: 3, error_since: Some(10), permission_since: None, title: "api".into(), from: None, detail: Some("session limit".into()) },
                 PaneNeed { id: 4, error_since: None, permission_since: Some(20), title: "Pane 4".into(), from: Some("Acme".into()), detail: Some("rm -rf build".into()) },
             ],
-            routines: vec![RoutineNeed { name: "nightly".into(), failed_at: Some(5), paused: false }],
+            routines: vec![RoutineNeed { name: "nightly".into(), failed_at: Some(5), paused: false, gesture: None }],
             asks: vec![AskNeed {
                 id: "a1".into(),
                 pane_id: Some(7),

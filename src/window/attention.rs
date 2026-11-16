@@ -541,7 +541,7 @@ mod tests {
                 needs::PaneNeed { id: 1, error_since: Some(50), permission_since: None, title: "api".into(), from: None, detail: None },
                 needs::PaneNeed { id: 2, error_since: None, permission_since: Some(30), title: "build".into(), from: Some("agent-b".into()), detail: Some("git push".into()) },
             ],
-            routines: vec![needs::RoutineNeed { name: "nightly".into(), failed_at: Some(5), paused: false }],
+            routines: vec![needs::RoutineNeed { name: "nightly".into(), failed_at: Some(5), paused: false, gesture: None }],
             asks: vec![needs::AskNeed {
                 id: "q1".into(),
                 pane_id: Some(3),

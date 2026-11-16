@@ -132,6 +132,51 @@ impl LastRun {
     }
 }
 
+/// Who has a failed last run in hand, as routinectl says in `last`
+/// (`retry_at`, `routed_to`, `gesture`). A failure nobody took is `Open`:
+/// it must not go unseen, and it is all an older routinectl ever says.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Care {
+    #[default]
+    Open,
+    /// routinectl tries again by itself (a passing cause: the network).
+    Retrying,
+    /// Handed to an agent, named here.
+    Routed(String),
+    /// Robin's gesture is needed (a quota, a login, an access): which one.
+    Gesture(String),
+}
+
+impl Care {
+    /// A failed run in this care makes a card: Robin's gesture, or nobody's.
+    pub fn asks_robin(&self) -> bool {
+        matches!(self, Care::Open | Care::Gesture(_))
+    }
+
+    /// The gesture asked, when routinectl named one.
+    pub fn gesture(&self) -> Option<&str> {
+        match self {
+            Care::Gesture(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// From `last`'s fields. A gesture wins over the rest: what needs
+    /// Robin is never hidden behind a retry or an agent.
+    fn from_wire(retry_at: Option<&str>, routed_to: Option<&str>, gesture: Option<&str>) -> Care {
+        let said = |v: Option<&str>| v.map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+        if let Some(text) = said(gesture) {
+            Care::Gesture(text)
+        } else if let Some(who) = said(routed_to) {
+            Care::Routed(who)
+        } else if said(retry_at).is_some() {
+            Care::Retrying
+        } else {
+            Care::Open
+        }
+    }
+}
+
 /// How the last run ended, in the four states a row can show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LastStatus {
@@ -211,6 +256,8 @@ pub struct Routine {
     pub next_run: Option<When>,
     /// The last run, when routinectl or the log knows of one.
     pub last: Option<LastRun>,
+    /// Who has that run in hand, when it failed.
+    pub care: Care,
     /// Where it runs, which decides, for a Claude routine, whose accounts it
     /// speaks with.
     pub cwd: String,
@@ -615,6 +662,12 @@ struct WireLast {
     end: Option<String>,
     #[serde(default)]
     code: i32,
+    #[serde(default)]
+    retry_at: Option<String>,
+    #[serde(default)]
+    routed_to: Option<String>,
+    #[serde(default)]
+    gesture: Option<String>,
 }
 
 fn yes() -> bool {
@@ -658,6 +711,7 @@ fn routine_from_wire(w: WireRoutine) -> Result<Option<Routine>, ()> {
         }),
         None => None,
     };
+    let care = w.last.as_ref().map_or(Care::Open, |l| Care::from_wire(l.retry_at.as_deref(), l.routed_to.as_deref(), l.gesture.as_deref()));
     // The prompt's text is not read: the view names the file, it never shows
     // it. Whether the file exists is all a row needs.
     let prompt_path = PathBuf::from(&w.prompt);
@@ -675,6 +729,7 @@ fn routine_from_wire(w: WireRoutine) -> Result<Option<Routine>, ()> {
         manual: w.manual,
         next_run,
         last,
+        care,
         cwd: w.cwd,
         log: w.log,
     }))
@@ -714,6 +769,7 @@ fn read_from_disk() -> Vec<Routine> {
             manual: false,
             next_run: None,
             last: std::fs::read_to_string(&log).ok().as_deref().and_then(last_from_log),
+            care: Care::Open,
             cwd: json
                 .get("ProgramArguments")
                 .and_then(|a| a.as_array())
@@ -854,6 +910,24 @@ mod tests {
 
     fn routine(name: &str) -> Routine {
         Routine { name: name.into(), loaded: true, ..Default::default() }
+    }
+
+    #[test]
+    fn a_failed_run_says_who_has_it_in_hand() {
+        // The three fields agreed with routinectl (16/11), in `last`.
+        let care = |extra: &str| {
+            let json = format!(r#"{{"name":"veille-reviews-pr","schedule":"x","schedule_words":"x","enabled":true,"loaded":true,"last":{{"start":"2026-11-16T14:13:04","end":"2026-11-16T14:14:28","code":1{extra}}},"cwd":"/tmp","prompt":"","log":""}}"#);
+            let wire: WireRoutine = serde_json::from_str(&json).expect("the wire shape");
+            routine_from_wire(wire).expect("parsed").expect("listed").care
+        };
+        assert_eq!(care(""), Care::Open, "an older routinectl: the failure is nobody's yet");
+        assert_eq!(care(r#","retry_at":"2026-11-16T14:19:28""#), Care::Retrying);
+        assert_eq!(care(r#","routed_to":"harness-v3""#), Care::Routed("harness-v3".into()));
+        assert_eq!(care(r#","gesture":"Se reconnecter à Linear""#), Care::Gesture("Se reconnecter à Linear".into()));
+        assert_eq!(care(r#","routed_to":"x","gesture":"Quota atteint""#), Care::Gesture("Quota atteint".into()), "what needs Robin is never hidden");
+        assert_eq!(care(r#","retry_at":" ","routed_to":"""#), Care::Open, "an empty field says nothing");
+        assert!(Care::Open.asks_robin() && Care::Gesture("g".into()).asks_robin());
+        assert!(!Care::Retrying.asks_robin() && !Care::Routed("a".into()).asks_robin());
     }
 
     #[test]

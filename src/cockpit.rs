@@ -482,7 +482,12 @@ pub fn from_need(need: &NeedItem, sheet: bool) -> Option<Item> {
             Kind::FailedRoutine,
             2,
             format!("Routine {} \u{b7} en échec", need.title),
-            "Regarder pourquoi elle a échoué".to_string(),
+            // The gesture routinectl named (a quota, a login, an access).
+            if need.detail.trim().is_empty() || need.detail == crate::window::needs::ROUTINE_FAILED {
+                "Regarder pourquoi elle a échoué".to_string()
+            } else {
+                need.detail.clone()
+            },
             "routines".to_string(),
         ),
         NeedKind::Ask => (
@@ -3128,6 +3133,20 @@ mod tests {
 
     fn need(kind: NeedKind, key: &str, since: u64) -> NeedItem {
         NeedItem { kind, key: key.into(), pane_id: Some(1), since, title: "build".into(), detail: "git push".into() }
+    }
+
+    #[test]
+    fn a_failed_routine_s_card_says_the_gesture_when_routinectl_named_one() {
+        let card = |detail: &str| {
+            let mut n = need(NeedKind::FailedRoutine, "routine:release-client-alert", 5);
+            n.title = "release-client-alert".into();
+            n.detail = detail.into();
+            from_need(&n, false).expect("a card")
+        };
+        let plain = card(crate::window::needs::ROUTINE_FAILED);
+        assert_eq!(plain.title, "Routine release-client-alert \u{b7} en échec");
+        assert_eq!(plain.needs, "Regarder pourquoi elle a échoué");
+        assert_eq!(card("Quota hebdo atteint, reprise à 20:00").needs, "Quota hebdo atteint, reprise à 20:00");
     }
 
     #[test]

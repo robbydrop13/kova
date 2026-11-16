@@ -514,16 +514,7 @@ impl KovaView {
             .map(|list| {
                 list.iter()
                     .filter(|routine| !routine.running)
-                    .map(|routine| RoutineNeed {
-                        name: routine.name.clone(),
-                        failed_at: routine
-                            .last
-                            .as_ref()
-                            .filter(|last| last.code != 0)
-                            .and_then(|last| last.at())
-                            .map(|when| when.epoch_secs()),
-                        paused: routine.paused,
-                    })
+                    .map(routine_need)
                     .collect()
             })
             .unwrap_or_default();
@@ -1569,5 +1560,54 @@ mod tests {
 
         let (show, ..) = split_layout(bounds(580.0, 600.0), 280.0, 300.0, true);
         assert!(show);
+    }
+}
+
+/// A routine as the needs see it: failed only when the failure is Robin's
+/// to see (`routines::Care::asks_robin`), with the gesture routinectl named.
+/// A run routinectl tries again, or one handed to an agent, makes no card.
+pub(super) fn routine_need(routine: &crate::routines::Routine) -> RoutineNeed {
+    RoutineNeed {
+        name: routine.name.clone(),
+        failed_at: routine
+            .last
+            .as_ref()
+            .filter(|last| last.code != 0 && routine.care.asks_robin())
+            .and_then(|last| last.at())
+            .map(|when| when.epoch_secs()),
+        paused: routine.paused,
+        gesture: routine.care.gesture().map(str::to_string),
+    }
+}
+
+#[cfg(test)]
+mod routine_need_tests {
+    use super::routine_need;
+    use crate::routines::{Care, LastRun, Routine, When};
+
+    fn failed(name: &str, end: &str, code: i32, care: Care) -> Routine {
+        Routine { name: name.into(), loaded: true, last: Some(LastRun { start: None, end: When::parse(end), code }), care, ..Default::default() }
+    }
+
+    /// The cases of 09 to 16/11 (Robin: "plusieurs par jour"), replayed.
+    #[test]
+    fn a_card_only_when_the_failure_is_robin_s_to_see() {
+        // veille-reviews-pr, 16/11 14:14: GitHub timed out, the next run
+        // passed. routinectl tries again: no card.
+        let retry = routine_need(&failed("veille-reviews-pr", "2026-11-16T14:14:28", 1, Care::Retrying));
+        assert_eq!(retry.failed_at, None);
+        // controle-directs, 16/11 15:57: its script was not executable
+        // (code 126). Handed to an agent: no card.
+        let routed = routine_need(&failed("controle-directs", "2026-11-16T15:57:24", 126, Care::Routed("harness-v3".into())));
+        assert_eq!((routed.failed_at, routed.gesture), (None, None));
+        // release-client-alert, 11/11 10:19: the weekly quota. Robin's
+        // gesture: a card that says which.
+        let quota = routine_need(&failed("release-client-alert", "2026-11-11T10:19:52", 1, Care::Gesture("Quota hebdo atteint, reprise à 20:00".into())));
+        assert!(quota.failed_at.is_some());
+        assert_eq!(quota.gesture.as_deref(), Some("Quota hebdo atteint, reprise à 20:00"));
+        // An older routinectl says nothing: the failure still shows.
+        assert!(routine_need(&failed("controle-directs", "2026-11-16T15:57:24", 126, Care::Open)).failed_at.is_some());
+        // A run that passed is no need, whatever is said.
+        assert_eq!(routine_need(&failed("x", "2026-11-16T16:08:00", 0, Care::Open)).failed_at, None);
     }
 }
