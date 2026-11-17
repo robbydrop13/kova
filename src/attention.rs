@@ -1319,7 +1319,7 @@ mod tests {
         let strings = |v: &serde_json::Value| -> Vec<String> {
             v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default()
         };
-        // The same five words on both sides.
+        // The same words on both sides.
         let gestures = contract["gestures"].as_object().expect("gestures");
         let mut theirs: Vec<&str> = gestures.keys().map(String::as_str).collect();
         let mut ours: Vec<&str> = Gesture::ALL.iter().map(|g| g.word()).collect();
@@ -1388,10 +1388,18 @@ mod tests {
         assert!(strings(&fields["waiting"]).iter().any(|w| w == "agent"));
         let card = serde_json::json!({"gestures": contract["gestures_by_waiting"]["agent"], "ask": {"text": "q", "ts": "2026-11-12T09:14:02+01:00", "to": "s", "label": "non remis"}});
         let reply = reply_of(Some(card["gestures"].clone()), None, Some("agent".into()), Some(card["ask"].clone()));
-        assert_eq!(reply.gestures, [Gesture::Cancel]);
+        // After a question: the way back, and the check since the contract's
+        // version 4 (17/11/2026); never the cross on what the user just asked.
+        assert!(reply.gestures.contains(&Gesture::Cancel) && !reply.gestures.contains(&Gesture::Dismiss), "{:?}", reply.gestures);
         assert_eq!(reply.asked.map(|a| (a.text, a.to, a.label)), Some(("q".into(), "s".into(), Some("non remis".into()))));
         let robin: Vec<Gesture> = strings(&contract["gestures_by_waiting"]["robin"]).iter().filter_map(|w| Gesture::parse(w)).collect();
         assert_eq!(robin.len(), strings(&contract["gestures_by_waiting"]["robin"]).len(), "every gesture offered is one Kova shows");
+        // Every state's list is made of gestures Kova shows, whatever states the contract names.
+        for (state, list) in contract["gestures_by_waiting"].as_object().expect("gestures_by_waiting") {
+            for word in strings(list) {
+                assert!(Gesture::parse(&word).is_some(), "{state} offers {word}, which Kova does not know");
+            }
+        }
         // The former buttons Kova still sends, as the contract reads them.
         let legacy = contract["legacy"].as_object().expect("legacy");
         for word in [Verb::Validate.label(), Verb::Correct.label(), Verb::Instruct.label(), "close --reason done", "close --reason nogo", "close --reason dismissed"] {
