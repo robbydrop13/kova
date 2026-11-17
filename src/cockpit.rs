@@ -819,12 +819,35 @@ pub fn icons(item: &Item, can_close: bool, can_snooze: bool) -> Vec<Button> {
     out
 }
 
-/// The icons of a card with a reply zone (`zoned`): the clock, and `Vu` when
-/// the queue offers it. No check, no cross: a card that waits for its agent
-/// has neither within reach.
+/// The icons of a card with a reply zone (`zoned`): the clock, then `Vu`,
+/// the cross and the check when the queue offers them (`seen`, `dismiss`,
+/// `done`). Kova deduces none: the queue lists the check in every state of
+/// a card, `Attend l'agent` included, so the user can always take a card
+/// off his list himself (Robin, 17/11/2026: such a card offered `Annuler
+/// ma demande` and nothing else), and the cross only while he has not
+/// given a go, a consigne or asked a question on it.
 pub fn zone_icons(item: &Item, can_snooze: bool) -> Vec<Button> {
-    let seen = item.reply.gestures.contains(&crate::attention::Gesture::Seen);
-    can_snooze.then_some(Button::Snooze).into_iter().chain(seen.then_some(Button::Seen)).collect()
+    use crate::attention::Gesture;
+    let has = |g: Gesture, b: Button| item.reply.gestures.contains(&g).then_some(b);
+    can_snooze
+        .then_some(Button::Snooze)
+        .into_iter()
+        .chain(has(Gesture::Seen, Button::Seen))
+        .chain(has(Gesture::Dismiss, Button::Dismiss))
+        .chain(has(Gesture::Done, Button::Done))
+        .collect()
+}
+
+/// The gesture the cross or the check stands for on a zoned card that
+/// lists it: the click goes through the reply's path, not the close command.
+pub fn closing_gesture(item: &Item, can_act: bool, button: Button) -> Option<crate::attention::Gesture> {
+    use crate::attention::Gesture;
+    let gesture = match button {
+        Button::Done => Gesture::Done,
+        Button::Dismiss => Gesture::Dismiss,
+        _ => return None,
+    };
+    (zoned(item, can_act) && item.reply.gestures.contains(&gesture)).then_some(gesture)
 }
 
 /// The user already acted on the card: a go went through, or a consigne
@@ -2757,6 +2780,40 @@ mod tests {
         assert!(card_html(&from_attention(&quiet, None, false).unwrap(), true, true, true, 10).contains("<span>Attend l'agent</span>"));
         let back = zone_entry("a-3", r#""gestures":["go"],"waiting":"robin","ask":{"text":"q"}"#);
         assert_eq!(back.reply.asked, None);
+    }
+
+    #[test]
+    fn every_state_of_a_card_offers_the_closers_the_queue_lists() {
+        use crate::attention::Gesture;
+        // The gestures the queue lists per state (contract v4, harness-v3,
+        // 17/11): the check everywhere, the cross until the user acted.
+        let card = |extra: &str| from_attention(&zone_entry("a-1", extra), None, false).unwrap();
+        let closers = |item: &Item| -> Vec<Button> {
+            zone_icons(item, true).into_iter().filter(|b| matches!(b, Button::Dismiss | Button::Done)).collect()
+        };
+        let waits = card(r#""gestures":["go","nogo","ask","seen","done","dismiss"],"waiting":"robin""#);
+        assert_eq!(closers(&waits), [Button::Dismiss, Button::Done], "waits for the user");
+        // Robin, 17/11: `Attend l'agent` offered `Annuler ma demande` only.
+        let asked = card(r#""gestures":["cancel","done"],"waiting":"agent","ask":{"text":"q","label":"non remis"}"#);
+        assert_eq!(closers(&asked), [Button::Done], "after a question: the check, and no cross on what he just asked");
+        let html = card_html(&asked, true, true, true, 10);
+        assert!(html.contains("Annuler ma demande") && html.contains(r#"data-act="done""#) && !html.contains(r#"data-act="dismiss""#), "{html}");
+        // A send in doubt, a click under way, a click that failed.
+        assert_eq!(closers(&card(r#""gestures":["done"],"waiting":"robin""#)), [Button::Done], "uncertain");
+        for state in [State::Running, State::Failed("non remis".into())] {
+            assert_eq!(closers(&Item { state: state.clone(), ..waits.clone() }), [Button::Dismiss, Button::Done], "{state:?}");
+        }
+        // The click is the queue's gesture, not the close command; an older
+        // queue lists neither and the card shows neither.
+        assert_eq!(closing_gesture(&asked, true, Button::Done), Some(Gesture::Done));
+        assert_eq!(closing_gesture(&asked, true, Button::Dismiss), None);
+        assert_eq!(closing_gesture(&waits, true, Button::Dismiss), Some(Gesture::Dismiss));
+        let old = card(r#""gestures":["cancel"],"waiting":"agent","ask":{"text":"q"}"#);
+        assert_eq!(closers(&old), [], "nothing deduced");
+        // An unzoned card keeps its own cross and check.
+        let plain = from_attention(&entry("a-2", Level::Now, None, 10), None, false).unwrap();
+        assert_eq!(icons(&plain, true, false), [Button::Dismiss, Button::Done]);
+        assert_eq!(closing_gesture(&plain, true, Button::Done), None);
     }
 
     #[test]

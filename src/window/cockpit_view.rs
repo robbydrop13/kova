@@ -822,6 +822,12 @@ impl KovaView {
                 | Button::Resend,
             ) => {
                 let Some(id) = attention_id else { return };
+                // The cross and the check of a card whose gestures the queue
+                // lists are two of them.
+                if let Some(gesture) = cockpit::closing_gesture(&item, crate::attention::can_act(), button) {
+                    self.cockpit_reply(&key, gesture.word(), text.as_deref(), None);
+                    return;
+                }
                 let (verb, text) = match button {
                     // The text left in the card's field goes with the button
                     // that files the card (`attention::perform_with`).
@@ -933,6 +939,8 @@ impl KovaView {
                 let words = match gesture {
                     Gesture::Go => "Go noté",
                     Gesture::NoGo => "No go noté",
+                    Gesture::Done => "Fait : carte rangée",
+                    Gesture::Dismiss => "Carte écartée",
                     _ => "Vu : carte rangée",
                 };
                 self.cockpit_filing(&item, id, words, text.filter(|_| gesture.takes_text()));

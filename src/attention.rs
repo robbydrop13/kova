@@ -162,7 +162,7 @@ pub struct Entry {
     pub reply: Reply,
 }
 
-/// One of the five gestures of a card's reply zone, as the queue names them
+/// One of the seven gestures of a card, as the queue names them
 /// (`act_command <id> <word>`). The queue lists the ones a card offers
 /// (`gestures`): Kova shows exactly those and deduces none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -177,10 +177,17 @@ pub enum Gesture {
     Seen,
     /// `cancel`: the question asked is withdrawn, the card waits for the user again.
     Cancel,
+    /// `done`: the Cockpit's check. The card is filed as done, in whatever
+    /// state it is (a question asked stays with its agent).
+    Done,
+    /// `dismiss`: the Cockpit's cross, not relevant. Never listed once the
+    /// user gave a go, a consigne or asked a question.
+    Dismiss,
 }
 
 impl Gesture {
-    pub const ALL: [Gesture; 5] = [Gesture::Go, Gesture::NoGo, Gesture::Ask, Gesture::Seen, Gesture::Cancel];
+    pub const ALL: [Gesture; 7] =
+        [Gesture::Go, Gesture::NoGo, Gesture::Ask, Gesture::Seen, Gesture::Cancel, Gesture::Done, Gesture::Dismiss];
 
     /// The word `act_command` receives, and the one the queue lists.
     pub fn word(self) -> &'static str {
@@ -190,6 +197,8 @@ impl Gesture {
             Gesture::Ask => "ask",
             Gesture::Seen => "seen",
             Gesture::Cancel => "cancel",
+            Gesture::Done => "done",
+            Gesture::Dismiss => "dismiss",
         }
     }
 
@@ -199,7 +208,7 @@ impl Gesture {
 
     /// Whether the gesture files the card: it leaves the list at once.
     pub fn files(self) -> bool {
-        matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Seen)
+        matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Seen | Gesture::Done | Gesture::Dismiss)
     }
 
     /// Whether the gesture carries the text typed in the card's field: every
@@ -207,7 +216,7 @@ impl Gesture {
     /// the button that files the card, `Vu` included; the queue takes it or
     /// refuses the click, and the card then keeps it.
     pub fn takes_text(self) -> bool {
-        matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Ask | Gesture::Seen)
+        matches!(self, Gesture::Go | Gesture::NoGo | Gesture::Ask | Gesture::Seen | Gesture::Done | Gesture::Dismiss)
     }
 }
 
@@ -1407,6 +1416,8 @@ mod tests {
         assert_eq!(argv(Gesture::Seen, Some(" "), None), Some(format!("{head} seen")));
         assert_eq!(argv(Gesture::Cancel, Some("x"), None), Some(format!("{head} cancel")));
         assert_eq!(argv(Gesture::Cancel, None, None), Some(format!("{head} cancel")));
+        assert_eq!(argv(Gesture::Done, None, None), Some(format!("{head} done")));
+        assert_eq!(argv(Gesture::Dismiss, Some("doublon"), None), Some(format!("{head} dismiss --text=doublon")));
         // The text is one argv element: never read as an option.
         // A draft the user rewrote goes with the go, and with no other gesture.
         let with_draft = |g| gesture_argv(&act, "a-1", g, None, Some("0123456789abcdef"), Some("Salut,\n--by evil"), cid, None).unwrap().1;
