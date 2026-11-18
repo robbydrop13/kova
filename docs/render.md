@@ -10,6 +10,24 @@ For an agent: look at what a change shows, and attach a before and an after
 to the work, without asking the user to launch anything. Code:
 `src/render_cli.rs`.
 
+## Which binary
+
+One binary only: the installed app's, `/Applications/Kova.app/Contents/MacOS/kova`
+(`kova` below stands for it). `./build.sh` puts the build there.
+
+Never a binary found under a `target/` folder, in this repo or elsewhere: it
+can be months old. One from before `render` existed does not know the word
+and starts the whole app instead: a window with the user's session restored,
+its PTYs, a socket, `session.json` written (18/11/2026: two full Kova started
+that way on the user's Mac, from a `target/release/kova` dated 30/04/2026).
+Do not try an unknown binary to see what it knows: trying is what starts
+the app.
+
+What the code does since then, so the mistake costs nothing with a current
+binary: a word that is not a subcommand exits 2 without starting the app
+(`stray_subcommand`, `src/main.rs`), and a Kova started while another one
+runs neither restores nor writes the session (`session::owns_session`).
+
 ## Commands
 
 ```
@@ -65,4 +83,6 @@ scripts/render-shot.sh after/en-cours.html after.png
 
 Same data both times: save the JSON once. From a worktree whose build is
 not installed, `cargo run --release -- render …` runs the same command
-(it never opens the app).
+(it never opens the app): cargo builds that worktree's source first, so
+what runs is never stale. That is the one exception to the rule above;
+the file cargo leaves under `target/` is not called by its path.
