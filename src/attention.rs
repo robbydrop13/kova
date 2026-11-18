@@ -798,8 +798,11 @@ fn verb_argv_with(
     };
     let (bin, words) = base.split_first()?;
     let mut args: Vec<String> = words.to_vec();
-    // A click on an agent's card says how far it went (`run_click`).
-    if acts {
+    // A click on an agent's card says how far it went (`run_click`), and so
+    // does `Plus tard` since the queue's contract names it (18/11/2026):
+    // refused (4) or the card changed (5), the card says why after
+    // `Non transmis :`, like any other gesture.
+    if acts || verb == Verb::Snooze {
         args.push(EXIT_CODES.to_string());
     }
     args.push(id.to_string());
@@ -829,6 +832,23 @@ fn verb_argv_with(
         }
     }
     Some((bin.clone(), args))
+}
+
+/// A snooze's argv with the click's id and the card's fingerprint, where the
+/// contract puts them: `snooze --exit-codes [--client-id=<uuid>]
+/// [--card-seen=<fingerprint>] <card> --until=<ISO 8601>`. Left as it is
+/// when the card's id is not found in it or the click's id is not one.
+fn snooze_flags(mut args: Vec<String>, id: &str, client_id: &str, card_seen: Option<&str>) -> Vec<String> {
+    let Some(at) = args.iter().position(|a| a == id) else { return args };
+    let mut flags = Vec::new();
+    if valid_id(client_id) {
+        flags.push(format!("{CLIENT_ID}={client_id}"));
+    }
+    if let Some(card) = card_seen.filter(|s| valid_seen(s)) {
+        flags.push(format!("{CARD_SEEN}={card}"));
+    }
+    args.splice(at..at, flags);
+    args
 }
 
 /// The flag that names one click (`--client-id=<uuid>`): the queue notes a
@@ -986,7 +1006,7 @@ pub fn perform_gesture(
 /// clicked (`Draft::seen`): it goes with `Valider` and a correction as
 /// `--seen=<fingerprint>`, and the CLI refuses the click when the draft
 /// changed since.
-pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>) -> Result<(), String> {
+pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>, card_seen: Option<&str>) -> Result<(), String> {
     let text = text.map(clean_text);
     let known = CACHE.read().as_ref().is_some_and(|entries| entries.iter().any(|e| e.id == id));
     if !known {
@@ -998,6 +1018,8 @@ pub fn perform_with(id: &str, verb: Verb, text: Option<&str>, seen: Option<&str>
     }
     .ok_or_else(|| format!("attention: no command for {}", verb.label()))?;
     let args = with_seen(args, verb, seen);
+    // `Plus tard` names its click and the card as the page showed it.
+    let args = if verb == Verb::Snooze { snooze_flags(args, id, &crate::ask::new_question_id(), card_seen) } else { args };
     // The check on a card whose field holds a text: the text goes first, as
     // an instruction to the card's agent, and the card is filed only once it
     // went. `close --reason done` hands no note to anyone.
@@ -1365,6 +1387,37 @@ mod tests {
         // The exit codes Kova tells apart.
         let codes = contract["exit_codes"].as_object().expect("exit_codes");
         assert!(codes.contains_key("0") && codes.contains_key(&EXIT_NOTED.to_string()) && codes.contains_key("4"), "{codes:?}");
+        // `Plus tard`, once the contract names it: the same flags in the
+        // contract's order, and the exit codes of a gesture.
+        if let Some(spec) = contract.get("snooze") {
+            let snooze: Vec<String> = ["/bin/attn", "snooze"].iter().map(|s| s.to_string()).collect();
+            let until = "2026-11-07T09:00:00+01:00";
+            let (_, argv) = verb_argv_with(&act, &[], &snooze, "a-1", Verb::Snooze, Some(until)).expect("a snooze has an argv");
+            let argv = snooze_flags(argv, "a-1", cid, Some(card_fp));
+            // The contract's line, its optional parts taken, with our values.
+            let wanted: Vec<String> = spec["argv"]
+                .as_str()
+                .expect("snooze.argv")
+                .split_whitespace()
+                .filter(|w| !matches!(*w, "ISO" | "8601>"))
+                .map(|w| w.trim_matches(|c| c == '[' || c == ']'))
+                .map(|w| match w {
+                    "<card>" => "a-1".to_string(),
+                    "--until=<ISO" => format!("--until={until}"),
+                    w if w.starts_with(CLIENT_ID) => format!("{CLIENT_ID}={cid}"),
+                    w if w.starts_with(CARD_SEEN) => format!("{CARD_SEEN}={card_fp}"),
+                    w => w.to_string(),
+                })
+                .collect();
+            assert_eq!(argv, wanted, "Plus tard, as the contract writes it");
+            assert_eq!(spec["noted"].as_i64(), Some(0));
+            assert_eq!(spec["refused"].as_i64(), Some(4));
+            assert_eq!(spec["card_changed"].as_i64(), Some(EXIT_CARD_CHANGED as i64));
+            // 5 is the card's own refusal, 4 the command's first line; never 3.
+            assert_eq!(delivery_of(Some(0), true), Some(Delivery::Delivered));
+            assert_eq!(delivery_of(Some(4), true), None);
+            assert_eq!(delivery_of(Some(5), true), None);
+        }
         // The card's fingerprint, once the contract names it: its flag on every
         // gesture, its exit code, its field.
         if let Some(card) = contract.get("card_seen") {
@@ -1563,8 +1616,18 @@ mod tests {
         assert_eq!(snooze, ["/bin/attn", "snooze"]);
         assert_eq!(
             verb_argv_with(&act, &close, &snooze, "a-1", Verb::Snooze, Some("2026-11-07T09:00:00+01:00")),
-            Some(("/bin/attn".to_string(), vec!["snooze".into(), "a-1".into(), "--until=2026-11-07T09:00:00+01:00".into()]))
+            Some(("/bin/attn".to_string(), vec!["snooze".into(), "--exit-codes".into(), "a-1".into(), "--until=2026-11-07T09:00:00+01:00".into()]))
         );
+        // The click's id and the card as shown go before the card's id; a
+        // fingerprint or an id that is not one is left out.
+        let (_, plain) = verb_argv_with(&act, &close, &snooze, "a-1", Verb::Snooze, Some("2026-11-07T09:00:00+01:00")).unwrap();
+        let cid = "0b5c1c2e-1111-4222-8333-444455556666";
+        assert_eq!(
+            snooze_flags(plain.clone(), "a-1", cid, Some("fedcba9876543210")),
+            ["snooze", "--exit-codes", &format!("--client-id={cid}"), "--card-seen=fedcba9876543210", "a-1", "--until=2026-11-07T09:00:00+01:00"]
+        );
+        assert_eq!(snooze_flags(plain.clone(), "a-1", cid, Some("--by robin")).len(), 5, "no fingerprint that is not one");
+        assert_eq!(snooze_flags(plain.clone(), "a-1", "--x", None), plain);
         assert_eq!(verb_argv_with(&act, &close, &snooze, "a-1", Verb::Snooze, Some("--by x")), None, "only a date");
         assert_eq!(or_close_bin(&["/x/explain".into()], &close, "explain"), ["/x/explain"]);
         assert!(or_close_bin(&[], &[], "explain").is_empty());
@@ -1865,7 +1928,7 @@ mod tests {
         set_commands(&Commands::default());
         assert!(!configured());
         assert!(snapshot().is_none());
-        assert!(perform_with("a-100001", Verb::Resolve, None, None).is_err());
+        assert!(perform_with("a-100001", Verb::Resolve, None, None, None).is_err());
     }
 
     #[test]

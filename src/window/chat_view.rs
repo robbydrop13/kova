@@ -655,7 +655,7 @@ impl KovaView {
         let queue = |action| crate::app::app_delegate(mtm).ivars().queue_ask_action(action);
         let attn = |verb, text: Option<&str>| {
             if let Some(e) = &entry
-                && let Err(why) = crate::attention::perform_with(e, verb, text, None)
+                && let Err(why) = crate::attention::perform_with(e, verb, text, None, None)
             {
                 log::warn!("chat: {why}");
             }
@@ -677,7 +677,7 @@ impl KovaView {
             }
             "instruct" if !text.trim().is_empty() => match &entry {
                 Some(e) => {
-                    if let Err(why) = crate::attention::perform_with(e, crate::attention::Verb::Instruct, Some(text), None) {
+                    if let Err(why) = crate::attention::perform_with(e, crate::attention::Verb::Instruct, Some(text), None, None) {
                         log::warn!("chat: {why}");
                         crate::attention::instruction_refused(e, text, "Kova n'a pas pu la transmettre");
                     }
