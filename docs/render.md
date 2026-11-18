@@ -26,7 +26,8 @@ the app.
 What the code does since then, so the mistake costs nothing with a current
 binary: a word that is not a subcommand exits 2 without starting the app
 (`stray_subcommand`, `src/main.rs`), and a Kova started while another one
-runs neither restores nor writes the session (`session::owns_session`).
+runs on the same home folder quits at once with exit 3, before any window,
+PTY or socket (`session::claim_at_launch`, on the session lock).
 
 ## Commands
 

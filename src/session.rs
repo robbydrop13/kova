@@ -349,18 +349,67 @@ fn try_acquire_lock(path: &std::path::Path) -> Option<std::fs::File> {
 /// quit. The lock is released by the kernel when the process dies, crash
 /// included, so a stale lock file is never a problem.
 pub fn owns_session() -> bool {
-    static LOCK: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| {
-        let held = try_acquire_lock(&session_lock_path());
-        if held.is_none() {
-            log::warn!(
-                "Another Kova owns {}: this instance starts fresh and will not save its session",
-                session_path().display()
-            );
+    SESSION_LOCK
+        .get_or_init(|| {
+            let held = try_acquire_lock(&session_lock_path());
+            if held.is_none() {
+                log::warn!(
+                    "Another Kova owns {}: this instance will not read nor save its session",
+                    session_path().display()
+                );
+            }
+            held
+        })
+        .is_some()
+}
+
+/// The session lock this process holds for its whole life, once asked.
+static SESSION_LOCK: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+
+/// How long a Kova that starts waits for the lock: the one the user just
+/// quit may still be on its way out.
+pub const LAUNCH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// At launch, before any window, PTY or socket: take the session lock, or
+/// say why this Kova must not start. Another Kova runs on this home folder
+/// when it holds the lock, and only then: the kernel drops the lock with
+/// its process, crash included, so a lock file left behind stops nobody,
+/// and neither does a dead socket, which is never looked at. A Kova under
+/// another `HOME` (a test instance) has its own lock file.
+///
+/// Before 18/11/2026 a second Kova started anyway, with a fresh window and
+/// its own socket: two of them, started by a stale binary that did not know
+/// `render`, took the user's screen and broke what listed the sockets.
+pub fn claim_at_launch() -> Result<(), String> {
+    let held = wait_for_lock(&session_lock_path(), LAUNCH_LOCK_WAIT);
+    if SESSION_LOCK.get_or_init(|| held).is_some() {
+        Ok(())
+    } else {
+        Err(second_instance_message(&session_lock_path()))
+    }
+}
+
+/// Try the lock until it is free or `wait` is over.
+fn wait_for_lock(path: &std::path::Path, wait: std::time::Duration) -> Option<std::fs::File> {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if let Some(file) = try_acquire_lock(path) {
+            return Some(file);
         }
-        held
-    })
-    .is_some()
+        if std::time::Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// What a Kova refused at launch prints.
+fn second_instance_message(lock: &std::path::Path) -> String {
+    format!(
+        "kova: another Kova is already running on this home folder (it holds {}). This one quits: no window, no session read or written.\n\
+         To write a page without the app: /Applications/Kova.app/Contents/MacOS/kova render --help. To test a build next to it: run it under another HOME.",
+        lock.display()
+    )
 }
 
 /// Save all windows to a single session file.
@@ -1142,6 +1191,36 @@ mod tests {
         drop(first);
         assert!(try_acquire_lock(&path).is_some(), "the lock is free once the owner is gone");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The three cases of a launch (18/11/2026): alone, second, and a lock
+    /// file left behind by a Kova that is gone.
+    #[test]
+    fn a_kova_starts_alone_or_over_an_orphan_lock_and_a_second_one_is_refused() {
+        let short = std::time::Duration::from_millis(250);
+        let dir = std::env::temp_dir().join(format!("kova-launch-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("session.lock");
+        // Alone, no lock file yet: it starts, and the folder is made.
+        let first = wait_for_lock(&path, short).expect("a Kova alone starts");
+        // A second one waits its short while, then is refused, and says so.
+        let began = std::time::Instant::now();
+        assert!(wait_for_lock(&path, short).is_none(), "a second Kova is refused");
+        assert!(began.elapsed() >= short, "after waiting for one on its way out");
+        let said = second_instance_message(&path);
+        assert!(said.contains("another Kova is already running") && said.contains("session.lock") && said.contains("another HOME"), "{said}");
+        // The first one quits while the next waits: the next one starts.
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || wait_for_lock(&path, std::time::Duration::from_secs(5)).is_some())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(first);
+        assert!(waiter.join().unwrap(), "a relaunch right after a quit goes through");
+        // An orphan: the file is there, nobody holds it (its Kova crashed).
+        assert!(path.is_file());
+        assert!(wait_for_lock(&path, std::time::Duration::ZERO).is_some(), "a lock file left behind stops nobody");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

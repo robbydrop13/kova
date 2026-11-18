@@ -265,6 +265,13 @@ fn main() {
         .find(|w| w[0] == "--session")
         .and_then(|w| w[1].parse::<usize>().ok());
 
+    // One Kova per home folder: a second one quits here, before the log,
+    // the captures, any window, PTY or socket (`session::claim_at_launch`).
+    if let Err(why) = session::claim_at_launch() {
+        eprintln!("{why}");
+        std::process::exit(3);
+    }
+
     setup_logging();
     log::info!("========== Kova starting ==========");
     prune_old_captures();
