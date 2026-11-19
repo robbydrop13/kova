@@ -160,6 +160,10 @@ pub struct Question {
     /// A message in the conversation does not withdraw it: it did not answer them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub follow_up: bool,
+    /// `kova ask --again`: the user asked for this question back after
+    /// removing it as not relevant; the refusal of a repost does not apply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub again: bool,
 }
 
 /// The kind of a question that carries a decision sheet.
@@ -1331,6 +1335,10 @@ impl Board {
             question.message
         );
         let same = (question.from.name.clone(), question.message.clone());
+        // Asked for again by the user: the removal is forgotten.
+        if question.again {
+            self.dismissed.remove(&same);
+        }
         if self.dismissed.contains(&same) {
             log::info!("ask {}: refused, the user removed the same question as not relevant", question.id);
             let _ = responder.send(crate::ipc::IpcResponse::Error { message: DISMISSED.to_string() });
@@ -1445,7 +1453,7 @@ impl Board {
                         run: None,
                         sheet: Some(rest),
                         draft: None,
-                        follow_up: true,
+                        follow_up: true, again: false,
                     };
                     text.push_str(&format!(
                         "\nStill open in the user's Kova Cockpit: {} (question {}). Their answer will come later as a message; if it no longer matters, drop it: kova ask --drop {}",
@@ -1802,6 +1810,9 @@ the user and prints the answer on stdout: the action, or \"action: text\" when t
                 \"New decision\", its Open button shows the page in Kova's side panel, and the
                 answer comes when the user clicks Done (default actions: Done; no text field
                 unless --actions is given too)
+  --again       the user asked for a question back after removing it from the Cockpit as not
+                relevant: without it, the same question (same asker, same text) is refused with
+                exit 3 until Kova's next launch
   --drop <id>   (alone) take a question off the user's Cockpit unanswered: a decision a sheet left
                 open (its id is in the answer) that no longer matters
   --decisions   a decision sheet Kova shows itself, from a JSON file (the decision-sheet skill's
@@ -1845,10 +1856,12 @@ struct CliArgs {
     open: Option<String>,
     /// `--run <name>`: a handoff to a declared command.
     run: Option<String>,
+    /// `--again`: the user asked for a question he had removed.
+    again: bool,
 }
 
 fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
-    let mut out = CliArgs { message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None, decision: None, sheet: None, open: None, run: None };
+    let mut out = CliArgs { again: false, message: String::new(), actions: Vec::new(), input: true, from: None, timeout: None, json: false, socket: None, decision: None, sheet: None, open: None, run: None };
     let mut message: Option<String> = None;
     let mut actions_given = false;
     let mut input_given = false;
@@ -1893,6 +1906,7 @@ fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
                 }
             }
             "--json" => out.json = true,
+            "--again" => out.again = true,
             "--socket" => out.socket = Some(value()?),
             flag if flag.starts_with("--") => return Err(format!("kova ask: unknown flag {}\n\n{}", flag, USAGE)),
             _ => {
@@ -2154,6 +2168,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         sheet: cli.sheet.clone(),
         draft: None,
         follow_up: false,
+        again: cli.again,
     };
 
     let body = serde_json::json!({"cmd": "ask", "question": question});
@@ -2229,8 +2244,9 @@ pub fn run_cli(args: &[String]) -> i32 {
         }
         if err == DISMISSED {
             return fail(
-                "kova ask: the user removed this question from the Cockpit as not relevant. Do not ask it again; \
-                 drop what it was for, or carry on without it.",
+                "kova ask: refused, the user removed this same question (same asker, same text or sheet title) from the \
+                 Cockpit as not relevant, and Kova keeps that until its next launch. Do not ask it again on your own: \
+                 drop what it was for, or carry on without it. Only if the user asked for it back, post it again with --again.",
                 3,
             );
         }
@@ -2314,7 +2330,7 @@ mod tests {
     }
 
     fn question(id: &str) -> Question {
-        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None, run: None, sheet: None, draft: None, follow_up: false }
+        Question { id: id.into(), message: "Send it?".into(), actions: vec!["OK".into(), "KO".into()], input: true, from: asker(), asked_at: 5, snoozed_until: 0, kind: None, url: None, run: None, sheet: None, draft: None, again: false, follow_up: false }
     }
 
     #[test]
@@ -2952,9 +2968,18 @@ mod tests {
         let (mut board, _rx) = board_with(q);
         board.close(&id, "dismissed").unwrap();
         let (tx, rx2) = std::sync::mpsc::channel();
-        board.add(again, tx);
+        board.add(again.clone(), tx);
         assert!(board.questions().is_empty(), "not back on the Cockpit");
         assert!(matches!(rx2.try_recv(), Ok(crate::ipc::IpcResponse::Error { message }) if message == DISMISSED));
+        // The user asked for it back (`--again`): same asker, same title, it
+        // is on the Cockpit again and waits (19/11/2026: a sheet removed by
+        // mistake had to be renamed to be posted again).
+        let (tx, rx3) = std::sync::mpsc::channel();
+        board.add(Question { again: true, ..again.clone() }, tx);
+        assert_eq!(board.questions().len(), 1, "back on the Cockpit");
+        assert!(rx3.try_recv().is_err(), "its asker waits for the answer");
+        let cli = |words: &[&str]| parse_cli(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>()).unwrap().again;
+        assert!(cli(&["x", "--again"]) && !cli(&["x"]));
 
         let q = question("00000000-0000-4000-8000-0000000000bb");
         let id = q.id.clone();

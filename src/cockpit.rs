@@ -591,6 +591,9 @@ pub enum Button {
     Seen,
     /// A plain go in one click, on a folded card that waits on one.
     Go,
+    /// On a question's card in the chat: out of this chat, still in the
+    /// Cockpit, its asker still waiting. Worded, never a bare cross.
+    HideChat,
 }
 
 impl Button {
@@ -611,6 +614,7 @@ impl Button {
             Button::Refuse => "refuse",
             Button::Snooze => "snooze",
             Button::Dismiss => "dismiss",
+            Button::HideChat => "hide",
             Button::NoGo => "nogo",
             Button::Left => "left",
             Button::Resend => "resend",
@@ -632,6 +636,7 @@ impl Button {
             "refuse" => Some(Button::Refuse),
             "snooze" => Some(Button::Snooze),
             "dismiss" => Some(Button::Dismiss),
+            "hide" => Some(Button::HideChat),
             _ => None,
         }
     }
@@ -655,6 +660,7 @@ impl Button {
             Button::Validate => "Valider",
             Button::Snooze => "Plus tard",
             Button::Dismiss => "Pas pertinent, retirer",
+            Button::HideChat => "Masquer du chat",
             Button::NoGo => "No go",
             Button::Left => "C'est parti",
             Button::Resend => "Renvoyer",
@@ -966,6 +972,9 @@ const ICON_CLOCK_S: &str = r#"<svg class="i" width="14" height="14" viewBox="0 0
 const ICON_X_S: &str = r#"<svg class="i" width="14" height="14" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>"#;
 const ICON_CHECK_S: &str = r#"<svg class="i" width="14" height="14" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>"#;
 
+/// What `Masquer du chat` does, said on hover.
+const HIDE_HINT: &str = "La carte quitte ce chat. La question reste dans le Cockpit et attend toujours ta réponse";
+
 fn icons_html(list: &[Button], disabled: bool) -> String {
     if list.is_empty() {
         return String::new();
@@ -976,6 +985,12 @@ fn icons_html(list: &[Button], disabled: bool) -> String {
             if b == Button::Seen {
                 return format!(
                     "<button type=\"button\" class=\"link vu\" data-act=\"reply\" data-arg=\"seen\" title=\"{SEEN_HINT}\"{}>{ICON_CHECK}<span>Vu</span></button>",
+                    if disabled { " disabled" } else { "" }
+                );
+            }
+            if b == Button::HideChat {
+                return format!(
+                    "<button type=\"button\" class=\"link vu\" data-act=\"hide\" title=\"{HIDE_HINT}\"{}><span>Masquer du chat</span></button>",
                     if disabled { " disabled" } else { "" }
                 );
             }

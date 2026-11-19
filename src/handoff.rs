@@ -349,6 +349,7 @@ command = "open x-apple.systempreferences:com.apple.preference.security"
             sheet: None,
             draft: None,
             follow_up: false,
+            again: false,
         }
     }
 

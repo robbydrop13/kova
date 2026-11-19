@@ -35,6 +35,15 @@ use crate::surface::PaneId;
 use super::sidebar::tokens;
 use super::KovaView;
 
+/// The questions the user hid from the chat (`Masquer du chat`): they stay
+/// in the Cockpit and their askers wait on. For this Kova's life; after a
+/// relaunch a question still waiting shows in its chat again.
+static HIDDEN_ASKS: parking_lot::Mutex<std::collections::BTreeSet<String>> = parking_lot::Mutex::new(std::collections::BTreeSet::new());
+
+fn hidden_from_chat(id: &str) -> bool {
+    HIDDEN_ASKS.lock().contains(id)
+}
+
 /// How often the screen (cards, the prompt line) is read again. The
 /// transcript and the hooks' turn file are read when the kqueue says they
 /// changed, the spinner as soon as it flips.
@@ -669,11 +678,17 @@ impl KovaView {
                 }
                 _ => refused = Some("Date de rappel invalide"),
             },
-            "dismiss" | "done" => {
-                let (reason, verb) =
-                    if act == "done" { ("done", crate::attention::Verb::Resolve) } else { ("dismissed", crate::attention::Verb::Dismiss) };
-                queue(AskAction::Close { id: id.to_string(), reason });
-                attn(verb, None);
+            // Out of the chat only: the question stays on the board and in
+            // the Cockpit, its `kova ask` goes on waiting, nothing is told
+            // to the queue.
+            "hide" => {
+                HIDDEN_ASKS.lock().insert(id.to_string());
+            }
+            // Never `dismissed` from the chat: not relevant is the
+            // Cockpit's cross, with its label.
+            "done" => {
+                queue(AskAction::Close { id: id.to_string(), reason: "done" });
+                attn(crate::attention::Verb::Resolve, None);
             }
             "instruct" if !text.trim().is_empty() => match &entry {
                 Some(e) => {
@@ -1033,7 +1048,7 @@ fn chat_poll(st: &mut ChatState, pane: &Pane, files: bool) -> Option<page::Updat
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
         let session = pane.claude_session_id();
         crate::app::app_delegate(mtm).ivars().for_each_waiting_ask(|q| {
-            if !cards::for_pane([q], pane.id, session.as_deref(), now).is_empty() {
+            if !cards::for_pane([q], pane.id, session.as_deref(), now).is_empty() && !hidden_from_chat(&q.id) {
                 questions.push(q.clone());
             }
         });
@@ -1360,6 +1375,20 @@ mod tests {
         assert_eq!(queue, ["relance les tests"]);
         assert_eq!(back.queue_reason, "part à la fin du tour");
         assert!(back.shown_queued.is_none(), "the fresh page is told about the queue");
+    }
+
+    #[test]
+    fn a_question_hidden_from_the_chat_is_only_hidden_there() {
+        let id = "00000000-0000-4000-8000-0000000000c1";
+        assert!(!hidden_from_chat(id));
+        HIDDEN_ASKS.lock().insert(id.to_string());
+        assert!(hidden_from_chat(id) && !hidden_from_chat("another"));
+        // The chat's handler: hiding closes nothing, and nothing in the
+        // chat closes a question as not relevant.
+        let own = include_str!("chat_view.rs").split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let hide = own.split("\"hide\" => {").nth(1).unwrap().split("\"done\" => {").next().unwrap();
+        assert!(!hide.contains("AskAction") && !hide.contains("attn("), "{hide}");
+        assert!(!own.contains("\"dismissed\""), "not relevant is the Cockpit's cross");
     }
 
     #[test]

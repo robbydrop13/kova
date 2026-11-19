@@ -137,7 +137,10 @@ pub fn ask_card_html(
     scope: crate::attention::Scope,
     now: u64,
 ) -> String {
-    let icons = [cockpit::Button::Snooze, cockpit::Button::Dismiss, cockpit::Button::Done];
+    // No cross here (Robin, 19/11/2026: the chat's cross took a decision
+    // sheet off the Cockpit and ended its `kova ask` with exit 3). The chat
+    // hides its card, in words; `Pas pertinent` is the Cockpit's cross.
+    let icons = [cockpit::Button::Snooze, cockpit::Button::HideChat, cockpit::Button::Done];
     let sheet = if q.panel_link().is_some() { vec![cockpit::Button::OpenSheet] } else { Vec::new() };
     if let Some(entry) = linked.filter(|_| q.is_decision()) {
         let item = cockpit::Item { key: q.id.clone(), ask: Some(q.id.clone()), ..entry.clone() };
@@ -436,6 +439,7 @@ mod tests {
             sheet: None,
             draft: None,
             follow_up: false,
+            again: false,
         }
     }
 
@@ -510,7 +514,11 @@ mod tests {
         assert!(html.starts_with("<article class=\"card open\" data-key=\"430b8a55-1\">"), "{html}");
         assert!(html.contains("<div class=\"t\">Plan \u{b7} 2 décisions</div>"), "an older sheet's colon reads in the one form: {html}");
         assert!(html.contains("Répondre à la fiche") && html.contains("kova \u{b7} il y a 1 min"), "{html}");
-        assert!(html.contains("data-act=\"snooze\"") && html.contains("data-act=\"dismiss\"") && html.contains("data-act=\"done\""));
+        assert!(html.contains("data-act=\"snooze\"") && html.contains("data-act=\"done\""));
+        // Robin, 19/11/2026: the chat's cross took a sheet off the Cockpit.
+        // No cross in the chat: the card is hidden from it, in words.
+        assert!(!html.contains("data-act=\"dismiss\"") && !html.contains("Pas pertinent"), "{html}");
+        assert!(html.contains("data-act=\"hide\"") && html.contains("<span>Masquer du chat</span>"), "{html}");
         assert!(html.contains("class=\"btn acc\" data-act=\"open\"><span>Décider</span>") && !html.contains("Ouvrir"), "{html}");
         assert!(html.contains("&lt;Qui&gt;") && !html.contains("<Qui>"), "escaped");
         assert!(!html.contains("cfrom") && !html.contains("class=\"ins\""), "no asker label, no instruction without an entry");
@@ -551,7 +559,7 @@ mod tests {
         };
         let html = ask_card_html(&d, None, Some(&entry), true, crate::attention::Scope::Pro, 100);
         assert!(html.contains("data-key=\"430b8a55-1\"") && html.contains("Harnais commun") && html.contains("Le fond"), "{html}");
-        assert!(html.contains("<div class=\"lbl\">Consigne</div>") && html.contains("<span>Décider</span>") && html.contains("data-act=\"dismiss\""));
+        assert!(html.contains("<div class=\"lbl\">Consigne</div>") && html.contains("<span>Décider</span>") && html.contains("data-act=\"hide\"") && !html.contains("data-act=\"dismiss\""));
         assert!(!ask_card_html(&d, None, Some(&entry), false, crate::attention::Scope::Pro, 100).contains("Consigne"), "no act command, no field");
         let mut long = question("l", Some(4), None);
         long.message = "x".repeat(80);

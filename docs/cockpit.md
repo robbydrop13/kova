@@ -161,7 +161,9 @@ it: one `WKWebView` per window over the active tab's panes area
   A waiting `kova ask` (sheet or question) has the same three icons (Robin,
   09/11/2026), acted on the board itself: the clock snoozes it, the x closes it
   `dismissed` (its `kova ask` exits 3 with `ask::DISMISSED`, and the same
-  question from the same asker is refused until Kova restarts), the check
+  question from the same asker is refused until Kova restarts, unless it
+  is posted with `kova ask --again`, for a question the user asks for back),
+  the check
   closes it `done` (`ask::DONE`). The other live needs keep their own buttons,
   no icons.
 - `Voir plus`: the list shows the first 10 cards in the priority order, then

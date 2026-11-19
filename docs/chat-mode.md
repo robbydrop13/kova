@@ -257,14 +257,18 @@ At the bottom of the thread, above the box:
 - every question is drawn as a Cockpit card (`cockpit::card_html_with`,
   `cockpit::CARD_CSS` with the design system's tokens, light or dark, set on
   `#asks`): its first line as the title, what it wants, who asked and when,
-  the rest of the message and its answers under it. Its three icons are the
-  Cockpit's: the clock opens the same snooze menu (the question comes back
-  at that date, `Board::snooze`), X and the check take it off the Cockpit
-  (`Board::close`, logged with reason `dismissed` or `done`; its `kova ask`
-  exits 3 as on a withdrawal). When an attention entry stands for a sheet
-  (its action `kova-sheet:<id>`), the card is that entry's opened Cockpit
-  card, the entry gets the same verb (`attn snooze`, `attn close --reason
-  dismissed|done`) and the card has the instruction field (`attn act ID
+  the rest of the message and its answers under it. At its head: the clock
+  opens the Cockpit's snooze menu (the question comes back at that date,
+  `Board::snooze`); `Masquer du chat`, in words, takes the card out of this
+  chat only (the question stays in the Cockpit, its `kova ask` waits on;
+  kept for this Kova's life, `chat_view::HIDDEN_ASKS`); the check takes it
+  off the Cockpit (`Board::close` with reason `done`; its `kova ask` exits
+  3). No cross in the chat (Robin, 19/11/2026: it closed a decision sheet
+  as not relevant, off the Cockpit, on one unlabelled click): `Pas
+  pertinent` is the Cockpit's cross. When an attention entry stands for a
+  sheet (its action `kova-sheet:<id>`), the card is that entry's opened
+  Cockpit card, the entry gets the same verb (`attn snooze`, `attn close
+  --reason done`) and the card has the instruction field (`attn act ID
   instruct --text=...`, Enter sends, Shift+Enter is a new line);
 - the menu Claude Code waits on, read off the pane's screen
   (`prompt_preview::parse_menu`, one grammar for a permission prompt, an

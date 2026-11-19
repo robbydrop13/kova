@@ -1004,7 +1004,7 @@ a.path {{ color: var(--accent); text-decoration: none; }} a.path:hover, .bubble 
       snzOpen(b, card.dataset.key);
     }} else if (act === "link" && b.dataset.arg) {{
       post({{ type: "link", href: b.dataset.arg }});
-    }} else if ((act === "dismiss" || act === "done") && card) {{
+    }} else if ((act === "hide" || act === "done") && card) {{
       hideCard(card.dataset.key);
       post({{ type: "ask", id: card.dataset.key, act }});
     }} else if (act === "vcancel" || act === "vfinish") {{
